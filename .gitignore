@@ -1,0 +1,30 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+tmp/
+
+# ── Virtual environment (setup.sh step 1) ─────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Output directory (setup.sh step 3) ───────────────────────────────────────
+output/
+
+# ── Downloaded code repos (files/setup_files.sh) ─────────────────────────────
+files/code/
+
+# ── Downloaded documentation (files/setup_files.sh) ──────────────────────────
+files/docs/
+
+# ── tools clone (tools/setup_tools.sh) ──────────────────────────────────────
+tools/magpie/
+tools/AgentKernelArena/
+.claude/
+.codex/
+
+# ── RAG tool generated data ───────────────────────────────────────────────────
+tools/rag_tool/chroma_db/
