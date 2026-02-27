@@ -57,8 +57,20 @@ mkdir -p "$CODE_DIR/rocm"
 clone https://github.com/ROCm/rocm-libraries       "$CODE_DIR/rocm/rocm-libraries"
 
 # Individual libraries
+clone https://github.com/ROCm/hipBLASLt            "$CODE_DIR/rocm/hipBLASLt"
+clone https://github.com/ROCm/rocRAND              "$CODE_DIR/rocm/hipRAND"      # hipRAND lives here
+clone https://github.com/ROCm/hipSOLVER            "$CODE_DIR/rocm/hipSOLVER"
+clone https://github.com/ROCm/hipSPARSELt          "$CODE_DIR/rocm/hipSPARSELt"
+clone https://github.com/ROCm/hipCUB               "$CODE_DIR/rocm/hipCUB"
+clone https://github.com/ROCm/hipTensor            "$CODE_DIR/rocm/hipTensor"
+clone https://github.com/ROCm/rocPRIM              "$CODE_DIR/rocm/rocPRIM"
+clone https://github.com/ROCm/rocThrust            "$CODE_DIR/rocm/rocThrust"
+clone https://github.com/ROCm/rocWMMA              "$CODE_DIR/rocm/rocWMMA"
 clone https://github.com/ROCm/composable_kernel    "$CODE_DIR/rocm/composable_kernel"
 clone https://github.com/ROCm/AMDMIGraphX          "$CODE_DIR/rocm/AMDMIGraphX"
+clone https://github.com/ROCm/rccl                 "$CODE_DIR/rocm/rccl"
+clone https://github.com/ROCm/rocSHMEM             "$CODE_DIR/rocm/rocSHMEM"
+clone https://github.com/AMD-AGI/Magpie            "$CODE_DIR/rocm/Magpie"
 
 echo ""
 echo "=== AITER ==="

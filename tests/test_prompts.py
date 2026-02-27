@@ -16,6 +16,9 @@ from kernel_prompt import (
     applicable_kernels,
     build_kernel_prompt,
     KERNEL_SPECS,
+    KernelSpec,
+    KernelSource,
+    _format_sources_block,
     detect_gpu,
     DEFAULT_TARGET,
     make_task_id as kernel_make_task_id,
@@ -197,6 +200,94 @@ class TestKernelPromptGeneration:
         arch = detect_gpu()
         assert arch == DEFAULT_TARGET
 
+    def test_prompt_mentions_source_finder(self, prompts):
+        for p in prompts[:10]:
+            assert "source-finder" in p["prompt"], \
+                f"{p['task_id']}: should mention source-finder MCP"
+
+    def test_prompt_mentions_find_kernel_source(self, prompts):
+        for p in prompts[:10]:
+            assert "find_kernel_source" in p["prompt"]
+
+    def test_prompt_mentions_multiple_libraries(self, prompts):
+        for p in prompts[:10]:
+            assert "composable_kernel" in p["prompt"] or "rocBLAS" in p["prompt"] \
+                or "tools/rocm/" in p["prompt"], \
+                f"{p['task_id']}: should reference multiple libraries or tools/rocm/"
+
+
+# ── KernelSource / multi-library model ────────────────────────────────────────
+
+class TestKernelSourceModel:
+    def test_every_kernel_spec_has_sources(self):
+        for k in KERNEL_SPECS:
+            assert len(k.sources) >= 1, \
+                f"{k.kernel_type}: must have at least one source"
+
+    def test_sources_have_valid_roles(self):
+        valid_roles = {"impl", "wrapper", "reference"}
+        for k in KERNEL_SPECS:
+            for src in k.sources:
+                assert src.role in valid_roles, \
+                    f"{k.kernel_type}/{src.library}: invalid role '{src.role}'"
+
+    def test_sources_have_non_empty_paths(self):
+        for k in KERNEL_SPECS:
+            for src in k.sources:
+                assert len(src.paths) >= 1, \
+                    f"{k.kernel_type}/{src.library}: must have at least one path"
+
+    def test_every_kernel_has_at_least_one_impl_source(self):
+        for k in KERNEL_SPECS:
+            impl_sources = [s for s in k.sources if s.role == "impl"]
+            assert len(impl_sources) >= 1, \
+                f"{k.kernel_type}: must have at least one 'impl' source"
+
+    def test_gemm_kernels_reference_multiple_libraries(self):
+        gemm_kernels = [k for k in KERNEL_SPECS if "gemm" in k.kernel_type]
+        for k in gemm_kernels:
+            libs = {s.library for s in k.sources}
+            assert len(libs) >= 3, \
+                f"{k.kernel_type}: GEMM kernels should reference aiter + CK/rocBLAS/hipBLASLt"
+
+    def test_all_reduce_references_rccl(self):
+        ar = next(k for k in KERNEL_SPECS if k.kernel_type == "all_reduce")
+        libs = {s.library for s in ar.sources}
+        assert "rccl" in libs, "all_reduce should reference rccl"
+
+    def test_format_sources_block_groups_by_role(self):
+        spec = KernelSpec(
+            kernel_type="test_kernel",
+            description="test",
+            applies_to="all",
+            sources=(
+                KernelSource("aiter", ("aiter/foo.py",)),
+                KernelSource("composable_kernel", ("ck/bar.hpp",), role="reference"),
+                KernelSource("vllm", ("vllm/wrapper.py",), role="wrapper"),
+            ),
+        )
+        block = _format_sources_block(spec, "vllm")
+        assert "Primary implementations" in block
+        assert "Reference" in block
+        assert "aiter" in block
+        assert "composable_kernel" in block
+        assert "vllm" in block
+
+    def test_format_sources_block_empty(self):
+        spec = KernelSpec(kernel_type="empty", description="test", applies_to="all")
+        block = _format_sources_block(spec, "vllm")
+        assert "source-finder" in block
+
+    def test_known_libraries_present_across_specs(self):
+        all_libs = set()
+        for k in KERNEL_SPECS:
+            for s in k.sources:
+                all_libs.add(s.library)
+        for expected in ("aiter", "composable_kernel", "rocBLAS", "hipBLASLt",
+                         "MIOpen", "rccl", "vllm", "sglang"):
+            assert expected in all_libs, \
+                f"Expected library '{expected}' not found in any KernelSpec"
+
 
 # ── model_prompt.py ───────────────────────────────────────────────────────────
 
@@ -241,3 +332,21 @@ class TestModelPromptGeneration:
         assert len(long) > 0
         for p in long[:3]:
             assert "chunked" in p["prompt"].lower() or "long" in p["prompt"].lower()
+
+    def test_model_prompt_mentions_multiple_rocm_libraries(self, prompts):
+        p = prompts[0]
+        text = p["prompt"]
+        for lib in ("aiter", "composable_kernel", "rocBLAS", "hipBLASLt", "MIOpen", "rccl"):
+            assert lib in text, f"model prompt should mention {lib}"
+
+    def test_model_prompt_mentions_source_finder(self, prompts):
+        for p in prompts[:5]:
+            assert "source-finder" in p["prompt"]
+
+    def test_model_prompt_mentions_find_kernel_source(self, prompts):
+        for p in prompts[:5]:
+            assert "find_kernel_source" in p["prompt"]
+
+    def test_model_prompt_mentions_identify_kernel_origin(self, prompts):
+        for p in prompts[:5]:
+            assert "identify_kernel_origin" in p["prompt"]

@@ -156,7 +156,7 @@ MODELS: list[ModelConfig] = [
     ModelConfig(
         hf_id="google/gemma-2-9b-it",
         family="gemma2", params_b=9.2,
-        attention="mha",    num_heads=16, num_kv_heads=8,  head_dim=256,
+        attention="gqa",    num_heads=16, num_kv_heads=8,  head_dim=256,
         hidden_dim=3584,    num_layers=42,
         mlp_type="dense",   num_experts=1, active_experts=1,
         context_len=8_192,
@@ -166,12 +166,12 @@ MODELS: list[ModelConfig] = [
     ModelConfig(
         hf_id="google/gemma-2-27b-it",
         family="gemma2", params_b=27.2,
-        attention="mha",    num_heads=32, num_kv_heads=16, head_dim=128,
+        attention="gqa",    num_heads=32, num_kv_heads=16, head_dim=128,
         hidden_dim=4608,    num_layers=46,
         mlp_type="dense",   num_experts=1, active_experts=1,
         context_len=8_192,
         frameworks=["sglang", "vllm"],
-        notes="Larger Gemma; tests intermediate head_dim and deeper nets",
+        notes="Larger Gemma; GQA with alternating sliding-window + global attention",
     ),
 
     # ── DeepSeek (MLA + MoE) ─────────────────────────────────────────────────
@@ -204,6 +204,19 @@ MODELS: list[ModelConfig] = [
         context_len=131_072,
         frameworks=["sglang", "vllm"],
         notes="DeepSeek reasoning distilled into Llama arch; dense, no MLA",
+    ),
+
+    # ── Moonshot Kimi K2 (MLA + MoE, DeepSeekV3 arch) ───────────────────────
+    ModelConfig(
+        hf_id="moonshotai/Kimi-K2-Thinking",
+        family="kimi", params_b=1000,
+        attention="mla",    num_heads=64, num_kv_heads=64, head_dim=128,
+        hidden_dim=7168,    num_layers=61,
+        mlp_type="moe_shared", num_experts=384, active_experts=8,
+        context_len=262_144,
+        frameworks=["sglang", "vllm"],
+        notes="DeepSeekV3 arch; MLA (kv_lora_rank=512, q_lora_rank=1536); "
+              "384 routed + 1 shared expert; top-8; FP8/MXFP4",
     ),
 
     # ── Microsoft Phi ────────────────────────────────────────────────────────

@@ -14,23 +14,27 @@ Expected output/ layout:
   output/
     <task_id>/
       solution.hip | solution.py | solution.cu   ← optimized kernel
-      config.yaml                                 ← Magpie compare config
-                                                    (see Magpie docs / examples)
+      config.yaml                                 ← task config
+                                                    (baseline path, commands, etc.)
 
-Each config.yaml should follow the Magpie kernel config schema and point to
-the baseline kernel. Example minimal config.yaml:
+Each config.yaml follows the prompt template schema:
 
   gpu:
     device: 0
+    arch: gfx950
   baseline:
-    path: /path/to/original/kernel.hip
+    path: tools/rocm/aiter/aiter/fused_moe.py
   optimized:
-    path: ./solution.hip
+    path: ./solution.py
   correctness:
-    command: "make test"
+    command: "pytest tests/ -k fused_moe -x"
   performance:
-    command: "make bench"
+    command: "python bench_fused_moe.py --arch gfx950"
+    warmup_iterations: 10
     iterations: 100
+
+The grader reads this config, locates baseline + solution files, and runs
+Magpie compare to evaluate compilation, correctness, and performance.
 """
 
 from __future__ import annotations
@@ -40,11 +44,11 @@ import json
 import sys
 from pathlib import Path
 
-# Allow running from any directory
 sys.path.insert(0, str(Path(__file__).parent))
 from score import (
     KernelResult,
-    run_magpie,
+    parse_task_config,
+    run_magpie_compare,
     parse_compare_result,
     PTS_COMPILED, PTS_CORRECT,
 )
@@ -74,7 +78,25 @@ def find_solution(task_dir: Path) -> Path | None:
     return None
 
 
-def grade_task(task_dir: Path) -> KernelResult:
+def _parse_config(config_path: Path) -> dict:
+    """Parse a task config.yaml and return the dict."""
+    return parse_task_config(config_path)
+
+
+def _detect_kernel_type(solution: Path) -> str:
+    """Infer Magpie kernel type from the solution file extension."""
+    ext = solution.suffix.lower()
+    if ext in (".hip", ".cu"):
+        return "hip"
+    return "pytorch"
+
+
+def grade_task(task_dir: Path, docker_image: str | None = None) -> KernelResult:
+    """
+    Grade a single task directory.
+
+    Reads config.yaml, finds baseline + solution, runs Magpie compare.
+    """
     task_id  = task_dir.name
     solution = find_solution(task_dir)
     config   = task_dir / "config.yaml"
@@ -85,11 +107,36 @@ def grade_task(task_dir: Path) -> KernelResult:
     if not config.exists():
         return KernelResult(
             task_id=task_id,
-            error=f"config.yaml missing in {task_dir}; cannot run Magpie",
+            compiled=True,
+            error=f"config.yaml missing in {task_dir}; solution exists but cannot run Magpie without config",
         )
 
-    # Run: magpie compare --config <config.yaml>
-    raw = run_magpie(["compare", "--config", str(config)])
+    cfg = _parse_config(config)
+
+    baseline_path = cfg.get("baseline", {}).get("path", "")
+    if not baseline_path:
+        return KernelResult(
+            task_id=task_id,
+            error="config.yaml missing baseline.path",
+        )
+
+    if not Path(baseline_path).is_absolute():
+        baseline_path = str(REPO_ROOT / baseline_path)
+
+    optimized_path = cfg.get("optimized", {}).get("path", str(solution))
+    if not Path(optimized_path).is_absolute():
+        optimized_path = str(task_dir / optimized_path)
+
+    testcase_cmd = cfg.get("correctness", {}).get("command")
+    kernel_type = _detect_kernel_type(solution)
+
+    raw = run_magpie_compare(
+        baseline_path=baseline_path,
+        optimized_path=optimized_path,
+        testcase_cmd=testcase_cmd,
+        kernel_type=kernel_type,
+        working_dir=str(task_dir),
+    )
 
     if "error" in raw:
         return KernelResult(task_id=task_id, raw=raw, error=raw["error"])

@@ -4,18 +4,17 @@ eval_fused_moe.py — Focused eval: optimize the fused MoE Triton kernel on MI35
 
 This test:
   1. Downloads only the necessary vLLM fused_moe files (sparse checkout)
-  2. Runs an agent backend (Codex default, Claude optional) with MCP tools to optimize the kernel
+  2. Runs the Claude Code agent with all MCP tools to optimize the kernel
   3. Grades the result (compile, correctness, speedup) via docker on GPU
 
 Usage:
     python3 tests/fused_moe/eval_fused_moe.py                   # full run
     python3 tests/fused_moe/eval_fused_moe.py --dry-run          # skip agent, use trivial solution
-    python3 tests/fused_moe/eval_fused_moe.py --agent claude --model opus  # use Claude opus
-    python3 tests/fused_moe/eval_fused_moe.py --agent codex --model gpt-5.3-codex  # use Codex model
+    python3 tests/fused_moe/eval_fused_moe.py --model opus       # use opus model
     python3 tests/fused_moe/eval_fused_moe.py --max-turns 15     # more agent turns
 
 Requirements:
-    - codex CLI (default backend), or pip install claude-agent-sdk for --agent claude
+    - pip install claude-agent-sdk
     - docker with rocm/pytorch:latest image
     - GPU access (--device=/dev/kfd --device=/dev/dri)
 """
@@ -23,7 +22,9 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -36,15 +37,8 @@ OUTPUT_DIR = REPO_ROOT / "output" / TASK_ID
 
 DOCKER_IMAGE = "rocm/pytorch:latest"
 
+DEFAULT_MODEL = "claude-sonnet-4-6"
 MAX_TURNS = 12
-
-sys.path.insert(0, str(REPO_ROOT))
-from agents.backends import (
-    DEFAULT_AGENT,
-    model_display_name,
-    resolve_default_model,
-    run_agent_task,
-)
 
 # ── Score constants (from graders/score.py) ──────────────────────────────────
 PTS_COMPILED = 20
@@ -184,9 +178,47 @@ def build_prompt(vllm_fused_moe_dir: Path) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. AGENT — Codex (default) / Claude
+# 3. AGENT — Claude Code via Agent SDK
 # ══════════════════════════════════════════════════════════════════════════════
-def run_agent(prompt: str, model: str | None, max_turns: int, dry_run: bool, agent: str) -> bool:
+
+async def _run_agent_async(prompt: str, model: str, max_turns: int) -> tuple[list, bool]:
+    from claude_agent_sdk import query, ClaudeAgentOptions
+
+    options = ClaudeAgentOptions(
+        cwd=str(REPO_ROOT),
+        model=model,
+        max_turns=max_turns,
+        permission_mode="bypassPermissions",
+        system_prompt=(
+            "You are an expert GPU kernel engineer specializing in AMD ROCm "
+            "and Triton optimization for MI355X (gfx950, CDNA4). "
+            "You have access to MCP tools: fusion-advisor, asm-tools, gpu-info, "
+            "rag-server, arxiv, source-finder, and magpie for profiling and analysis. "
+            "Use these tools to analyze and optimize the kernel."
+        ),
+    )
+
+    trajectory = []
+    async for message in query(prompt=prompt, options=options):
+        trajectory.append(message)
+        if hasattr(message, "content"):
+            for block in message.content:
+                if hasattr(block, "name"):
+                    args = list(block.input.keys()) if hasattr(block, "input") else []
+                    print(f"    tool: {block.name}({args})")
+                elif hasattr(block, "text"):
+                    # Print first line of text responses
+                    first_line = block.text.strip().split("\n")[0][:100]
+                    if first_line:
+                        print(f"    text: {first_line}...")
+        if hasattr(message, "num_turns"):
+            cost = getattr(message, "total_cost_usd", 0.0) or 0.0
+            print(f"  result: turns={message.num_turns}, cost=${cost:.4f}")
+
+    return trajectory, (OUTPUT_DIR / "solution.py").exists()
+
+
+def run_agent(prompt: str, model: str, max_turns: int, dry_run: bool) -> bool:
     if dry_run:
         print("  [dry-run] writing trivial autotuned solution...")
         solution = textwrap.dedent("""\
@@ -197,23 +229,17 @@ def run_agent(prompt: str, model: str | None, max_turns: int, dry_run: bool, age
         return True
 
     try:
-        _, solution_written = run_agent_task(
-            prompt=prompt,
-            cwd=REPO_ROOT,
-            model=model,
-            max_turns=max_turns,
-            agent=agent,
-            system_prompt=(
-                "You are an expert GPU kernel engineer specializing in AMD ROCm "
-                "and Triton optimization for MI355X (gfx950, CDNA4). "
-                "You have access to MCP tools such as magpie and kernel-rag if configured. "
-                "Use available tools to analyze and optimize the kernel."
-            ),
-            solution_path=OUTPUT_DIR / "solution.py",
-        )
-    except RuntimeError as e:
-        print(f"ERROR: {e}")
+        from claude_agent_sdk import query, ClaudeAgentOptions  # noqa: F401
+    except ImportError:
+        print("ERROR: claude-agent-sdk not installed. Run: pip install claude-agent-sdk")
         return False
+
+    _cc = os.environ.pop("CLAUDECODE", None)
+    try:
+        _, solution_written = asyncio.run(_run_agent_async(prompt, model, max_turns))
+    finally:
+        if _cc is not None:
+            os.environ["CLAUDECODE"] = _cc
 
     return solution_written
 
@@ -254,25 +280,21 @@ def grade_in_docker(solution_path: Path) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Fused MoE kernel optimization eval")
-    parser.add_argument("--agent", choices=["codex", "claude"], default=DEFAULT_AGENT,
-                        help=f"Agent backend (default: {DEFAULT_AGENT})")
-    parser.add_argument("--model", default=None,
-                        help="Model name (default: backend-specific; codex reads ~/.codex/config.toml, e.g. gpt-5.3-codex)")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help=f"Claude model (default: {DEFAULT_MODEL})")
     parser.add_argument("--max-turns", type=int, default=MAX_TURNS)
     parser.add_argument("--dry-run", action="store_true",
                         help="Skip agent, write trivial solution")
     parser.add_argument("--grade-only", action="store_true",
                         help="Skip agent, just grade existing solution.py")
     args = parser.parse_args()
-    model = args.model or resolve_default_model(args.agent)
 
     print("")
     print("=" * 60)
     print("  Fused MoE Kernel Optimization — MI355X Eval")
     print("=" * 60)
     print(f"  Task:    {TASK_ID}")
-    print(f"  Agent:   {args.agent}")
-    print(f"  Model:   {model_display_name(model, args.agent)}")
+    print(f"  Model:   {args.model}")
     print(f"  Docker:  {DOCKER_IMAGE}")
     print("")
 
@@ -292,7 +314,7 @@ def main():
 
         # Step 4: Run agent
         print("\n--- Step 4: Running agent ---")
-        solution_written = run_agent(prompt, model, args.max_turns, args.dry_run, args.agent)
+        solution_written = run_agent(prompt, args.model, args.max_turns, args.dry_run)
 
         if not solution_written:
             print("  Agent did not write solution.py")

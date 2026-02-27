@@ -46,15 +46,14 @@ def detect_gpu() -> str:
         out = subprocess.check_output(
             ["rocm-smi", "--showproductname"], text=True, timeout=5
         )
-        for arch, name in ARCH_MAP.items():
-            if any(k in out for k in ["MI355", "MI350"]):
-                return "gfx950"
-            if "MI300X" in out:
-                return "gfx942"
-            if "MI300A" in out:
-                return "gfx940"
-            if "MI250" in out:
-                return "gfx90a"
+        if any(k in out for k in ["MI355", "MI350"]):
+            return "gfx950"
+        if "MI300X" in out:
+            return "gfx942"
+        if "MI300A" in out:
+            return "gfx940"
+        if "MI250" in out:
+            return "gfx90a"
     except Exception:
         pass
     return DEFAULT_TARGET
@@ -63,14 +62,22 @@ def detect_gpu() -> str:
 # ── Kernel type registry ──────────────────────────────────────────────────────
 
 @dataclass
+class KernelSource:
+    """A known implementation of a kernel in a specific library."""
+    library:  str    # aiter | composable_kernel | rocBLAS | hipBLASLt | MIOpen | rccl | triton | vllm | sglang
+    paths:    tuple[str, ...]   # relative to tools/rocm/
+    role:     str    = "impl"   # impl | wrapper | reference
+
+
+@dataclass
 class KernelSpec:
     kernel_type:  str
     description:  str
     applies_to:   str   # "all" | attention type | mlp type
-    # Where this kernel lives in each framework
-    vllm_path:    str   = ""
-    sglang_path:  str   = ""
     triton:       bool  = False   # True = Triton kernel (else HIP/C++)
+    # Known implementations across ROCm libraries.
+    # Paths are relative to tools/rocm/.  Use source-finder MCP to discover more.
+    sources:      tuple[KernelSource, ...] = ()
 
 
 KERNEL_SPECS: list[KernelSpec] = [
@@ -78,97 +85,227 @@ KERNEL_SPECS: list[KernelSpec] = [
         kernel_type="flash_attn_prefill",
         description="Flash attention for the prefill (prompt) phase",
         applies_to="all",
-        vllm_path="vllm/attention/backends/rocm_flash_attn.py",
-        sglang_path="sglang/srt/layers/attention/triton_ops/prefill_attention.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/triton/attention/mha.py",
+                "aiter/aiter/ops/triton/attention/pa_prefill.py",
+            )),
+            KernelSource("composable_kernel", (
+                "composable_kernel/include/ck_tile/ops/fmha/kernel/fmha_fwd_kernel.hpp",
+            ), role="reference"),
+            KernelSource("vllm", (
+                "vllm/vllm/v1/attention/backends/rocm_aiter_fa.py",
+            ), role="wrapper"),
+            KernelSource("sglang", (
+                "sglang/python/sglang/srt/layers/attention/vision.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="paged_attn_decode",
         description="Paged attention for autoregressive decoding (single token per step)",
         applies_to="all",
-        vllm_path="vllm/attention/backends/rocm_flash_attn.py",
-        sglang_path="sglang/srt/layers/attention/triton_ops/decode_attention.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/triton/attention/pa_decode.py",
+                "aiter/aiter/ops/triton/gluon/pa_decode_gluon.py",
+            )),
+            KernelSource("vllm", (
+                "vllm/vllm/v1/attention/backends/rocm_aiter_fa.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="mla_attn",
         description="Multi-Head Latent Attention (MLA) — DeepSeek-specific compressed KV",
         applies_to="mla",
-        vllm_path="vllm/attention/backends/mla/rocm_mla_attn.py",
-        sglang_path="sglang/srt/layers/attention/mla_attn_backend.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/mla.py",
+            )),
+            KernelSource("vllm", (
+                "vllm/vllm/v1/attention/backends/mla/rocm_aiter_mla.py",
+            ), role="wrapper"),
+            KernelSource("sglang", (
+                "sglang/python/sglang/srt/layers/attention/nsa_backend.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="fused_moe",
         description="Fused Mixture-of-Experts gate + topk routing + expert GEMM",
         applies_to="moe",
-        vllm_path="vllm/model_executor/layers/fused_moe/rocm_aiter_fused_moe.py",
-        sglang_path="sglang/srt/layers/moe/fused_moe_triton.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/fused_moe.py",
+                "aiter/aiter/fused_moe_bf16_asm.py",
+            )),
+            KernelSource("vllm", (
+                "vllm/vllm/model_executor/layers/fused_moe/rocm_aiter_fused_moe.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="gemm_w8a8",
         description="FP8 weight × FP8 activation GEMM for linear layers (W8A8)",
         applies_to="all",
-        vllm_path="vllm/model_executor/layers/quantization/utils/w8a8_utils.py",
-        sglang_path="sglang/srt/layers/quantization/fp8_kernel.py",
         triton=False,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/gemm_op_a8w8.py",
+                "aiter/aiter/ops/triton/gemm/basic/gemm_a8w8_blockscale.py",
+            )),
+            KernelSource("composable_kernel", (
+                "composable_kernel/include/ck/tensor_operation/gpu/device/impl/device_gemm_xdl.hpp",
+            ), role="reference"),
+            KernelSource("hipBLASLt", (
+                "hipBLASLt/library/src/",
+            ), role="reference"),
+            KernelSource("vllm", (
+                "vllm/vllm/model_executor/layers/quantization/utils/fp8_utils.py",
+            ), role="wrapper"),
+            KernelSource("sglang", (
+                "sglang/python/sglang/srt/layers/quantization/fp8_utils.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="gemm_bf16",
         description="BF16 GEMM for linear (QKV proj, up/gate/down proj)",
         applies_to="all",
-        vllm_path="vllm/model_executor/layers/linear.py",
-        sglang_path="sglang/srt/layers/linear.py",
         triton=False,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/gemm_op_a16w16.py",
+            )),
+            KernelSource("rocBLAS", (
+                "rocBLAS/library/src/blas3/",
+            ), role="reference"),
+            KernelSource("hipBLASLt", (
+                "hipBLASLt/library/src/",
+            ), role="reference"),
+            KernelSource("composable_kernel", (
+                "composable_kernel/include/ck/tensor_operation/gpu/device/impl/device_gemm_xdl.hpp",
+            ), role="reference"),
+            KernelSource("vllm", (
+                "vllm/vllm/model_executor/layers/utils.py",
+            ), role="wrapper"),
+            KernelSource("sglang", (
+                "sglang/python/sglang/srt/layers/rocm_linear_utils.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="rms_norm",
         description="RMSNorm (pre/post attention and MLP)",
         applies_to="all",
-        vllm_path="vllm/model_executor/layers/layernorm.py",
-        sglang_path="sglang/srt/layers/layernorm.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/triton/normalization/rmsnorm.py",
+                "aiter/csrc/include/rmsnorm.h",
+            )),
+            KernelSource("composable_kernel", (
+                "composable_kernel/include/ck/tensor_operation/gpu/device/impl/device_normalization_fwd_impl.hpp",
+            ), role="reference"),
+            KernelSource("MIOpen", (
+                "MIOpen/src/kernels/",
+            ), role="reference"),
+            KernelSource("vllm", (
+                "vllm/vllm/model_executor/layers/layernorm.py",
+            ), role="wrapper"),
+            KernelSource("sglang", (
+                "sglang/python/sglang/srt/layers/layernorm.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="rope_embedding",
         description="Rotary Position Embedding (RoPE) — applied to Q and K",
         applies_to="all",
-        vllm_path="vllm/model_executor/layers/rotary_embedding.py",
-        sglang_path="sglang/srt/layers/rotary_embedding.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/triton/rope/rope.py",
+                "aiter/aiter/ops/triton/fusions/fused_qk_concat.py",
+            )),
+            KernelSource("vllm", (
+                "vllm/vllm/model_executor/layers/rotary_embedding/__init__.py",
+            ), role="wrapper"),
+            KernelSource("sglang", (
+                "sglang/python/sglang/srt/layers/rotary_embedding/factory.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="kv_cache_ops",
         description="KV cache reshape, copy, and quantization ops (paged cache management)",
         applies_to="all",
-        vllm_path="vllm/attention/ops/paged_attn.py",
-        sglang_path="sglang/srt/mem_cache/memory_pool.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/cache.py",
+                "aiter/csrc/kernels/cache_kernels.cu",
+            )),
+        ),
     ),
     KernelSpec(
         kernel_type="all_reduce",
         description="Tensor-parallel all-reduce (RCCL + custom fused reduce-scatter kernels)",
         applies_to="all",
-        vllm_path="vllm/distributed/communication_op.py",
-        sglang_path="sglang/srt/distributed/all_reduce.py",
         triton=False,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/dist/device_communicators/custom_all_reduce.py",
+                "aiter/csrc/kernels/custom_all_reduce.cu",
+            )),
+            KernelSource("rccl", (
+                "rccl/src/",
+            ), role="reference"),
+            KernelSource("vllm", (
+                "vllm/vllm/distributed/device_communicators/custom_all_reduce.py",
+            ), role="wrapper"),
+            KernelSource("sglang", (
+                "sglang/python/sglang/srt/distributed/device_communicators/custom_all_reduce.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="act_quant_fp8",
         description="Dynamic per-token FP8 activation quantization before GEMM",
         applies_to="all",
-        vllm_path="vllm/model_executor/layers/quantization/fp8.py",
-        sglang_path="sglang/srt/layers/quantization/fp8_kernel.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/quant.py",
+                "aiter/aiter/ops/triton/quant/fused_fp8_quant.py",
+            )),
+            KernelSource("vllm", (
+                "vllm/vllm/model_executor/layers/quantization/input_quant_fp8.py",
+            ), role="wrapper"),
+        ),
     ),
     KernelSpec(
         kernel_type="silu_mul",
         description="Fused SiLU × gate (SwiGLU) activation for MLP",
         applies_to="all",
-        vllm_path="vllm/model_executor/layers/activation.py",
-        sglang_path="sglang/srt/layers/activation.py",
         triton=True,
+        sources=(
+            KernelSource("aiter", (
+                "aiter/aiter/ops/activation.py",
+                "aiter/csrc/kernels/activation_kernels.cu",
+            )),
+            KernelSource("MIOpen", (
+                "MIOpen/src/kernels/",
+            ), role="reference"),
+            KernelSource("vllm", (
+                "vllm/vllm/model_executor/layers/activation.py",
+            ), role="wrapper"),
+        ),
     ),
 ]
 
@@ -215,28 +352,65 @@ Model architecture:
 - Layers: {num_layers}, hidden_dim: {hidden_dim}
 - Context length: {context_len:,} tokens
 
-Kernel source location in {framework}:
-  {kernel_path}
+## Kernel source locations
+
+On AMD ROCm, kernel implementations are spread across multiple libraries under \
+`tools/rocm/`.  The most common primary source is **aiter** (AMD AI Tensor Engine \
+for ROCm), but other libraries such as **composable_kernel** (CK), **rocBLAS**, \
+**hipBLASLt**, **MIOpen**, and **rccl** also provide kernels and reference \
+implementations.  vLLM and SGLang typically provide thin wrappers that call into \
+these libraries on ROCm.
+
+{sources_block}
+
+IMPORTANT: The paths above are known starting points — they may be incomplete. \
+Always use the **source-finder** MCP to search broadly across `tools/rocm/`:
+  - `find_kernel_source("{kernel_type}")` — searches ALL cloned ROCm repos
+  - `find_ck_template` — find composable_kernel tile/device templates
+  - `identify_kernel_origin` — trace which library a kernel comes from
+Also use **kernel-rag** `search_library_code` to find related patterns.
+
+## Available MCP tools
+
+You have access to the following MCP servers — use them throughout this task:
+
+| MCP | Key tools | When to use |
+|-----|-----------|-------------|
+| **source-finder** | `find_kernel_source`, `classify_kernel`, `identify_kernel_origin`, `find_ck_template` | Locate kernel source files, find CK templates, understand kernel lineage |
+| **kernel-rag** | `search_kernel_optimization`, `get_optimization_snippet`, `analyze_kernel_for_optimization`, `get_optimization_playbook` | Get optimization patterns, code snippets, and analysis |
+| **gpu-info** | `get_gpu_info`, `get_arch_optimization_hints` | Get target GPU specs and architecture-specific optimization hints |
+| **fusion-advisor** | `detect_fusion_opportunities`, `generate_fused_kernel` | Find kernel fusion opportunities and generate fused implementations |
+| **magpie** | `analyze`, `compare`, `benchmark` | Evaluate kernel correctness and performance |
 
 ## Instructions
 
-1. **Read** the existing kernel implementation at the path above (it will be \
-available in the sandbox after running `bash files/setup_files.sh`).
+1. **Locate** the kernel source using the source-finder MCP:
+   - `find_kernel_source("{kernel_type}")` to search ALL ROCm repos
+   - Read the implementations listed above (aiter, CK, rocBLAS, etc.)
+   - Use `identify_kernel_origin` to understand which library provides the hot path
 
-2. **Identify** the primary performance bottleneck(s):
+2. **Analyze** the kernel using kernel-rag MCP:
+   - `analyze_kernel_for_optimization` with the kernel code
+   - `get_optimization_snippet` for relevant patterns
+   - `get_arch_optimization_hints` from gpu-info for {gpu_arch}-specific tips
+
+3. **Identify** the primary performance bottleneck(s):
    - Memory access pattern (coalescing, LDS bank conflicts)
    - Compute utilization (MFMA usage, register pressure)
    - Occupancy (wavefront count per CU)
    - Kernel launch overhead
 
-3. **Write** your optimized implementation to:
+4. **Check** for fusion opportunities using fusion-advisor:
+   - `detect_fusion_opportunities` on the surrounding ops
+
+5. **Write** your optimized implementation to:
    `output/{task_id}/solution{ext}`
 
-4. **Write** a Magpie evaluation config to:
+6. **Write** a Magpie evaluation config to:
    `output/{task_id}/config.yaml`
    (set `baseline.path` to the original kernel, `optimized.path` to your solution)
 
-5. **Do not** modify any files outside `output/{task_id}/`.
+7. **Do not** modify any files outside `output/{task_id}/`.
 
 ## output/{task_id}/config.yaml template
 ```yaml
@@ -244,7 +418,7 @@ gpu:
   device: 0
   arch: {gpu_arch}
 baseline:
-  path: <path-to-original-{framework}-kernel>
+  path: <path-to-original-kernel>  # e.g. tools/rocm/aiter/..., tools/rocm/composable_kernel/...
 optimized:
   path: ./solution{ext}
 correctness:
@@ -270,6 +444,44 @@ def make_task_id(model: ModelConfig, kernel: KernelSpec) -> str:
     return f"{model_slug}__{kernel.kernel_type}"
 
 
+def _format_sources_block(kernel: KernelSpec, framework: str) -> str:
+    """Format all known source locations grouped by role."""
+    if not kernel.sources:
+        return "  (no known paths — use source-finder MCP to locate)"
+
+    impl_lines: list[str] = []
+    ref_lines: list[str] = []
+    wrapper_lines: list[str] = []
+
+    for src in kernel.sources:
+        paths_str = "\n".join(f"    tools/rocm/{p}" for p in src.paths)
+        entry = f"  **{src.library}**:\n{paths_str}"
+        if src.role == "impl":
+            impl_lines.append(entry)
+        elif src.role == "reference":
+            ref_lines.append(entry)
+        elif src.role == "wrapper":
+            wrapper_lines.append(entry)
+
+    blocks: list[str] = []
+    if impl_lines:
+        blocks.append("Primary implementations:\n" + "\n".join(impl_lines))
+    if ref_lines:
+        blocks.append("Reference / alternative implementations:\n" + "\n".join(ref_lines))
+
+    fw_wrappers = [e for e in wrapper_lines
+                   if f"**{framework}**" in e]
+    other_wrappers = [e for e in wrapper_lines
+                      if f"**{framework}**" not in e]
+    if fw_wrappers:
+        blocks.append(f"{framework} wrappers (call into ROCm libs):\n" + "\n".join(fw_wrappers))
+    if other_wrappers:
+        other_fw = "vllm" if framework == "sglang" else "sglang"
+        blocks.append(f"{other_fw} wrappers:\n" + "\n".join(other_wrappers))
+
+    return "\n\n".join(blocks)
+
+
 def build_kernel_prompt(
     model:     ModelConfig,
     kernel:    KernelSpec,
@@ -280,7 +492,6 @@ def build_kernel_prompt(
     cdna_gen  = "CDNA4" if gpu_arch == "gfx950" else "CDNA3" if gpu_arch in ("gfx942","gfx940") else "CDNA2"
     ext       = ".py" if kernel.triton else ".hip"
     task_id   = make_task_id(model, kernel)
-    kpath     = kernel.sglang_path if framework == "sglang" else kernel.vllm_path
 
     moe_info = ""
     if model.mlp_type in ("moe", "moe_shared"):
@@ -309,7 +520,7 @@ def build_kernel_prompt(
         hidden_dim=model.hidden_dim, num_layers=model.num_layers,
         mlp_type=model.mlp_type, moe_info=moe_info,
         context_len=model.context_len,
-        kernel_path=kpath or "(see framework source)",
+        sources_block=_format_sources_block(kernel, framework),
         task_id=task_id, ext=ext,
         extra_hints=extra_hints,
     )

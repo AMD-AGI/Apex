@@ -159,15 +159,41 @@ precision: {precision}
 ## Key optimization strategies for this config
 {strategy_notes}
 
-## Reference implementations
-- Flash attention (AMD): `files/code/aiter/aiter/ops/triton/`
-- FusedMoE (AMD): `files/code/rocm/rocm-libraries/` or AITER
-- Composable Kernel GEMM: `files/code/rocm/composable_kernel/include/ck/`
-- Triton kernels: `files/code/triton/python/triton/ops/`
-- vLLM AMD kernels: `files/code/vllm/vllm/attention/backends/rocm_flash_attn.py`
-- SGLang AMD kernels: `files/code/sglang/python/sglang/srt/layers/attention/`
+## Available MCP tools
 
-Use the RAG tool (`find_relevant_files`) to locate the most relevant reference code.
+You have access to the following MCP servers — use them throughout this task:
+
+| MCP | Key tools | When to use |
+|-----|-----------|-------------|
+| **source-finder** | `find_kernel_source`, `classify_kernel`, `find_ck_template`, `decode_tensile_kernel` | Locate kernel source files in ROCm repos, find CK templates |
+| **kernel-rag** | `search_kernel_optimization`, `get_optimization_snippet`, `analyze_kernel_for_optimization`, `search_library_code`, `get_optimization_playbook` | Get optimization patterns, snippets, and analysis for HIP/Triton |
+| **gpu-info** | `get_gpu_info`, `get_arch_optimization_hints`, `get_gpu_specs` | Get target GPU specs and architecture-specific tips |
+| **fusion-advisor** | `detect_fusion_opportunities`, `generate_fused_kernel`, `estimate_fusion_benefit` | Find and exploit kernel fusion opportunities |
+| **magpie** | `analyze`, `compare`, `benchmark` | Evaluate kernel correctness and performance |
+
+## Reference implementations
+
+All AMD kernel implementations are in `tools/rocm/` (cloned ROCm repos).  \
+Kernels are spread across **multiple libraries** — do NOT assume a single \
+library contains everything.
+
+| Library | Location | What it provides |
+|---------|----------|-----------------|
+| **aiter** | `tools/rocm/aiter/` | Primary Triton/HIP kernels for attention, MLA, MoE, GEMM, norm, activation (vLLM/SGLang import from here) |
+| **composable_kernel** | `tools/rocm/composable_kernel/include/ck/` | Tile-based C++ templates for GEMM, batched-GEMM, grouped-convolution, normalization, MHA |
+| **rocBLAS** | `tools/rocm/rocBLAS/library/src/` | Optimized BLAS routines (GEMM, TRSM, etc.) for ROCm |
+| **hipBLASLt** | `tools/rocm/hipBLASLt/library/src/` | Lightweight GEMM library with epilogue fusion (bias, activation, scaling) |
+| **MIOpen** | `tools/rocm/MIOpen/src/` | CNN/normalization/activation/pooling primitives |
+| **rccl** | `tools/rocm/rccl/src/` | Collective communication (AllReduce, AllGather, ReduceScatter) |
+| **triton** | `tools/rocm/triton/python/triton/` | Triton compiler and language library for AMD GPUs |
+| **vLLM** | `tools/rocm/vllm/vllm/` | Framework wrappers that call into the above libraries on ROCm |
+| **SGLang** | `tools/rocm/sglang/python/sglang/srt/layers/` | Framework wrappers that call into the above libraries on ROCm |
+
+IMPORTANT: Always use **source-finder** MCP to search across ALL repos:
+  - `find_kernel_source("<kernel_type>")` — searches every cloned ROCm repo
+  - `find_ck_template` — find composable_kernel tile/device templates
+  - `identify_kernel_origin` — trace which library provides the actual implementation
+Also use **kernel-rag** MCP `search_library_code` for optimization patterns.
 """
 
 

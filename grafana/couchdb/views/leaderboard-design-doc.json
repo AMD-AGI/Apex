@@ -1,0 +1,16 @@
+{
+  "_id": "_design/leaderboard",
+  "views": {
+    "by_timestamp": {
+      "map": "function(doc) { if (doc.type === 'leaderboard') { emit(doc.timestamp, { agent_version: doc.agent_version, task_id: doc.task_id, kernel_type: doc.kernel_type, model_id: doc.model_id, kernel_score: doc.kernel_score, model_score: doc.model_score, arena_score: doc.arena_score, speedup: doc.speedup, throughput_ratio: doc.throughput_ratio, baseline_tps: doc.baseline_tps, optimized_tps: doc.optimized_tps, timestamp: doc.timestamp }); } }"
+    },
+    "by_agent": {
+      "map": "function(doc) { if (doc.type === 'leaderboard') { emit(doc.agent_version, { count: 1, arena_score: doc.arena_score, speedup: doc.speedup, throughput_ratio: doc.throughput_ratio, kernel_score: doc.kernel_score, model_score: doc.model_score }); } }",
+      "reduce": "function(keys, values, rereduce) { var r = { count: 0, total_arena: 0, total_speedup: 0, total_throughput: 0, best_score: 0 }; for (var i = 0; i < values.length; i++) { var v = values[i]; if (rereduce) { r.count += v.count; r.total_arena += v.total_arena; r.total_speedup += v.total_speedup; r.total_throughput += v.total_throughput; r.best_score = Math.max(r.best_score, v.best_score); } else { r.count += 1; r.total_arena += v.arena_score; r.total_speedup += v.speedup; r.total_throughput += v.throughput_ratio; r.best_score = Math.max(r.best_score, v.arena_score); } } r.avg_arena = r.count > 0 ? r.total_arena / r.count : 0; r.avg_speedup = r.count > 0 ? r.total_speedup / r.count : 0; r.avg_throughput = r.count > 0 ? r.total_throughput / r.count : 0; return r; }"
+    },
+    "by_kernel": {
+      "map": "function(doc) { if (doc.type === 'leaderboard') { emit([doc.kernel_type, doc.model_id], { kernel_type: doc.kernel_type, model_id: doc.model_id, agent_version: doc.agent_version, speedup: doc.speedup, arena_score: doc.arena_score, timestamp: doc.timestamp }); } }"
+    }
+  },
+  "language": "javascript"
+}

@@ -1,0 +1,123 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keystone-eval
+  namespace: keystone
+  labels:
+    app.kubernetes.io/name: keystone-eval
+    app.kubernetes.io/component: pipeline
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keystone-eval
+    spec:
+      restartPolicy: Never
+      containers:
+        # Main eval container
+        - name: eval
+          image: keystone-eval:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "pipeline.py"]
+          args:
+            - "--model"
+            - "$(MODEL_ID)"
+            - "--kernel"
+            - "$(KERNEL_TYPE)"
+            - "--framework"
+            - "$(FRAMEWORK)"
+            - "--gpu"
+            - "$(GPU_ARCH)"
+            - "--agent-version"
+            - "$(AGENT_VERSION)"
+            - "--trajectory-store"
+            - "$(TRAJECTORY_STORE)"
+            - "--leaderboard"
+          env:
+            - name: MODEL_ID
+              value: "deepseek-ai/DeepSeek-R1"
+            - name: KERNEL_TYPE
+              value: "all"
+            - name: FRAMEWORK
+              value: "sglang"
+            - name: GPU_ARCH
+              value: "gfx950"
+            - name: AGENT_VERSION
+              value: "v1.0"
+            - name: TRAJECTORY_STORE
+              value: "couchdb"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: keystone-secrets
+                  key: anthropic-api-key
+            - name: COUCHDB_URL
+              value: "http://couchdb.keystone.svc.cluster.local:5984"
+            - name: COUCHDB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: keystone-secrets
+                  key: couchdb-user
+            - name: COUCHDB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: keystone-secrets
+                  key: couchdb-pass
+          volumeMounts:
+            - name: output
+              mountPath: /workspace/output
+            - name: rocm-repos
+              mountPath: /workspace/tools/rocm
+              readOnly: true
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+            - name: trajectories
+              mountPath: /workspace/trajectories
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              amd.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "64Gi"
+              amd.com/gpu: "1"
+
+        # MCP sidecar
+        - name: mcp-sidecar
+          image: keystone-mcp:latest
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: rocm-repos
+              mountPath: /workspace/tools/rocm
+              readOnly: true
+          resources:
+            requests:
+              cpu: "1"
+              memory: "4Gi"
+            limits:
+              cpu: "2"
+              memory: "8Gi"
+
+      volumes:
+        - name: output
+          persistentVolumeClaim:
+            claimName: keystone-output
+        - name: rocm-repos
+          persistentVolumeClaim:
+            claimName: keystone-rocm-repos
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: keystone-model-cache
+        - name: trajectories
+          persistentVolumeClaim:
+            claimName: keystone-trajectories
+
+      nodeSelector:
+        accelerator: amd-gpu
+      tolerations:
+        - key: "amd.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"

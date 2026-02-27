@@ -68,6 +68,7 @@ echo "--- 2. Python dependencies ---"
 
 # Core for graders + prompts (always needed)
 python3 -m pip install --quiet \
+    anthropic \
     pyyaml \
     rich
 
@@ -76,7 +77,7 @@ python3 -m pip install --quiet \
     pytest \
     pytest-asyncio
 
-echo "  installed: pyyaml, rich, pytest"
+echo "  installed: anthropic, pyyaml, rich, pytest"
 
 # RAG tool deps (needed for eval + tools tests)
 python3 -m pip install --quiet \
@@ -86,8 +87,6 @@ python3 -m pip install --quiet \
     tiktoken
 
 echo "  installed: chromadb, sentence-transformers, mcp, tiktoken"
-
-echo "  note: agent backends are external CLIs/SDKs (codex default; claude optional)"
 
 # ── 3. Create output/ directory ───────────────────────────────────────────────
 echo ""
@@ -124,22 +123,10 @@ validate_import() {
         || echo "  ✗ import $module FAILED"
 }
 
+validate_import anthropic
 validate_import pytest
 validate_import chromadb
 validate_import yaml
-validate_import rich
-
-if command -v codex >/dev/null 2>&1; then
-    echo "  ✓ codex CLI"
-else
-    echo "  ! codex CLI not found (default agent backend for eval.py)"
-fi
-
-if command -v claude >/dev/null 2>&1; then
-    echo "  ✓ claude CLI"
-else
-    echo "  ! claude CLI not found (optional backend)"
-fi
 
 # Validate graders are importable
 python3 -c "
@@ -178,7 +165,6 @@ echo ""
 echo "  Activate venv:  source $VENV_DIR/bin/activate"
 echo "  Run tests:      pytest tests/ -v"
 echo "  Run mini eval:  python3 eval.py"
-echo "                 (default agent=codex; use --agent claude for Claude backend)"
 echo ""
 echo "  Kernel prompts: python3 prompts/kernel_prompt.py --list"
 echo "  Model prompts:  python3 prompts/model_prompt.py  --list"

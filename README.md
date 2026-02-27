@@ -76,16 +76,10 @@ Activate the environment:
 source .venv/bin/activate
 ```
 
-**Agent backend setup (default: Codex CLI):**
+**Environment variable required for the agent:**
 
 ```bash
-# Codex backend (default in eval scripts)
-codex login
-# default model is read from ~/.codex/config.toml (e.g. gpt-5.3-codex)
-
-# Claude backend (optional)
 export ANTHROPIC_API_KEY=sk-ant-...
-# and install: pip install claude-agent-sdk
 ```
 
 ## Quick Start
@@ -95,17 +89,14 @@ export ANTHROPIC_API_KEY=sk-ant-...
 Exercises the full pipeline on a CPU-only task (naive Python RMSNorm → NumPy):
 
 ```bash
-# Uses Codex CLI by default to write an optimized solution
+# Uses the Claude API to write an optimized solution
 python3 eval.py
 
 # Skip the API call; write a trivial numpy solution and grade it
 python3 eval.py --dry-run
 
-# Use Claude backend explicitly
-python3 eval.py --agent claude --model claude-opus-4-6 --max-turns 12
-
-# Codex defaults to ~/.codex/config.toml (commonly gpt-5.3-codex), or override explicitly
-python3 eval.py --agent codex --model gpt-5.3-codex --max-turns 12
+# Use a different model or increase turn budget
+python3 eval.py --model claude-opus-4-6 --max-turns 12
 ```
 
 ### Run the test suite

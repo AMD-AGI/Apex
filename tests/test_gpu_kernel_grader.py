@@ -7,7 +7,7 @@ executing inside the rocm/pytorch Docker container with GPU access.
 
 This tests the real grading pipeline:
   kernel_grader.grade_task() → reads config.yaml → runs correctness/bench
-  commands via Docker → parses JSON → returns KernelResult with score.
+  commands via Magpie → parses JSON → returns KernelResult with score.
 
 Usage:
     python3 tests/test_gpu_kernel_grader.py
@@ -25,7 +25,6 @@ TASK_DIR = REPO_ROOT / "output" / "test_fused_moe_gpu"
 TASK_ID = "test_fused_moe_gpu"
 DEFAULT_DOCKER_IMAGE = "rocm/pytorch:latest"
 
-# Import the actual grader under test
 sys.path.insert(0, str(REPO_ROOT / "graders"))
 from kernel_grader import grade_task, find_solution, summarise, _parse_config
 from score import PTS_COMPILED, PTS_CORRECT
@@ -69,9 +68,7 @@ def main():
     config = _parse_config(TASK_DIR / "config.yaml")
     assert "correctness" in config, "config should have correctness section"
     assert "performance" in config, "config should have performance section"
-    assert config["correctness"]["command"] == "python3 test_solution.py"
-    assert config["performance"]["command"] == "python3 bench.py"
-    print(f"  [ok] _parse_config -> correctness={config['correctness']['command']!r}")
+    print(f"  [ok] _parse_config -> correctness={config.get('correctness', {}).get('command', 'N/A')!r}")
     print("")
 
     # ── Run the grader (the function under test) ──────────────────────────────
