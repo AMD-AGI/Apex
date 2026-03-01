@@ -1,0 +1,58 @@
+# Dockerfile.workload — Sandboxed workload optimization trajectory container
+#
+# Contains: Apex pipeline, Magpie, MCPs, graders, Claude/Codex agent SDK.
+# GPU: Required (ROCm devices mounted via --device).
+# Designed to run as isolated pods for scalability via k8s.
+#
+# Build:
+#   docker build -f docker/Dockerfile.workload -t apex-workload .
+#
+# Run (single workload):
+#   docker run --rm \
+#     --device=/dev/kfd --device=/dev/dri --group-add video \
+#     -v $(pwd)/output:/workspace/output \
+#     -v $(pwd)/results:/workspace/results \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+#     apex-workload \
+#     --benchmark-config examples/benchmark_vllm_gptoss_120b.yaml \
+#     --kernel-types all --kernels all --leaderboard
+#
+# Run (skip initial benchmark):
+#   docker run --rm \
+#     --device=/dev/kfd --device=/dev/dri --group-add video \
+#     -v $(pwd)/output:/workspace/output \
+#     -v $(pwd)/results:/workspace/results \
+#     apex-workload \
+#     --benchmark-config examples/benchmark_vllm_gptoss_120b.yaml \
+#     --skip-benchmark results/benchmark_report.json \
+#     --kernel-types triton,ck
+
+FROM rocm/pytorch:rocm6.3_ubuntu22.04_py3.10_pytorch_release_2.4.0
+
+WORKDIR /workspace
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl jq && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python deps
+RUN pip install --no-cache-dir \
+    pyyaml requests boto3 claude-agent-sdk
+
+# Copy project
+COPY . /workspace/
+
+# Install Magpie (editable, with MCP extras)
+RUN if [ -d tools/magpie/Magpie ]; then \
+      pip install --no-cache-dir -e "tools/magpie/Magpie[mcp]" 2>/dev/null || true; \
+    fi
+
+# Install MCPs
+RUN bash tools/setup_tools.sh --claude 2>/dev/null || true
+
+ENV PYTHONPATH="/workspace:/workspace/graders:/workspace/prompts:${PYTHONPATH}"
+
+ENTRYPOINT ["python", "workload_optimizer.py"]
+CMD ["--help"]

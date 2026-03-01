@@ -90,6 +90,84 @@ class TrajectoryRecord:
         return cls(**filtered)
 
 
+@dataclass
+class WorkloadTrajectoryRecord:
+    """Full workload optimization trajectory: benchmark → bottleneck → optimize → re-benchmark."""
+
+    trajectory_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    workload_id: str = ""
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    # Agent
+    agent_model: str = ""
+    agent_version: str = ""
+
+    # Benchmark config
+    benchmark_config_path: str = ""
+    benchmark_config: dict = field(default_factory=dict)
+    framework: str = ""
+    model_id: str = ""
+    gpu_arch: str = ""
+
+    # Baseline benchmark
+    baseline_benchmark: dict = field(default_factory=dict)
+    baseline_tps: float = 0.0
+
+    # Bottleneck discovery
+    bottleneck_kernels: list[dict] = field(default_factory=list)
+    kernel_type_filter: list[str] = field(default_factory=list)
+    selected_kernels: list[str] = field(default_factory=list)
+
+    # Per-kernel optimization
+    kernel_optimizations: list[dict] = field(default_factory=list)
+
+    # Re-injection
+    reinjected_kernels: list[str] = field(default_factory=list)
+
+    # Final benchmark
+    final_benchmark: dict = field(default_factory=dict)
+    final_tps: float = 0.0
+
+    # Reward
+    per_kernel_scores: list[float] = field(default_factory=list)
+    avg_kernel_score: float = 0.0
+    normalized_kernel_score: float = 0.0
+    model_reward: float = 0.0
+    total_reward: float = 0.0
+    trajectory_quality: str = "unknown"
+
+    # Metadata
+    skip_benchmark_used: bool = False
+    total_duration_s: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+    def apply_reward(self, reward_dict: dict) -> None:
+        """Apply reward results from trajectory_reward()."""
+        self.per_kernel_scores = reward_dict.get("per_kernel_scores", [])
+        self.avg_kernel_score = reward_dict.get("avg_kernel_score", 0.0)
+        self.normalized_kernel_score = reward_dict.get("normalized_kernel_score", 0.0)
+        self.model_reward = reward_dict.get("model_reward", 0.0)
+        self.total_reward = reward_dict.get("total_reward", 0.0)
+
+        if self.total_reward >= 0.8:
+            self.trajectory_quality = "good"
+        elif self.total_reward >= 0.3:
+            self.trajectory_quality = "mediocre"
+        else:
+            self.trajectory_quality = "bad"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> WorkloadTrajectoryRecord:
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in d.items() if k in known}
+        return cls(**filtered)
+
+
 class TrajectoryStore(ABC):
     """Pluggable storage backend for trajectory records."""
 
@@ -124,6 +202,13 @@ class TrajectoryStore(ABC):
         return count
 
 
+def _record_from_dict(d: dict) -> TrajectoryRecord | WorkloadTrajectoryRecord:
+    """Deserialize a dict into the appropriate record type."""
+    if "workload_id" in d:
+        return WorkloadTrajectoryRecord.from_dict(d)
+    return TrajectoryRecord.from_dict(d)
+
+
 class FileStore(TrajectoryStore):
     """Store trajectories as individual JSON files in a directory."""
 
@@ -140,12 +225,12 @@ class FileStore(TrajectoryStore):
             json.dump(record.to_dict(), f, indent=2, default=str)
         return record.trajectory_id
 
-    def load(self, trajectory_id: str) -> TrajectoryRecord | None:
+    def load(self, trajectory_id: str) -> TrajectoryRecord | WorkloadTrajectoryRecord | None:
         path = self._path(trajectory_id)
         if not path.exists():
             return None
         with open(path) as f:
-            return TrajectoryRecord.from_dict(json.load(f))
+            return _record_from_dict(json.load(f))
 
     def list_ids(self, filters: dict | None = None) -> list[str]:
         ids = []

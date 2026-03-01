@@ -2,9 +2,17 @@
 """
 Shared agent backend runner for repo eval scripts.
 
-Supports:
-  - Codex CLI (`codex exec`) [default backend]
-  - Claude Code via `claude-agent-sdk`
+Supports two backends (selectable via --agent-backend):
+
+  - claude (default): Claude Code via `claude-code-sdk`.
+    Auth: Max plan (claude auth login) or ANTHROPIC_API_KEY.
+    Gets access to MCP tools (Magpie, GPU info, RAG, etc.) from mcp_config.json.
+    Default model: claude-sonnet-4-6.
+
+  - codex: OpenAI Codex via `codex exec` CLI.
+    Auth: OPENAI_API_KEY or `codex login`.
+    No MCP support; uses built-in Bash and file tools only.
+    Default model: gpt-5.3-codex. Requires Node.js 18+.
 """
 
 from __future__ import annotations
@@ -17,9 +25,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_AGENT = "codex"
+DEFAULT_AGENT = "claude"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MCP_CONFIG_PATH = REPO_ROOT / "mcp_config.json"
 
 
 def resolve_default_model(agent: str) -> str | None:
@@ -35,6 +46,14 @@ def model_display_name(model: str | None, agent: str) -> str:
     if model:
         return model
     return "(default)"
+
+
+def _load_mcp_config() -> dict | None:
+    """Load MCP server config for Claude Code from mcp_config.json."""
+    if MCP_CONFIG_PATH.exists():
+        with open(MCP_CONFIG_PATH) as f:
+            return json.load(f)
+    return None
 
 
 def run_agent_task(
@@ -81,16 +100,22 @@ def _run_claude_task(
     solution_path: Path,
 ) -> tuple[list, bool]:
     try:
-        from claude_agent_sdk import query, ClaudeAgentOptions  # noqa: F401
+        from claude_code_sdk import query, ClaudeCodeOptions  # noqa: F401
     except ImportError as e:
         raise RuntimeError(
-            "claude-agent-sdk not installed. Run: pip install claude-agent-sdk"
+            "claude-code-sdk not installed. Run: pip install claude-code-sdk"
         ) from e
 
-    async def _run() -> tuple[list, bool]:
-        from claude_agent_sdk import query, ClaudeAgentOptions
+    mcp_cfg = _load_mcp_config()
+    mcp_servers = None
+    if mcp_cfg and "mcpServers" in mcp_cfg:
+        mcp_servers = mcp_cfg["mcpServers"]
+        print(f"    MCPs: {', '.join(mcp_servers.keys())}")
 
-        options = ClaudeAgentOptions(
+    async def _run() -> tuple[list, bool]:
+        from claude_code_sdk import query, ClaudeCodeOptions
+
+        options = ClaudeCodeOptions(
             cwd=str(cwd),
             model=model,
             max_turns=max_turns,
@@ -98,27 +123,43 @@ def _run_claude_task(
             system_prompt=system_prompt,
         )
 
+        if mcp_servers is not None:
+            options.mcp_servers = mcp_servers
+
         trajectory = []
-        async for message in query(prompt=prompt, options=options):
-            trajectory.append(message)
-            if hasattr(message, "content"):
-                for block in message.content:
-                    if hasattr(block, "name"):
-                        keys = list(block.input.keys()) if hasattr(block, "input") else []
-                        print(f"    tool: {block.name}({keys})")
-            if hasattr(message, "num_turns"):
-                cost = getattr(message, "total_cost_usd", 0.0) or 0.0
-                print(f"  result: turns={message.num_turns}, cost=${cost:.4f}")
+        try:
+            async for message in query(prompt=prompt, options=options):
+                trajectory.append(message)
+                if hasattr(message, "content"):
+                    for block in message.content:
+                        if hasattr(block, "name"):
+                            keys = list(block.input.keys()) if hasattr(block, "input") else []
+                            print(f"    tool: {block.name}({keys})")
+                if hasattr(message, "num_turns"):
+                    cost = getattr(message, "total_cost_usd", 0.0) or 0.0
+                    print(f"  result: turns={message.num_turns}, cost=${cost:.4f}")
+        except Exception as e:
+            err_str = str(e)
+            if trajectory and ("exit code" in err_str or "Command failed" in err_str):
+                print(f"    [warn] CLI exited non-zero after {len(trajectory)} messages "
+                      f"(likely max-turns reached): {err_str[:120]}")
+            else:
+                print(f"    [error] Claude SDK error: {err_str[:200]}")
+                raise
 
         return trajectory, solution_path.exists()
 
-    # Avoid nested-session guard when launched programmatically.
-    _cc = os.environ.pop("CLAUDECODE", None)
+    # Remove env vars that prevent Claude Code SDK from spawning a fresh session
+    saved_env = {}
+    for key in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
+        val = os.environ.pop(key, None)
+        if val is not None:
+            saved_env[key] = val
+
     try:
         return asyncio.run(_run())
     finally:
-        if _cc is not None:
-            os.environ["CLAUDECODE"] = _cc
+        os.environ.update(saved_env)
 
 
 def _run_codex_task(

@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -91,11 +93,76 @@ def _detect_kernel_type(solution: Path) -> str:
     return "pytorch"
 
 
+def _run_benchmark_script(script_path: str, python_bin: str, cwd: str, timeout: int = 120) -> float:
+    """Run a kernel script and measure its execution time.
+
+    Tries multiple strategies:
+    1. Run with --benchmark flag and parse BENCHMARK_MS from stdout
+    2. If no BENCHMARK_MS, parse common patterns like 'avg: X.XXms' or 'X.XX ms/iter'
+    3. Fall back to measuring wall-clock time of the script itself
+    """
+    # Strategy 1: Try --benchmark flag first
+    cmd = [python_bin, script_path, "--benchmark"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        if proc.returncode == 0:
+            match = re.search(r"BENCHMARK_MS:\s*([\d.]+)", proc.stdout)
+            if match:
+                return float(match.group(1))
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+
+    # Strategy 2: Run without --benchmark and try parsing output for timing
+    cmd = [python_bin, script_path]
+    try:
+        import time as _time
+        t0 = _time.monotonic()
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        wall_ms = (_time.monotonic() - t0) * 1000.0
+
+        if proc.returncode != 0:
+            return 0.0
+
+        # Parse common patterns
+        for pattern in [
+            r"BENCHMARK_MS:\s*([\d.]+)",
+            r"(?:avg|mean|median)\s*[:=]\s*([\d.]+)\s*ms",
+            r"([\d.]+)\s*ms[/\s]*iter",
+            r"Time[:\s]*([\d.]+)\s*ms",
+        ]:
+            match = re.search(pattern, proc.stdout, re.IGNORECASE)
+            if match:
+                return float(match.group(1))
+
+        # Strategy 3: Use wall-clock as last resort (very rough)
+        if wall_ms > 100:  # only if the script took meaningful time
+            return wall_ms
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+
+    return 0.0
+
+
+def _measure_speedup(cfg: dict, task_dir: Path, baseline_path: str, optimized_path: str) -> float:
+    """Measure speedup by running baseline and solution with --benchmark flag."""
+    perf_cfg = cfg.get("performance", {})
+    perf_cmd = perf_cfg.get("command", "")
+    python_bin = perf_cmd.split()[0] if perf_cmd else "/home/sirafati/Kernel/.venv/bin/python3"
+
+    baseline_ms = _run_benchmark_script(baseline_path, python_bin, str(task_dir))
+    optimized_ms = _run_benchmark_script(optimized_path, python_bin, str(task_dir))
+
+    if baseline_ms > 0 and optimized_ms > 0:
+        return baseline_ms / optimized_ms
+    return 0.0
+
+
 def grade_task(task_dir: Path, docker_image: str | None = None) -> KernelResult:
     """
     Grade a single task directory.
 
     Reads config.yaml, finds baseline + solution, runs Magpie compare.
+    Falls back to script-level benchmarking when Magpie doesn't report timing.
     """
     task_id  = task_dir.name
     solution = find_solution(task_dir)
@@ -121,7 +188,7 @@ def grade_task(task_dir: Path, docker_image: str | None = None) -> KernelResult:
         )
 
     if not Path(baseline_path).is_absolute():
-        baseline_path = str(REPO_ROOT / baseline_path)
+        baseline_path = str(task_dir / baseline_path)
 
     optimized_path = cfg.get("optimized", {}).get("path", str(solution))
     if not Path(optimized_path).is_absolute():
@@ -142,6 +209,20 @@ def grade_task(task_dir: Path, docker_image: str | None = None) -> KernelResult:
         return KernelResult(task_id=task_id, raw=raw, error=raw["error"])
 
     compiled, correct, speedup = parse_compare_result(raw)
+
+    if compiled and correct and speedup <= 0:
+        perf_cfg = cfg.get("performance", {})
+        perf_cmd = perf_cfg.get("command", "")
+        python_bin = perf_cmd.split()[0] if perf_cmd else "/home/sirafati/Kernel/.venv/bin/python3"
+
+        b_ms = _run_benchmark_script(baseline_path, python_bin, str(task_dir))
+        o_ms = _run_benchmark_script(optimized_path, python_bin, str(task_dir))
+        if b_ms > 0 and o_ms > 0:
+            speedup = b_ms / o_ms
+            raw["baseline_ms"] = round(b_ms, 4)
+            raw["optimized_ms"] = round(o_ms, 4)
+            raw["_benchmark_speedup"] = round(speedup, 4)
+
     return KernelResult(
         task_id=task_id,
         compiled=compiled,

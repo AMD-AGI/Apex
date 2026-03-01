@@ -165,6 +165,11 @@ MAGPIE_MODULE = "Magpie"
 
 def _magpie_bin() -> list[str]:
     """Return command list to invoke Magpie."""
+    magpie_root = os.environ.get("MAGPIE_ROOT", "")
+    if magpie_root:
+        venv_python = Path(magpie_root) / ".venv" / "bin" / "python3"
+        if venv_python.exists():
+            return [str(venv_python), "-m", MAGPIE_MODULE]
     if shutil.which("magpie"):
         return ["magpie"]
     local = Path(__file__).parent.parent / "tools" / "magpie" / "Magpie" / "main.py"
@@ -396,6 +401,12 @@ def parse_compare_result(raw: dict) -> tuple[bool, bool, float]:
 
 def _extract_compiled(kernel_result: dict) -> bool:
     """Extract compilation status from a Magpie kernel result entry."""
+    # Magpie native format: compiling_state / compiling_result
+    state = kernel_result.get("compiling_state", "")
+    if state:
+        # SKIPPED means no compilation needed (e.g. PyTorch) → treat as compiled
+        return state in ("SUCCESS", "SKIPPED")
+
     comp = kernel_result.get("compile", kernel_result.get("compilation", {}))
     if isinstance(comp, dict):
         return bool(comp.get("success", comp.get("passed", False)))
@@ -404,6 +415,15 @@ def _extract_compiled(kernel_result: dict) -> bool:
 
 def _extract_correct(kernel_result: dict) -> bool:
     """Extract correctness status from a Magpie kernel result entry."""
+    # Magpie native format: correctness_state / correctness_result
+    state = kernel_result.get("correctness_state", "")
+    if state:
+        return state == "SUCCESS"
+
+    cr = kernel_result.get("correctness_result")
+    if isinstance(cr, dict):
+        return bool(cr.get("success", cr.get("passed", False)))
+
     corr = kernel_result.get("correctness", {})
     if isinstance(corr, dict):
         return bool(corr.get("passed", corr.get("success", False)))
@@ -412,7 +432,8 @@ def _extract_correct(kernel_result: dict) -> bool:
 
 def _extract_time_ms(kernel_result: dict) -> float:
     """Extract average execution time (ms) from a Magpie kernel result entry."""
-    perf = kernel_result.get("performance", {})
+    # Magpie native format: performance_result
+    perf = kernel_result.get("performance_result") or kernel_result.get("performance", {})
     if isinstance(perf, dict):
         for key in ("avg_time_ms", "mean_ms", "avg_ms", "time_ms", "median_ms"):
             v = perf.get(key)
@@ -459,6 +480,77 @@ def extract_tps(raw: dict) -> float:
             return float(v)
 
     return 0.0
+
+
+# ── Workload-level reward functions ──────────────────────────────────────────
+
+
+def workload_kernel_reward(
+    compiled: bool, correct: bool,
+    baseline_ms: float, optimized_ms: float,
+) -> float:
+    """
+    Kernel-level reward for the workload optimization trajectory.
+
+    score = compiled × 20 + correct × 100 + (baseline_ms / optimized_ms) × 100
+    """
+    score = (20.0 if compiled else 0.0) + (100.0 if correct else 0.0)
+    if compiled and correct and optimized_ms > 0:
+        score += (baseline_ms / optimized_ms) * 100.0
+    return round(score, 4)
+
+
+def workload_model_reward(
+    normalized_kernel_score: float,
+    optimized_tps: float,
+    baseline_tps: float,
+) -> float:
+    """
+    Model-level reward for the workload optimization trajectory.
+
+    score = 0.5 × normalized_kernel_score + 0.5 × (optimized_tps / baseline_tps − 1)
+    """
+    tps_improvement = (optimized_tps / baseline_tps - 1.0) if baseline_tps > 0 else 0.0
+    return round(0.5 * normalized_kernel_score + 0.5 * max(0.0, tps_improvement), 4)
+
+
+def trajectory_reward(
+    kernel_results: list[dict],
+    baseline_tps: float,
+    optimized_tps: float,
+    max_kernel_score: float = 320.0,
+) -> dict:
+    """
+    Combine kernel-level and model-level rewards into a full trajectory score.
+
+    Each entry in kernel_results should contain:
+      compiled (bool), correct (bool), baseline_ms (float), optimized_ms (float)
+
+    Returns a dict with kernel_reward, model_reward, total_reward, and
+    per-kernel scores.
+    """
+    per_kernel: list[float] = []
+    for kr in kernel_results:
+        score = workload_kernel_reward(
+            compiled=kr.get("compiled", False),
+            correct=kr.get("correct", False),
+            baseline_ms=float(kr.get("baseline_ms", 0)),
+            optimized_ms=float(kr.get("optimized_ms", 0)),
+        )
+        per_kernel.append(score)
+
+    avg_kernel = sum(per_kernel) / len(per_kernel) if per_kernel else 0.0
+    normalized = min(avg_kernel / max_kernel_score, 1.0)
+
+    model_score = workload_model_reward(normalized, optimized_tps, baseline_tps)
+
+    return {
+        "per_kernel_scores": per_kernel,
+        "avg_kernel_score": round(avg_kernel, 4),
+        "normalized_kernel_score": round(normalized, 4),
+        "model_reward": model_score,
+        "total_reward": round(normalized * 0.5 + model_score * 0.5, 4),
+    }
 
 
 def parse_benchmark_result(raw: dict) -> float:

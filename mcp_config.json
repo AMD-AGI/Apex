@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "magpie": {
+      "command": "/home/sirafati/Kernel/.venv/bin/python",
+      "args": ["-m", "Magpie.mcp"],
+      "env": {
+        "PYTHONPATH": "/home/sirafati/code_combine/Magpie"
+      }
+    },
+    "gpu-info": {
+      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_gpu_info/run_server.sh",
+      "args": []
+    },
+    "kernel-perf": {
+      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_kernel_perf/run_server.sh",
+      "args": []
+    },
+    "source-finder": {
+      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_source_finder/run_server.sh",
+      "args": []
+    },
+    "asm-tools": {
+      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_asm_tools/run_server.sh",
+      "args": []
+    },
+    "fusion-advisor": {
+      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_fusion_advisor/run_server.sh",
+      "args": []
+    },
+    "rag-server": {
+      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_rag_server/run_server.sh",
+      "args": []
+    }
+  }
+}
