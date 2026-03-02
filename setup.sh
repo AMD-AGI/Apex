@@ -1,171 +1,176 @@
 #!/usr/bin/env bash
-# setup.sh — One-shot environment setup for the RL kernel-optimization sandbox.
+# setup.sh — Configure Claude Code CLI for the Apex workload optimization pipeline.
 #
-# What this does:
-#   1. Creates a Python virtual environment
-#   2. Installs Python dependencies (test runner + prompt/grader libs)
-#   3. Validates the environment (imports, script permissions)
-#   4. Creates the output/ directory
-#   5. Optionally runs files/setup_files.sh and tools/setup_tools.sh
+# Run once from the Apex project root:
+#   cd /home/sirafati/code_combine/Apex && bash setup.sh
 #
-# Usage:
-#   bash setup.sh                   # full setup
-#   bash setup.sh --skip-downloads  # skip cloning repos and downloading docs
-#   bash setup.sh --skip-tools      # skip Magpie + RAG tool install
-#   bash setup.sh --venv=.venv      # custom venv path (default: .venv)
+# What it does:
+#   1. Verifies prerequisites (claude CLI, python venv, Magpie)
+#   2. Registers all 7 MCP servers with claude (project-scoped)
+#   3. Creates the results directory
+#   4. Prints the one-liner to start the agent
+#
+# After running setup.sh, just:
+#   cd /home/sirafati/code_combine/Apex && claude
+#   Then paste your task (e.g., the GPT OSS 120B workflow prompt below)
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/.venv"
-SKIP_DOWNLOADS=false
-SKIP_TOOLS=false
+APEX_ROOT="$(cd "$(dirname "$0")" && pwd)"
+RESULTS_DIR="${RESULTS_DIR:-/home/sirafati/results_total_agent}"
+VENV="/home/sirafati/Kernel/.venv"
+MAGPIE_ROOT="${MAGPIE_ROOT:-/home/sirafati/code_combine/Magpie}"
+AGIKIT_MCP="/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src"
 
-for arg in "$@"; do
-    case "$arg" in
-        --skip-downloads) SKIP_DOWNLOADS=true ;;
-        --skip-tools)     SKIP_TOOLS=true ;;
-        --venv=*)         VENV_DIR="${arg#*=}" ;;
-        -h|--help)
-            echo "Usage: bash setup.sh [--skip-downloads] [--skip-tools] [--venv=PATH]"
-            exit 0 ;;
-    esac
-done
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' required but not found"; exit 1; }; }
+ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
+warn() { echo -e "  ${YELLOW}!${NC} $1"; }
+fail() { echo -e "  ${RED}✗${NC} $1"; }
 
-echo ""
-echo "=== RL Kernel Optimization — Environment Setup ==="
+echo "═══════════════════════════════════════════════════════"
+echo " Apex — Claude Code CLI Setup"
+echo "═══════════════════════════════════════════════════════"
 echo ""
 
-# ── pre-flight ────────────────────────────────────────────────────────────────
-need python3
-need git
-need curl
+# ── 1. Prerequisites ─────────────────────────────────────────────────────────
 
-PYTHON_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
-if [ "$PYTHON_MINOR" -lt 10 ]; then
-    echo "ERROR: Python 3.10+ required (found 3.$PYTHON_MINOR)"
+echo "▸ Checking prerequisites..."
+
+if command -v claude &>/dev/null; then
+    ok "Claude Code CLI: $(claude --version 2>&1 | head -1)"
+else
+    fail "Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code"
     exit 1
 fi
 
-# ── 1. Python virtual environment ─────────────────────────────────────────────
-echo "--- 1. Python virtual environment ($VENV_DIR) ---"
-if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv "$VENV_DIR"
-    echo "  created $VENV_DIR"
+if [ -d "$VENV" ]; then
+    ok "Python venv: $VENV"
 else
-    echo "  exists: $VENV_DIR"
+    warn "Python venv not found at $VENV — some pipeline steps may fail"
 fi
 
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-python3 -m pip install --quiet --upgrade pip
-
-# ── 2. Python dependencies ────────────────────────────────────────────────────
-echo ""
-echo "--- 2. Python dependencies ---"
-
-# Core for graders + prompts (always needed)
-python3 -m pip install --quiet \
-    anthropic \
-    pyyaml \
-    rich
-
-# Test runner
-python3 -m pip install --quiet \
-    pytest \
-    pytest-asyncio
-
-echo "  installed: anthropic, pyyaml, rich, pytest"
-
-# RAG tool deps (needed for eval + tools tests)
-python3 -m pip install --quiet \
-    chromadb \
-    "sentence-transformers>=2.7" \
-    mcp \
-    tiktoken
-
-echo "  installed: chromadb, sentence-transformers, mcp, tiktoken"
-
-# ── 3. Create output/ directory ───────────────────────────────────────────────
-echo ""
-echo "--- 3. Output directory ---"
-mkdir -p "$SCRIPT_DIR/output"
-echo "  created/verified: output/"
-
-# ── 4. files/setup_files.sh (repos + docs) ───────────────────────────────────
-echo ""
-if $SKIP_DOWNLOADS; then
-    echo "--- 4. Skipping files/setup_files.sh (--skip-downloads) ---"
+if [ -d "$MAGPIE_ROOT" ]; then
+    ok "Magpie: $MAGPIE_ROOT"
 else
-    echo "--- 4. Downloading code repos and documentation ---"
-    bash "$SCRIPT_DIR/files/setup_files.sh"
+    warn "Magpie not found at $MAGPIE_ROOT — benchmark steps will fail"
 fi
 
-# ── 5. tools/setup_tools.sh (Magpie + RAG) ───────────────────────────────────
-echo ""
-if $SKIP_TOOLS; then
-    echo "--- 5. Skipping tools/setup_tools.sh (--skip-tools) ---"
+if [ -f "$APEX_ROOT/mcp_config.json" ]; then
+    ok "mcp_config.json found"
 else
-    echo "--- 5. Installing tools (Magpie + RAG tool) ---"
-    bash "$SCRIPT_DIR/tools/setup_tools.sh"
+    warn "mcp_config.json not found — MCPs will not be available to workload_optimizer.py"
 fi
 
-# ── 6. Environment validation ─────────────────────────────────────────────────
 echo ""
-echo "--- 6. Validating environment ---"
 
-validate_import() {
-    local module="$1"
-    python3 -c "import $module" 2>/dev/null \
-        && echo "  ✓ import $module" \
-        || echo "  ✗ import $module FAILED"
+# ── 2. Register MCP servers (project-scoped) ─────────────────────────────────
+
+echo "▸ Registering MCP servers with Claude Code (project scope)..."
+
+cd "$APEX_ROOT"
+
+register_mcp() {
+    local name="$1"
+    local json="$2"
+    # Remove existing, ignore errors
+    claude mcp remove -s project "$name" 2>/dev/null || true
+    if claude mcp add-json -s project "$name" "$json" 2>/dev/null; then
+        ok "$name"
+    else
+        warn "$name — failed to register (check paths)"
+    fi
 }
 
-validate_import anthropic
-validate_import pytest
-validate_import chromadb
-validate_import yaml
+register_mcp "magpie" "{
+  \"command\": \"$VENV/bin/python\",
+  \"args\": [\"-m\", \"Magpie.mcp\"],
+  \"env\": { \"PYTHONPATH\": \"$MAGPIE_ROOT\" }
+}"
 
-# Validate graders are importable
-python3 -c "
-import sys; sys.path.insert(0, 'graders')
-from score import total_score, KernelResult, ModelResult
-from kernel_grader import find_tasks, grade_all
-from model_grader import grade_all as model_grade_all
-print('  ✓ graders module')
-"
+register_mcp "gpu-info" "{
+  \"command\": \"$AGIKIT_MCP/mcp_gpu_info/run_server.sh\",
+  \"args\": []
+}"
 
-# Validate prompts are importable
-python3 -c "
-import sys; sys.path.insert(0, 'prompts')
-from models import MODELS
-from configs import CONFIGS
-from kernel_prompt import all_prompts as kp
-from model_prompt import all_prompts as mp
-kc = len(list(kp()))
-mc = len(list(mp()))
-print(f'  ✓ prompts: {len(MODELS)} models, {len(CONFIGS)} configs → {kc} kernel tasks, {mc} model tasks')
-"
+register_mcp "kernel-perf" "{
+  \"command\": \"$AGIKIT_MCP/mcp_kernel_perf/run_server.sh\",
+  \"args\": []
+}"
 
-# Check script permissions
-for sh in files/setup_files.sh tools/setup_tools.sh; do
-    if [ -x "$SCRIPT_DIR/$sh" ]; then
-        echo "  ✓ executable: $sh"
-    else
-        echo "  ✗ NOT executable: $sh"
-    fi
-done
+register_mcp "source-finder" "{
+  \"command\": \"$AGIKIT_MCP/mcp_source_finder/run_server.sh\",
+  \"args\": []
+}"
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+register_mcp "asm-tools" "{
+  \"command\": \"$AGIKIT_MCP/mcp_asm_tools/run_server.sh\",
+  \"args\": []
+}"
+
+register_mcp "fusion-advisor" "{
+  \"command\": \"$AGIKIT_MCP/mcp_fusion_advisor/run_server.sh\",
+  \"args\": []
+}"
+
+register_mcp "rag-server" "{
+  \"command\": \"$AGIKIT_MCP/mcp_rag_server/run_server.sh\",
+  \"args\": []
+}"
+
 echo ""
-echo "=== Setup complete ==="
+
+# ── 3. Create results directory ──────────────────────────────────────────────
+
+echo "▸ Setting up results directory..."
+mkdir -p "$RESULTS_DIR"
+ok "Results dir: $RESULTS_DIR"
 echo ""
-echo "  Activate venv:  source $VENV_DIR/bin/activate"
-echo "  Run tests:      pytest tests/ -v"
-echo "  Run mini eval:  python3 eval.py"
+
+# ── 4. Verify MCP registration ──────────────────────────────────────────────
+
+echo "▸ Verifying MCP registration..."
+claude mcp list 2>&1 | grep -E "^[a-z]" || true
 echo ""
-echo "  Kernel prompts: python3 prompts/kernel_prompt.py --list"
-echo "  Model prompts:  python3 prompts/model_prompt.py  --list"
-echo "  Grade output:   python3 graders/kernel_grader.py"
+
+# ── 5. Summary ───────────────────────────────────────────────────────────────
+
+echo "═══════════════════════════════════════════════════════"
+echo -e " ${GREEN}Setup complete!${NC}"
+echo "═══════════════════════════════════════════════════════"
+echo ""
+echo " MCPs registered:  7 (magpie, gpu-info, kernel-perf, source-finder,"
+echo "                       asm-tools, fusion-advisor, rag-server)"
+echo " Skills available: 13 (in tools/skills/)"
+echo " Project context:  CLAUDE.md (auto-loaded by Claude Code)"
+echo " Results dir:      $RESULTS_DIR"
+echo ""
+echo " ── How to use ──────────────────────────────────────"
+echo ""
+echo " Option 1: Interactive Claude Code session"
+echo "   cd $APEX_ROOT && claude"
+echo "   Then paste your task prompt (see CLAUDE.md for examples)"
+echo ""
+echo " Option 2: One-shot CLI"
+cat << EXAMPLE
+   cd $APEX_ROOT && claude -p "Focus on GPT OSS 120B on vLLM.
+   Benchmark it E2E with Magpie, report top 10 triton kernels,
+   optimize them, and save all results to $RESULTS_DIR.
+   Use all available MCP tools and read relevant skills from
+   tools/skills/ before starting. Run the full pipeline via
+   workload_optimizer.py."
+EXAMPLE
+echo ""
+echo " Option 3: Automated pipeline (no interactive agent)"
+echo "   source $VENV/bin/activate"
+echo "   export MAGPIE_ROOT=$MAGPIE_ROOT"
+echo "   python3 workload_optimizer.py run \\"
+echo "     -r $RESULTS_DIR \\"
+echo "     -b \$MAGPIE_ROOT/examples/benchmark_vllm_gptoss_120b.yaml \\"
+echo "     --kernel-types triton --top-k 10 \\"
+echo "     --max-iterations 3 --max-turns 25 --leaderboard"
+echo ""
+echo "═══════════════════════════════════════════════════════"

@@ -77,6 +77,17 @@ from bottleneck import (
     deduplicate_by_spec,
     format_bottleneck_table,
 )
+from kernel_prompt import (
+    KERNEL_SPECS,
+    KERNEL_MAP,
+    KernelSpec,
+    applicable_kernels as _applicable_kernels,
+    build_kernel_prompt as _build_rich_kernel_prompt,
+    _format_sources_block,
+    ARCH_MAP,
+    DEFAULT_TARGET,
+)
+from models import MODELS, ModelConfig
 
 
 MAGPIE_ROOT = Path(os.environ.get(
@@ -182,27 +193,54 @@ GPU INFO:
 - mcp__gpu-info__get_arch_optimization_hints: Architecture-specific optimization hints
 
 SOURCE FINDER:
-- mcp__source-finder__find_kernel_source: Find source code for a kernel
+- mcp__source-finder__find_kernel_source: Find source code for a kernel type
 - mcp__source-finder__classify_kernel: Classify kernel by name
 - mcp__source-finder__find_ck_template: Find CK templates for an operation
+- mcp__source-finder__identify_kernel_origin: Trace which library a kernel comes from
 
 RAG SERVER:
 - mcp__rag-server__search_kernel_optimization: Search optimization patterns
 - mcp__rag-server__search_gpu_documentation: Search AMD GPU docs
+- mcp__rag-server__get_optimization_snippet: Get code snippets for a pattern
+- mcp__rag-server__analyze_kernel_for_optimization: Analyze kernel and suggest optimizations
+- mcp__rag-server__get_optimization_playbook: Get complete optimization playbook
 
 KERNEL PERF:
 - mcp__kernel-perf__profile_kernel: Profile kernel with rocprof
 - mcp__kernel-perf__roofline_analysis: Roofline model analysis
 - mcp__kernel-perf__statistical_test: Statistical comparison of measurements
 
+FUSION ADVISOR:
+- mcp__fusion-advisor__detect_fusion_opportunities: Find kernel fusion opportunities
+- mcp__fusion-advisor__generate_fused_kernel: Generate fused kernel implementations
+- mcp__fusion-advisor__estimate_fusion_benefit: Estimate fusion benefit
+
+ASM TOOLS:
+- mcp__asm-tools__disassemble_kernel: Disassemble kernel to ISA
+- mcp__asm-tools__analyze_isa: Analyze instruction mix and register usage
+- mcp__asm-tools__count_instructions: Count instruction types
+
+SKILLS (read these files BEFORE starting optimization):
+- For Triton kernels: tools/skills/triton-kernel-optimization/SKILL.md
+- For HIP/C++ kernels: tools/skills/hip-kernel-optimization/SKILL.md
+- Architecture context: tools/skills/gpu-architecture-fundamentals/SKILL.md
+- MI300/MI355 specifics: tools/skills/mi300-cdna3-architecture/SKILL.md
+- AMD aiter patterns: tools/skills/aiter-reflection/SKILL.md
+- Prior experiments: tools/skills/kernel-exp-history/SKILL.md
+- Profiling guide: tools/skills/rocprof-compute/SKILL.md
+
 WORKFLOW:
-1. Read the baseline kernel code, understand it thoroughly
-2. Use mcp__gpu-info__get_gpu_info to understand the target GPU
-3. Use mcp__rag-server__search_kernel_optimization for relevant patterns
-4. Write an optimized version to solution.py
-5. Use mcp__magpie__analyze to profile your solution
-6. Use mcp__magpie__compare to compare baseline vs solution
-7. Iterate until speedup is substantial
+1. Read relevant skill files from tools/skills/ for domain knowledge
+2. Read the baseline kernel code, understand it thoroughly
+3. Use mcp__gpu-info__get_gpu_info to understand the target GPU
+4. Use mcp__source-finder__find_kernel_source to find all implementations
+5. Use mcp__rag-server__search_kernel_optimization for relevant patterns
+6. Use mcp__fusion-advisor__detect_fusion_opportunities for fusion chances
+7. Write an optimized version to solution.py
+8. Use mcp__magpie__analyze to profile your solution
+9. Use mcp__magpie__compare to compare baseline vs solution
+10. Use mcp__asm-tools__analyze_isa for ISA-level analysis if needed
+11. Iterate until speedup is substantial
 
 Focus on: memory coalescing, LDS usage, MFMA utilization, register pressure,
 bank conflicts, optimal block/tile sizes for the target architecture.
@@ -212,6 +250,10 @@ IMPORTANT:
 - The solution must be a self-contained Python file with a __main__ block that
   runs the kernel and prints PASS/FAIL
 - Do NOT modify files outside the task directory
+- Do NOT create new scripts — all evaluation uses Magpie MCP (analyze, compare)
+- Do NOT hardcode kernel names — they are provided dynamically by the pipeline
+- Only solutions with >5% speedup will be integrated into the final benchmark
+- Use Magpie compare to verify correctness AND measure speedup every iteration
 """
 
 
@@ -500,10 +542,15 @@ def _build_kernel_prompt(
     benchmark_config: dict,
     task_dir: Path,
 ) -> str:
-    """Build a prompt with actual source code included."""
+    """Build a prompt using the rich kernel_prompt.py template + actual source code."""
     spec = kernel.matched_kernel_spec or "unknown"
     model_id = benchmark_config.get("benchmark", {}).get("model", config.framework)
+    framework = config.framework or "vllm"
+    gpu_arch = config.gpu_arch or DEFAULT_TARGET
     baseline_sources = _find_baseline_sources(spec)
+
+    # Try to build the rich prompt from kernel_prompt.py templates
+    rich_prompt = _try_build_rich_prompt(spec, model_id, framework, gpu_arch)
 
     source_sections = []
     for src_path in baseline_sources[:3]:
@@ -511,38 +558,32 @@ def _build_kernel_prompt(
         source_sections.append(f"### Source: {src_path}\n```python\n{code}\n```")
 
     sources_text = "\n\n".join(source_sections) if source_sections else (
-        "No source files found on disk. Use the filesystem to search for kernel "
+        "No source files found on disk. Use source-finder MCP to search for kernel "
         "implementations under tools/rocm/aiter/ and tools/rocm/composable_kernel/."
     )
 
-    return textwrap.dedent(f"""\
-## Task: Optimize the {spec} kernel ({kernel.category})
+    profiling_context = textwrap.dedent(f"""\
+## Profiling Context
 
 **Profiler kernel name:** `{kernel.name}`
 **Category:** {kernel.category}
 **Current GPU time:** {kernel.percent_total:.1f}% of total ({kernel.total_time_us/1000:.1f} ms over {kernel.calls} calls)
+**Task directory:** `{task_dir}`
 
-**Model:** {model_id}
-**Framework:** {config.framework or 'vllm'}
-**Target GPU:** AMD Instinct MI355X ({config.gpu_arch}, CDNA4)
-
-## Baseline Source Code
+## Baseline Source Code (from disk)
 
 {sources_text}
 
 ## Your Task
 
-1. Read and understand the baseline kernel implementation above.
-2. Identify performance bottlenecks (memory access patterns, compute utilization, occupancy).
-3. Write an optimized version focusing on:
-   - Better memory coalescing and LDS usage (64 KB per CU)
-   - MFMA instruction utilization (v_mfma_* for matrix ops >= 16x16x16)
-   - Optimal BLOCK_SIZE (multiples of 64 for wavefront width)
-   - Reduced register pressure and bank conflicts
-   - For Triton: use tl.dot for matrix multiplies, pad LDS rows by 1 to avoid 32-way bank conflicts
-4. Save your optimized kernel to: `{task_dir}/solution.py`
-5. The config.yaml at `{task_dir}/config.yaml` already has the baseline path set.
-   Update it if you find a better baseline path.
+1. Read the skill files listed above for domain-specific optimization knowledge.
+2. Read and understand the baseline kernel implementation above.
+3. Use MCP tools: source-finder to find all implementations, rag-server for patterns,
+   gpu-info for arch hints, fusion-advisor for fusion opportunities.
+4. Identify performance bottlenecks (memory access patterns, compute utilization, occupancy).
+5. Write an optimized version to: `{task_dir}/solution.py`
+6. Use mcp__magpie__compare to validate correctness and measure speedup.
+7. The config.yaml at `{task_dir}/config.yaml` already has the baseline path set.
 
 ## IMPORTANT Constraints
 - Your solution must be functionally equivalent to the baseline (same inputs → same outputs).
@@ -550,6 +591,47 @@ def _build_kernel_prompt(
 - Focus on real performance improvements, not just code style changes.
 - Include the kernel function with the same signature as the baseline.
 """)
+
+    if rich_prompt:
+        return rich_prompt + "\n\n" + profiling_context
+    return profiling_context
+
+
+def _try_build_rich_prompt(
+    kernel_spec: str, model_id: str, framework: str, gpu_arch: str,
+) -> str:
+    """Try to build a rich prompt using kernel_prompt.py templates.
+
+    Returns the rich prompt text, or empty string if the model/kernel isn't found.
+    """
+    try:
+        kernel = KERNEL_MAP.get(kernel_spec)
+        if not kernel:
+            return ""
+
+        model = None
+        for m in MODELS:
+            if m.hf_id == model_id:
+                model = m
+                break
+        if not model:
+            for m in MODELS:
+                if m.hf_id.split("/")[-1].lower() in model_id.lower():
+                    model = m
+                    break
+        if not model:
+            model = MODELS[0]
+
+        result = _build_rich_kernel_prompt(
+            model=model,
+            kernel=kernel,
+            framework=framework,
+            gpu_arch=gpu_arch,
+        )
+        return result.get("prompt", "")
+    except Exception as e:
+        print(f"    [warn] Could not build rich prompt: {e}")
+        return ""
 
 
 def _make_kernel_task_id(kernel: BottleneckKernel, config: WorkloadConfig) -> str:

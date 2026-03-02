@@ -252,6 +252,18 @@ MODELS: list[ModelConfig] = [
         frameworks=["vllm"],
         notes="MQA (1 KV head); extreme KV compression; non-power-of-2 heads",
     ),
+
+    # ── OpenAI GPT OSS (open-source MoE) ──────────────────────────────────
+    ModelConfig(
+        hf_id="openai/gpt-oss-120b",
+        family="gpt_oss", params_b=120,
+        attention="gqa",    num_heads=64, num_kv_heads=8,  head_dim=128,
+        hidden_dim=8192,    num_layers=48,
+        mlp_type="moe",     num_experts=16, active_experts=4,
+        context_len=128_000,
+        frameworks=["vllm"],
+        notes="GPT OSS 120B MoE; FP4 primary; fused_moe + paged_attn_decode + GEMM critical path; TP=8 MI355X",
+    ),
 ]
 
 # ── Convenience groupings ──────────────────────────────────────────────────────

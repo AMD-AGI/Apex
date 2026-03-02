@@ -166,10 +166,56 @@ You have access to the following MCP servers — use them throughout this task:
 | MCP | Key tools | When to use |
 |-----|-----------|-------------|
 | **source-finder** | `find_kernel_source`, `classify_kernel`, `find_ck_template`, `decode_tensile_kernel` | Locate kernel source files in ROCm repos, find CK templates |
-| **kernel-rag** | `search_kernel_optimization`, `get_optimization_snippet`, `analyze_kernel_for_optimization`, `search_library_code`, `get_optimization_playbook` | Get optimization patterns, snippets, and analysis for HIP/Triton |
+| **kernel-rag** / **rag-server** | `search_kernel_optimization`, `get_optimization_snippet`, `analyze_kernel_for_optimization`, `search_library_code`, `get_optimization_playbook` | Get optimization patterns, snippets, and analysis for HIP/Triton |
 | **gpu-info** | `get_gpu_info`, `get_arch_optimization_hints`, `get_gpu_specs` | Get target GPU specs and architecture-specific tips |
 | **fusion-advisor** | `detect_fusion_opportunities`, `generate_fused_kernel`, `estimate_fusion_benefit` | Find and exploit kernel fusion opportunities |
 | **magpie** | `analyze`, `compare`, `benchmark` | Evaluate kernel correctness and performance |
+
+## Available skills (Claude Code agent)
+
+The following skills are installed and should be read for domain-specific guidance:
+
+| Skill | Path | Use for |
+|-------|------|---------|
+| triton-kernel-optimization | `tools/skills/triton-kernel-optimization/SKILL.md` | Triton tiling, autotuning, MFMA usage |
+| hip-kernel-optimization | `tools/skills/hip-kernel-optimization/SKILL.md` | HIP C++ kernel patterns, LDS, coalescing |
+| gpu-architecture-fundamentals | `tools/skills/gpu-architecture-fundamentals/SKILL.md` | CU layout, memory hierarchy, wavefront scheduling |
+| mi300-cdna3-architecture | `tools/skills/mi300-cdna3-architecture/SKILL.md` | MI300/MI355 CDNA3/4 specifics |
+| aiter-reflection | `tools/skills/aiter-reflection/SKILL.md` | AMD AI Tensor Engine patterns and best practices |
+| triton-hip-reference-kernel-search | `tools/skills/triton-hip-reference-kernel-search/SKILL.md` | Finding reference implementations |
+| kernel-exp-history | `tools/skills/kernel-exp-history/SKILL.md` | Learning from prior optimization experiments |
+| triton-kernel-reflection-prompts | `tools/skills/triton-kernel-reflection-prompts/SKILL.md` | Self-reflection prompts for kernel quality |
+| rocprof-compute | `tools/skills/rocprof-compute/SKILL.md` | Using rocprof for profiling and analysis |
+
+Read relevant skills before starting optimization. Example: for Triton kernels, read
+`triton-kernel-optimization` and `aiter-reflection` first.
+
+## Top-K kernel reporting
+
+After profiling, report the **top 10 Triton kernels** by GPU time percentage.
+Format the report as a table:
+
+```
+| Rank | Kernel Name | Spec | GPU Time % | Calls | Category |
+|------|-------------|------|------------|-------|----------|
+| 1    | ...         | ...  | ...        | ...   | triton   |
+```
+
+Focus optimization on these top-10 kernels. For each, document:
+- Why it's a bottleneck (compute vs memory bound)
+- What optimization strategy was applied
+- Measured speedup (baseline vs optimized)
+
+## Pipeline constraints
+
+- **No hardcoding**: kernel lists must be extracted dynamically from profiling, never pre-selected.
+- **No new scripts**: do not create new benchmark/eval scripts. Use Magpie MCP (analyze, compare, benchmark) and workload_optimizer.py for everything.
+- **Speedup threshold**: only integrate kernels with >5% speedup over baseline.
+- **No cache**: test every step for correctness. Do not reuse stale intermediate results.
+- **Leaderboard**: always append a new record to leaderboard.json after each run.
+- **Trajectories**: persist full trajectory.json with kernel-level and model-level results.
+- **Replication**: generate a step-by-step replication guide (replication_guide.md) alongside the report.
+- **Deprecated**: disregard AgentKernelArena and any arena-related logic.
 
 ## Reference implementations
 

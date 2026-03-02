@@ -377,10 +377,28 @@ You have access to the following MCP servers — use them throughout this task:
 | MCP | Key tools | When to use |
 |-----|-----------|-------------|
 | **source-finder** | `find_kernel_source`, `classify_kernel`, `identify_kernel_origin`, `find_ck_template` | Locate kernel source files, find CK templates, understand kernel lineage |
-| **kernel-rag** | `search_kernel_optimization`, `get_optimization_snippet`, `analyze_kernel_for_optimization`, `get_optimization_playbook` | Get optimization patterns, code snippets, and analysis |
+| **kernel-rag** / **rag-server** | `search_kernel_optimization`, `get_optimization_snippet`, `analyze_kernel_for_optimization`, `get_optimization_playbook` | Get optimization patterns, code snippets, and analysis |
 | **gpu-info** | `get_gpu_info`, `get_arch_optimization_hints` | Get target GPU specs and architecture-specific optimization hints |
 | **fusion-advisor** | `detect_fusion_opportunities`, `generate_fused_kernel` | Find kernel fusion opportunities and generate fused implementations |
 | **magpie** | `analyze`, `compare`, `benchmark` | Evaluate kernel correctness and performance |
+
+## Available skills (Claude Code agent)
+
+Read these skill files before starting. They contain domain-specific optimization
+knowledge that directly applies to this task:
+
+| Skill | Path | Use for |
+|-------|------|---------|
+| triton-kernel-optimization | `tools/skills/triton-kernel-optimization/SKILL.md` | Triton tiling, autotuning, MFMA, LDS usage |
+| hip-kernel-optimization | `tools/skills/hip-kernel-optimization/SKILL.md` | HIP C++ patterns, memory coalescing |
+| gpu-architecture-fundamentals | `tools/skills/gpu-architecture-fundamentals/SKILL.md` | CU layout, memory hierarchy, wavefronts |
+| mi300-cdna3-architecture | `tools/skills/mi300-cdna3-architecture/SKILL.md` | MI300/MI355 CDNA3/4 arch specifics |
+| aiter-reflection | `tools/skills/aiter-reflection/SKILL.md` | AMD AI Tensor Engine patterns |
+| kernel-exp-history | `tools/skills/kernel-exp-history/SKILL.md` | Learning from prior experiments |
+| rocprof-compute | `tools/skills/rocprof-compute/SKILL.md` | Profiling with rocprof |
+
+For Triton kernels: read `triton-kernel-optimization` and `aiter-reflection` first.
+For HIP kernels: read `hip-kernel-optimization` and `mi300-cdna3-architecture` first.
 
 ## Instructions
 
@@ -411,6 +429,8 @@ You have access to the following MCP servers — use them throughout this task:
    (set `baseline.path` to the original kernel, `optimized.path` to your solution)
 
 7. **Do not** modify any files outside `output/{task_id}/`.
+8. **Do not** create new benchmark scripts — use Magpie MCP (analyze, compare) for evaluation.
+9. **Speedup threshold**: only solutions with >5% speedup over baseline are kept.
 
 ## output/{task_id}/config.yaml template
 ```yaml
