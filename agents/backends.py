@@ -11,7 +11,7 @@ Supports two backends (selectable via --agent-backend):
 
   - codex: OpenAI Codex via `codex exec` CLI.
     Auth: OPENAI_API_KEY or `codex login`.
-    No MCP support; uses built-in Bash and file tools only.
+    MCP tools configured globally via `codex mcp add` (same tools as Claude).
     Default model: gpt-5.3-codex. Requires Node.js 18+.
 """
 
@@ -182,6 +182,7 @@ def _run_codex_task(
         "--color",
         "never",
         "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
         "-C",
         str(cwd),
     ]
@@ -197,54 +198,68 @@ def _run_codex_task(
     ):
         env.pop(key, None)
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-
-    stderr = (proc.stderr or "").strip()
-    if stderr:
-        for line in stderr.splitlines():
-            line = line.strip()
-            if line:
-                print(f"    codex-stderr: {line[:200]}")
+    # Stream output line-by-line for long-running tasks
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, bufsize=1,
+    )
 
     trajectory: list[dict] = []
     usage = None
     final_error = None
-    for raw_line in (proc.stdout or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        trajectory.append(event)
-        etype = event.get("type")
-        if etype == "item.completed":
-            item = event.get("item") or {}
-            item_type = item.get("type")
-            if item_type in {"function_call", "tool_call"}:
-                name = item.get("name") or item.get("tool_name") or "tool"
-                print(f"    tool: {name}")
-            elif item_type == "agent_message":
-                text = (item.get("text") or "").strip()
-                if text:
-                    print(f"    text: {text.splitlines()[0][:100]}...")
-            elif item_type == "error":
-                msg = item.get("message") or ""
-                if msg:
-                    print(f"    error: {str(msg)[:200]}")
-        elif etype == "turn.completed":
-            usage = event.get("usage")
-        elif etype in {"turn.failed", "error"}:
-            err = event.get("error") or {}
-            final_error = err.get("message") if isinstance(err, dict) else event.get("message")
+    total_in_tokens = 0
+    total_out_tokens = 0
+    turn_count = 0
 
-    if usage:
-        in_tok = usage.get("input_tokens", 0)
-        out_tok = usage.get("output_tokens", 0)
-        print(f"  result: turns=1+, tokens(in={in_tok}, out={out_tok})")
+    try:
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            trajectory.append(event)
+            etype = event.get("type")
+            if etype == "item.completed":
+                item = event.get("item") or {}
+                item_type = item.get("type")
+                if item_type in {"function_call", "tool_call"}:
+                    name = item.get("name") or item.get("tool_name") or "tool"
+                    print(f"    tool: {name}")
+                elif item_type == "agent_message":
+                    text = (item.get("text") or "").strip()
+                    if text:
+                        print(f"    text: {text.splitlines()[0][:100]}...")
+                elif item_type == "error":
+                    msg = item.get("message") or ""
+                    if msg:
+                        print(f"    error: {str(msg)[:200]}")
+                elif item_type == "mcp_call":
+                    name = item.get("server_label", "") + "::" + (item.get("name") or "")
+                    print(f"    mcp: {name}")
+            elif etype == "turn.completed":
+                usage = event.get("usage")
+                turn_count += 1
+                if usage:
+                    total_in_tokens += usage.get("input_tokens", 0)
+                    total_out_tokens += usage.get("output_tokens", 0)
+            elif etype in {"turn.failed", "error"}:
+                err = event.get("error") or {}
+                final_error = err.get("message") if isinstance(err, dict) else event.get("message")
+    finally:
+        proc.wait()
+
+    stderr = (proc.stderr.read() or "").strip()
+    if stderr:
+        for sline in stderr.splitlines()[:10]:
+            sline = sline.strip()
+            if sline:
+                print(f"    codex-stderr: {sline[:200]}")
+
+    if turn_count > 0:
+        print(f"  result: turns={turn_count}, tokens(in={total_in_tokens}, out={total_out_tokens})")
 
     if proc.returncode != 0 and final_error:
         print(f"  codex error: {final_error}")
