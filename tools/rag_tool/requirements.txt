@@ -1,5 +1,0 @@
-chromadb
-sentence-transformers
-mcp
-tiktoken
-rich

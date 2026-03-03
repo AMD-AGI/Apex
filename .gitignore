@@ -38,3 +38,4 @@ tools/mcps/rag_tool/chroma_db/
 # ── Pipeline runtime data ────────────────────────────────────────────────────
 trajectories/
 leaderboard.jsonl
+.mcp.json
