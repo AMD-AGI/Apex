@@ -1,35 +1,35 @@
 {
   "mcpServers": {
     "magpie": {
-      "command": "/home/sirafati/Kernel/.venv/bin/python",
+      "command": "python3",
       "args": ["-m", "Magpie.mcp"],
       "env": {
-        "PYTHONPATH": "/home/sirafati/code_combine/Magpie"
+        "PYTHONPATH": "./tools/magpie"
       }
     },
     "gpu-info": {
-      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_gpu_info/run_server.sh",
-      "args": []
-    },
-    "kernel-perf": {
-      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_kernel_perf/run_server.sh",
-      "args": []
+      "command": "python3",
+      "args": ["./tools/mcps/gpu_info/server.py"],
+      "env": {}
     },
     "source-finder": {
-      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_source_finder/run_server.sh",
-      "args": []
-    },
-    "asm-tools": {
-      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_asm_tools/run_server.sh",
-      "args": []
+      "command": "python3",
+      "args": ["./tools/mcps/source_finder/server.py"],
+      "env": {}
     },
     "fusion-advisor": {
-      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_fusion_advisor/run_server.sh",
-      "args": []
+      "command": "python3",
+      "args": ["./tools/mcps/fusion_advisor/server.py"],
+      "env": {}
     },
-    "rag-server": {
-      "command": "/home/sirafati/Kernel/AGIKIT-V2/mcp_tools/src/mcp_rag_server/run_server.sh",
-      "args": []
+    "kernel-rag": {
+      "command": "python3",
+      "args": ["./tools/mcps/rag_tool/server.py"],
+      "env": {
+        "MCP_ROCM_DIR": "./tools/rocm",
+        "MCP_DOC_DIR": "./tools/doc",
+        "MCP_JSONS_DIR": "./tools/jsons"
+      }
     }
   }
 }

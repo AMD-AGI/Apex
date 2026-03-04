@@ -170,11 +170,14 @@ def _magpie_bin() -> list[str]:
         venv_python = Path(magpie_root) / ".venv" / "bin" / "python3"
         if venv_python.exists():
             return [str(venv_python), "-m", MAGPIE_MODULE]
+        magpie_pkg = Path(magpie_root) / MAGPIE_MODULE
+        if magpie_pkg.is_dir() and (magpie_pkg / "__main__.py").exists():
+            return ["python3", "-m", MAGPIE_MODULE]
     if shutil.which("magpie"):
         return ["magpie"]
-    local = Path(__file__).parent.parent / "tools" / "magpie" / "Magpie" / "main.py"
-    if local.exists():
-        return ["python3", str(local)]
+    local_dir = Path(__file__).parent.parent / "tools" / "magpie"
+    if (local_dir / MAGPIE_MODULE / "__main__.py").exists():
+        return ["python3", "-m", MAGPIE_MODULE]
     return ["python3", "-m", MAGPIE_MODULE]
 
 
@@ -256,6 +259,24 @@ def _auto_tp(model: str, gpu_count: int) -> int:
     return 1
 
 
+def _detect_run_mode() -> str:
+    """Return run mode: honours MAGPIE_RUN_MODE env var, otherwise auto-detects."""
+    override = os.environ.get("MAGPIE_RUN_MODE", "").strip().lower()
+    if override in ("local", "docker"):
+        return override
+    import shutil
+    if shutil.which("docker") is None:
+        return "local"
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "docker" if result.returncode == 0 else "local"
+    except Exception:
+        return "local"
+
+
 def run_magpie_benchmark(
     framework: str,
     model: str,
@@ -293,6 +314,9 @@ def run_magpie_benchmark(
             "--output-len", str(output_len),
         ]
 
+    # Auto-detect run mode: use local when Docker is unavailable
+    cmd += ["--run-mode", _detect_run_mode()]
+
     with tempfile.TemporaryDirectory(prefix="magpie_bench_") as tmpdir:
         cmd += ["--output-dir", tmpdir]
         import sys
@@ -315,9 +339,11 @@ def run_magpie_benchmark(
             proc.wait(timeout=timeout)
             stdout_text = "".join(stdout_lines)
 
-            result_files = list(Path(tmpdir).rglob("*.json"))
-            if result_files:
-                with open(result_files[0]) as f:
+            report = list(Path(tmpdir).rglob("benchmark_report.json"))
+            if not report:
+                report = list(Path(tmpdir).rglob("*.json"))
+            if report:
+                with open(report[0]) as f:
                     return json.load(f)
 
             if proc.returncode != 0:
@@ -439,6 +465,28 @@ def _extract_time_ms(kernel_result: dict) -> float:
             v = perf.get(key)
             if v is not None and float(v) > 0:
                 return float(v)
+
+        # Check summary dict (used by SCRIPT_BENCHMARK backend)
+        summary = perf.get("summary", {})
+        if isinstance(summary, dict):
+            dm = summary.get("duration_ms")
+            if isinstance(dm, dict):
+                v = dm.get("value")
+                if v is not None and float(v) > 0:
+                    return float(v)
+
+        # Check kernels list for duration_ns
+        kernels = perf.get("kernels", [])
+        if isinstance(kernels, list):
+            for kinfo in kernels:
+                dur = kinfo.get("duration_ns", {})
+                if isinstance(dur, dict):
+                    avg_ns = dur.get("avg")
+                    if avg_ns is not None and float(avg_ns) > 0:
+                        return float(avg_ns) / 1e6
+                elif isinstance(dur, (int, float)) and float(dur) > 0:
+                    return float(dur) / 1e6
+
         metrics = perf.get("metrics", {})
         for key in ("avg_time_ms", "mean_ms", "avg_ms"):
             v = metrics.get(key)
@@ -526,8 +574,8 @@ def trajectory_reward(
     Each entry in kernel_results should contain:
       compiled (bool), correct (bool), baseline_ms (float), optimized_ms (float)
 
-    Returns a dict with kernel_reward, model_reward, total_reward, and
-    per-kernel scores.
+    Returns a dict with per-kernel scores, normalized_kernel_score,
+    and model_reward.
     """
     per_kernel: list[float] = []
     for kr in kernel_results:
@@ -549,7 +597,6 @@ def trajectory_reward(
         "avg_kernel_score": round(avg_kernel, 4),
         "normalized_kernel_score": round(normalized, 4),
         "model_reward": model_score,
-        "total_reward": round(normalized * 0.5 + model_score * 0.5, 4),
     }
 
 

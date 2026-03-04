@@ -216,11 +216,20 @@ for mcp_dir in "$MCPS_DIR"/*/; do
     [[ ! -d "$mcp_dir" ]] && continue
     mcp_name="$(basename "$mcp_dir")"
     if [[ -f "$mcp_dir/pyproject.toml" ]]; then
-        if $PYTHON -m pip install --quiet -e "$mcp_dir" 2>/dev/null; then
+        pip_log="$(mktemp)"
+        if $PYTHON -m pip install -e "$mcp_dir" > "$pip_log" 2>&1; then
             ok "$mcp_name"
         else
-            warn "$mcp_name — pip install failed"
+            warn "$mcp_name — pip install failed (retrying without --quiet)..."
+            if $PYTHON -m pip install -e "$mcp_dir" 2>&1 | tail -20; then
+                ok "$mcp_name (retry succeeded)"
+            else
+                fail "$mcp_name — pip install failed"
+                echo "    pip output (last 10 lines):"
+                tail -10 "$pip_log" | while IFS= read -r line; do echo "      $line"; done
+            fi
         fi
+        rm -f "$pip_log"
     fi
 done
 
@@ -270,12 +279,12 @@ register_mcp() {
     done
 
     if [[ "$INSTALL_CLAUDE" == "true" ]]; then
-        local claude_opts=(-s project --transport stdio)
+        local claude_env_opts=()
         for ev in "${env_pairs[@]+"${env_pairs[@]}"}"; do
-            claude_opts+=(-e "$ev")
+            claude_env_opts+=(-e "$ev")
         done
         claude mcp remove -s project "$name" 2>/dev/null || true
-        if claude mcp add "${claude_opts[@]}" "$name" -- "${cmd_parts[@]}" 2>/dev/null; then
+        if claude mcp add -s project --transport stdio "$name" "${claude_env_opts[@]+"${claude_env_opts[@]}"}" -- "${cmd_parts[@]}" 2>/dev/null; then
             ok "$name (claude)"
         else
             warn "$name (claude) — registration failed"
@@ -323,6 +332,51 @@ register_mcp "fusion-advisor" \
 register_mcp "magpie" \
     "PYTHONPATH=$MAGPIE_ROOT" \
     -- "$PYTHON" "-m" "Magpie.mcp"
+
+# ── Generate .mcp.json (for Claude Code IDE / Cursor) ──────────────────────
+cat > "$APEX_ROOT/.mcp.json" <<MCPJSON
+{
+  "mcpServers": {
+    "source-finder": {
+      "type": "stdio",
+      "command": "$PYTHON",
+      "args": ["$MCPS_DIR/source_finder/server.py"],
+      "env": {}
+    },
+    "kernel-rag": {
+      "type": "stdio",
+      "command": "$PYTHON",
+      "args": ["$MCPS_DIR/rag_tool/server.py"],
+      "env": {
+        "MCP_ROCM_DIR": "$ROCM_DIR",
+        "MCP_DOC_DIR": "$DOC_DIR",
+        "MCP_JSONS_DIR": "$JSONS_DIR"
+      }
+    },
+    "gpu-info": {
+      "type": "stdio",
+      "command": "$PYTHON",
+      "args": ["$MCPS_DIR/gpu_info/server.py"],
+      "env": {}
+    },
+    "fusion-advisor": {
+      "type": "stdio",
+      "command": "$PYTHON",
+      "args": ["$MCPS_DIR/fusion_advisor/server.py"],
+      "env": {}
+    },
+    "magpie": {
+      "type": "stdio",
+      "command": "$PYTHON",
+      "args": ["-m", "Magpie.mcp"],
+      "env": {
+        "PYTHONPATH": "$MAGPIE_ROOT"
+      }
+    }
+  }
+}
+MCPJSON
+ok "Generated .mcp.json (auto-resolved paths for IDE)"
 
 echo ""
 

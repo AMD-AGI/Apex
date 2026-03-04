@@ -164,15 +164,13 @@ class PipelineState:
 
 
 def _detect_kernel_python() -> str:
-    """Auto-detect python with torch+triton for kernel execution."""
-    candidates = [
-        Path("/home/sirafati/Kernel/.venv/bin/python3"),
-        Path.home() / "Kernel" / ".venv" / "bin" / "python3",
-    ]
-    for p in candidates:
-        if p.exists():
-            return str(p)
-    return "python3"
+    """Auto-detect python with torch+triton for kernel execution.
+
+    Uses the currently active python (sys.executable) since the venv should
+    already be activated before running the pipeline.
+    """
+    import sys as _sys
+    return _sys.executable or "python3"
 
 
 SYSTEM_PROMPT = """\
@@ -254,6 +252,8 @@ IMPORTANT:
 - Do NOT hardcode kernel names — they are provided dynamically by the pipeline
 - Only solutions with >5% speedup will be integrated into the final benchmark
 - Use Magpie compare to verify correctness AND measure speedup every iteration
+- Do ALL work directly yourself — read files, write code, call MCP tools directly.
+  Do NOT delegate to sub-agents via the Agent tool. Work hands-on.
 """
 
 
@@ -417,6 +417,51 @@ def _find_baseline_sources(kernel_spec: str) -> list[str]:
     return []
 
 
+def _fixup_aiter_imports(filepath: Path) -> None:
+    """Fix aiter import paths that differ between source tree and installed package.
+
+    The source tree has nested dirs (e.g. attention/pa_decode.py) but the pip-
+    installed aiter flattens them.  Also replaces AiterTritonLogger with a stub
+    since the installed package may not include it.
+    """
+    import re as _re
+    try:
+        text = filepath.read_text()
+    except OSError:
+        return
+    original = text
+    # Flatten nested _triton_kernels sub-packages:
+    #   aiter.ops.triton._triton_kernels.attention.pa_decode  →  ...._triton_kernels.pa_decode
+    text = _re.sub(
+        r'(aiter\.ops\.triton\._triton_kernels)\.\w+\.([\w.]+)',
+        r'\1.\2',
+        text,
+    )
+    # Replace AiterTritonLogger import + usage with a no-op stub
+    if "AiterTritonLogger" in text:
+        text = _re.sub(
+            r'^from\s+aiter\.ops\.triton\.utils\.logger\s+import\s+AiterTritonLogger\s*$',
+            'class AiterTritonLogger:\n    def info(self, *a, **kw): pass',
+            text,
+            flags=_re.MULTILINE,
+        )
+    # Guard top-level `from aiter import ...` / `import aiter` that triggers
+    # the pandas→bottleneck import chain.  Wrap in try/except so the script
+    # can still run standalone even if the full aiter package is broken.
+    for pat in [
+        r'^(from\s+aiter\s+import\s+.+)$',
+        r'^(import\s+aiter\s*)$',
+    ]:
+        text = _re.sub(
+            pat,
+            r'try:\n    \1\nexcept ImportError:\n    pass',
+            text,
+            flags=_re.MULTILINE,
+        )
+    if text != original:
+        filepath.write_text(text)
+
+
 def _read_source_code(path: str, max_lines: int = 500) -> str:
     """Read source file content, truncating if very long."""
     try:
@@ -500,11 +545,11 @@ def _create_task_config(
     if local_baseline.exists():
         baseline_path = f"./baseline{ext}"
     elif baseline_paths:
-        # Copy the first baseline source into the task dir as baseline.py
         import shutil
         src = Path(baseline_paths[0])
         if src.exists():
             shutil.copy2(src, local_baseline)
+            _fixup_aiter_imports(local_baseline)
             baseline_path = f"./baseline{ext}"
         else:
             baseline_path = baseline_paths[0]
@@ -1040,8 +1085,7 @@ def _generate_report(
         f"| Per-kernel scores | {reward.get('per_kernel_scores', [])} |",
         f"| Avg kernel score | {reward.get('avg_kernel_score', 0):.4f} |",
         f"| Normalized kernel score | {reward.get('normalized_kernel_score', 0):.4f} |",
-        f"| Model reward | {reward.get('model_reward', 0):.4f} |",
-        f"| **Total reward** | **{reward.get('total_reward', 0):.4f}** |",
+        f"| **Model reward** | **{reward.get('model_reward', 0):.4f}** |",
         f"| Quality | {trajectory.trajectory_quality} |",
         f"",
         f"## Scoring Formulas",
@@ -1428,7 +1472,6 @@ def _run_workload_optimization_inner(
     print(f"  Avg kernel score: {reward['avg_kernel_score']:.2f}")
     print(f"  Normalized kernel: {reward['normalized_kernel_score']:.4f}")
     print(f"  Model reward: {reward['model_reward']:.4f}")
-    print(f"  Total reward: {reward['total_reward']:.4f}")
     print(f"  Quality: {trajectory.trajectory_quality}")
     step_timings["score"] = time.monotonic() - t_step
     print(f"  Duration: {step_timings['score']:.1f}s")
@@ -1484,7 +1527,7 @@ def _run_workload_optimization_inner(
             gpu_arch=config.gpu_arch,
             kernel_score=reward["avg_kernel_score"],
             model_score=reward.get("model_reward", 0.0),
-            arena_score=reward["total_reward"] * 100,
+            arena_score=reward.get("model_reward", 0.0) * 100,
             baseline_tps=baseline_tps,
             optimized_tps=final_tps,
             throughput_ratio=final_tps / baseline_tps if baseline_tps > 0 else 0.0,
@@ -1519,7 +1562,7 @@ def _run_workload_optimization_inner(
     print(f"  Final TPS:      {final_tps:.1f}")
     if baseline_tps > 0 and final_tps > 0:
         print(f"  Improvement:    {final_tps/baseline_tps:.4f}x")
-    print(f"  Total reward:   {trajectory.total_reward:.4f} ({trajectory.trajectory_quality})")
+    print(f"  Model reward:   {trajectory.model_reward:.4f} ({trajectory.trajectory_quality})")
     print(f"  Duration:       {trajectory.total_duration_s:.1f}s")
     print(f"  Trajectory ID:  {tid}")
     print(f"  Results dir:    {results_dir}")
@@ -1912,7 +1955,6 @@ def cmd_score(args):
     print(f"  Avg kernel score: {reward['avg_kernel_score']:.2f}")
     print(f"  Normalized kernel: {reward['normalized_kernel_score']:.4f}")
     print(f"  Model reward: {reward['model_reward']:.4f}")
-    print(f"  Total reward: {reward['total_reward']:.4f}")
 
     state.update({
         "reward": reward,
@@ -1949,7 +1991,7 @@ def cmd_score(args):
             gpu_arch=config.gpu_arch,
             kernel_score=reward["avg_kernel_score"],
             model_score=reward.get("model_reward", 0.0),
-            arena_score=reward["total_reward"] * 100,
+            arena_score=reward.get("model_reward", 0.0) * 100,
             baseline_tps=baseline_tps,
             optimized_tps=final_tps,
             throughput_ratio=final_tps / baseline_tps if baseline_tps > 0 else 0.0,

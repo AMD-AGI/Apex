@@ -86,10 +86,17 @@ def _parse_config(config_path: Path) -> dict:
 
 
 def _detect_kernel_type(solution: Path) -> str:
-    """Infer Magpie kernel type from the solution file extension."""
+    """Infer Magpie kernel type from the solution file extension and content."""
     ext = solution.suffix.lower()
     if ext in (".hip", ".cu"):
         return "hip"
+    if ext == ".py":
+        try:
+            content = solution.read_text(errors="ignore")[:4096]
+            if "import triton" in content or "triton.jit" in content or "from aiter" in content:
+                return "triton"
+        except OSError:
+            pass
     return "pytorch"
 
 
@@ -147,13 +154,16 @@ def _measure_speedup(cfg: dict, task_dir: Path, baseline_path: str, optimized_pa
     """Measure speedup by running baseline and solution with --benchmark flag."""
     perf_cfg = cfg.get("performance", {})
     perf_cmd = perf_cfg.get("command", "")
-    python_bin = perf_cmd.split()[0] if perf_cmd else "/home/sirafati/Kernel/.venv/bin/python3"
+    python_bin = perf_cmd.split()[0] if perf_cmd else "python3"
 
     baseline_ms = _run_benchmark_script(baseline_path, python_bin, str(task_dir))
     optimized_ms = _run_benchmark_script(optimized_path, python_bin, str(task_dir))
 
     if baseline_ms > 0 and optimized_ms > 0:
-        return baseline_ms / optimized_ms
+        ratio = baseline_ms / optimized_ms
+        if ratio > 100:
+            return 0.0
+        return ratio
     return 0.0
 
 
@@ -188,11 +198,11 @@ def grade_task(task_dir: Path, docker_image: str | None = None) -> KernelResult:
         )
 
     if not Path(baseline_path).is_absolute():
-        baseline_path = str(task_dir / baseline_path)
+        baseline_path = str((task_dir / baseline_path).resolve())
 
     optimized_path = cfg.get("optimized", {}).get("path", str(solution))
     if not Path(optimized_path).is_absolute():
-        optimized_path = str(task_dir / optimized_path)
+        optimized_path = str((task_dir / optimized_path).resolve())
 
     testcase_cmd = cfg.get("correctness", {}).get("command")
     kernel_type = _detect_kernel_type(solution)
@@ -202,7 +212,7 @@ def grade_task(task_dir: Path, docker_image: str | None = None) -> KernelResult:
         optimized_path=optimized_path,
         testcase_cmd=testcase_cmd,
         kernel_type=kernel_type,
-        working_dir=str(task_dir),
+        working_dir=str(task_dir.resolve()),
     )
 
     if "error" in raw:
@@ -213,12 +223,14 @@ def grade_task(task_dir: Path, docker_image: str | None = None) -> KernelResult:
     if compiled and correct and speedup <= 0:
         perf_cfg = cfg.get("performance", {})
         perf_cmd = perf_cfg.get("command", "")
-        python_bin = perf_cmd.split()[0] if perf_cmd else "/home/sirafati/Kernel/.venv/bin/python3"
+        python_bin = perf_cmd.split()[0] if perf_cmd else "python3"
 
         b_ms = _run_benchmark_script(baseline_path, python_bin, str(task_dir))
         o_ms = _run_benchmark_script(optimized_path, python_bin, str(task_dir))
         if b_ms > 0 and o_ms > 0:
             speedup = b_ms / o_ms
+            if speedup > 100:
+                speedup = 0.0
             raw["baseline_ms"] = round(b_ms, 4)
             raw["optimized_ms"] = round(o_ms, 4)
             raw["_benchmark_speedup"] = round(speedup, 4)

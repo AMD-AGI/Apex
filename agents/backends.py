@@ -49,11 +49,24 @@ def model_display_name(model: str | None, agent: str) -> str:
 
 
 def _load_mcp_config() -> dict | None:
-    """Load MCP server config for Claude Code from mcp_config.json."""
-    if MCP_CONFIG_PATH.exists():
-        with open(MCP_CONFIG_PATH) as f:
-            return json.load(f)
-    return None
+    """Load MCP server config and resolve relative paths against REPO_ROOT."""
+    if not MCP_CONFIG_PATH.exists():
+        return None
+    with open(MCP_CONFIG_PATH) as f:
+        cfg = json.load(f)
+    servers = cfg.get("mcpServers", {})
+    for _name, srv in servers.items():
+        for i, arg in enumerate(srv.get("args", [])):
+            if arg.startswith("./"):
+                srv["args"][i] = str(REPO_ROOT / arg)
+        env = srv.get("env", {})
+        for k, v in env.items():
+            if isinstance(v, str) and v.startswith("./"):
+                env[k] = str(REPO_ROOT / v)
+        cmd = srv.get("command", "")
+        if cmd == "python3":
+            srv["command"] = sys.executable or "python3"
+    return cfg
 
 
 def run_agent_task(
@@ -119,7 +132,24 @@ def _run_claude_task(
             cwd=str(cwd),
             model=model,
             max_turns=max_turns,
-            permission_mode="bypassPermissions",
+            permission_mode="acceptEdits",
+            allowed_tools=[
+                "Bash", "Read", "Edit", "Write", "MultiEdit",
+                "Glob", "Grep", "Agent",
+                "mcp__magpie__analyze", "mcp__magpie__compare",
+                "mcp__magpie__hardware_spec", "mcp__magpie__suggest_optimizations",
+                "mcp__magpie__discover_kernels", "mcp__magpie__create_kernel_config",
+                "mcp__gpu-info__get_gpu_info", "mcp__gpu-info__get_arch_optimization_hints",
+                "mcp__source-finder__find_kernel_source", "mcp__source-finder__classify_kernel",
+                "mcp__source-finder__find_ck_template", "mcp__source-finder__identify_kernel_origin",
+                "mcp__source-finder__suggest_optimization_approach",
+                "mcp__kernel-rag__search_kernel_optimization", "mcp__kernel-rag__search_gpu_documentation",
+                "mcp__kernel-rag__get_optimization_snippet", "mcp__kernel-rag__analyze_kernel_for_optimization",
+                "mcp__kernel-rag__get_optimization_playbook", "mcp__kernel-rag__get_gpu_specs",
+                "mcp__fusion-advisor__detect_fusion_opportunities",
+                "mcp__fusion-advisor__generate_fused_kernel", "mcp__fusion-advisor__estimate_fusion_benefit",
+                "mcp__fusion-advisor__check_library_fusion",
+            ],
             system_prompt=system_prompt,
         )
 
@@ -140,7 +170,9 @@ def _run_claude_task(
                     print(f"  result: turns={message.num_turns}, cost=${cost:.4f}")
         except Exception as e:
             err_str = str(e)
-            if trajectory and ("exit code" in err_str or "Command failed" in err_str):
+            if "MessageParseError" in type(e).__name__ or "Unknown message type" in err_str:
+                print(f"    [warn] Ignoring unknown message type: {err_str[:120]}")
+            elif trajectory and ("exit code" in err_str or "Command failed" in err_str):
                 print(f"    [warn] CLI exited non-zero after {len(trajectory)} messages "
                       f"(likely max-turns reached): {err_str[:120]}")
             else:

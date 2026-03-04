@@ -333,7 +333,7 @@ class TestTrajectoryReward:
         result = trajectory_reward(krs, baseline_tps=100.0, optimized_tps=150.0)
         assert "per_kernel_scores" in result
         assert len(result["per_kernel_scores"]) == 2
-        assert result["total_reward"] > 0
+        assert result["model_reward"] > 0
         assert result["avg_kernel_score"] > 0
 
     def test_empty_kernels(self):
@@ -348,7 +348,7 @@ class TestTrajectoryReward:
         ]
         result = trajectory_reward(krs, baseline_tps=100.0, optimized_tps=100.0)
         assert result["avg_kernel_score"] == 0.0
-        assert result["total_reward"] == 0.0
+        assert result["model_reward"] == 0.0
 
 
 # ── trajectory.py — WorkloadTrajectoryRecord ──────────────────────────────────
@@ -373,10 +373,9 @@ class TestWorkloadTrajectoryRecord:
             "avg_kernel_score": 295.0,
             "normalized_kernel_score": 0.92,
             "model_reward": 0.8,
-            "total_reward": 0.86,
         }
         rec.apply_reward(reward)
-        assert rec.total_reward == 0.86
+        assert rec.model_reward == 0.8
         assert rec.trajectory_quality == "good"
 
     def test_bad_quality(self):
@@ -386,8 +385,7 @@ class TestWorkloadTrajectoryRecord:
             "per_kernel_scores": [],
             "avg_kernel_score": 0,
             "normalized_kernel_score": 0,
-            "model_reward": 0,
-            "total_reward": 0.1,
+            "model_reward": 0.1,
         })
         assert rec.trajectory_quality == "bad"
 
@@ -398,8 +396,7 @@ class TestWorkloadTrajectoryRecord:
             "per_kernel_scores": [],
             "avg_kernel_score": 0,
             "normalized_kernel_score": 0,
-            "model_reward": 0,
-            "total_reward": 0.5,
+            "model_reward": 0.5,
         })
         assert rec.trajectory_quality == "mediocre"
 
@@ -408,13 +405,13 @@ class TestWorkloadTrajectoryRecord:
         d = {
             "workload_id": "test",
             "model_id": "test-model",
-            "total_reward": 0.9,
+            "model_reward": 0.9,
             "trajectory_quality": "good",
             "extra_field": "ignored",
         }
         rec = WorkloadTrajectoryRecord.from_dict(d)
         assert rec.workload_id == "test"
-        assert rec.total_reward == 0.9
+        assert rec.model_reward == 0.9
 
     def test_store_save_load(self, tmp_path):
         from trajectory import WorkloadTrajectoryRecord, FileStore
@@ -422,7 +419,7 @@ class TestWorkloadTrajectoryRecord:
         rec = WorkloadTrajectoryRecord(
             workload_id="test",
             model_id="test-model",
-            total_reward=0.5,
+            model_reward=0.5,
         )
         tid = store.save(rec)
         loaded = store.load(tid)
@@ -452,7 +449,7 @@ class TestWorkloadOptimizerDryRun:
         assert trajectory.workload_id != ""
         assert trajectory.baseline_tps > 0
         assert trajectory.final_tps > 0
-        assert trajectory.total_reward > 0
+        assert trajectory.model_reward > 0
         assert trajectory.trajectory_quality in ("good", "mediocre", "bad")
         assert len(trajectory.bottleneck_kernels) > 0
         assert len(trajectory.kernel_optimizations) > 0

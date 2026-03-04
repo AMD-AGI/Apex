@@ -135,7 +135,6 @@ class WorkloadTrajectoryRecord:
     avg_kernel_score: float = 0.0
     normalized_kernel_score: float = 0.0
     model_reward: float = 0.0
-    total_reward: float = 0.0
     trajectory_quality: str = "unknown"
 
     # Metadata
@@ -149,11 +148,10 @@ class WorkloadTrajectoryRecord:
         self.avg_kernel_score = reward_dict.get("avg_kernel_score", 0.0)
         self.normalized_kernel_score = reward_dict.get("normalized_kernel_score", 0.0)
         self.model_reward = reward_dict.get("model_reward", 0.0)
-        self.total_reward = reward_dict.get("total_reward", 0.0)
 
-        if self.total_reward >= 0.8:
+        if self.model_reward >= 0.8:
             self.trajectory_quality = "good"
-        elif self.total_reward >= 0.3:
+        elif self.model_reward >= 0.3:
             self.trajectory_quality = "mediocre"
         else:
             self.trajectory_quality = "bad"

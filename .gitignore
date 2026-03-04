@@ -39,3 +39,6 @@ tools/mcps/rag_tool/chroma_db/
 trajectories/
 leaderboard.jsonl
 .mcp.json
+results
+tools/.cache/*
+mcp_config.json
