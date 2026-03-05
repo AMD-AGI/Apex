@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -277,6 +280,119 @@ def _detect_run_mode() -> str:
         return "local"
 
 
+_BENCHMARK_PGIDS: set[int] = set()
+
+
+def _track_benchmark_pgid(pgid: int) -> None:
+    """Register a process-group ID from a Magpie benchmark subprocess."""
+    _BENCHMARK_PGIDS.add(pgid)
+
+
+def cleanup_inference_server(timeout: float = 15.0) -> None:
+    """Kill orphaned vLLM/EngineCore processes and wait for GPU memory release.
+
+    Safety model (shared-machine safe):
+      1. Try ``os.killpg`` on every tracked process group first -- this is the
+         fastest and most precise path.
+      2. Fall back to a ``ps``-based scan for any vLLM/EngineCore processes that
+         are (a) owned by the current UID **and** (b) are a descendant of this
+         process or a tracked benchmark PGID.  The ``ppid == 1`` (orphaned)
+         case also requires UID match, so other users' orphaned servers are
+         never touched.
+    """
+    import sys
+
+    our_uid = os.getuid()
+    our_pid = os.getpid()
+
+    killed: list[int] = []
+
+    # --- Phase 1: kill tracked process groups --------------------------------
+    for pgid in list(_BENCHMARK_PGIDS):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            killed.append(-pgid)  # negative to indicate group kill
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    _BENCHMARK_PGIDS.clear()
+
+    # --- Phase 2: scan for any stragglers (same UID only) --------------------
+    try:
+        ps = subprocess.run(
+            ["ps", "-eo", "pid,uid,ppid,args"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in ps.stdout.splitlines()[1:]:
+            fields = line.split(None, 3)
+            if len(fields) < 4:
+                continue
+            try:
+                pid, uid, ppid = int(fields[0]), int(fields[1]), int(fields[2])
+            except ValueError:
+                continue
+            if uid != our_uid:
+                continue
+            args = fields[3]
+            if not re.search(r"vllm serve|VLLM::EngineCore", args):
+                continue
+            if ppid not in (our_pid, 1) and not _is_descendant_of(pid, our_pid):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass
+
+    if not killed:
+        return
+
+    print(f"  [cleanup] Killed {len(killed)} orphaned server process(es): "
+          f"{[abs(p) for p in killed]}", file=sys.stderr)
+
+    deadline = time.monotonic() + timeout
+    positive_pids = [p for p in killed if p > 0]
+    while positive_pids and time.monotonic() < deadline:
+        positive_pids = [p for p in positive_pids if _pid_alive(p)]
+        if not positive_pids:
+            break
+        time.sleep(1.0)
+
+    time.sleep(3.0)
+
+
+def _is_descendant_of(pid: int, ancestor: int, max_depth: int = 8) -> bool:
+    """Walk the parent chain (via /proc) to see if *pid* descends from *ancestor*."""
+    cur = pid
+    for _ in range(max_depth):
+        try:
+            status = Path(f"/proc/{cur}/status").read_text()
+        except OSError:
+            return False
+        for line in status.splitlines():
+            if line.startswith("PPid:"):
+                cur = int(line.split()[1])
+                if cur == ancestor:
+                    return True
+                if cur <= 1:
+                    return False
+                break
+        else:
+            return False
+    return False
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def run_magpie_benchmark(
     framework: str,
     model: str,
@@ -302,7 +418,8 @@ def run_magpie_benchmark(
     cmd = _magpie_bin()
 
     if benchmark_config_path:
-        cmd += ["benchmark", "--benchmark-config", str(benchmark_config_path)]
+        abs_config = str(Path(benchmark_config_path).resolve())
+        cmd += ["benchmark", "--benchmark-config", abs_config]
     else:
         cmd += [
             "benchmark", framework,
@@ -329,7 +446,10 @@ def run_magpie_benchmark(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                cwd=tmpdir,
+                start_new_session=True,
             )
+            _track_benchmark_pgid(proc.pid)
             stdout_lines: list[str] = []
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -354,7 +474,10 @@ def run_magpie_benchmark(
             return {"error": "no result file produced", "stdout": stdout_text[-500:]}
 
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
             return {"error": f"magpie benchmark timed out ({timeout}s)"}
         except FileNotFoundError as e:
             return {"error": f"magpie not found: {e}"}

@@ -36,11 +36,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
+import importlib.util
 import json
 import os
+import re as _re_mod
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import uuid
@@ -57,6 +61,7 @@ sys.path.insert(0, str(REPO_ROOT / "prompts"))
 
 from score import (
     KernelResult,
+    cleanup_inference_server,
     run_magpie_benchmark,
     run_magpie_compare,
     parse_compare_result,
@@ -69,7 +74,7 @@ from kernel_grader import grade_task, find_solution
 from reflector import reflect, should_continue
 from trajectory import WorkloadTrajectoryRecord, get_store
 from leaderboard import Leaderboard, LeaderboardEntry
-from bottleneck import (
+from kernel_bottleneck import (
     BottleneckKernel,
     extract_bottlenecks,
     filter_by_types,
@@ -95,6 +100,552 @@ MAGPIE_ROOT = Path(os.environ.get(
     str(REPO_ROOT.parent / "Magpie"),
 ))
 os.environ.setdefault("MAGPIE_ROOT", str(MAGPIE_ROOT))
+
+
+# ---------------------------------------------------------------------------
+# Kernel patching infrastructure (Fixes 1, 9, 10, 11)
+# ---------------------------------------------------------------------------
+
+_KERNEL_SPEC_TO_MODULE = {
+    # Triton kernels
+    "paged_attn_decode": "aiter.ops.triton.pa_decode",
+    "paged_attn_decode_gluon": "aiter.ops.triton.pa_decode_gluon",
+    # HIP kernel Python wrappers
+    "gemm_w8a8": "aiter.ops.gemm_op_a8w8",
+    "gemm_bf16": "aiter.ops.gemm_op_a16w16",
+    "all_reduce": "aiter.dist.device_communicators.custom_all_reduce",
+}
+
+# HIP kernel specs whose compiled .so can be located by name
+_HIP_SPEC_TO_SO = {
+    "all_reduce": "custom_all_reduce",
+}
+
+PATCH_LOCK_PATH = Path("/tmp/magpie_kernel_patch.lock")
+PATCH_MANIFEST_PATH = Path("/tmp/magpie_kernel_patch_manifest.json")
+
+MIN_SPEEDUP_FOR_REINJECTION = 1.05
+
+
+def _resolve_installed_module_path(kernel_spec: str) -> Optional[Path]:
+    """Resolve a kernel spec to its installed Python module file path."""
+    module_name = _KERNEL_SPEC_TO_MODULE.get(kernel_spec)
+    if not module_name:
+        return None
+    try:
+        spec = importlib.util.find_spec(module_name)
+        if spec and spec.origin:
+            return Path(spec.origin)
+    except (ModuleNotFoundError, ValueError):
+        pass
+    return None
+
+
+def _clear_pycache(module_path: Path) -> None:
+    """Remove __pycache__ for the directory containing a patched module."""
+    cache_dir = module_path.parent / "__pycache__"
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+        print(f"    Cleared bytecode cache: {cache_dir}")
+
+
+def _find_installed_so(kernel_spec: str) -> Optional[Path]:
+    """Find the installed shared library for a HIP kernel spec."""
+    so_name = _HIP_SPEC_TO_SO.get(kernel_spec)
+    if not so_name:
+        return None
+    try:
+        import aiter as _aiter_pkg
+        pkg_dir = Path(_aiter_pkg.__file__).parent
+        for so in pkg_dir.rglob(f"*{so_name}*.so"):
+            return so
+    except (ImportError, Exception):
+        pass
+    return None
+
+
+def _hipcc_compile(source: Path, build_dir: str, kernel_spec: str, gpu_arch: str = "gfx950") -> Optional[Path]:
+    """Compile a .hip/.cu source into a shared library."""
+    output = Path(build_dir) / f"{kernel_spec}.so"
+    cmd = [
+        "hipcc", "-shared", "-fPIC", "-O3",
+        f"--offload-arch={gpu_arch}",
+        "-o", str(output),
+        str(source),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            print(f"    hipcc error: {result.stderr[:500]}")
+            return None
+        return output
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"    hipcc failed: {e}")
+        return None
+
+
+def _compile_and_patch_hip(
+    solution_path: Path, kernel_spec: str, gpu_arch: str = "gfx950",
+) -> tuple[Optional[Path], Optional[Path]]:
+    """Compile a .hip solution and patch the installed .so library."""
+    installed_so = _find_installed_so(kernel_spec)
+    if not installed_so:
+        print(f"    WARNING: Cannot find installed .so for {kernel_spec}, skipping HIP patch")
+        return None, None
+
+    backup = Path(str(installed_so) + ".bak")
+    shutil.copy2(installed_so, backup)
+
+    with tempfile.TemporaryDirectory(prefix="hip_build_") as build_dir:
+        compiled = _hipcc_compile(solution_path, build_dir, kernel_spec, gpu_arch)
+        if compiled and compiled.exists():
+            shutil.copy2(compiled, installed_so)
+            print(f"    Patched HIP kernel: {installed_so}")
+        else:
+            shutil.move(str(backup), str(installed_so))
+            print(f"    WARNING: HIP compilation failed for {kernel_spec}")
+            return None, None
+
+    return installed_so, backup
+
+
+def _acquire_patch_lock() -> "IO":
+    """Acquire an exclusive file lock to prevent concurrent patching."""
+    lock_fd = open(PATCH_LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fd.close()
+        raise RuntimeError(
+            "Another pipeline instance is currently patching kernels. "
+            "Cannot run concurrent final benchmarks."
+        )
+    return lock_fd
+
+
+def _release_patch_lock(lock_fd) -> None:
+    """Release the patch lock and clean up lock/manifest files."""
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+    except Exception:
+        pass
+    PATCH_LOCK_PATH.unlink(missing_ok=True)
+    PATCH_MANIFEST_PATH.unlink(missing_ok=True)
+
+
+def _recover_orphaned_patches() -> None:
+    """Restore any orphaned patches from a previous crashed run."""
+    if not PATCH_MANIFEST_PATH.exists():
+        return
+    print("  WARNING: Found orphaned kernel patches from a previous crashed run")
+    try:
+        manifest = json.loads(PATCH_MANIFEST_PATH.read_text())
+        for installed, backup in manifest.items():
+            if Path(backup).exists():
+                shutil.move(backup, installed)
+                print(f"    Restored: {installed}")
+            else:
+                print(f"    WARNING: Backup missing, cannot restore: {backup}")
+        PATCH_MANIFEST_PATH.unlink(missing_ok=True)
+        print("  Orphaned patches recovered successfully")
+    except Exception as e:
+        print(f"  WARNING: Failed to recover orphaned patches: {e}")
+
+
+def _apply_kernel_patches(
+    reinjected_dir: Path, gpu_arch: str = "gfx950",
+) -> tuple[dict[Path, Path], "IO"]:
+    """Patch installed kernel modules with optimized solutions.
+
+    The manifest is written incrementally after each patch so that
+    ``_recover_orphaned_patches()`` can restore even if the process
+    crashes mid-way.
+
+    Returns (backups_dict, lock_fd) for use with _restore_kernel_patches.
+    """
+    _recover_orphaned_patches()
+    lock_fd = _acquire_patch_lock()
+    backups: dict[Path, Path] = {}
+
+    def _write_manifest() -> None:
+        PATCH_MANIFEST_PATH.write_text(json.dumps(
+            {str(k): str(v) for k, v in backups.items()}
+        ))
+
+    try:
+        if not reinjected_dir.exists():
+            print("  No reinjected directory found -- nothing to patch")
+            return backups, lock_fd
+
+        for solution_file in sorted(reinjected_dir.glob("*_solution.*")):
+            spec = solution_file.name.split("_solution")[0]
+            suffix = solution_file.suffix
+
+            if suffix == ".py":
+                installed_path = _resolve_installed_module_path(spec)
+                if not installed_path:
+                    print(f"    WARNING: No installed module for {spec}, skipping")
+                    continue
+                backup = Path(str(installed_path) + ".bak")
+                shutil.copy2(installed_path, backup)
+                shutil.copy2(solution_file, installed_path)
+                _fixup_aiter_imports(installed_path)
+                _clear_pycache(installed_path)
+                backups[installed_path] = backup
+                _write_manifest()
+                print(f"    Patched: {installed_path}")
+
+            elif suffix in (".hip", ".cu"):
+                installed, backup = _compile_and_patch_hip(
+                    solution_file, spec, gpu_arch,
+                )
+                if installed and backup:
+                    backups[installed] = backup
+                    _write_manifest()
+            else:
+                print(f"    WARNING: Unknown solution type {suffix} for {spec}")
+
+    except Exception:
+        _restore_kernel_patches(backups, lock_fd)
+        raise
+
+    return backups, lock_fd
+
+
+def _restore_kernel_patches(
+    backups: dict[Path, Path], lock_fd=None,
+) -> None:
+    """Restore all backed-up modules and release the patch lock."""
+    for installed, backup in backups.items():
+        try:
+            if backup.exists():
+                shutil.move(str(backup), str(installed))
+                _clear_pycache(installed)
+                print(f"    Restored: {installed}")
+            else:
+                print(f"    WARNING: Backup missing for {installed}")
+        except Exception as e:
+            print(f"    ERROR restoring {installed}: {e}")
+    if lock_fd:
+        _release_patch_lock(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch path validation (Fix 7)
+# ---------------------------------------------------------------------------
+
+def _validate_optimization_relevance(
+    solution_path: Path,
+    baseline_path: Optional[Path],
+    benchmark_config: dict,
+    model_config: dict,
+    kernel_spec: str,
+) -> Optional[str]:
+    """Check if the optimization targets a code path actually used at runtime.
+
+    Returns a warning string if the optimization is likely a no-op, else None.
+    """
+    if kernel_spec != "paged_attn_decode":
+        return None
+
+    if not baseline_path or not baseline_path.exists() or not solution_path.exists():
+        return None
+
+    try:
+        baseline_text = baseline_path.read_text()
+        solution_text = solution_path.read_text()
+    except OSError:
+        return None
+
+    baseline_partition = _re_mod.search(r'_SEQ_PARTITION_SIZE\s*=\s*(\d+)', baseline_text)
+    solution_partition = _re_mod.search(r'_SEQ_PARTITION_SIZE\s*=\s*(\d+)', solution_text)
+
+    if not baseline_partition or not solution_partition:
+        return None
+    if baseline_partition.group(1) == solution_partition.group(1):
+        return None
+
+    bench_section = benchmark_config.get("benchmark", {})
+    envs = bench_section.get("envs", {})
+    conc = int(envs.get("CONC", 64))
+    osl = int(envs.get("OSL", 1024))
+
+    num_q_heads = model_config.get("num_q_heads", 0)
+    if num_q_heads == 0:
+        return None
+
+    num_seqs_times_heads = conc * num_q_heads
+    max_seq_len = osl
+    use_v1 = (num_seqs_times_heads > 512) and (max_seq_len <= 8192)
+
+    if use_v1:
+        return (
+            f"WARNING: Optimization modifies V2 path (_SEQ_PARTITION_SIZE "
+            f"{baseline_partition.group(1)}->{solution_partition.group(1)}) but workload "
+            f"uses V1 path (max_seq_len={max_seq_len} <= 8192 and "
+            f"num_seqs*num_q_heads={num_seqs_times_heads} > 512). "
+            f"This optimization may have NO EFFECT on the actual workload."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Shape validation (Fix 8)
+# ---------------------------------------------------------------------------
+
+def _load_model_config(benchmark_config: dict) -> dict:
+    """Extract model architecture parameters from the target model's config.json.
+
+    Returns a dict with GQA params (for attention kernels) and dimension params
+    (for GEMM / normalization / activation kernels).
+    """
+    bench_section = benchmark_config.get("benchmark", {})
+    model_path = bench_section.get("model", "")
+    if not model_path:
+        return {}
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        cfg = json.loads(config_path.read_text())
+        num_heads = cfg.get("num_attention_heads", 0)
+        hidden = cfg.get("hidden_size", 0)
+        return {
+            "num_q_heads": num_heads,
+            "num_kv_heads": cfg.get("num_key_value_heads", num_heads),
+            "head_dim": hidden // max(num_heads, 1),
+            "hidden_size": hidden,
+            "intermediate_size": cfg.get("intermediate_size", 0),
+            "num_experts": cfg.get("num_local_experts", cfg.get("num_experts", 0)),
+            "vocab_size": cfg.get("vocab_size", 0),
+        }
+    except Exception:
+        return {}
+
+
+# Keep backward-compatible alias
+_load_model_gqa_config = _load_model_config
+
+
+_ATTENTION_KERNEL_SPECS = frozenset({
+    "flash_attn_prefill", "paged_attn_decode", "mla_attn",
+})
+
+_GEMM_KERNEL_SPECS = frozenset({
+    "gemm_bf16", "gemm_w8a8",
+})
+
+_NORM_ACT_KERNEL_SPECS = frozenset({
+    "rms_norm", "silu_mul", "act_quant_fp8", "rope_embedding",
+})
+
+_MOE_KERNEL_SPECS = frozenset({
+    "fused_moe",
+})
+
+
+def _validate_solution_shapes(
+    solution_path: Path, model_config: dict,
+    kernel_spec: str = "",
+) -> tuple[bool, list[str]]:
+    """Check if solution.py test shapes match the target model config.
+
+    Uses per-kernel-spec shape patterns:
+      - Attention kernels: num_q_heads, num_kv_heads, head_dim
+      - GEMM kernels: M/N/K dimensions vs hidden_size / intermediate_size
+      - Norm/activation: hidden_size / dim
+      - MoE: num_experts, hidden_size
+      - All others: skipped (no validation)
+
+    Returns (has_mismatch, list_of_warnings).
+    """
+    if not model_config or not solution_path.exists():
+        return False, []
+
+    try:
+        text = solution_path.read_text()
+    except OSError:
+        return False, []
+
+    shape_checks: dict[str, list[tuple[str, int]]] = {}
+
+    if kernel_spec in _ATTENTION_KERNEL_SPECS or not kernel_spec:
+        shape_checks.update({
+            "num_q_heads": [
+                (r'num_q(?:uery)?_heads\s*=\s*(\d+)', model_config.get("num_q_heads", 0)),
+                (r'num_heads\s*=\s*(\d+)', model_config.get("num_q_heads", 0)),
+                (r'NUM_Q(?:UERY)?_HEADS\s*=\s*(\d+)', model_config.get("num_q_heads", 0)),
+            ],
+            "num_kv_heads": [
+                (r'num_kv_heads\s*=\s*(\d+)', model_config.get("num_kv_heads", 0)),
+                (r'NUM_KV_HEADS\s*=\s*(\d+)', model_config.get("num_kv_heads", 0)),
+            ],
+            "head_dim": [
+                (r'head_(?:sz|dim|size)\s*=\s*(\d+)', model_config.get("head_dim", 0)),
+                (r'HEAD_(?:DIM|SIZE)\s*=\s*(\d+)', model_config.get("head_dim", 0)),
+            ],
+        })
+
+    if kernel_spec in _GEMM_KERNEL_SPECS:
+        hidden = model_config.get("hidden_size", 0)
+        inter = model_config.get("intermediate_size", 0)
+        expected_dims = [d for d in (hidden, inter) if d > 0]
+        if expected_dims:
+            shape_checks["gemm_N_or_K"] = [
+                (r'[NK]\s*=\s*(\d+)', 0),
+            ]
+            shape_checks["_gemm_dims_raw"] = expected_dims  # type: ignore[assignment]
+
+    if kernel_spec in _NORM_ACT_KERNEL_SPECS:
+        hidden = model_config.get("hidden_size", 0)
+        if hidden:
+            shape_checks["hidden_size"] = [
+                (r'hidden_size\s*=\s*(\d+)', hidden),
+                (r'dim\s*=\s*(\d+)', hidden),
+                (r'D\s*=\s*(\d+)', hidden),
+            ]
+
+    if kernel_spec in _MOE_KERNEL_SPECS:
+        n_experts = model_config.get("num_experts", 0)
+        if n_experts:
+            shape_checks["num_experts"] = [
+                (r'num_experts\s*=\s*(\d+)', n_experts),
+                (r'NUM_EXPERTS\s*=\s*(\d+)', n_experts),
+                (r'E\s*=\s*(\d+)', n_experts),
+            ]
+
+    if not shape_checks:
+        return False, []
+
+    warnings: list[str] = []
+
+    # Special handling for GEMM dimension checks
+    if "_gemm_dims_raw" in shape_checks:
+        expected_dims = shape_checks.pop("_gemm_dims_raw")
+        gemm_patterns = shape_checks.pop("gemm_N_or_K", [])
+        for pattern_str, _ in gemm_patterns:
+            for m in _re_mod.finditer(pattern_str, text):
+                val = int(m.group(1))
+                if val > 64 and val not in expected_dims:
+                    warnings.append(
+                        f"solution.py uses GEMM dim {m.group(0).strip()}={val} "
+                        f"which doesn't match model dims {expected_dims}"
+                    )
+
+    for param, patterns_expected in shape_checks.items():
+        for pattern_str, expected in patterns_expected:
+            if expected == 0:
+                continue
+            match = _re_mod.search(pattern_str, text, _re_mod.IGNORECASE)
+            if match:
+                found_val = int(match.group(1))
+                if found_val != expected:
+                    warnings.append(
+                        f"solution.py tests with {param}={found_val} "
+                        f"but target model has {param}={expected}"
+                    )
+                break
+
+    return len(warnings) > 0, warnings
+
+
+# ---------------------------------------------------------------------------
+# Multi-run benchmark averaging (Fix 12)
+# ---------------------------------------------------------------------------
+
+def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> dict:
+    """Run benchmark N times and return result with averaged throughput + statistics."""
+    n = getattr(config, "num_benchmark_runs", 1)
+    if n <= 1:
+        cleanup_inference_server()
+        result = run_magpie_benchmark(
+            framework=config.framework or "vllm",
+            model="",
+            benchmark_config_path=config.benchmark_config,
+            timeout=config.benchmark_timeout,
+        )
+        cleanup_inference_server()
+        tps = extract_tps(result)
+        result["_multi_run"] = {
+            "num_runs": 1,
+            "individual_tps": [round(tps, 2)],
+            "mean_tps": round(tps, 2),
+            "std_tps": 0.0,
+            "cv_pct": 0.0,
+            "note": "single-run -- no statistical confidence",
+        }
+        return result
+
+    all_tps = []
+    all_results = []
+    for i in range(n):
+        print(f"    Run {i+1}/{n}...")
+        cleanup_inference_server()
+        result = run_magpie_benchmark(
+            framework=config.framework or "vllm",
+            model="",
+            benchmark_config_path=config.benchmark_config,
+            timeout=config.benchmark_timeout,
+        )
+        tps = extract_tps(result)
+        if tps <= 0 and result.get("error"):
+            print(f"    Run {i+1}/{n}: FAILED ({result['error'][:100]})")
+            continue
+        all_tps.append(tps)
+        all_results.append(result)
+        print(f"    Run {i+1}/{n}: {tps:.1f} tok/s")
+
+    cleanup_inference_server()
+
+    if not all_results:
+        return {"error": "All benchmark runs failed", "success": False}
+
+    avg_result = all_results[0].copy()
+    mean_tps = sum(all_tps) / len(all_tps)
+    std_tps = (sum((t - mean_tps) ** 2 for t in all_tps) / len(all_tps)) ** 0.5
+
+    if "throughput" in avg_result and isinstance(avg_result["throughput"], dict):
+        avg_result["throughput"]["output_throughput"] = mean_tps
+    avg_result["_multi_run"] = {
+        "num_runs": len(all_tps),
+        "individual_tps": [round(t, 2) for t in all_tps],
+        "mean_tps": round(mean_tps, 2),
+        "std_tps": round(std_tps, 2),
+        "cv_pct": round(std_tps / mean_tps * 100, 2) if mean_tps > 0 else 0,
+    }
+
+    cv_pct = std_tps / mean_tps * 100 if mean_tps > 0 else 0
+    print(f"    {label}: {mean_tps:.1f} +/- {std_tps:.1f} tok/s "
+          f"(CV={cv_pct:.1f}%, n={len(all_tps)})")
+    return avg_result
+
+
+def _is_improvement_significant(baseline_result: dict, final_result: dict) -> bool:
+    """Check if throughput improvement exceeds measurement noise."""
+    b_multi = baseline_result.get("_multi_run", {})
+    f_multi = final_result.get("_multi_run", {})
+
+    if not b_multi or not f_multi:
+        return True
+
+    b_mean = b_multi.get("mean_tps", 0)
+    b_std = b_multi.get("std_tps", 0)
+    f_mean = f_multi.get("mean_tps", 0)
+    f_std = f_multi.get("std_tps", 0)
+
+    if b_mean <= 0 or f_mean <= 0:
+        return True
+
+    improvement = f_mean - b_mean
+    combined_std = (b_std ** 2 + f_std ** 2) ** 0.5
+
+    if combined_std > 0 and improvement < 2 * combined_std:
+        print(f"  WARNING: Improvement {improvement:.1f} tok/s < 2*std {2 * combined_std:.1f} tok/s")
+        print(f"  The throughput change is NOT statistically significant")
+        return False
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Pipeline state management
@@ -279,6 +830,7 @@ class WorkloadConfig:
     trajectory_store: str = "file"
     push_leaderboard: bool = False
     dry_run: bool = False
+    num_benchmark_runs: int = 3
     benchmark_timeout: int = 5400
 
     @property
@@ -300,6 +852,7 @@ class KernelOptResult:
     iterations_used: int = 0
     reinjected: bool = False
     agent_turns: int = 0
+    shape_mismatch: bool = False
     error: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -325,12 +878,7 @@ def _run_initial_benchmark(config: WorkloadConfig) -> dict:
 
     print(f"  Running Magpie benchmark with config: {config.benchmark_config}")
     print(f"  This may take 10-90 minutes for large models...")
-    result = run_magpie_benchmark(
-        framework=config.framework or "vllm",
-        model="",
-        benchmark_config_path=config.benchmark_config,
-        timeout=config.benchmark_timeout,
-    )
+    result = _run_benchmark_multi(config, label="baseline")
     return result
 
 
@@ -833,10 +1381,24 @@ def _optimize_kernel(
         opt_result.speedup = best_kr.speedup
         opt_result.score = best_kr.score
         b_ms, o_ms = _extract_timing_from_raw(raw)
+        if b_ms == 0 and o_ms == 0 and best_kr.speedup > 0:
+            o_ms = 1.0
+            b_ms = best_kr.speedup * o_ms
         opt_result.baseline_ms = b_ms
         opt_result.optimized_ms = o_ms
         opt_result.agent_turns = total_agent_turns
         opt_result.error = best_kr.error
+
+        # Shape validation (Fix 8)
+        model_cfg = _load_model_config(benchmark_config)
+        solution = find_solution(task_dir)
+        if solution and model_cfg:
+            has_mismatch, shape_warnings = _validate_solution_shapes(
+                solution, model_cfg, kernel_spec=spec,
+            )
+            opt_result.shape_mismatch = has_mismatch
+            for w in shape_warnings:
+                print(f"    WARNING: {w}")
     elif config.dry_run:
         opt_result.compiled = True
         opt_result.correct = True
@@ -863,6 +1425,11 @@ def _reinject_kernel(
               f"compiled={opt_result.compiled} correct={opt_result.correct}")
         return False
 
+    if opt_result.speedup < MIN_SPEEDUP_FOR_REINJECTION:
+        print(f"    Skipping re-injection for {opt_result.kernel_spec}: "
+              f"speedup={opt_result.speedup:.3f}x < {MIN_SPEEDUP_FOR_REINJECTION}x threshold")
+        return False
+
     solution = find_solution(task_dir)
     if solution is None:
         print(f"    No solution file found in {task_dir}")
@@ -887,19 +1454,45 @@ def _run_final_benchmark(config: WorkloadConfig) -> dict:
         return {
             "success": True, "dry_run": True,
             "throughput": {"output_throughput": 150.0, "total_token_throughput": 300.0},
+            "_kernel_patches_applied": False,
         }
 
     if config.skip_benchmark:
-        print(f"  Loading existing benchmark: {config.skip_benchmark}")
-        return json.loads(Path(config.skip_benchmark).read_text())
+        print(f"  WARNING: Loading cached result -- kernel patches NOT applied to this run")
+        print(f"  WARNING: E2E throughput comparison will NOT reflect kernel optimizations")
+        result = json.loads(Path(config.skip_benchmark).read_text())
+        result["_kernel_patches_applied"] = False
+        return result
 
-    print(f"  Running final E2E benchmark with optimized kernels...")
-    result = run_magpie_benchmark(
-        framework=config.framework or "vllm",
-        model="",
-        benchmark_config_path=config.benchmark_config,
-        timeout=config.benchmark_timeout,
-    )
+    reinjected_dir = config.output_dir / "reinjected"
+    has_patches = reinjected_dir.exists() and any(reinjected_dir.glob("*_solution.*"))
+
+    if not has_patches:
+        print(f"  No reinjected kernels found -- running unpatched benchmark")
+        result = _run_benchmark_multi(config, label="final (unpatched)")
+        result["_kernel_patches_applied"] = False
+        result["_patched_kernels"] = []
+        return result
+
+    _recover_orphaned_patches()
+
+    with tempfile.TemporaryDirectory(prefix="triton_cache_") as triton_cache:
+        old_triton_cache = os.environ.get("TRITON_CACHE_DIR")
+        os.environ["TRITON_CACHE_DIR"] = triton_cache
+
+        backups, lock_fd = _apply_kernel_patches(reinjected_dir, config.gpu_arch)
+        try:
+            print(f"  Running final E2E benchmark with {len(backups)} patched kernel(s)...")
+            result = _run_benchmark_multi(config, label="final (patched)")
+            result["_kernel_patches_applied"] = len(backups) > 0
+            result["_patched_kernels"] = [str(p) for p in backups.keys()]
+        finally:
+            _restore_kernel_patches(backups, lock_fd)
+            if old_triton_cache is not None:
+                os.environ["TRITON_CACHE_DIR"] = old_triton_cache
+            else:
+                os.environ.pop("TRITON_CACHE_DIR", None)
+
     return result
 
 
@@ -1066,9 +1659,14 @@ def _generate_report(
             f"| Iterations | {kr.iterations_used} |",
             f"| Re-injected | {'Yes' if kr.reinjected else 'No'} |",
         ]
+        if kr.shape_mismatch:
+            lines.append(f"| Shape mismatch | **YES** (test shapes differ from target model) |")
         if kr.error:
             lines.append(f"| Error | {kr.error[:100]} |")
         lines.append("")
+
+    patches_applied = final_result.get("_kernel_patches_applied", False)
+    patched_kernels = final_result.get("_patched_kernels", [])
 
     lines += [
         f"## Final E2E Performance",
@@ -1077,7 +1675,51 @@ def _generate_report(
         f"|--------|----------|-----------|--------|",
         f"| Output throughput (tok/s) | {baseline_tps:.2f} | {final_tps:.2f} | {(tps_ratio-1)*100:+.2f}% |",
         f"| Throughput ratio | 1.00x | {tps_ratio:.4f}x | |",
+        f"| Kernel patches applied | {'Yes' if patches_applied else '**No**'} | {len(patched_kernels)} kernel(s) | |",
         f"",
+    ]
+
+    b_multi = baseline_result.get("_multi_run", {})
+    f_multi = final_result.get("_multi_run", {})
+    if b_multi or f_multi:
+        lines += [
+            f"## E2E Benchmark Statistics",
+            f"",
+            f"| Metric | Baseline | Optimized |",
+            f"|--------|----------|-----------|",
+        ]
+        b_runs = b_multi.get("num_runs", 1) if b_multi else "N/A"
+        f_runs = f_multi.get("num_runs", 1) if f_multi else "N/A"
+        lines.append(f"| Runs | {b_runs} | {f_runs} |")
+        lines.append(
+            f"| Mean TPS | "
+            f"{b_multi.get('mean_tps', baseline_tps):.1f} "
+            f"+/- {b_multi.get('std_tps', 0):.1f} | "
+            f"{f_multi.get('mean_tps', final_tps):.1f} "
+            f"+/- {f_multi.get('std_tps', 0):.1f} |"
+            if b_multi else
+            f"| Mean TPS | {baseline_tps:.1f} | "
+            f"{f_multi.get('mean_tps', final_tps):.1f} "
+            f"+/- {f_multi.get('std_tps', 0):.1f} |"
+        )
+        lines.append(
+            f"| CV | "
+            f"{b_multi.get('cv_pct', 0):.2f}% | "
+            f"{f_multi.get('cv_pct', 0):.2f}% |"
+            if b_multi else
+            f"| CV | N/A | {f_multi.get('cv_pct', 0):.2f}% |"
+        )
+        significant = _is_improvement_significant(baseline_result, final_result) \
+            if b_multi and f_multi else True
+        lines.append(
+            f"| Significant? | -- | {'Yes' if significant else '**No** (improvement < 2*sigma)'} |"
+        )
+        note = b_multi.get("note") or f_multi.get("note")
+        if note:
+            lines.append(f"| Note | {note} | |")
+        lines.append("")
+
+    lines += [
         f"## Reward Scores",
         f"",
         f"| Component | Value |",
@@ -1412,6 +2054,7 @@ def _run_workload_optimization_inner(
     print(f"{'─'*65}")
 
     t_step = time.monotonic()
+    model_cfg = _load_model_config(benchmark_cfg)
     reinjected = []
     for opt_result in kernel_opt_results:
         bk = BottleneckKernel(name=opt_result.kernel_name, matched_kernel_spec=opt_result.kernel_spec)
@@ -1419,6 +2062,17 @@ def _run_workload_optimization_inner(
         task_dir = config.output_dir / task_id
         if _reinject_kernel(opt_result, task_dir, config):
             reinjected.append(opt_result.kernel_spec)
+            # Dispatch path validation (Fix 7)
+            solution = find_solution(task_dir)
+            baseline_sources = _find_baseline_sources(opt_result.kernel_spec)
+            baseline_path = Path(baseline_sources[0]) if baseline_sources else None
+            if solution:
+                warning = _validate_optimization_relevance(
+                    solution, baseline_path, benchmark_cfg, model_cfg,
+                    opt_result.kernel_spec,
+                )
+                if warning:
+                    print(f"    {warning}")
 
     trajectory.reinjected_kernels = reinjected
     step_timings["integrate"] = time.monotonic() - t_step
@@ -1431,10 +2085,11 @@ def _run_workload_optimization_inner(
     print(f"{'─'*65}")
 
     t_step = time.monotonic()
-    any_success = any(o.compiled and o.correct for o in kernel_opt_results)
-    if not any_success and not config.dry_run:
-        print(f"  Skipping final benchmark (no kernels were successfully optimized)")
+    any_reinjected = len(reinjected) > 0
+    if not any_reinjected and not config.dry_run:
+        print(f"  Skipping final benchmark (no kernels met reinjection criteria)")
         final_result = baseline_result
+        final_result["_kernel_patches_applied"] = False
     else:
         final_result = _run_final_benchmark(config)
     trajectory.final_benchmark = final_result
@@ -1447,6 +2102,10 @@ def _run_workload_optimization_inner(
     if baseline_tps > 0 and final_tps > 0:
         ratio = final_tps / baseline_tps
         print(f"  Throughput improvement: {ratio:.4f}x ({(ratio-1)*100:.2f}%)")
+        if not _is_improvement_significant(baseline_result, final_result):
+            trajectory.errors.append("E2E throughput improvement not statistically significant")
+    if not final_result.get("_kernel_patches_applied", True):
+        print(f"  WARNING: No kernel patches were applied for this benchmark run")
     print(f"  Duration: {step_timings['benchmark_final']:.1f}s")
 
     # Step 8: Compute trajectory reward
@@ -1533,6 +2192,7 @@ def _run_workload_optimization_inner(
             throughput_ratio=final_tps / baseline_tps if baseline_tps > 0 else 0.0,
             speedup=sum(o.speedup for o in kernel_opt_results) / max(len(kernel_opt_results), 1),
             iterations_used=sum(o.iterations_used for o in kernel_opt_results),
+            total_agent_turns=sum(o.agent_turns for o in kernel_opt_results),
             trajectory_id=tid,
         )
         _save_leaderboard(entry, results_dir)
@@ -1607,6 +2267,7 @@ def _init_config_from_args(args) -> WorkloadConfig:
         trajectory_store=getattr(args, "trajectory_store", "file"),
         push_leaderboard=getattr(args, "leaderboard", False),
         dry_run=getattr(args, "dry_run", False),
+        num_benchmark_runs=getattr(args, "num_benchmark_runs", 3),
         benchmark_timeout=getattr(args, "benchmark_timeout", 5400),
     )
 
@@ -1842,6 +2503,9 @@ def cmd_integrate(args):
     else:
         specs_to_inject = list(opt_results.keys())
 
+    benchmark_cfg = state.get("benchmark_config", {})
+    model_cfg = _load_model_config(benchmark_cfg)
+
     print(f"\n  Step 6: Re-inject Optimized Kernels")
     print(f"  {'─'*55}")
 
@@ -1860,6 +2524,17 @@ def cmd_integrate(args):
         if _reinject_kernel(opt, task_dir, config):
             reinjected.append(spec)
             opt_results[spec]["reinjected"] = True
+
+            # Dispatch path validation (Fix 7)
+            solution = find_solution(task_dir)
+            baseline_sources = _find_baseline_sources(spec)
+            baseline_path = Path(baseline_sources[0]) if baseline_sources else None
+            if solution:
+                warning = _validate_optimization_relevance(
+                    solution, baseline_path, benchmark_cfg, model_cfg, spec,
+                )
+                if warning:
+                    print(f"    {warning}")
 
     elapsed = time.monotonic() - t0
     state.update({
@@ -1886,12 +2561,15 @@ def cmd_benchmark_final(args):
     if not config.framework:
         config.framework = state.get("framework", "vllm")
 
+    _recover_orphaned_patches()
+
     print(f"\n  Step 7: Final E2E Benchmark")
     print(f"  {'─'*55}")
 
     final_result = _run_final_benchmark(config)
     final_tps = extract_tps(final_result)
     baseline_tps = state.get("baseline_tps", 0)
+    baseline_result = state.get("baseline_result", {})
 
     elapsed = time.monotonic() - t0
     state.update({
@@ -1905,6 +2583,9 @@ def cmd_benchmark_final(args):
     if baseline_tps > 0 and final_tps > 0:
         ratio = final_tps / baseline_tps
         print(f"  Throughput improvement: {ratio:.4f}x ({(ratio-1)*100:.2f}%)")
+        _is_improvement_significant(baseline_result, final_result)
+    if not final_result.get("_kernel_patches_applied", True):
+        print(f"  WARNING: No kernel patches were applied for this benchmark run")
     print(f"  Duration: {elapsed:.1f}s")
     print(f"  State saved to {state.path}")
 
@@ -1997,6 +2678,7 @@ def cmd_score(args):
             throughput_ratio=final_tps / baseline_tps if baseline_tps > 0 else 0.0,
             speedup=sum(o.speedup for o in kernel_opt_results) / max(len(kernel_opt_results), 1),
             iterations_used=sum(o.iterations_used for o in kernel_opt_results),
+            total_agent_turns=sum(o.agent_turns for o in kernel_opt_results),
             trajectory_id=tid,
         )
         _save_leaderboard(entry, results_dir)
@@ -2098,6 +2780,8 @@ def _add_benchmark_args(parser):
                         help="Path to existing benchmark_report.json (skip benchmark)")
     parser.add_argument("--framework", default="",
                         help="Inference framework (default: auto-detect from config)")
+    parser.add_argument("--num-benchmark-runs", type=int, default=3,
+                        help="Number of benchmark runs for statistical averaging (default: 3)")
     parser.add_argument("--benchmark-timeout", type=int, default=5400)
 
 

@@ -81,55 +81,55 @@ def benchmark_config_file(tmp_path):
 
 class TestClassifyKernel:
     def test_triton_prefix(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("triton_poi_fused_constant_pad_nd_moe_forward_0") == "triton"
 
     def test_triton_gemm(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("_gemm_a16_w16_kernel_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16") == "triton"
 
     def test_triton_unified_attention(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("kernel_unified_attention_2d") == "triton"
 
     def test_ck_rmsnorm(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("_ZN7ck_tile6kentryI_Rmsnorm2dFwd_Pipeline") == "ck"
 
     def test_asm_matmul_ogs(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("_matmul_ogs_NNT_bf16xbf16xmxfp4_16x128x256x1_swiglu") == "asm"
 
     def test_asm_topk(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("_topk_forward") == "asm"
 
     def test_asm_combined_routing(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("_combined_routing_memset") == "asm"
 
     def test_asm_finalize(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("_finalize_matmul_scatter_bf16") == "asm"
 
     def test_hip_vllm(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("void vllm::cross_device_reduce_1stage<__hip_bfloat16>") == "hip"
 
     def test_hip_rccl(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("void rcclGenericKernel<1, false>") == "hip"
 
     def test_hip_pytorch_native(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("void at::native::vectorized_elementwise_kernel<4>") == "hip"
 
     def test_hip_wvsplitk(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("void wvSplitKrc_<__hip_bfloat16, 64, 16>") == "hip"
 
     def test_unknown_kernel(self):
-        from bottleneck import classify_kernel
+        from kernel_bottleneck import classify_kernel
         assert classify_kernel("some_random_function") == "unknown"
 
 
@@ -137,43 +137,43 @@ class TestClassifyKernel:
 
 class TestMatchToKernelSpec:
     def test_all_reduce(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("void vllm::cross_device_reduce_1stage") == "all_reduce"
 
     def test_rccl_all_reduce(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("void rcclGenericKernel<1, false>") == "all_reduce"
 
     def test_fused_moe(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("_topk_forward") == "fused_moe"
 
     def test_fused_moe_triton(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("triton_poi_fused_constant_pad_nd_moe_forward_0") == "fused_moe"
 
     def test_gemm_bf16(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("_matmul_ogs_NNT_bf16xbf16xmxfp4_16x128x256x1_swiglu") == "gemm_bf16"
 
     def test_gemm_triton(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("_gemm_a16_w16_kernel_BLOCK_SIZE_M_32") == "gemm_bf16"
 
     def test_rms_norm(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("_ZN7ck_tile6kentryI_Rmsnorm2dFwd") == "rms_norm"
 
     def test_kv_cache(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("void vllm::reshape_and_cache_flash_kernel") == "kv_cache_ops"
 
     def test_attention(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("kernel_unified_attention_2d") == "paged_attn_decode"
 
     def test_no_match(self):
-        from bottleneck import match_to_kernel_spec
+        from kernel_bottleneck import match_to_kernel_spec
         assert match_to_kernel_spec("void at::native::vectorized_elementwise_kernel<4>") is None
 
 
@@ -181,24 +181,24 @@ class TestMatchToKernelSpec:
 
 class TestExtractBottlenecks:
     def test_extracts_from_gap_analysis(self, benchmark_result):
-        from bottleneck import extract_bottlenecks
+        from kernel_bottleneck import extract_bottlenecks
         kernels = extract_bottlenecks(benchmark_result, top_k=20)
         assert len(kernels) == 11
         assert kernels[0].total_time_us > kernels[-1].total_time_us
 
     def test_top_k_limits_output(self, benchmark_result):
-        from bottleneck import extract_bottlenecks
+        from kernel_bottleneck import extract_bottlenecks
         kernels = extract_bottlenecks(benchmark_result, top_k=3)
         assert len(kernels) == 3
 
     def test_all_have_categories(self, benchmark_result):
-        from bottleneck import extract_bottlenecks
+        from kernel_bottleneck import extract_bottlenecks
         kernels = extract_bottlenecks(benchmark_result)
         for k in kernels:
             assert k.category in ("triton", "hip", "ck", "asm", "unknown")
 
     def test_fallback_to_top_bottlenecks(self):
-        from bottleneck import extract_bottlenecks
+        from kernel_bottleneck import extract_bottlenecks
         result = {
             "gap_analysis": None,
             "kernel_summary": [],
@@ -210,7 +210,7 @@ class TestExtractBottlenecks:
         assert kernels[1].category == "asm"
 
     def test_empty_result(self):
-        from bottleneck import extract_bottlenecks
+        from kernel_bottleneck import extract_bottlenecks
         kernels = extract_bottlenecks({})
         assert kernels == []
 
@@ -219,32 +219,32 @@ class TestExtractBottlenecks:
 
 class TestFilterFunctions:
     def test_filter_by_types_all(self, benchmark_result):
-        from bottleneck import extract_bottlenecks, filter_by_types
+        from kernel_bottleneck import extract_bottlenecks, filter_by_types
         kernels = extract_bottlenecks(benchmark_result)
         filtered = filter_by_types(kernels, ["all"])
         assert len(filtered) == len(kernels)
 
     def test_filter_by_types_triton(self, benchmark_result):
-        from bottleneck import extract_bottlenecks, filter_by_types
+        from kernel_bottleneck import extract_bottlenecks, filter_by_types
         kernels = extract_bottlenecks(benchmark_result)
         filtered = filter_by_types(kernels, ["triton"])
         assert all(k.category == "triton" for k in filtered)
         assert len(filtered) > 0
 
     def test_filter_by_types_multiple(self, benchmark_result):
-        from bottleneck import extract_bottlenecks, filter_by_types
+        from kernel_bottleneck import extract_bottlenecks, filter_by_types
         kernels = extract_bottlenecks(benchmark_result)
         filtered = filter_by_types(kernels, ["triton", "ck"])
         assert all(k.category in ("triton", "ck") for k in filtered)
 
     def test_filter_by_names(self, benchmark_result):
-        from bottleneck import extract_bottlenecks, filter_by_names
+        from kernel_bottleneck import extract_bottlenecks, filter_by_names
         kernels = extract_bottlenecks(benchmark_result)
         filtered = filter_by_names(kernels, ["all_reduce", "fused_moe"])
         assert all(k.matched_kernel_spec in ("all_reduce", "fused_moe") for k in filtered)
 
     def test_deduplicate_by_spec(self, benchmark_result):
-        from bottleneck import extract_bottlenecks, deduplicate_by_spec
+        from kernel_bottleneck import extract_bottlenecks, deduplicate_by_spec
         kernels = extract_bottlenecks(benchmark_result)
         deduped = deduplicate_by_spec(kernels)
         specs = [k.matched_kernel_spec for k in deduped if k.matched_kernel_spec]
@@ -255,14 +255,14 @@ class TestFilterFunctions:
 
 class TestFormatTable:
     def test_format_nonempty(self, benchmark_result):
-        from bottleneck import extract_bottlenecks, format_bottleneck_table
+        from kernel_bottleneck import extract_bottlenecks, format_bottleneck_table
         kernels = extract_bottlenecks(benchmark_result, top_k=3)
         table = format_bottleneck_table(kernels)
         assert "Category" in table
         assert len(table.splitlines()) >= 4
 
     def test_format_empty(self):
-        from bottleneck import format_bottleneck_table
+        from kernel_bottleneck import format_bottleneck_table
         result = format_bottleneck_table([])
         assert "no bottleneck" in result.lower()
 
