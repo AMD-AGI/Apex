@@ -1,0 +1,41 @@
+# Dockerfile.mcp — MCP servers sidecar container
+#
+# Runs all 5 MCP servers (source-finder, kernel-rag, gpu-info, fusion-advisor, magpie)
+# as background processes. Used as a sidecar in K8s pods.
+#
+# Build:
+#   docker build -f docker/Dockerfile.mcp -t keystone-mcp .
+#
+# Run:
+#   docker run --rm -v $(pwd)/tools:/workspace/tools keystone-mcp
+
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python deps for MCP servers
+RUN pip install --no-cache-dir \
+    pyyaml requests chromadb sentence-transformers mcp
+
+# Copy MCP source
+COPY tools/mcps/ /workspace/tools/mcps/
+COPY tools/jsons/ /workspace/tools/jsons/
+
+# Install each MCP
+RUN for mcp_dir in /workspace/tools/mcps/*/; do \
+      if [ -f "$mcp_dir/requirements.txt" ]; then \
+        pip install --no-cache-dir -r "$mcp_dir/requirements.txt" 2>/dev/null || true; \
+      fi; \
+    done
+
+ENV PYTHONPATH="/workspace:/workspace/tools:${PYTHONPATH}"
+
+# Startup script that launches all MCP servers
+COPY docker/start-mcps.sh /workspace/start-mcps.sh
+RUN chmod +x /workspace/start-mcps.sh
+
+ENTRYPOINT ["/workspace/start-mcps.sh"]

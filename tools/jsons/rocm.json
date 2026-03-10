@@ -1,0 +1,119 @@
+{
+    "rocm_libraries": [
+      {
+        "name": "rocm-libraries",
+        "github": "https://github.com/ROCm/rocm-libraries",
+        "description": "Monorepo that consolidates multiple ROCm libraries (math, primitives, machine learning, communication) to streamline development, CI and integration. Many individual librarie’s sources now live here. Includes hipBLAS, hipFFT, hipSPARSE, rocBLAS, rocFFT, rocSPARSE, rocPRIM, rocsolver, tensile, and more. :contentReference[oaicite:1]{index=1}"
+      },
+      {
+        "name": "hipBLAS",
+        "github": "https://github.com/ROCm/hipBLAS",
+        "description": "BLAS marshalling library exposing a consistent interface to BLAS operations. Sits above backend libraries (rocBLAS or cuBLAS) and marshals inputs/results. Now integrated in rocm-libraries. :contentReference[oaicite:2]{index=2}"
+      },
+      {
+        "name": "hipBLASLt",
+        "github": "https://github.com/ROCm/hipBLASLt",
+        "description": "Flexible BLAS-style API for general matrix-matrix multiply (GEMM) with more flexible layouts and algorithms than classic BLAS. Deprecated standalone; integrated into rocm-libraries. :contentReference[oaicite:3]{index=3}"
+      },
+      {
+        "name": "rocBLAS",
+        "github": "https://github.com/ROCm/rocBLAS",
+        "description": "ROCm’s Basic Linear Algebra Subprograms library optimized for AMD GPUs (BLAS). Implemented in HIP; used by many higher-level numerical routines. Deprecated standalone; sources now integrated in rocm-libraries. :contentReference[oaicite:4]{index=4}"
+      },
+      {
+        "name": "hipFFT",
+        "github": "https://github.com/ROCm/rocFFT",
+        "description": "Library for computing Fast Fourier Transforms (FFTs). Provides efficient Fourier transform routines for scientific and signal processing workloads on AMD hardware. Standalone repo is deprecated; now part of rocm-libraries. :contentReference[oaicite:5]{index=5}"
+      },
+      {
+        "name": "hipRAND",
+        "github": "https://github.com/ROCm/rocRAND",
+        "description": "Random number generation library providing various RNG primitives (uniform, normal distributions etc.) optimized for ROCm. Integrated under rocm-libraries. :contentReference[oaicite:6]{index=6}"
+      },
+      {
+        "name": "hipSOLVER",
+        "github": "https://github.com/ROCm/hipSOLVER",
+        "description": "Solver library implementing LAPACK-style linear algebra factorizations/solvers (QR, LU, Cholesky, eigen decomposition). Now part of rocm-libraries. :contentReference[oaicite:7]{index=7}"
+      },
+      {
+        "name": "hipSPARSE",
+        "github": "https://github.com/ROCm/hipSPARSE",
+        "description": "Sparse matrix algebra interface that marshals calls to backend sparse libraries (e.g., rocSPARSE). Suitable for sparse linear algebra workloads. Integrated into rocm-libraries. :contentReference[oaicite:8]{index=8}"
+      },
+      {
+        "name": "hipSPARSELt",
+        "github": "https://github.com/ROCm/hipSPARSELt",
+        "description": "Lightweight library for sparse operations optimized for next-gen AMD architectures."
+      },
+      {
+        "name": "hipCUB",
+        "github": "https://github.com/ROCm/hipCUB",
+        "description": "HIP port of the CUB library, providing CUDA-like primitives (scan, sort, reduce, etc.) for parallel algorithms."
+      },
+      {
+        "name": "hipTensor",
+        "github": "https://github.com/ROCm/hipTensor",
+        "description": "Tensor utility and primitive library for multi-dimensional tensor operations under ROCm."
+      },
+      {
+        "name": "rocPRIM",
+        "github": "https://github.com/ROCm/rocPRIM",
+        "description": "Primitive parallel algorithms (scan, sort, reduction) for HIP/ROCm, analogous to primitives in CUDA."
+      },
+      {
+        "name": "rocThrust",
+        "github": "https://github.com/ROCm/rocThrust",
+        "description": "STL-like parallel template algorithms, similar to Thrust for CUDA, optimized for ROCm."
+      },
+      {
+        "name": "rocWMMA",
+        "github": "https://github.com/ROCm/rocWMMA",
+        "description": "Matrix multiply-accumulate primitives optimized for specialized matrix operations on AMD hardware."
+      },
+      {
+        "name": "composable_kernel",
+        "github": "https://github.com/ROCm/composable_kernel",
+        "description": "Template library to write performance-critical kernels (e.g., GEMM, reductions) portable across AMD architectures."
+      },
+      {
+        "name": "AMDMIGraphX",
+        "github": "https://github.com/ROCm/AMDMIGraphX",
+        "description": "Graph optimization engine focused on neural network inference acceleration. Part of ROCm ML stack."
+      },
+      {
+        "name": "MIOpen",
+        "github": "https://github.com/ROCm/MIOpen",
+        "description": "High-performance machine learning primitives library (convolutions, activations, pooling) for deep learning frameworks. Deprecated standalone; moved to rocm-libraries. :contentReference[oaicite:17]{index=17}"
+      },
+      {
+        "name": "RCCL",
+        "github": "https://github.com/ROCm/rccl",
+        "description": "Communication library providing multi-GPU collectives (all-reduce, broadcast) similar to NVIDIA’s NCCL, optimized for ROCm. :contentReference[oaicite:18]{index=18}"
+      },
+      {
+        "name": "rocSHMEM",
+        "github": "https://github.com/ROCm/rocSHMEM",
+        "description": "Partitioned global address space (PGAS) communication library for symmetric access."
+      },
+      {
+        "name": "vllm",
+        "github": "https://github.com/vllm-project/vllm",
+        "description": "vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs, supporting both CUDA and ROCm backends for running large language models on AMD GPUs."
+      },
+      {
+        "name": "sglang",
+        "github": "https://github.com/sgl-project/sglang",
+        "description": "sGLang is an open-source programming language and LLM serving framework enabling fast, scalable deployment of large language models with multi-backend support, including ROCm."
+      },
+      {
+        "name": "aiter",
+        "github": "https://github.com/ROCm/aiter",
+        "description": "AITER (AI Tensor Engine for ROCm) - A centralized repository containing high-performance AI operators for accelerating various AI workloads on AMD GPUs. Includes kernels from Triton, CK, HIP, and ASM for MHA, MLA, MoE, quantization, and more."
+      },
+      {
+        "name": "triton",
+        "github": "https://github.com/triton-lang/triton",
+        "description": "Triton is an open-source language and compiler for writing highly efficient custom deep learning primitives. It provides a Python-based programming model for creating GPU kernels with automatic optimizations."
+      }
+    ]
+  }
