@@ -82,6 +82,59 @@ source .venv/bin/activate
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+## Agent CLI Installation
+
+Apex uses an LLM agent (Claude Code or OpenAI Codex) to optimize kernels. Install at least one CLI before running `setup.sh`.
+
+### Install Claude Code CLI
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude login
+```
+
+### Install Codex CLI
+
+```bash
+npm install -g @openai/codex
+codex login
+```
+
+### What `setup.sh` does
+
+Running `bash setup.sh` from the Apex project root is the single command needed to get everything configured. The script is interactive and walks you through each step:
+
+1. **CLI selection** — prompts you to choose Claude Code, Codex, or both
+2. **Prerequisite checks** — verifies the selected CLI(s) are installed, locates or creates a Python venv
+3. **ROCm repos & docs** (optional) — offers to clone AMD ROCm source repos into `tools/rocm/` and download architecture documentation PDFs into `tools/doc/`, used by the source-finder and RAG MCP servers
+4. **MCP Python dependencies** — installs each MCP server's Python packages into the venv (including cloning and setting up Magpie)
+5. **MCP server registration** — registers all 5 MCP servers (`source-finder`, `kernel-rag`, `gpu-info`, `fusion-advisor`, `magpie`) with the selected CLI(s) so the agent can call them at runtime
+6. **Skill installation** — makes 13 domain skills (Triton optimization, HIP tuning, architecture guides, etc.) discoverable by the agent. For Claude Code this relies on `CLAUDE.md`; for Codex the skills are symlinked into `$CODEX_HOME/skills/`
+7. **Results directory** — creates the output directory for pipeline state, trajectories, and leaderboard data
+8. **Verification & summary** — lists registered MCPs, prints configured paths, and shows ready-to-run commands for both interactive and automated usage
+
+After setup completes you can launch the agent interactively:
+
+```bash
+# Claude Code
+cd Apex && claude
+
+# Codex
+cd Apex && codex
+```
+
+Or run the automated pipeline directly (no interactive agent):
+
+```bash
+source .venv/bin/activate
+export MAGPIE_ROOT=tools/magpie
+python3 workload_optimizer.py run \
+  -r $RESULTS_DIR \
+  -b $MAGPIE_ROOT/examples/benchmark_vllm_gptoss_120b.yaml \
+  --kernel-types triton --top-k 10 \
+  --max-iterations 3 --max-turns 25 --leaderboard
+```
+
 ## Quick Start
 
 ### Run the mini eval (no GPU required)
