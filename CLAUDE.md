@@ -392,6 +392,11 @@ Key state fields: `completed_steps`, `baseline_tps`, `identified_kernels`,
     └── reinjected/            # Solutions for final benchmark
 ```
 
+## Existing benchmark data
+
+Existing benchmark reports that can be reused with `--skip-benchmark`:
+- `/home/sirafati/code_combine/Magpie/results/benchmark_vllm_20260227_105427/benchmark_report.json`
+
 ## Model → benchmark config lookup
 
 When the user says a model name, resolve `-b` from this table:
@@ -405,6 +410,7 @@ When the user says a model name, resolve `-b` from this table:
 
 - `openai/gpt-oss-120b` — MoE 16 experts top-4, GQA 64Q/8KV, 48 layers
 - vLLM, FP4, TP=8, MI355X (gfx950)
+- Critical triton kernels: fused_moe, paged_attn_decode, gemm_bf16, flash_attn_prefill
 
 ### GPT OSS 20B details
 
