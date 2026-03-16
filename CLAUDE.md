@@ -17,14 +17,14 @@ Default target: **MI355X / gfx950 (CDNA4)**. Also supports gfx942 (MI300X), gfx9
 ## Environment (always set first)
 
 Ensure you are in the Apex repo root (the directory containing this CLAUDE.md),
-then activate the venv:
+then activate the venv and set MAGPIE_ROOT:
 ```bash
-source ../.venv/bin/activate
-export MAGPIE_ROOT=$(pwd)/tools/magpie
+cd "$(dirname "$(readlink -f CLAUDE.md)" 2>/dev/null || pwd)"
+source ../../Kernel/.venv/bin/activate
+export MAGPIE_ROOT=$(cd ../Magpie && pwd)
 ```
 
-All commands below assume this working directory. If any command fails with
-"activate: No such file", `cd` back to the Apex root and retry.
+All commands below assume this working directory (`APEX_ROOT`).
 
 ## GPU cleanup (only if needed)
 
@@ -80,7 +80,7 @@ python3 graders/model_grader.py        # Grade model throughput
 
 # Full pipeline (example for GPT OSS 120B)
 python3 workload_optimizer.py run -r <RESULTS_DIR> \
-  -b $MAGPIE_ROOT/examples/benchmark_vllm_gptoss_120b.yaml \
+  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml \
   --kernel-types triton --top-k 10 --max-iterations 3 --leaderboard
 ```
 
@@ -91,7 +91,7 @@ python3 workload_optimizer.py run -r <RESULTS_DIR> \
 ```bash
 python3 workload_optimizer.py run \
   -r <RESULTS_DIR> \
-  -b $MAGPIE_ROOT/examples/benchmark_vllm_gptoss_120b.yaml \
+  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml \
   --kernel-types triton \
   --top-k 10 \
   --max-iterations 3 \
@@ -231,6 +231,37 @@ python3 workload_optimizer.py report -r <RESULTS_DIR> -b <BENCH_CONFIG>
 
 Produces: `report.md`, `replication_guide.md`.
 
+### `export-rl` — Export trajectories to keystone-rl-training format
+
+Converts scored trajectories into keystone-compatible `tasks.json` (for GRPO training)
+and optional `sft_warmstart.jsonl` (for SFT warm-start).
+
+```bash
+# Basic export (tasks.json only)
+python3 workload_optimizer.py export-rl -r <RESULTS_DIR> --export-output-dir /path/to/keystone/data/
+
+# With SFT warm-start pairs from good trajectories
+python3 workload_optimizer.py export-rl -r <RESULTS_DIR> --export-output-dir /path/to/output/ --sft --quality good
+
+# Custom trajectories directory and minimum score filter
+python3 workload_optimizer.py export-rl -r <RESULTS_DIR> --export-output-dir /path/to/output/ \
+  --trajectories-dir trajectories/ --min-score 100 --gpu-arch gfx950
+```
+
+Also available as a standalone script:
+```bash
+python3 export_rl_dataset.py --trajectories-dir trajectories/ --results-dirs results_total_* --output-dir /output/ --sft
+```
+
+Or programmatically via `TrajectoryStore`:
+```python
+from trajectory import FileStore
+store = FileStore(base_dir=Path("trajectories"))
+store.export_for_keystone_rl(output_dir=Path("/output"), include_sft=True)
+```
+
+Produces: `tasks.json`, `export_metadata.json`, optionally `sft_warmstart.jsonl`.
+
 ## Key flags reference
 
 | Flag | Used by | Purpose |
@@ -245,6 +276,10 @@ Produces: `report.md`, `replication_guide.md`.
 | `--max-turns 25` | optimize, run | Agent turns per iteration |
 | `--leaderboard` | score, run | Append to leaderboard.json |
 | `--dry-run` | any | Simulate without GPU or API calls |
+| `--export-output-dir <DIR>` | export-rl | Output directory for exported tasks.json |
+| `--sft` | export-rl | Also emit SFT warm-start JSONL |
+| `--quality good` | export-rl | Filter SFT trajectories by quality |
+| `--min-score 100` | export-rl | Minimum kernel score to include |
 
 ## Architecture
 
@@ -260,14 +295,17 @@ Produces: `report.md`, `replication_guide.md`.
   - `score.py`: Scoring formula, Magpie result parsing, helper functions
   - `kernel_grader.py`: Grades individual kernel solutions
   - `model_grader.py`: Grades end-to-end model throughput
+  - `ground_truth_templates.py`: Per-kernel-type CPU baseline and test-shape generators for RL training export (12 kernel types)
 
 - **`agents/backends.py`** — Dual agent backend (Claude Code via `claude-agent-sdk`, Codex via `codex exec` CLI)
 
-- **`workload_optimizer.py`** — Full pipeline orchestrator with subcommands: `benchmark`, `identify`, `optimize`, `grade`, `integrate`, `benchmark-final`, `score`, `report`, `run` (all-in-one)
+- **`workload_optimizer.py`** — Full pipeline orchestrator with subcommands: `benchmark`, `identify`, `optimize`, `grade`, `integrate`, `benchmark-final`, `score`, `report`, `run` (all-in-one), `export-rl` (keystone RL dataset export)
 
 - **`eval.py`** — Lightweight CPU-only eval that exercises the full pipeline without GPU or Magpie
 
-- **`trajectory.py`** — Captures full agent runs (messages, tool calls, solutions, scores) with pluggable backends: FileStore, CouchDB, S3
+- **`trajectory.py`** — Captures full agent runs (messages, tool calls, solutions, scores) with pluggable backends: FileStore, CouchDB, S3. Includes `export_for_keystone_rl()` on `TrajectoryStore` for direct keystone-compatible export.
+
+- **`export_rl_dataset.py`** — Converts scored trajectories into keystone-rl-training format (`tasks.json` + optional `sft_warmstart.jsonl`). Also available via `workload_optimizer.py export-rl`.
 
 - **`leaderboard.py`** — Tracks agent performance across runs for RL comparison
 
@@ -395,7 +433,7 @@ Key state fields: `completed_steps`, `baseline_tps`, `identified_kernels`,
 ## Existing benchmark data
 
 Existing benchmark reports that can be reused with `--skip-benchmark`:
-- `/home/sirafati/code_combine/Magpie/results/benchmark_vllm_20260227_105427/benchmark_report.json`
+- `$MAGPIE_ROOT/results/benchmark_vllm_20260227_105427/benchmark_report.json`
 
 ## Model → benchmark config lookup
 
@@ -403,8 +441,10 @@ When the user says a model name, resolve `-b` from this table:
 
 | Model name | `-b` flag |
 |------------|-----------|
-| GPT OSS 20B | `$MAGPIE_ROOT/examples/benchmark_vllm_gptoss_20b.yaml` |
-| GPT OSS 120B | `$MAGPIE_ROOT/examples/benchmark_vllm_gptoss_120b.yaml` |
+| GPT OSS 20B | `$MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_20b.yaml` |
+| GPT OSS 120B | `$MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml` |
+
+Note: configs live in `$MAGPIE_ROOT/examples/benchmarks/`, **not** `$MAGPIE_ROOT/examples/`.
 
 ### GPT OSS 120B details
 
@@ -417,3 +457,30 @@ When the user says a model name, resolve `-b` from this table:
 - `openai/gpt-oss-20b` — MoE 32 experts top-4, GQA 64Q/8KV, 24 layers, hidden 2880
 - 20.9B total params, 3.6B active per token
 - vLLM, FP4, TP=1, MI355X (gfx950)
+
+## Default workflow — what to do when user says "optimize <model>"
+
+When the user gives a short instruction like "optimize GPT OSS 20B" or "run the
+full pipeline for gptoss120b", follow these steps **without asking for more details**:
+
+1. Set up environment (see above).
+2. Pick a fresh results directory: `$HOME/results_total_<N>` (increment N
+   from whatever already exists — run `ls -d $HOME/results_total_* 2>/dev/null` to check).
+3. Look up the `-b` config from the table above.
+4. Check GPU availability with `rocm-smi`. Clean up if needed (see GPU cleanup section).
+5. Run the full pipeline step-by-step:
+   ```bash
+   RESULTS=$HOME/results_total_<N>
+   BENCH_CONFIG=$MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_<size>.yaml
+
+   python3 workload_optimizer.py benchmark -r $RESULTS -b $BENCH_CONFIG
+   python3 workload_optimizer.py identify  -r $RESULTS --kernel-types triton --top-k 10
+   python3 workload_optimizer.py list-kernels -r $RESULTS
+   python3 workload_optimizer.py optimize  -r $RESULTS --kernel-types triton --max-iterations 3 --max-turns 25
+   python3 workload_optimizer.py integrate -r $RESULTS
+   python3 workload_optimizer.py benchmark-final -r $RESULTS -b $BENCH_CONFIG
+   python3 workload_optimizer.py score     -r $RESULTS --leaderboard
+   python3 workload_optimizer.py report    -r $RESULTS -b $BENCH_CONFIG
+   ```
+6. After each step, verify it succeeded before proceeding to the next.
+7. Print a summary of final results (TPS improvement, kernel-level speedups, report location).

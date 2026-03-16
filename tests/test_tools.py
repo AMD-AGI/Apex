@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 test_tools.py — Tests for tools/setup_tools.sh and the MCP server modules.
 

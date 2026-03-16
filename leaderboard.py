@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 leaderboard.py — Agent performance leaderboard for the RL kernel-optimization pipeline.
 

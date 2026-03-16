@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """Tests for trajectory.py — TrajectoryRecord and TrajectoryStore backends."""
 
 import json

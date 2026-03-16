@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 from __future__ import annotations
 
 import json

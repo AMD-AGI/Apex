@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 bottleneck.py — Kernel bottleneck extraction and classification from Magpie
 benchmark results.

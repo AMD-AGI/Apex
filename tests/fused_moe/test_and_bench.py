@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 test_and_bench.py — Correctness test + benchmark for fused MoE kernel.
 

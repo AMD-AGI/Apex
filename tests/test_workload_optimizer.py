@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 test_workload_optimizer.py — Tests for bottleneck classification, workload reward
 computation, WorkloadTrajectoryRecord, and the dry-run flow.

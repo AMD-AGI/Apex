@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 kernel_grader.py — Kernel-level grader for the RL kernel-optimization sandbox.
 
@@ -86,17 +88,18 @@ def _parse_config(config_path: Path) -> dict:
 
 
 def _detect_kernel_type(solution: Path) -> str:
-    """Infer Magpie kernel type from the solution file extension and content."""
+    """Infer Magpie kernel type from the solution file extension and content.
+
+    Note: Python/Triton kernels always return "pytorch" so Magpie uses
+    testcase-based correctness checking (fast, ~seconds) rather than
+    rocprof-compute profiling (very slow, causes 300s timeouts).
+    The triton/aiter content detection is kept only for HIP vs Python distinction.
+    """
     ext = solution.suffix.lower()
     if ext in (".hip", ".cu"):
         return "hip"
-    if ext == ".py":
-        try:
-            content = solution.read_text(errors="ignore")[:4096]
-            if "import triton" in content or "triton.jit" in content or "from aiter" in content:
-                return "triton"
-        except OSError:
-            pass
+    # All Python kernels (including Triton and aiter) use "pytorch" mode so that
+    # Magpie runs the correctness testcase script directly instead of rocprof-compute.
     return "pytorch"
 
 

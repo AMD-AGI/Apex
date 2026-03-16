@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """Tests for leaderboard.py — LeaderboardEntry and Leaderboard."""
 
 import json

@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 conftest.py — Shared pytest fixtures for the RL kernel-optimization env tests.
 """

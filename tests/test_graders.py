@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 test_graders.py — Unit tests for graders/score.py, kernel_grader.py, model_grader.py.
 

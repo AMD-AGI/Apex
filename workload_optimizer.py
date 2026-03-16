@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 workload_optimizer.py — Modular workload optimization trajectory pipeline.
 
@@ -16,6 +18,7 @@ Subcommands:
     score           Compute trajectory reward and push to leaderboard
     report          Generate markdown report and replication guide
     run             Full pipeline (all steps sequentially)
+    export-rl       Export trajectories to keystone-rl-training format
 
 Usage:
     # Step-by-step (each step resumes from previous state):
@@ -1089,8 +1092,12 @@ def _create_task_config(
     spec = kernel.matched_kernel_spec or "unknown"
     ext = ".py" if kernel.category == "triton" else ".hip"
 
+    # Prefer baseline_ref.py over baseline.py if it exists (it has proper benchmark output)
+    local_baseline_ref = task_dir / f"baseline_ref{ext}"
     local_baseline = task_dir / f"baseline{ext}"
-    if local_baseline.exists():
+    if local_baseline_ref.exists():
+        baseline_path = f"./baseline_ref{ext}"
+    elif local_baseline.exists():
         baseline_path = f"./baseline{ext}"
     elif baseline_paths:
         import shutil
@@ -2755,6 +2762,37 @@ def cmd_run(args):
     run_workload_optimization(config)
 
 
+def cmd_export_rl(args):
+    """Export scored trajectories to keystone-rl-training format."""
+    from export_rl_dataset import export
+    import glob as _glob
+
+    traj_dir = Path(args.trajectories_dir) if args.trajectories_dir else REPO_ROOT / "trajectories"
+    export_output = Path(args.export_output_dir)
+
+    results_dir = Path(args.results_dir)
+    results_dirs = []
+    if results_dir.is_dir():
+        results_dirs.append(results_dir)
+    for pattern in _glob.glob(str(results_dir.parent / "results_total_*")):
+        p = Path(pattern)
+        if p.is_dir() and p not in results_dirs:
+            results_dirs.append(p)
+    if not results_dirs:
+        results_dirs = [REPO_ROOT / "output"]
+
+    summary = export(
+        trajectories_dir=traj_dir,
+        results_dirs=results_dirs,
+        output_dir=export_output,
+        include_sft=args.sft,
+        quality_filter=args.quality,
+        min_score=args.min_score,
+        gpu_arch=args.gpu_arch,
+    )
+    print(f"\nExport complete: {summary}")
+
+
 # ---------------------------------------------------------------------------
 # CLI with subcommands
 # ---------------------------------------------------------------------------
@@ -2884,6 +2922,25 @@ def main():
     p.add_argument("--trajectory-store", default="file")
     p.add_argument("--leaderboard", action="store_true")
 
+    # ── export-rl: export trajectories to keystone-rl-training format ─────
+    p = subparsers.add_parser(
+        "export-rl",
+        help="Export scored trajectories to keystone-rl-training format (tasks.json + optional SFT JSONL)",
+    )
+    _add_common_args(p)
+    p.add_argument("--trajectories-dir", type=str, default=None,
+                   help="Directory with trajectory JSON files (default: <repo>/trajectories)")
+    p.add_argument("--export-output-dir", type=str, required=True,
+                   help="Output directory for tasks.json and sft_warmstart.jsonl")
+    p.add_argument("--sft", action="store_true",
+                   help="Also emit SFT warm-start JSONL from good trajectories")
+    p.add_argument("--quality", type=str, default=None,
+                   help="Filter SFT trajectories by quality (good|mediocre|bad)")
+    p.add_argument("--min-score", type=float, default=0.0,
+                   help="Minimum kernel score to include as a task")
+    p.add_argument("--gpu-arch", type=str, default="gfx950",
+                   help="Target GPU architecture (default: gfx950)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -2901,6 +2958,7 @@ def main():
         "score": cmd_score,
         "report": cmd_report,
         "run": cmd_run,
+        "export-rl": cmd_export_rl,
     }
     handlers[args.command](args)
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 score.py — Shared scoring logic and Magpie helpers for the RL graders.
 
@@ -218,7 +220,11 @@ def run_magpie_compare(
                 cwd=working_dir,
             )
 
-            result_files = list(Path(tmpdir).glob("compare_results_*.json"))
+            # Magpie writes to compare_<timestamp>/compare_report.json
+            result_files = list(Path(tmpdir).glob("compare_*/compare_report.json"))
+            # Also support legacy compare_results_*.json pattern
+            if not result_files:
+                result_files = list(Path(tmpdir).glob("compare_results_*.json"))
             if result_files:
                 with open(result_files[0]) as f:
                     return json.load(f)

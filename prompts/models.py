@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 models.py — Registry of open-source LLM models available in SGLang and vLLM
 with AMD/ROCm-optimized kernels.

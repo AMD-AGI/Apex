@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 trajectory.py — Trajectory persistence for the RL kernel-optimization pipeline.
 
@@ -198,6 +200,38 @@ class TrajectoryStore(ABC):
                     f.write(json.dumps(record.to_dict(), default=str) + "\n")
                 count += 1
         return count
+
+    def export_for_keystone_rl(
+        self,
+        output_dir: Path,
+        results_dirs: list[Path] | None = None,
+        quality: str | None = None,
+        include_sft: bool = False,
+        min_score: float = 0.0,
+        gpu_arch: str = "gfx950",
+    ) -> dict:
+        """Export trajectories to keystone-rl-training format.
+
+        Delegates to export_rl_dataset.export() after loading all workload
+        trajectories from this store.
+
+        Returns dict with counts: tasks_exported, sft_pairs_exported.
+        """
+        from export_rl_dataset import export
+
+        traj_dir = self.base_dir if hasattr(self, "base_dir") else REPO_ROOT / "trajectories"
+        if results_dirs is None:
+            results_dirs = [REPO_ROOT / "output"]
+
+        return export(
+            trajectories_dir=traj_dir,
+            results_dirs=results_dirs,
+            output_dir=output_dir,
+            include_sft=include_sft,
+            quality_filter=quality,
+            min_score=min_score,
+            gpu_arch=gpu_arch,
+        )
 
 
 def _record_from_dict(d: dict) -> TrajectoryRecord | WorkloadTrajectoryRecord:

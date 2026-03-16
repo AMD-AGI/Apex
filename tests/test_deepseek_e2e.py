@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 test_deepseek_e2e.py — End-to-end test of model grader with DeepSeek R1 FP8.
 

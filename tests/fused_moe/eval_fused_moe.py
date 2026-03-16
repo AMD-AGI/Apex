@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 eval_fused_moe.py — Focused eval: optimize the fused MoE Triton kernel on MI355X.
 

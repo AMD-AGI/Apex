@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 baseline_fused_moe.py — Standalone fused MoE Triton kernel (extracted from vLLM).
 

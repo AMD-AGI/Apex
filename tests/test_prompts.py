@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 test_prompts.py — Unit tests for prompts/models.py, configs.py,
                   kernel_prompt.py, and model_prompt.py.

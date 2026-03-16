@@ -1,5 +1,5 @@
-# Copyright(C) [2025] Advanced Micro Devices, Inc. All rights reserved.
-
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 # Concise reflection/prompts for Triton kernels on AMD/ROCm.
 
 prompt = """

@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """
 reflector.py — Reflection / iteration logic for the RL kernel-optimization pipeline.
 
