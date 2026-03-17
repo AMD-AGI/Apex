@@ -1,5 +1,27 @@
 # RL Environment for Kernel Optimization
 
+> **License Notice**
+>
+> Copyright © 2025 Advanced Micro Devices, Inc. All rights reserved.
+>
+> This project is licensed under the **MIT License**. You are free to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the software, subject to the following conditions:
+>
+> - The above copyright notice and this license notice must be included in all copies or substantial portions of the software.
+> - The software is provided **"as is"**, without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement.
+>
+> **Third-party dependencies** (ROCm libraries, vLLM, Triton, Magpie, etc.) are governed by their own respective licenses. End users are responsible for reviewing and complying with the licensing terms of any dependencies used in conjunction with this software.
+>
+> **AI Agent notice** — This software orchestrates third-party AI coding agents to perform kernel optimization:
+>
+> | Agent | Provider | What you need |
+> |---|---|---|
+> | **Claude Code** | Anthropic | An active [Anthropic account](https://console.anthropic.com/) and acceptance of [Anthropic's usage policies](https://www.anthropic.com/legal/usage-policy) |
+> | **OpenAI Codex** | OpenAI | An active [OpenAI account](https://platform.openai.com/) and acceptance of [OpenAI's terms of service](https://openai.com/policies/terms-of-use) |
+>
+> Each user must independently obtain their own credentials and comply with the respective provider's licensing and usage terms. **This project does not include, bundle, or sublicense access to any AI model or API.** Usage of these agents may incur costs billed directly by the provider.
+
+---
+
 An RL training environment that tasks an LLM agent with optimizing GPU kernels for AMD ROCm hardware. The agent is given a baseline kernel, a sandbox with relevant source code and documentation, and is scored on compilation, correctness, and runtime speedup.
 
 ## Overview
