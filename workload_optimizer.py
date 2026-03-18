@@ -592,8 +592,17 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
             timeout=config.benchmark_timeout,
         )
         tps = extract_tps(result)
-        if tps <= 0 and result.get("error"):
-            print(f"    Run {i+1}/{n}: FAILED ({result['error'][:100]})")
+        run_failed = (
+            result.get("success") is False or
+            bool(result.get("error")) or
+            (tps <= 0 and bool(result.get("errors")))
+        )
+        if run_failed:
+            err = result.get("error")
+            if not err:
+                errs = result.get("errors") or []
+                err = errs[0] if errs else "benchmark produced no throughput"
+            print(f"    Run {i+1}/{n}: FAILED ({str(err)[:100]})")
             continue
         all_tps.append(tps)
         all_results.append(result)
@@ -821,7 +830,7 @@ class WorkloadConfig:
     max_iterations: int = 5
     max_turns_per_iter: int = 25
     score_threshold: float = 300.0
-    agent_model: str = "claude-sonnet-4-6"
+    agent_model: str = ""
     agent_version: str = "v1.0"
     agent_backend: str = "claude"
     framework: str = ""
@@ -971,9 +980,11 @@ def _find_baseline_sources(kernel_spec: str) -> list[str]:
 def _fixup_aiter_imports(filepath: Path) -> None:
     """Fix aiter import paths that differ between source tree and installed package.
 
-    The source tree has nested dirs (e.g. attention/pa_decode.py) but the pip-
-    installed aiter flattens them.  Also replaces AiterTritonLogger with a stub
-    since the installed package may not include it.
+    Handles:
+      - Relative imports (from ..jit.core import X → from aiter.jit.core import X)
+      - Nested _triton_kernels sub-packages flattening
+      - AiterTritonLogger stub replacement
+      - Guard top-level aiter imports
     """
     import re as _re
     try:
@@ -981,13 +992,51 @@ def _fixup_aiter_imports(filepath: Path) -> None:
     except OSError:
         return
     original = text
-    # Flatten nested _triton_kernels sub-packages:
-    #   aiter.ops.triton._triton_kernels.attention.pa_decode  →  ...._triton_kernels.pa_decode
+
+    # Convert relative imports to absolute aiter imports.
+    # Determine the module's position in the aiter package from the file path.
+    aiter_base = "aiter"
+    fpath_str = str(filepath.resolve())
+    # Try to find aiter package root from file path
+    aiter_idx = fpath_str.find("/aiter/aiter/")
+    if aiter_idx >= 0:
+        # File is inside aiter source tree; compute the package prefix
+        rel = fpath_str[aiter_idx + len("/aiter/aiter/"):]
+        parts = Path(rel).parent.parts  # e.g., ('ops', 'triton', 'gemm', 'basic')
+    else:
+        parts = ()
+
+    def _resolve_relative(match: _re.Match) -> str:
+        dots = match.group(1)
+        rest = match.group(2)
+        levels = len(dots)
+        if levels <= len(parts):
+            prefix = ".".join(["aiter"] + list(parts[:len(parts) - levels]))
+        else:
+            prefix = "aiter"
+        return f"from {prefix}.{rest}"
+
     text = _re.sub(
-        r'(aiter\.ops\.triton\._triton_kernels)\.\w+\.([\w.]+)',
-        r'\1.\2',
+        r'^from\s+(\.{1,})([\w.]+)\s+import',
+        lambda m: _resolve_relative(m) + " import",
         text,
+        flags=_re.MULTILINE,
     )
+
+    # Only flatten _triton_kernels sub-packages if the nested import doesn't work.
+    # Modern aiter installations preserve the directory structure.
+    import importlib
+    _flatten_needed = False
+    try:
+        importlib.import_module("aiter.ops.triton._triton_kernels.attention.pa_decode")
+    except (ImportError, ModuleNotFoundError):
+        _flatten_needed = True
+    if _flatten_needed:
+        text = _re.sub(
+            r'(aiter\.ops\.triton\._triton_kernels)\.\w+\.([\w.]+)',
+            r'\1.\2',
+            text,
+        )
     # Replace AiterTritonLogger import + usage with a no-op stub
     if "AiterTritonLogger" in text:
         text = _re.sub(
@@ -1122,6 +1171,12 @@ def _create_task_config(
             "command": kernel_python,
             "warmup_iterations": 10,
             "iterations": 100,
+        },
+        "_pipeline_metadata": {
+            "kernel_type": spec,
+            "framework": config.framework or "vllm",
+            "generated_by": "workload_optimizer.py",
+            "tamper_protected": True,
         },
     }
 
@@ -1356,7 +1411,7 @@ def _optimize_kernel(
             continue
 
         print("    Grading with Magpie...")
-        kr = grade_task(task_dir, docker_image=config.docker_image or None)
+        kr = grade_task(task_dir, isolate_caches=True, gpu_device=0)
         print(f"      compiled={kr.compiled} correct={kr.correct} "
               f"speedup={kr.speedup:.2f}x score={kr.score:.0f}")
         if kr.error:
@@ -2250,8 +2305,12 @@ def _load_benchmark_config(args) -> dict:
 
 def _init_config_from_args(args) -> WorkloadConfig:
     """Build WorkloadConfig from parsed CLI args."""
+    from agents.backends import resolve_default_model
+
     results_dir = Path(args.results_dir)
     output_dir = Path(getattr(args, "output_dir", None) or str(results_dir / "output"))
+    agent_backend = getattr(args, "agent_backend", "claude")
+    agent_model = getattr(args, "agent_model", None) or resolve_default_model(agent_backend)
 
     return WorkloadConfig(
         benchmark_config=getattr(args, "benchmark_config", ""),
@@ -2262,9 +2321,9 @@ def _init_config_from_args(args) -> WorkloadConfig:
         max_iterations=getattr(args, "max_iterations", 5),
         max_turns_per_iter=getattr(args, "max_turns", 25),
         score_threshold=getattr(args, "score_threshold", 300.0),
-        agent_model=getattr(args, "agent_model", "claude-sonnet-4-6"),
+        agent_model=agent_model,
         agent_version=getattr(args, "agent_version", "v1.0"),
-        agent_backend=getattr(args, "agent_backend", "claude"),
+        agent_backend=agent_backend,
         framework=getattr(args, "framework", ""),
         gpu_arch=getattr(args, "gpu", "gfx950"),
         docker_image=getattr(args, "docker_image", ""),
@@ -2839,7 +2898,8 @@ def _add_agent_args(parser):
                         help="Max agent turns per iteration (default: 25)")
     parser.add_argument("--score-threshold", type=float, default=300.0,
                         help="Stop early if score exceeds this (default: 300)")
-    parser.add_argument("--agent-model", default="claude-sonnet-4-6")
+    parser.add_argument("--agent-model", default=None,
+                        help="Override the backend-specific default agent model")
     parser.add_argument("--agent-version", default="v1.0")
     parser.add_argument("--agent-backend", default="claude", choices=["claude", "codex"])
 

@@ -35,10 +35,23 @@ tools/mcps/rag_tool/chroma_db/
 .claude/skills/
 .cursor/skills/
 
+# ── Generated datasets (export-rl output) ────────────────────────────────────
+datasets/
+
 # ── Pipeline runtime data ────────────────────────────────────────────────────
 trajectories/
 leaderboard.jsonl
+leaderboard.json
 .mcp.json
-results
-tools/.cache/*
 mcp_config.json
+results
+results_total_*/
+tools/.cache/*
+tools/mcps/.cache/
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+*.egg-info/
+dist/
+build/
+.cache/
+tmp/

@@ -242,6 +242,27 @@ def run_magpie_compare(
             return {"error": f"magpie not found: {e}"}
 
 
+def run_magpie_compare_isolated(
+    baseline_path: str,
+    optimized_path: str,
+    testcase_cmd: str | None = None,
+    kernel_type: str = "pytorch",
+    working_dir: str | None = None,
+    timeout: int = 300,
+) -> dict:
+    """Run Magpie compare with fully isolated Triton/torch/comgr caches."""
+    from cache_manager import isolated_grading_env
+    with isolated_grading_env(warmup_gpu=False):
+        return run_magpie_compare(
+            baseline_path=baseline_path,
+            optimized_path=optimized_path,
+            testcase_cmd=testcase_cmd,
+            kernel_type=kernel_type,
+            working_dir=working_dir,
+            timeout=timeout,
+        )
+
+
 def _detect_gpu_count() -> int:
     """Detect number of ROCm GPUs available, fallback to 1."""
     try:

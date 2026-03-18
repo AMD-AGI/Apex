@@ -52,6 +52,12 @@ sys.path.insert(0, str(REPO_ROOT / "graders"))
 sys.path.insert(0, str(REPO_ROOT / "prompts"))
 
 from score import KernelResult, ModelResult, total_score, PTS_COMPILED, PTS_CORRECT
+from cache_manager import (
+    isolated_triton_cache,
+    clear_pycache,
+    clear_torch_caches,
+    gpu_sync_and_flush,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -334,12 +340,16 @@ def grade_locally(task_dir: Path) -> KernelResult:
         return KernelResult(task_id=task_id, compiled=True, correct=False,
                             error=test_out[:200])
 
-    # ── 3. Performance: run bench.py ──────────────────────────────────────────
+    # ── 3. Performance: run bench.py (with isolated caches) ─────────────────
+    clear_pycache(solution)
+    clear_torch_caches()
+    gpu_sync_and_flush()
     try:
-        r = subprocess.run(
-            [sys.executable, str(task_dir / "bench.py")],
-            capture_output=True, text=True, timeout=60,
-        )
+        with isolated_triton_cache():
+            r = subprocess.run(
+                [sys.executable, str(task_dir / "bench.py")],
+                capture_output=True, text=True, timeout=60,
+            )
         bench_out = r.stdout.strip()
         bench_data = json.loads(bench_out)
         baseline_ms  = bench_data["baseline_ms"]

@@ -1,317 +1,334 @@
-#!/usr/bin/env python3
-# Copyright (c) 2025 Advanced Micro Devices, Inc.
-# SPDX-License-Identifier: MIT
 """
-export_rl_dataset.py — Convert Apex scored trajectories to keystone-rl-training format.
+export_rl_dataset.py — Export Apex trajectories to RL fine-tuning dataset.
 
-Reads WorkloadTrajectoryRecord JSON files from Apex's trajectories/ directory,
-extracts per-kernel optimization tasks, generates ground truth via templates,
-and outputs a keystone-compatible tasks.json (+ optional SFT warm-start JSONL).
+Converts Apex pipeline trajectories into the keystone-rl-training TaskRow
+schema with 3 ground truth modes (pytorch, library_test, accordo).
 
-Usage:
-    python export_rl_dataset.py \\
-        --trajectories-dir trajectories/ \\
-        --results-dirs results_total_2 results_total_3 \\
-        --output-dir /path/to/keystone/data/ \\
-        [--sft] [--quality good] [--min-score 0] [--gpu-arch gfx950]
+Also supports standalone mode: generate tasks directly from discovered
+kernel implementations + ground truth (no trajectories needed).
+
+Output files:
+  datasets/tasks.json          — Task definitions for RL training
+  datasets/sft_warmstart.jsonl — SFT warm-start pairs from successful runs
+  datasets/export_metadata.json — Provenance metadata
 """
 
 from __future__ import annotations
 
-import argparse
-import glob
 import json
 import sys
-from dataclasses import dataclass, field
+import textwrap
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-REPO_ROOT = Path(__file__).parent
+REPO_ROOT = Path(__file__).resolve().parent
+
 sys.path.insert(0, str(REPO_ROOT / "graders"))
 sys.path.insert(0, str(REPO_ROOT / "prompts"))
 
-from ground_truth_templates import (
-    OP_TYPE_MAP,
-    get_ground_truth,
-    get_instruction,
+from ground_truth import (
+    GroundTruthSpec,
+    MANUAL_REGISTRY,
+    ROCM_DIR,
+    discover_all,
+    get_spec,
 )
-from trajectory import WorkloadTrajectoryRecord
+from trajectory import (
+    FileStore,
+    TrajectoryRecord,
+    WorkloadTrajectoryRecord,
+    _record_from_dict,
+)
 
 
-# ── Data structures ──────────────────────────────────────────────────────────
-
-@dataclass
-class ExtractedTask:
-    """An extracted kernel optimization task ready for keystone export."""
-    task_id: str
-    kernel_spec: str
-    instruction: str
-    base_gpu_kernel_code: str
-    difficulty_level: int
-    op_type: str
-    ground_truth: dict  # {"cpu_baseline_code": str, "test_shapes_code": str}
-    # Provenance
-    source_trajectory_id: str = ""
-    gpu_arch: str = "gfx950"
-    framework: str = "vllm"
-    model_id: str = ""
-    score: float = 0.0
+_SPEC_CACHE: dict[str, GroundTruthSpec | None] = {}
 
 
-@dataclass
-class SFTPair:
-    """A supervised fine-tuning example from a scored trajectory."""
-    task_id: str
-    source_trajectory_id: str
-    trajectory_quality: str
-    reward: float
-    messages: list[dict]
+def _get_spec_cached(kernel_type: str) -> GroundTruthSpec | None:
+    """Cache-through wrapper for get_spec to avoid re-scanning for each kernel."""
+    if kernel_type in _SPEC_CACHE:
+        return _SPEC_CACHE[kernel_type]
+    spec = get_spec(kernel_type)
+    _SPEC_CACHE[kernel_type] = spec
+    return spec
 
 
-# ── Loading ──────────────────────────────────────────────────────────────────
+# ── Kernel type -> instruction templates ─────────────────────────────────────
 
-def load_trajectories(traj_dir: Path) -> list[WorkloadTrajectoryRecord]:
-    """Load all WorkloadTrajectoryRecord JSON files from a directory."""
-    records = []
-    for path in sorted(traj_dir.glob("*.json")):
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            if "workload_id" in data:
-                records.append(WorkloadTrajectoryRecord.from_dict(data))
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            print(f"  [warn] skipping {path.name}: {e}", file=sys.stderr)
-    return records
+_INSTRUCTION_TEMPLATES: dict[str, str] = {
+    "rms_norm": (
+        "You are an expert GPU AI Compiler Engineer specializing in Triton kernels. "
+        "Optimize the RMSNorm kernel for AMD MI355X (CDNA4, gfx950). "
+        "Focus on vectorized memory access, fused residual add, and dynamic quantization fusion."
+    ),
+    "silu_mul": (
+        "You are an expert GPU AI Compiler Engineer specializing in Triton kernels. "
+        "Optimize the fused SiLU-and-Multiply (SwiGLU) activation kernel for AMD MI355X. "
+        "Focus on memory coalescing, vectorized loads, and potential quantization fusion."
+    ),
+    "fused_moe": (
+        "You are an expert GPU AI Compiler Engineer specializing in Triton kernels. "
+        "Optimize the Fused Mixture-of-Experts kernel for AMD MI355X (CDNA4, gfx950). "
+        "Focus on expert routing efficiency, MFMA utilization, tiled GEMM, and memory coalescing."
+    ),
+    "flash_attn_prefill": (
+        "You are an expert GPU AI Compiler Engineer specializing in attention kernels. "
+        "Optimize the Flash Attention prefill kernel for AMD MI355X (CDNA4, gfx950). "
+        "Focus on tiled QKV processing, online softmax, LDS utilization, and MFMA instructions."
+    ),
+    "paged_attn_decode": (
+        "You are an expert GPU AI Compiler Engineer specializing in attention kernels. "
+        "Optimize the Paged Attention decode kernel for AMD MI355X (CDNA4, gfx950). "
+        "Focus on KV cache paging efficiency, memory coalescing, and reduction optimization."
+    ),
+    "gemm_bf16": (
+        "You are an expert GPU AI Compiler Engineer specializing in GEMM kernels. "
+        "Optimize the BF16 GEMM kernel for AMD MI355X (CDNA4, gfx950). "
+        "Focus on MFMA tile shapes, double buffering, LDS bank conflict avoidance, and occupancy."
+    ),
+    "gemm_w8a8": (
+        "You are an expert GPU AI Compiler Engineer specializing in quantized GEMM kernels. "
+        "Optimize the W8A8 (INT8/FP8) quantized GEMM for AMD MI355X (CDNA4, gfx950). "
+        "Focus on quantization-aware tiling, scale factor handling, and MFMA FP8 support."
+    ),
+    "rope_embedding": (
+        "You are an expert GPU AI Compiler Engineer specializing in Triton kernels. "
+        "Optimize the Rotary Position Embedding (RoPE) kernel for AMD MI355X. "
+        "Focus on vectorized sin/cos computation, memory coalescing, and fusion opportunities."
+    ),
+    "act_quant_fp8": (
+        "You are an expert GPU AI Compiler Engineer specializing in quantization kernels. "
+        "Optimize the dynamic FP8 activation quantization kernel for AMD MI355X. "
+        "Focus on per-token scaling, efficient max reduction, and fused quantize-dequantize."
+    ),
+    "mla_attn": (
+        "You are an expert GPU AI Compiler Engineer specializing in attention kernels. "
+        "Optimize the Multi-Head Latent Attention (MLA) kernel for AMD MI355X. "
+        "Focus on latent compression handling, sparse computation, and memory efficiency."
+    ),
+    "kv_cache_ops": (
+        "You are an expert GPU AI Compiler Engineer specializing in memory kernels. "
+        "Optimize the KV cache operations kernel for AMD MI355X. "
+        "Focus on paged memory management, copy efficiency, and quantized cache support."
+    ),
+    "all_reduce": (
+        "You are an expert GPU AI Compiler Engineer specializing in collective operations. "
+        "Optimize the tensor-parallel all-reduce kernel for AMD MI355X. "
+        "Focus on cross-XCD communication, bandwidth utilization, and overlap with compute."
+    ),
+}
+
+_DEFAULT_INSTRUCTION = (
+    "You are an expert GPU AI Compiler Engineer specializing in HIP/Triton kernels. "
+    "Optimize the {kernel_type} kernel for AMD MI355X (CDNA4, gfx950). "
+    "Focus on memory coalescing, tiling, MFMA utilization, and occupancy optimization."
+)
 
 
-def _find_baseline_code(
-    kernel_spec: str,
-    results_dirs: list[Path],
-) -> str | None:
-    """Search results directories for baseline.py for a given kernel_spec."""
-    patterns = [
-        f"output/workload__vllm__{kernel_spec}/baseline.py",
-        f"output/workload__sglang__{kernel_spec}/baseline.py",
-        f"output/kernel_{kernel_spec}/baseline.py",
-        f"output/*__{kernel_spec}/baseline.py",
+def _get_instruction(kernel_type: str) -> str:
+    return _INSTRUCTION_TEMPLATES.get(
+        kernel_type,
+        _DEFAULT_INSTRUCTION.format(kernel_type=kernel_type),
+    )
+
+
+# ── Baseline code extraction ────────────────────────────────────────────────
+
+def _read_baseline_code(kernel_type: str, framework: str = "vllm") -> str:
+    """Try to read the baseline kernel source code from tools/rocm/."""
+    try:
+        from kernel_prompt import KERNEL_MAP
+    except ImportError:
+        KERNEL_MAP = {}
+
+    spec = KERNEL_MAP.get(kernel_type)
+    if spec is None:
+        return ""
+
+    path_attr = f"{framework}_path"
+    rel_path = getattr(spec, path_attr, "") or ""
+    if not rel_path:
+        return ""
+
+    candidates = [
+        ROCM_DIR / framework / rel_path,
+        ROCM_DIR / rel_path,
     ]
-    for rdir in results_dirs:
-        for pattern in patterns:
-            matches = list(rdir.glob(pattern))
-            if matches:
-                return matches[0].read_text(encoding="utf-8")
-    return None
+
+    for candidate in candidates:
+        if candidate.exists():
+            try:
+                return candidate.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    return ""
 
 
-def _find_solution_code(
-    kernel_spec: str,
-    results_dirs: list[Path],
-) -> str | None:
-    """Search results directories for solution.py for a given kernel_spec."""
-    patterns = [
-        f"output/workload__vllm__{kernel_spec}/solution.py",
-        f"output/workload__sglang__{kernel_spec}/solution.py",
-        f"output/kernel_{kernel_spec}/solution.py",
-        f"output/*__{kernel_spec}/solution.py",
-    ]
-    for rdir in results_dirs:
-        for pattern in patterns:
-            matches = list(rdir.glob(pattern))
-            if matches:
-                code = matches[0].read_text(encoding="utf-8")
-                if code.strip():
-                    return code
-    return None
+# ── Task generation ─────────────────────────────────────────────────────────
 
-
-# ── Difficulty assignment ────────────────────────────────────────────────────
-
-def assign_difficulty(scores: list[float]) -> int:
-    """Map historical kernel optimization scores to difficulty level 1-3.
-
-    Uses the best score across all trajectories for this kernel_spec.
-    """
-    if not scores:
-        return 3
-    best = max(scores)
-    if best >= 260:
-        return 1
-    if best >= 200:
-        return 2
-    return 3
-
-
-def classify_op_type(kernel_spec: str) -> str:
-    return OP_TYPE_MAP.get(kernel_spec, "memory_bound")
-
-
-# ── Task extraction ──────────────────────────────────────────────────────────
-
-def extract_kernel_tasks(
-    trajectories: list[WorkloadTrajectoryRecord],
-    results_dirs: list[Path],
-    gpu_arch: str = "gfx950",
+def _trajectory_to_tasks(
+    record: WorkloadTrajectoryRecord | TrajectoryRecord,
+    quality_filter: str | None = None,
     min_score: float = 0.0,
-) -> list[ExtractedTask]:
-    """Extract unique kernel tasks from trajectories, deduplicated by kernel_spec.
-
-    For each unique kernel_spec found across all trajectories:
-    1. Collect all scores from all trajectories
-    2. Find the baseline code from results directories
-    3. Generate ground truth from templates
-    4. Assign difficulty from historical scores
-    """
-    # Collect per-kernel-spec data across all trajectories
-    kernel_data: dict[str, dict] = {}
-    for traj in trajectories:
-        for kopt in traj.kernel_optimizations:
-            spec = kopt.get("kernel_spec", "")
-            if not spec:
-                continue
-            if spec not in kernel_data:
-                kernel_data[spec] = {
-                    "scores": [],
-                    "best_traj": None,
-                    "best_score": -1,
-                    "model_id": traj.model_id,
-                    "framework": traj.framework,
-                    "gpu_arch": traj.gpu_arch or gpu_arch,
-                }
-            score = kopt.get("score", 0.0)
-            kernel_data[spec]["scores"].append(score)
-            if score > kernel_data[spec]["best_score"]:
-                kernel_data[spec]["best_score"] = score
-                kernel_data[spec]["best_traj"] = traj
-
+) -> list[dict]:
+    """Convert a trajectory record into dataset task dicts."""
     tasks = []
-    for spec, data in sorted(kernel_data.items()):
-        if data["best_score"] < min_score:
-            continue
 
-        baseline_code = _find_baseline_code(spec, results_dirs)
-        if not baseline_code:
-            print(f"  [warn] no baseline.py found for {spec}, using template fallback",
-                  file=sys.stderr)
+    if isinstance(record, WorkloadTrajectoryRecord):
+        if quality_filter and record.trajectory_quality != quality_filter:
+            return []
 
-        try:
-            gt = get_ground_truth(spec, baseline_code)
-        except ValueError as e:
-            print(f"  [warn] skipping {spec}: {e}", file=sys.stderr)
-            continue
+        framework = record.framework or "vllm"
+        model_id = record.model_id or ""
 
-        model_slug = data["model_id"].split("/")[-1].replace(".", "-").lower() if data["model_id"] else "unknown"
-        task_id = f"{spec}_{model_slug}_v1"
-        difficulty = assign_difficulty(data["scores"])
-        instruction = get_instruction(spec, data["gpu_arch"])
+        for ko in record.kernel_optimizations:
+            kernel_name = ko.get("kernel_name", "")
+            if not kernel_name:
+                continue
 
-        task = ExtractedTask(
-            task_id=task_id,
-            kernel_spec=spec,
-            instruction=instruction,
-            base_gpu_kernel_code=baseline_code or "",
-            difficulty_level=difficulty,
-            op_type=classify_op_type(spec),
-            ground_truth=gt,
-            source_trajectory_id=data["best_traj"].trajectory_id if data["best_traj"] else "",
-            gpu_arch=data["gpu_arch"],
-            framework=data["framework"],
-            model_id=data["model_id"],
-            score=data["best_score"],
-        )
-        tasks.append(task)
+            score = ko.get("kernel_score", 0.0)
+            if score < min_score:
+                continue
+
+            gt_spec = _get_spec_cached(kernel_name)
+            base_code = _read_baseline_code(kernel_name, framework)
+
+            if gt_spec:
+                ground_truth = gt_spec.to_ground_truth_dict()
+                difficulty = gt_spec.difficulty_level
+                op_type = gt_spec.op_type
+            else:
+                ground_truth = {
+                    "pytorch_reference_code": "",
+                    "test_shapes_code": "",
+                    "repo_url": "",
+                    "unit_test_command": "",
+                    "accordo_config": {},
+                }
+                difficulty = 2
+                op_type = "memory_bound"
+
+            task_id = f"{kernel_name}_{framework}_{model_id.replace('/', '_')}"
+
+            tasks.append({
+                "task_id": task_id,
+                "instruction": _get_instruction(kernel_name),
+                "base_gpu_kernel_code": base_code,
+                "difficulty_level": difficulty,
+                "op_type": op_type,
+                "ground_truth": ground_truth,
+            })
+
+    elif isinstance(record, TrajectoryRecord):
+        if quality_filter and record.trajectory_quality != quality_filter:
+            return []
+        if record.final_score < min_score:
+            return []
+
+        kernel_type = record.kernel_type or ""
+        if not kernel_type:
+            return []
+
+        gt_spec = _get_spec_cached(kernel_type)
+        base_code = _read_baseline_code(kernel_type, record.framework or "vllm")
+
+        if gt_spec:
+            ground_truth = gt_spec.to_ground_truth_dict()
+            difficulty = gt_spec.difficulty_level
+            op_type = gt_spec.op_type
+        else:
+            ground_truth = {
+                "pytorch_reference_code": "",
+                "test_shapes_code": "",
+                "repo_url": "",
+                "unit_test_command": "",
+                "accordo_config": {},
+            }
+            difficulty = 2
+            op_type = "memory_bound"
+
+        tasks.append({
+            "task_id": record.task_id or f"{kernel_type}_{record.framework}",
+            "instruction": _get_instruction(kernel_type),
+            "base_gpu_kernel_code": base_code,
+            "difficulty_level": difficulty,
+            "op_type": op_type,
+            "ground_truth": ground_truth,
+        })
 
     return tasks
 
 
-# ── Keystone formatting ──────────────────────────────────────────────────────
-
-def format_keystone_tasks(tasks: list[ExtractedTask]) -> list[dict]:
-    """Format tasks as keystone TaskRow-compatible JSON dicts."""
-    rows = []
-    for task in tasks:
-        rows.append({
-            "task_id": task.task_id,
-            "instruction": task.instruction,
-            "base_gpu_kernel_code": task.base_gpu_kernel_code,
-            "difficulty_level": task.difficulty_level,
-            "op_type": task.op_type,
-            "ground_truth": {
-                "cpu_baseline_code": task.ground_truth["cpu_baseline_code"],
-                "test_shapes_code": task.ground_truth["test_shapes_code"],
-            },
-        })
-    return rows
-
-
-# ── SFT warm-start extraction ───────────────────────────────────────────────
-
-def extract_sft_pairs(
-    trajectories: list[WorkloadTrajectoryRecord],
-    results_dirs: list[Path],
-    quality_filter: str | None = None,
-    gpu_arch: str = "gfx950",
-) -> list[SFTPair]:
-    """Extract (prompt, solution) pairs from scored trajectories for SFT.
-
-    Each pair is formatted with <think>/<answer> tags matching keystone's
-    expected model output format.
-    """
+def _trajectory_to_sft_pairs(
+    record: WorkloadTrajectoryRecord | TrajectoryRecord,
+) -> list[dict]:
+    """Extract SFT warm-start pairs from successful trajectory iterations."""
     pairs = []
-    for traj in trajectories:
-        if quality_filter and traj.trajectory_quality != quality_filter:
-            continue
 
-        for kopt in traj.kernel_optimizations:
-            spec = kopt.get("kernel_spec", "")
-            if not spec:
-                continue
-            if not kopt.get("compiled") or not kopt.get("correct"):
-                continue
-            if kopt.get("speedup", 0) <= 1.0:
-                continue
+    if isinstance(record, TrajectoryRecord):
+        for iteration in record.iterations:
+            solution = iteration.get("solution_code", "")
+            score = iteration.get("score", 0.0)
+            if solution and score > 0:
+                pairs.append({
+                    "prompt": record.prompt,
+                    "response": solution,
+                    "score": score,
+                    "kernel_type": record.kernel_type,
+                    "task_id": record.task_id,
+                })
 
-            solution_code = _find_solution_code(spec, results_dirs)
-            if not solution_code:
-                continue
-
-            instruction = get_instruction(spec, traj.gpu_arch or gpu_arch)
-
-            baseline_code = _find_baseline_code(spec, results_dirs)
-            prompt_text = instruction
-            if baseline_code:
-                prompt_text += f"\n\nBaseline kernel:\n```python\n{baseline_code}\n```"
-
-            speedup = kopt.get("speedup", 1.0)
-            think_content = (
-                f"The baseline {spec} kernel can be optimized for AMD MI355X. "
-                f"Key optimizations: tiling for LDS, MFMA utilization, "
-                f"memory coalescing, and occupancy tuning. "
-                f"This achieved {speedup:.2f}x speedup."
-            )
-            answer_content = solution_code
-
-            assistant_msg = (
-                f"<think>{think_content}</think>\n"
-                f"<answer>{answer_content}</answer>"
-            )
-
-            model_slug = traj.model_id.split("/")[-1].replace(".", "-").lower() if traj.model_id else "unknown"
-            task_id = f"{spec}_{model_slug}_v1"
-
-            pairs.append(SFTPair(
-                task_id=task_id,
-                source_trajectory_id=traj.trajectory_id,
-                trajectory_quality=traj.trajectory_quality,
-                reward=traj.model_reward,
-                messages=[
-                    {"role": "user", "content": prompt_text},
-                    {"role": "assistant", "content": assistant_msg},
-                ],
-            ))
+    elif isinstance(record, WorkloadTrajectoryRecord):
+        for ko in record.kernel_optimizations:
+            if ko.get("correct") and ko.get("kernel_score", 0) > 0:
+                kernel_name = ko.get("kernel_name", "unknown")
+                pairs.append({
+                    "prompt": _get_instruction(kernel_name),
+                    "response": f"# Optimized {kernel_name} kernel (speedup: {ko.get('speedup', 0):.2f}x)",
+                    "score": ko.get("kernel_score", 0),
+                    "kernel_type": kernel_name,
+                    "task_id": f"{kernel_name}_{record.framework}",
+                })
 
     return pairs
 
 
-# ── Main export ──────────────────────────────────────────────────────────────
+# ── Standalone mode ──────────────────────────────────────────────────────────
+
+def generate_standalone_tasks(
+    max_specs: int = 200,
+    rocm_dir: Path | None = None,
+) -> list[dict]:
+    """Generate tasks directly from discovered ground truth (no trajectories).
+
+    Useful for creating training data before any optimization runs.
+    """
+    specs = discover_all(rocm_dir=rocm_dir, max_files=2000)
+    tasks = []
+    seen_types: set[str] = set()
+
+    for spec in specs[:max_specs]:
+        if spec.kernel_type in seen_types:
+            continue
+        seen_types.add(spec.kernel_type)
+
+        base_code = _read_baseline_code(spec.kernel_type)
+
+        tasks.append({
+            "task_id": f"{spec.kernel_type}_{spec.source_library}",
+            "instruction": _get_instruction(spec.kernel_type),
+            "base_gpu_kernel_code": base_code,
+            "difficulty_level": spec.difficulty_level,
+            "op_type": spec.op_type,
+            "ground_truth": spec.to_ground_truth_dict(),
+        })
+
+    return tasks
+
+
+# ── Main export function ─────────────────────────────────────────────────────
 
 def export(
     trajectories_dir: Path,
@@ -321,122 +338,189 @@ def export(
     quality_filter: str | None = None,
     min_score: float = 0.0,
     gpu_arch: str = "gfx950",
+    extra_files: list[Path] | None = None,
+    standalone: bool = False,
 ) -> dict:
-    """Run the full export pipeline.
+    """Export trajectories to keystone-rl-training dataset format.
 
-    Returns a summary dict with counts of exported items.
+    Returns dict with counts: tasks_exported, sft_pairs_exported.
     """
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading trajectories from {trajectories_dir} ...")
-    trajectories = load_trajectories(trajectories_dir)
-    print(f"  Loaded {len(trajectories)} workload trajectories")
+    # Preload spec cache to avoid repeated scans
+    _SPEC_CACHE.clear()
+    for spec in discover_all(max_files=2000):
+        if spec.kernel_type not in _SPEC_CACHE:
+            _SPEC_CACHE[spec.kernel_type] = spec
 
-    if not trajectories:
-        print("  [error] no trajectories found", file=sys.stderr)
-        return {"tasks_exported": 0, "sft_pairs_exported": 0}
+    all_tasks: list[dict] = []
+    all_sft: list[dict] = []
+    trajectory_count = 0
 
-    print(f"Extracting kernel tasks (min_score={min_score}) ...")
-    tasks = extract_kernel_tasks(trajectories, results_dirs, gpu_arch, min_score)
-    print(f"  Extracted {len(tasks)} unique kernel tasks")
+    # Load trajectories from FileStore
+    if trajectories_dir.exists():
+        store = FileStore(base_dir=trajectories_dir)
+        for tid in store.list_ids():
+            record = store.load(tid)
+            if record is None:
+                continue
+            trajectory_count += 1
+            all_tasks.extend(_trajectory_to_tasks(
+                record, quality_filter=quality_filter, min_score=min_score,
+            ))
+            if include_sft:
+                all_sft.extend(_trajectory_to_sft_pairs(record))
 
-    task_rows = format_keystone_tasks(tasks)
+    # Load trajectories from results dirs
+    for rdir in (results_dirs or []):
+        traj_file = rdir / "trajectory.json"
+        if traj_file.exists():
+            try:
+                with open(traj_file) as f:
+                    data = json.load(f)
+                record = _record_from_dict(data)
+                trajectory_count += 1
+                all_tasks.extend(_trajectory_to_tasks(
+                    record, quality_filter=quality_filter, min_score=min_score,
+                ))
+                if include_sft:
+                    all_sft.extend(_trajectory_to_sft_pairs(record))
+            except Exception:
+                pass
+
+    # Load extra trajectory files
+    for extra in (extra_files or []):
+        if extra.exists():
+            try:
+                with open(extra) as f:
+                    data = json.load(f)
+                record = _record_from_dict(data)
+                trajectory_count += 1
+                all_tasks.extend(_trajectory_to_tasks(
+                    record, quality_filter=quality_filter, min_score=min_score,
+                ))
+                if include_sft:
+                    all_sft.extend(_trajectory_to_sft_pairs(record))
+            except Exception:
+                pass
+
+    # Standalone mode: supplement with auto-discovered tasks
+    if standalone or not all_tasks:
+        standalone_tasks = generate_standalone_tasks()
+        existing_types = {t["task_id"] for t in all_tasks}
+        for t in standalone_tasks:
+            if t["task_id"] not in existing_types:
+                all_tasks.append(t)
+
+    # Deduplicate by task_id
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for task in all_tasks:
+        if task["task_id"] not in seen:
+            seen.add(task["task_id"])
+            deduped.append(task)
+    all_tasks = deduped
+
+    # Write tasks.json
     tasks_path = output_dir / "tasks.json"
     with open(tasks_path, "w") as f:
-        json.dump(task_rows, f, indent=2)
-    print(f"  Wrote {len(task_rows)} tasks to {tasks_path}")
+        json.dump(all_tasks, f, indent=2, default=str)
 
-    summary = {"tasks_exported": len(task_rows), "sft_pairs_exported": 0}
+    # Write SFT warm-start
+    sft_count = 0
+    if include_sft and all_sft:
+        sft_path = output_dir / "sft_warmstart.jsonl"
+        with open(sft_path, "w") as f:
+            for pair in all_sft:
+                f.write(json.dumps(pair, default=str) + "\n")
+                sft_count += 1
 
-    if include_sft:
-        print(f"Extracting SFT pairs (quality={quality_filter or 'all'}) ...")
-        pairs = extract_sft_pairs(trajectories, results_dirs, quality_filter, gpu_arch)
-        print(f"  Extracted {len(pairs)} SFT pairs")
-        if pairs:
-            sft_path = output_dir / "sft_warmstart.jsonl"
-            with open(sft_path, "w") as f:
-                for pair in pairs:
-                    row = {
-                        "task_id": pair.task_id,
-                        "source_trajectory_id": pair.source_trajectory_id,
-                        "trajectory_quality": pair.trajectory_quality,
-                        "reward": pair.reward,
-                        "messages": pair.messages,
-                    }
-                    f.write(json.dumps(row, default=str) + "\n")
-            print(f"  Wrote {len(pairs)} SFT pairs to {sft_path}")
-            summary["sft_pairs_exported"] = len(pairs)
-
-    # Write a metadata file for provenance
+    # Write metadata
     meta = {
-        "source_trajectories_dir": str(trajectories_dir),
-        "source_results_dirs": [str(d) for d in results_dirs],
-        "num_trajectories_loaded": len(trajectories),
-        "gpu_arch": gpu_arch,
-        "min_score": min_score,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "trajectories_dir": str(trajectories_dir),
+        "results_dirs": [str(d) for d in (results_dirs or [])],
+        "trajectory_count": trajectory_count,
+        "tasks_exported": len(all_tasks),
+        "sft_pairs_exported": sft_count,
         "quality_filter": quality_filter,
-        **summary,
+        "min_score": min_score,
+        "gpu_arch": gpu_arch,
+        "standalone_mode": standalone,
     }
     meta_path = output_dir / "export_metadata.json"
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    return summary
+    return {
+        "tasks_exported": len(all_tasks),
+        "sft_pairs_exported": sft_count,
+    }
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+
     parser = argparse.ArgumentParser(
-        description="Export Apex trajectories to keystone-rl-training format"
+        description="Export Apex trajectories to RL fine-tuning dataset."
     )
     parser.add_argument(
-        "--trajectories-dir", type=Path,
-        default=REPO_ROOT / "trajectories",
+        "--trajectories-dir",
+        default=str(REPO_ROOT / "trajectories"),
         help="Directory containing trajectory JSON files",
     )
     parser.add_argument(
-        "--results-dirs", type=str, nargs="+",
+        "--results-dirs",
+        nargs="*",
         default=[],
-        help="Result directories containing output/<task_id>/ dirs (supports globs)",
+        help="Additional results directories to scan for trajectory.json",
     )
     parser.add_argument(
-        "--output-dir", type=Path,
-        required=True,
-        help="Output directory for tasks.json and optional sft_warmstart.jsonl",
+        "--output-dir",
+        default=str(REPO_ROOT / "datasets"),
+        help="Output directory for exported dataset",
     )
-    parser.add_argument("--sft", action="store_true", help="Also emit SFT warm-start JSONL")
-    parser.add_argument("--quality", type=str, default=None,
-                        help="Filter trajectories by quality (good|mediocre|bad)")
-    parser.add_argument("--min-score", type=float, default=0.0,
-                        help="Minimum kernel score to include as a task")
-    parser.add_argument("--gpu-arch", type=str, default="gfx950",
-                        help="Target GPU architecture")
-    parser.add_argument("--framework", type=str, default="vllm",
-                        help="Target framework")
+    parser.add_argument(
+        "--include-sft",
+        action="store_true",
+        help="Include SFT warm-start pairs",
+    )
+    parser.add_argument(
+        "--quality",
+        choices=["good", "mediocre", "bad"],
+        default=None,
+        help="Filter trajectories by quality",
+    )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=0.0,
+        help="Minimum kernel score to include",
+    )
+    parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="Generate tasks from ground truth even without trajectories",
+    )
     args = parser.parse_args()
 
-    # Expand globs in results-dirs
-    expanded_dirs = []
-    for pattern in args.results_dirs:
-        matches = glob.glob(pattern)
-        for m in matches:
-            p = Path(m)
-            if p.is_dir():
-                expanded_dirs.append(p)
-    if not expanded_dirs:
-        expanded_dirs = [REPO_ROOT / "output"]
-
-    summary = export(
-        trajectories_dir=args.trajectories_dir,
-        results_dirs=expanded_dirs,
-        output_dir=args.output_dir,
-        include_sft=args.sft,
+    result = export(
+        trajectories_dir=Path(args.trajectories_dir),
+        results_dirs=[Path(d) for d in args.results_dirs],
+        output_dir=Path(args.output_dir),
+        include_sft=args.include_sft,
         quality_filter=args.quality,
         min_score=args.min_score,
-        gpu_arch=args.gpu_arch,
+        standalone=args.standalone,
     )
-    print(f"\nExport complete: {summary}")
+
+    print(f"[export_rl_dataset] Exported {result['tasks_exported']} tasks")
+    if result["sft_pairs_exported"]:
+        print(f"[export_rl_dataset] Exported {result['sft_pairs_exported']} SFT pairs")
+    print(f"[export_rl_dataset] Output: {args.output_dir}")
 
 
 if __name__ == "__main__":
