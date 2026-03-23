@@ -356,12 +356,7 @@ Model architecture:
 
 ## Kernel source locations
 
-On AMD ROCm, kernel implementations are spread across multiple libraries under \
-`tools/rocm/`.  The most common primary source is **aiter** (AMD AI Tensor Engine \
-for ROCm), but other libraries such as **composable_kernel** (CK), **rocBLAS**, \
-**hipBLASLt**, **MIOpen**, and **rccl** also provide kernels and reference \
-implementations.  vLLM and SGLang typically provide thin wrappers that call into \
-these libraries on ROCm.
+{library_context}
 
 {sources_block}
 
@@ -486,11 +481,42 @@ def _format_sources_block(kernel: KernelSpec, framework: str) -> str:
     return "\n\n".join(blocks)
 
 
+def _build_library_context(origin_library: str = "aiter") -> str:
+    """Generate library-specific context paragraph for the kernel prompt."""
+    if origin_library == "vllm":
+        return (
+            "This kernel is implemented in **vLLM** (not aiter). "
+            "The source is a vLLM Triton kernel under `vllm/v1/attention/ops/` or "
+            "`vllm/model_executor/layers/`. Your solution MUST preserve the same "
+            "function signatures and import style as the vLLM baseline. "
+            "Do NOT use aiter imports.\n\n"
+            "Other libraries such as **composable_kernel** (CK), **rocBLAS**, and **rccl** "
+            "may still provide reference implementations under `tools/rocm/`."
+        )
+    elif origin_library == "sglang":
+        return (
+            "This kernel is from **SGLang**. Preserve SGLang import conventions and "
+            "function signatures. The source is under `sglang/srt/layers/`. "
+            "Do NOT use aiter imports.\n\n"
+            "Other libraries under `tools/rocm/` may provide reference implementations."
+        )
+    else:
+        return (
+            "On AMD ROCm, kernel implementations are spread across multiple libraries under "
+            "`tools/rocm/`.  The most common primary source is **aiter** (AMD AI Tensor Engine "
+            "for ROCm), but other libraries such as **composable_kernel** (CK), **rocBLAS**, "
+            "**hipBLASLt**, **MIOpen**, and **rccl** also provide kernels and reference "
+            "implementations.  vLLM and SGLang typically provide thin wrappers that call into "
+            "these libraries on ROCm."
+        )
+
+
 def build_kernel_prompt(
     model:     ModelConfig,
     kernel:    KernelSpec,
     framework: str = "sglang",
     gpu_arch:  str = DEFAULT_TARGET,
+    origin_library: str = "aiter",
 ) -> dict:
     gpu_name  = ARCH_MAP.get(gpu_arch, gpu_arch)
     cdna_gen  = "CDNA4" if gpu_arch == "gfx950" else "CDNA3" if gpu_arch in ("gfx942","gfx940") else "CDNA2"
@@ -514,6 +540,8 @@ def build_kernel_prompt(
         extra_hints = "- MLA absorbs W_UK and W_UV into the projection; avoid re-expanding KV\n"
         extra_hints += "- Latent KV dim is 512 (R1/V3); full KV is 128*num_heads; keep latent in LDS"
 
+    library_context = _build_library_context(origin_library)
+
     prompt = KERNEL_PROMPT_TEMPLATE.format(
         gpu_name=gpu_name, gpu_arch=gpu_arch, cdna_gen=cdna_gen,
         kernel_type=kernel.kernel_type,
@@ -524,6 +552,7 @@ def build_kernel_prompt(
         hidden_dim=model.hidden_dim, num_layers=model.num_layers,
         mlp_type=model.mlp_type, moe_info=moe_info,
         context_len=model.context_len,
+        library_context=library_context,
         sources_block=_format_sources_block(kernel, framework),
         task_id=task_id, ext=ext,
         extra_hints=extra_hints,

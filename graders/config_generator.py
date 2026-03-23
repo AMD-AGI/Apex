@@ -122,8 +122,9 @@ def _detect_framework(task_dir: Path) -> str:
             fw = cfg.get("framework", "")
             if fw in ("vllm", "sglang"):
                 return fw
-        except Exception:
-            pass
+        except Exception as e:
+            import sys
+            print(f"    [config] WARNING: Failed to parse {cfg_path}: {e}", file=sys.stderr)
     return "vllm"
 
 

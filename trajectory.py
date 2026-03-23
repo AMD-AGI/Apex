@@ -413,3 +413,24 @@ def get_store(backend: str = "file", **kwargs: Any) -> TrajectoryStore:
     if backend == "s3":
         return S3Store(**kwargs)
     return FileStore(**kwargs)
+
+
+def export_for_keystone_rl(
+    output_dir: Path,
+    results_dirs: list[Path] | None = None,
+    quality: str | None = None,
+    include_sft: bool = False,
+    min_score: float = 0.0,
+    gpu_arch: str = "gfx950",
+    base_dir: Path | None = None,
+) -> dict:
+    """Module-level convenience wrapper around TrajectoryStore.export_for_keystone_rl."""
+    store = FileStore(base_dir=base_dir)
+    return store.export_for_keystone_rl(
+        output_dir=output_dir,
+        results_dirs=results_dirs,
+        quality=quality,
+        include_sft=include_sft,
+        min_score=min_score,
+        gpu_arch=gpu_arch,
+    )

@@ -6,8 +6,8 @@ reflector.py — Reflection / iteration logic for the RL kernel-optimization pip
 After each grading round, analyses the KernelResult and generates a structured
 reflection prompt that feeds back into the agent for the next attempt.
 
-Integrates the existing triton-kernel-reflection-prompts skill for AMD/ROCm-specific
-reflection templates.
+Includes profiler data, Magpie compare details, and dual speedup thresholds
+(integration minimum vs stretch goal).
 """
 
 from __future__ import annotations
@@ -80,6 +80,10 @@ PERF_REGRESSION_REFLECTION = dedent("""\
 
     Your solution is correct but **slower than baseline** ({speedup:.2f}x).
 
+    ### Speedup thresholds
+    - **Integration minimum:** {min_speedup:.2f}x (needed for re-injection into E2E)
+    - **Stretch goal:** {target_speedup:.1f}x
+
     ### Your previous solution
     ```python
     {solution}
@@ -88,7 +92,9 @@ PERF_REGRESSION_REFLECTION = dedent("""\
     ### Performance analysis
     - Baseline: {baseline_ms:.4f} ms
     - Your solution: {optimized_ms:.4f} ms
-    - Speedup: {speedup:.2f}x (need > 1.0x)
+    - Speedup: {speedup:.2f}x (need >= {min_speedup:.2f}x)
+    {compare_details}
+    {profile_section}
 
     ### What to fix
     - Check for unnecessary memory copies or synchronisation barriers.
@@ -96,6 +102,7 @@ PERF_REGRESSION_REFLECTION = dedent("""\
     - Use MFMA instructions for matrix operations where applicable.
     - Reduce register pressure — check occupancy with `rocprof`.
     - Consider using shared memory (LDS) for data reuse.
+    - Try a completely different strategy (library dispatch vs custom Triton).
     {hints}
 
     ### Instructions
@@ -108,12 +115,23 @@ IMPROVEMENT_REFLECTION = dedent("""\
     ## Reflection — Iteration {iteration}: Improvement Opportunity
 
     Your solution is correct and achieves **{speedup:.2f}x speedup** — good progress.
-    Current score: {score:.0f} pts. Let's push for more.
+    Current score: {score:.0f} pts.
+
+    ### Speedup thresholds
+    - **Integration minimum:** {min_speedup:.2f}x (ACHIEVED — your kernel qualifies for re-injection)
+    - **Stretch goal:** {target_speedup:.1f}x — push for more!
 
     ### Your previous solution
     ```python
     {solution}
     ```
+
+    ### Performance analysis
+    - Baseline: {baseline_ms:.4f} ms
+    - Your solution: {optimized_ms:.4f} ms
+    - Speedup: {speedup:.2f}x
+    {compare_details}
+    {profile_section}
 
     ### Optimization suggestions
     - Current speedup: {speedup:.2f}x → target: {target_speedup:.1f}x+
@@ -121,6 +139,7 @@ IMPROVEMENT_REFLECTION = dedent("""\
     - Tune tile sizes and block dimensions for the target GPU.
     - Explore FP8/FP4 quantisation if precision allows.
     - Use `source-finder` MCP to find alternative implementations in CK or rocBLAS.
+    - Try a hybrid approach: library dispatch for large shapes, custom Triton for small.
     {hints}
 
     ### Available MCP tools for deeper analysis
@@ -131,6 +150,38 @@ IMPROVEMENT_REFLECTION = dedent("""\
     ### Instructions
     Write an improved `solution.py` with better performance.
     Correctness must still pass. Target: {target_speedup:.1f}x+ speedup.
+""")
+
+
+BELOW_THRESHOLD_REFLECTION = dedent("""\
+    ## Reflection — Iteration {iteration}: Below Integration Threshold
+
+    Your solution is correct and slightly faster ({speedup:.2f}x) but **below the
+    integration threshold** of {min_speedup:.2f}x. It won't be re-injected for E2E testing.
+
+    ### Your previous solution
+    ```python
+    {solution}
+    ```
+
+    ### Performance analysis
+    - Baseline: {baseline_ms:.4f} ms
+    - Your solution: {optimized_ms:.4f} ms
+    - Speedup: {speedup:.2f}x (need >= {min_speedup:.2f}x for integration)
+    {compare_details}
+    {profile_section}
+
+    ### What to fix
+    - You need at least {min_speedup:.2f}x speedup for the optimization to be used.
+    - Consider a fundamentally different approach:
+      * Library dispatch (hipBLASLt, rocBLAS) instead of custom kernel, or vice versa
+      * Kernel fusion with adjacent operations
+      * Different tile sizes / block dimensions
+    {hints}
+
+    ### Instructions
+    Write a significantly improved `solution.py` that achieves >= {min_speedup:.2f}x speedup.
+    Correctness must still pass.
 """)
 
 
@@ -159,7 +210,8 @@ def _get_hints(kernel_type: str) -> str:
         "gemm_bf16": (
             "- Use MFMA (v_mfma_f32_32x32x8_bf16) for BF16 matrix multiply.\n"
             "- Tile sizes: try 128x128 or 256x128 blocks.\n"
-            "- Check rocBLAS and hipBLASLt for reference implementations."
+            "- Check rocBLAS and hipBLASLt for reference implementations.\n"
+            "- For decode (small M): try torch.addmm to leverage hipBLASLt tuning."
         ),
         "gemm_w8a8": (
             "- INT8/FP8 GEMM: ensure proper quantisation scaling.\n"
@@ -176,8 +228,47 @@ def _get_hints(kernel_type: str) -> str:
             "- For small messages, consider tree or ring reduction.\n"
             "- Profile inter-GPU bandwidth with rccl-tests."
         ),
+        "paged_attn_decode": (
+            "- Paged attention decode is bandwidth-bound on MI355X.\n"
+            "- Do NOT change SEQ_PARTITION_SIZE (causes full Triton re-JIT).\n"
+            "- Focus on memory access patterns, not compute.\n"
+            "- Buffer pooling for exp_sums/max_logits has minimal impact."
+        ),
     }
     return hints_map.get(kernel_type, "- Use source-finder MCP to explore alternative implementations.")
+
+
+def _extract_compare_details(raw: dict) -> str:
+    """Extract structured Magpie compare details from raw grading result."""
+    if not raw:
+        return ""
+
+    lines = []
+    kernel_results = raw.get("results", raw).get("kernel_results", [])
+    if len(kernel_results) >= 2:
+        baseline_kr = kernel_results[0]
+        optimized_kr = kernel_results[-1]
+
+        b_perf = baseline_kr.get("performance_result", {})
+        o_perf = optimized_kr.get("performance_result", {})
+
+        b_corr = baseline_kr.get("correctness_result", {})
+        o_corr = optimized_kr.get("correctness_result", {})
+
+        if isinstance(b_perf, dict) and isinstance(o_perf, dict):
+            b_summary = b_perf.get("summary", {})
+            o_summary = o_perf.get("summary", {})
+            if b_summary or o_summary:
+                lines.append("\n### Magpie Compare Details")
+                if b_summary:
+                    lines.append(f"  - Baseline perf summary: {b_summary}")
+                if o_summary:
+                    lines.append(f"  - Solution perf summary: {o_summary}")
+
+        if isinstance(o_corr, dict) and o_corr.get("errors"):
+            lines.append(f"\n### Correctness errors\n  {o_corr['errors']}")
+
+    return "\n".join(lines)
 
 
 def reflect(
@@ -186,15 +277,27 @@ def reflect(
     iteration: int,
     kernel_type: str = "",
     target_speedup: float = 3.0,
+    min_speedup: float = 1.05,
+    profile_data: str = "",
 ) -> str:
-    """
-    Generate a reflection prompt based on the grading result.
+    """Generate a reflection prompt based on the grading result.
 
-    Returns a structured prompt string for the agent's next iteration.
+    Args:
+        kernel_result: Grading outcome from Magpie compare.
+        task_dir: Directory containing solution and baseline.
+        iteration: Current iteration number.
+        kernel_type: Kernel spec name for type-specific hints.
+        target_speedup: Stretch goal speedup.
+        min_speedup: Minimum speedup for re-injection (integration threshold).
+        profile_data: Optional rocprof profiling output for the solution.
     """
     solution_code = _read_solution(task_dir)
     hints = _get_hints(kernel_type)
     error = kernel_result.error or ""
+    compare_details = _extract_compare_details(kernel_result.raw or {})
+    profile_section = ""
+    if profile_data:
+        profile_section = f"\n### Profiling of Your Solution (Iteration {iteration})\n{profile_data}"
 
     if not kernel_result.compiled:
         return COMPILE_REFLECTION.format(
@@ -223,6 +326,23 @@ def reflect(
             speedup=kernel_result.speedup,
             baseline_ms=baseline_ms,
             optimized_ms=optimized_ms,
+            min_speedup=min_speedup,
+            target_speedup=target_speedup,
+            compare_details=compare_details,
+            profile_section=profile_section,
+            hints=hints,
+        )
+
+    if kernel_result.speedup < min_speedup:
+        return BELOW_THRESHOLD_REFLECTION.format(
+            iteration=iteration,
+            solution=solution_code,
+            speedup=kernel_result.speedup,
+            baseline_ms=baseline_ms,
+            optimized_ms=optimized_ms,
+            min_speedup=min_speedup,
+            compare_details=compare_details,
+            profile_section=profile_section,
             hints=hints,
         )
 
@@ -232,6 +352,11 @@ def reflect(
         speedup=kernel_result.speedup,
         score=kernel_result.score,
         target_speedup=target_speedup,
+        min_speedup=min_speedup,
+        baseline_ms=baseline_ms,
+        optimized_ms=optimized_ms,
+        compare_details=compare_details,
+        profile_section=profile_section,
         hints=hints,
     )
 

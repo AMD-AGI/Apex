@@ -25,6 +25,7 @@ Magpie compare to evaluate compilation, correctness, and performance.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -81,6 +82,75 @@ def find_solution(task_dir: Path) -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def _detect_benchmark_gaming(solution_path: Path, baseline_path: str) -> list[str]:
+    """Detect solutions that game the benchmark via __main__ fast-exit tricks.
+
+    Returns a list of warning strings.  An empty list means no gaming detected.
+    """
+    warnings: list[str] = []
+    try:
+        src = solution_path.read_text()
+        tree = ast.parse(src)
+    except Exception:
+        return warnings
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        is_main_guard = False
+        if isinstance(test, ast.Compare):
+            left = test.left
+            if isinstance(left, ast.Name) and left.id == "__name__":
+                is_main_guard = True
+            elif isinstance(left, ast.Constant) and left.value == "__main__":
+                is_main_guard = True
+        if not is_main_guard:
+            continue
+
+        body_src = ast.get_source_segment(src, node)
+        if body_src is None:
+            continue
+
+        if "SystemExit" in body_src or "sys.exit" in body_src:
+            warnings.append(
+                "Solution has SystemExit/sys.exit inside __main__ guard — "
+                "likely gaming standalone benchmark measurement"
+            )
+        if re.search(r'BENCHMARK_MS:\s*[\d.]+', body_src):
+            warnings.append(
+                "Solution prints hardcoded BENCHMARK_MS inside __main__ guard — "
+                "fabricated benchmark number"
+            )
+        if re.search(r'print\s*\(\s*["\']PASS["\']\s*\)', body_src):
+            warnings.append(
+                "Solution prints hardcoded PASS inside __main__ guard — "
+                "bypassing correctness check"
+            )
+
+    if not Path(baseline_path).exists():
+        return warnings
+
+    try:
+        baseline_src = Path(baseline_path).read_text()
+        baseline_tree = ast.parse(baseline_src)
+    except Exception:
+        return warnings
+
+    baseline_has_main = any(
+        isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+        and isinstance(n.test.left, ast.Name) and n.test.left.id == "__name__"
+        for n in ast.walk(baseline_tree)
+    )
+    if not baseline_has_main and warnings:
+        warnings.append(
+            "Baseline has no __main__ guard but solution added one — "
+            "structural gaming"
+        )
+
+    return warnings
 
 
 def _parse_config(config_path: Path) -> dict:
@@ -260,12 +330,18 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
     testcase_cmd = cfg.get("correctness", {}).get("command")
     kernel_type = _detect_kernel_type(solution)
 
+    meta = cfg.get("_pipeline_metadata", {})
+    framework = meta.get("framework", "")
+    has_heavy_imports = framework in ("vllm", "sglang")
+    compare_timeout = 600 if has_heavy_imports else 300
+
     raw = run_magpie_compare(
         baseline_path=baseline_path,
         optimized_path=optimized_path,
         testcase_cmd=testcase_cmd,
         kernel_type=kernel_type,
         working_dir=str(task_dir.resolve()),
+        timeout=compare_timeout,
     )
 
     if "error" in raw:
@@ -287,6 +363,23 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
             raw["baseline_ms"] = round(b_ms, 4)
             raw["optimized_ms"] = round(o_ms, 4)
             raw["_benchmark_speedup"] = round(speedup, 4)
+
+    if compiled and correct and speedup <= 0:
+        speedup = 1.0
+        raw["_no_perf_data"] = True
+        print(f"    [grader] No performance data available; assuming 1.0x (baseline parity)",
+              file=sys.stderr)
+
+    gaming_warnings = _detect_benchmark_gaming(solution, baseline_path)
+    if gaming_warnings:
+        for gw in gaming_warnings:
+            print(f"    [grader] GAMING DETECTED: {gw}", file=sys.stderr)
+        raw["_gaming_warnings"] = gaming_warnings
+        if speedup > 1.5:
+            print(f"    [grader] Capping speedup from {speedup:.2f}x to 1.0x due to gaming",
+                  file=sys.stderr)
+            speedup = 1.0
+            raw["_speedup_capped_for_gaming"] = True
 
     return KernelResult(
         task_id=task_id,

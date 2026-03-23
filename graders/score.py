@@ -40,14 +40,27 @@ PTS_CORRECT   = 100
 
 
 def speedup_score(speedup: float) -> float:
-    """Points awarded for performance improvement. speedup = baseline/optimized."""
-    return max(0.0, speedup) * 100.0
+    """Points awarded for performance. Penalises regressions, rewards improvements steeply.
+
+    speedup = baseline_time / optimized_time.
+      >= 1.0: 100 + (speedup - 1) * 200  (1.2x -> 140, 2.0x -> 300)
+      <  1.0: max(0, 100 * speedup - 50) (0.8x -> 30, 0.5x -> 0)
+    """
+    if speedup >= 1.0:
+        return 100.0 + (speedup - 1.0) * 200.0
+    return max(0.0, 100.0 * speedup - 50.0)
 
 
-def total_score(compiled: bool, correct: bool, speedup: float) -> float:
-    return (PTS_COMPILED if compiled else 0) + \
-           (PTS_CORRECT  if correct  else 0) + \
-           (speedup_score(speedup) if (compiled and correct) else 0)
+def total_score(
+    compiled: bool, correct: bool, speedup: float,
+    shape_mismatch: bool = False,
+) -> float:
+    score = (PTS_COMPILED if compiled else 0) + \
+            (PTS_CORRECT  if correct  else 0) + \
+            (speedup_score(speedup) if (compiled and correct) else 0)
+    if shape_mismatch:
+        score *= 0.8
+    return score
 
 
 # ── result dataclasses ────────────────────────────────────────────────────────
@@ -92,10 +105,10 @@ class ModelResult:
     error:                Optional[str] = None
 
     def __post_init__(self):
-        # Weight: 50% kernel score (normalised to 0-1), 50% e2e improvement
-        k_norm = min(self.kernel_score / 320.0, 1.0)   # 320 = compile+correct+3× speedup
-        e_norm = max(0.0, self.e2e_throughput_ratio - 1.0)  # improvement over baseline
-        self.score = round((k_norm + e_norm) * 100.0, 2)
+        # Weight: 70% kernel score (normalised to 0-1), 30% E2E throughput improvement
+        k_norm = min(self.kernel_score / 420.0, 1.0)   # 420 = compile+correct+2× speedup (new scale)
+        e_norm = max(0.0, self.e2e_throughput_ratio - 1.0)
+        self.score = round((0.7 * k_norm + 0.3 * e_norm) * 100.0, 2)
 
     def to_dict(self) -> dict:
         return {
@@ -686,15 +699,22 @@ def extract_tps(raw: dict) -> float:
 def workload_kernel_reward(
     compiled: bool, correct: bool,
     baseline_ms: float, optimized_ms: float,
+    shape_mismatch: bool = False,
 ) -> float:
-    """
-    Kernel-level reward for the workload optimization trajectory.
+    """Kernel-level reward for the workload optimization trajectory.
 
-    score = compiled × 20 + correct × 100 + (baseline_ms / optimized_ms) × 100
+    Penalises regressions, rewards improvements with a steep curve,
+    and applies a discount when shape_mismatch is detected.
     """
     score = (20.0 if compiled else 0.0) + (100.0 if correct else 0.0)
     if compiled and correct and optimized_ms > 0:
-        score += (baseline_ms / optimized_ms) * 100.0
+        speedup = baseline_ms / optimized_ms
+        if speedup >= 1.0:
+            score += 100.0 + (speedup - 1.0) * 200.0
+        else:
+            score += max(0.0, 100.0 * speedup - 50.0)
+        if shape_mismatch:
+            score *= 0.8
     return round(score, 4)
 
 
@@ -703,29 +723,22 @@ def workload_model_reward(
     optimized_tps: float,
     baseline_tps: float,
 ) -> float:
-    """
-    Model-level reward for the workload optimization trajectory.
-
-    score = 0.5 × normalized_kernel_score + 0.5 × (optimized_tps / baseline_tps − 1)
-    """
-    tps_improvement = (optimized_tps / baseline_tps - 1.0) if baseline_tps > 0 else 0.0
-    return round(0.5 * normalized_kernel_score + 0.5 * max(0.0, tps_improvement), 4)
+    """Model-level reward: 70% kernel score + 30% E2E throughput improvement."""
+    tps_improvement = max(0.0, optimized_tps / baseline_tps - 1.0) if baseline_tps > 0 else 0.0
+    return round(0.7 * normalized_kernel_score + 0.3 * tps_improvement, 4)
 
 
 def trajectory_reward(
     kernel_results: list[dict],
     baseline_tps: float,
     optimized_tps: float,
-    max_kernel_score: float = 320.0,
+    max_kernel_score: float = 420.0,
 ) -> dict:
-    """
-    Combine kernel-level and model-level rewards into a full trajectory score.
+    """Combine kernel-level and model-level rewards into a full trajectory score.
 
     Each entry in kernel_results should contain:
-      compiled (bool), correct (bool), baseline_ms (float), optimized_ms (float)
-
-    Returns a dict with per-kernel scores, normalized_kernel_score,
-    and model_reward.
+      compiled (bool), correct (bool), baseline_ms (float), optimized_ms (float),
+      and optionally shape_mismatch (bool).
     """
     per_kernel: list[float] = []
     for kr in kernel_results:
@@ -734,6 +747,7 @@ def trajectory_reward(
             correct=kr.get("correct", False),
             baseline_ms=float(kr.get("baseline_ms", 0)),
             optimized_ms=float(kr.get("optimized_ms", 0)),
+            shape_mismatch=kr.get("shape_mismatch", False),
         )
         per_kernel.append(score)
 

@@ -18,6 +18,8 @@ Categories:
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -89,11 +91,28 @@ _SPEC_MAPPING: list[tuple[re.Pattern, str]] = [
 ]
 
 
+_SPEC_TO_AITER_ENV: dict[str, str] = {
+    "paged_attn_decode": "VLLM_ROCM_USE_AITER_PAGED_ATTN",
+    "flash_attn_prefill": "VLLM_ROCM_USE_AITER_MHA",
+    "fused_moe": "VLLM_ROCM_USE_AITER_MOE",
+    "rms_norm": "VLLM_ROCM_USE_AITER_RMSNORM",
+    "mla_attn": "VLLM_ROCM_USE_AITER_MLA",
+    "rope_embedding": "VLLM_ROCM_USE_AITER_TRITON_ROPE",
+    "gemm_bf16": "VLLM_ROCM_USE_AITER_LINEAR",
+    "gemm_w8a8": "VLLM_ROCM_USE_AITER_LINEAR",
+    "act_quant_fp8": "VLLM_ROCM_USE_AITER",
+    "silu_mul": "VLLM_ROCM_USE_AITER",
+    "kv_cache_ops": "VLLM_ROCM_USE_AITER",
+    "all_reduce": "VLLM_ROCM_USE_AITER",
+}
+
+
 @dataclass
 class BottleneckKernel:
     """One kernel extracted from profiler traces with its classification."""
     name: str
     category: str = "unknown"
+    origin_library: str = "unknown"
     total_time_us: float = 0.0
     calls: int = 0
     avg_time_us: float = 0.0
@@ -104,6 +123,7 @@ class BottleneckKernel:
         return {
             "name": self.name,
             "category": self.category,
+            "origin_library": self.origin_library,
             "total_time_us": round(self.total_time_us, 2),
             "calls": self.calls,
             "avg_time_us": round(self.avg_time_us, 2),
@@ -142,9 +162,125 @@ def match_to_kernel_spec(kernel_name: str) -> Optional[str]:
     return None
 
 
+def detect_origin_library(
+    kernel_name: str,
+    kernel_spec: Optional[str] = None,
+    config_envs: Optional[dict] = None,
+) -> str:
+    """Detect which library provides a kernel at runtime.
+
+    For HIP kernels, the profiler name reveals the library directly.
+    For Triton kernels (ambiguous), checks VLLM_ROCM_USE_AITER_* env vars
+    to determine if aiter or vLLM is providing the kernel.
+
+    Args:
+        config_envs: Benchmark config envs dict — checked before os.environ
+                     so detection works even outside the benchmark subprocess.
+    """
+    if re.search(r"^void vllm::", kernel_name):
+        return "vllm"
+    if re.search(r"^void sglang::", kernel_name):
+        return "sglang"
+    if re.search(r"^void at::native::", kernel_name):
+        return "pytorch"
+
+    def _env(key: str, default: str = "0") -> str:
+        if config_envs:
+            val = config_envs.get(key)
+            if val is not None:
+                return str(val)
+        return os.environ.get(key, default)
+
+    aiter_global = _env("VLLM_ROCM_USE_AITER", "0")
+    aiter_enabled = aiter_global in ("1", "true", "True")
+
+    if kernel_spec and aiter_enabled:
+        env_key = _SPEC_TO_AITER_ENV.get(kernel_spec, "VLLM_ROCM_USE_AITER")
+        per_kernel = _env(env_key, "1")
+        if per_kernel in ("1", "true", "True"):
+            return "aiter"
+
+    category = classify_kernel(kernel_name)
+    if category == "triton":
+        return "aiter" if aiter_enabled else "vllm"
+    if category in ("ck", "asm"):
+        return "aiter"
+    if category == "hip":
+        return "vllm"
+    return "unknown"
+
+
+def _extract_from_per_run_reports(
+    per_run_dir: str,
+    config_envs: Optional[dict] = None,
+) -> list[BottleneckKernel]:
+    """Fallback: scan per-run benchmark JSONs for kernel data when aggregated report is corrupted."""
+    import glob
+    kernels_by_name: dict[str, BottleneckKernel] = {}
+    run_files = sorted(glob.glob(os.path.join(per_run_dir, "*.json")))
+    if not run_files:
+        return []
+
+    print(f"  Fallback: scanning {len(run_files)} per-run report(s) in {per_run_dir}")
+    for rf in run_files:
+        try:
+            with open(rf) as f:
+                run_data = json.load(f)
+        except Exception:
+            continue
+
+        found = False
+        gap = run_data.get("gap_analysis") or {}
+        for entry in gap.get("top_kernels", []):
+            name = entry.get("name", "")
+            if not name:
+                continue
+            found = True
+            if name not in kernels_by_name:
+                bk = BottleneckKernel(
+                    name=name,
+                    total_time_us=float(entry.get("self_cuda_total_us", 0)),
+                    calls=int(entry.get("calls", 0)),
+                    avg_time_us=float(entry.get("avg_time_us", 0)),
+                    percent_total=float(entry.get("pct_total", 0)),
+                )
+                bk.category = classify_kernel(name)
+                bk.matched_kernel_spec = match_to_kernel_spec(name)
+                bk.origin_library = detect_origin_library(name, bk.matched_kernel_spec, config_envs)
+                kernels_by_name[name] = bk
+
+        if found:
+            print(f"    Found {len(kernels_by_name)} unique kernels from {os.path.basename(rf)}")
+            continue
+
+        for entry in run_data.get("kernel_summary", []):
+            name = entry.get("name", "")
+            if not name or name in kernels_by_name:
+                continue
+            time_ms = float(entry.get("time_ms", 0))
+            bk = BottleneckKernel(
+                name=name,
+                total_time_us=time_ms * 1000.0,
+                calls=int(entry.get("calls", 0)),
+                avg_time_us=(time_ms * 1000.0 / max(int(entry.get("calls", 1)), 1)),
+                percent_total=float(entry.get("percent", 0)),
+            )
+            bk.category = classify_kernel(name)
+            bk.matched_kernel_spec = match_to_kernel_spec(name)
+            bk.origin_library = detect_origin_library(name, bk.matched_kernel_spec, config_envs)
+            kernels_by_name[name] = bk
+
+    result = list(kernels_by_name.values())
+    if result:
+        print(f"  Fallback: recovered {len(result)} kernel(s) from per-run reports")
+    return result
+
+
 def extract_bottlenecks(
     benchmark_result: dict,
     top_k: int = 20,
+    config_envs: Optional[dict] = None,
+    per_run_dir: Optional[str] = None,
 ) -> list[BottleneckKernel]:
     """
     Parse a Magpie benchmark_report.json and return the top bottleneck kernels
@@ -154,10 +290,21 @@ def extract_bottlenecks(
       1. gap_analysis.top_kernels  (richest data)
       2. kernel_summary            (aggregated from traces)
       3. top_bottlenecks           (names only, no timing)
+      4. per-run benchmark reports (fallback when aggregated data is corrupted)
+
+    Args:
+        config_envs: Benchmark config envs dict for library detection.
+        per_run_dir: Path to benchmark_runs/ dir with per-run report JSONs.
     """
     kernels: list[BottleneckKernel] = []
 
     gap = benchmark_result.get("gap_analysis") or {}
+    gap_errors = gap.get("errors", [])
+    if gap_errors:
+        print(f"  WARNING: gap_analysis has {len(gap_errors)} error(s):")
+        for err in gap_errors[:3]:
+            print(f"    {err[:120]}")
+
     top_kernels = gap.get("top_kernels", [])
 
     if top_kernels:
@@ -174,6 +321,7 @@ def extract_bottlenecks(
             )
             bk.category = classify_kernel(name)
             bk.matched_kernel_spec = match_to_kernel_spec(name)
+            bk.origin_library = detect_origin_library(name, bk.matched_kernel_spec, config_envs)
             kernels.append(bk)
 
     elif benchmark_result.get("kernel_summary"):
@@ -191,6 +339,7 @@ def extract_bottlenecks(
             )
             bk.category = classify_kernel(name)
             bk.matched_kernel_spec = match_to_kernel_spec(name)
+            bk.origin_library = detect_origin_library(name, bk.matched_kernel_spec, config_envs)
             kernels.append(bk)
 
     elif benchmark_result.get("top_bottlenecks"):
@@ -198,7 +347,21 @@ def extract_bottlenecks(
             bk = BottleneckKernel(name=name)
             bk.category = classify_kernel(name)
             bk.matched_kernel_spec = match_to_kernel_spec(name)
+            bk.origin_library = detect_origin_library(name, bk.matched_kernel_spec, config_envs)
             kernels.append(bk)
+
+    if not kernels and per_run_dir:
+        kernels = _extract_from_per_run_reports(per_run_dir, config_envs)
+
+    # Warn about unmatched high-impact kernels
+    for bk in kernels:
+        if bk.matched_kernel_spec is None and bk.percent_total > 2.0:
+            print(f"  WARNING: Unmatched kernel '{bk.name[:70]}' ({bk.percent_total:.1f}% GPU time, "
+                  f"category={bk.category}) — add pattern to _SPEC_MAPPING to enable optimization")
+
+    unmatched_pct = sum(k.percent_total for k in kernels if k.matched_kernel_spec is None)
+    if unmatched_pct > 5.0:
+        print(f"  WARNING: {unmatched_pct:.1f}% of GPU time is in kernels with no known spec mapping")
 
     kernels.sort(key=lambda k: k.total_time_us, reverse=True)
     return kernels[:top_k]
@@ -259,13 +422,14 @@ def format_bottleneck_table(kernels: list[BottleneckKernel]) -> str:
         return "  (no bottleneck kernels found)"
 
     lines = [
-        f"  {'#':<4} {'Category':<9} {'Spec':<22} {'Time%':<8} {'Calls':<10} {'Name'}",
-        f"  {'─'*4} {'─'*9} {'─'*22} {'─'*8} {'─'*10} {'─'*40}",
+        f"  {'#':<4} {'Category':<9} {'Library':<9} {'Spec':<22} {'Time%':<8} {'Calls':<10} {'Name'}",
+        f"  {'─'*4} {'─'*9} {'─'*9} {'─'*22} {'─'*8} {'─'*10} {'─'*40}",
     ]
     for i, k in enumerate(kernels, 1):
         spec = k.matched_kernel_spec or "—"
-        short_name = k.name[:60] + ("…" if len(k.name) > 60 else "")
+        lib = k.origin_library if k.origin_library != "unknown" else "—"
+        short_name = k.name[:55] + ("…" if len(k.name) > 55 else "")
         lines.append(
-            f"  {i:<4} {k.category:<9} {spec:<22} {k.percent_total:>6.2f}% {k.calls:<10} {short_name}"
+            f"  {i:<4} {k.category:<9} {lib:<9} {spec:<22} {k.percent_total:>6.2f}% {k.calls:<10} {short_name}"
         )
     return "\n".join(lines)
