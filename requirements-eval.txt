@@ -1,0 +1,7 @@
+# End-to-end mini eval (eval.py): local grading + optional Claude Agent SDK.
+# Install into your venv, e.g.:
+#   source /path/to/.venv/bin/activate && pip install -r requirements-eval.txt
+#
+claude-agent-sdk>=0.1.50
+numpy>=1.24
+PyYAML>=6.0

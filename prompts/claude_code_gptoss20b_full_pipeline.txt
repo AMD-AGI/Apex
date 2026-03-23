@@ -1,0 +1,39 @@
+You are working in the Apex repo at /home/sirafati/code_combine/Apex. Your task is to optimize the inference workload for GPT OSS 20B end-to-end using the Apex pipeline only. Do everything through workload_optimizer.py — no new scripts.
+
+Goal: Run the full pipeline so we get a benchmark, bottleneck kernel discovery, kernel optimization, reinjection, final benchmark, scoring, and a report — all logged under /home/sirafati/results_total_8.
+
+Environment (run once at the start):
+  source /home/sirafati/Kernel/.venv/bin/activate
+  export MAGPIE_ROOT=/home/sirafati/code_combine/Magpie
+  cd /home/sirafati/code_combine/Apex
+
+Results directory: -r /home/sirafati/results_total_8
+Benchmark config for GPT OSS 20B: -b /home/sirafati/gptoss-20/benchmark_vllm_gptoss_20b.yaml
+
+If you have an existing benchmark report for this model (e.g. under /home/sirafati/gptoss-20/ with benchmark_report.json and profiling/gap data), use --skip-benchmark <path/to/benchmark_report.json> for the benchmark step to avoid re-running the heavy benchmark. Otherwise run a fresh benchmark.
+
+Steps to run in order (each step reads/writes pipeline_state.json in the results dir):
+
+1) Benchmark (or load existing)
+   python3 workload_optimizer.py benchmark -r /home/sirafati/results_total_8 -b /home/sirafati/gptoss-20/benchmark_vllm_gptoss_20b.yaml
+   Or with existing report: add --skip-benchmark <path/to/benchmark_report.json>
+
+2) Identify bottleneck kernels (triton only, top 10)
+   python3 workload_optimizer.py identify -r /home/sirafati/results_total_8 --kernel-types triton --top-k 10
+
+3) Optimize the identified kernels (agent loop)
+   python3 workload_optimizer.py optimize -r /home/sirafati/results_total_8 --kernel-types triton --max-iterations 3 --max-turns 25
+
+4) Integrate (reinject kernels with >5% speedup)
+   python3 workload_optimizer.py integrate -r /home/sirafati/results_total_8
+
+5) Final benchmark with optimized kernels
+   python3 workload_optimizer.py benchmark-final -r /home/sirafati/results_total_8 -b /home/sirafati/gptoss-20/benchmark_vllm_gptoss_20b.yaml
+
+6) Score and leaderboard
+   python3 workload_optimizer.py score -r /home/sirafati/results_total_8 --leaderboard
+
+7) Report
+   python3 workload_optimizer.py report -r /home/sirafati/results_total_8 -b /home/sirafati/gptoss-20/benchmark_vllm_gptoss_20b.yaml
+
+Deliverables: Ensure /home/sirafati/results_total_8/ contains pipeline_state.json, report.md, replication_guide.md, leaderboard.json, and the output/ directory with per-kernel baseline and solution files. Log all commands you run and any errors; if a step fails, fix and retry before proceeding.

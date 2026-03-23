@@ -1,0 +1,243 @@
+{
+    "triton_opt_snippets_rag": {
+      "scope": "Triton kernel optimization clues + tricks with code snippets (LLM/RAG friendly)",
+      "last_verified_date": "2026-01-15",
+      "source_backing": {
+        "tutorials_gallery": "https://triton-lang.org/main/getting-started/tutorials/",
+        "tl_api": "https://triton-lang.org/main/python-api/triton.language.html",
+        "pytorch_ud_kernels": "https://docs.pytorch.org/tutorials/recipes/torch_compile_user_defined_triton_kernel_tutorial.html",
+        "amd_opt_steps": "https://rocm.docs.amd.com/en/docs-6.1.1/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html",
+        "citations": ["turn0search5", "turn0search0", "turn0search2", "turn0search19"]
+      },
+      "snippets": [
+        {
+          "id": "vector_add_masked_load_store",
+          "category": "memory_coalescing_and_bounds",
+          "title": "Masked load/store + tl.arange baseline",
+          "clue": "Always use masks for OOB-safe loads/stores; keep offsets contiguous for coalescing.",
+          "watch_for": ["incorrect results near tail", "out-of-bounds loads", "bad bandwidth from strided offsets"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef add_kernel(X_ptr, Y_ptr, Z_ptr, n_elements: tl.constexpr, BLOCK: tl.constexpr):\n    pid = tl.program_id(axis=0)\n    offsets = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offsets < n_elements\n    x = tl.load(X_ptr + offsets, mask=mask, other=0.0)\n    y = tl.load(Y_ptr + offsets, mask=mask, other=0.0)\n    tl.store(Z_ptr + offsets, x + y, mask=mask)\n\n# grid = (triton.cdiv(n, BLOCK),)\n",
+          "rewrite_moves": [
+            "Ensure offsets are contiguous (tl.arange) for coalescing",
+            "Use other=0 for masked loads to avoid NaNs"
+          ]
+        },
+        {
+          "id": "compiler_hints_alignment",
+          "category": "compiler_hints",
+          "title": "Alignment/contiguity hints (tl.multiple_of + tl.max_contiguous)",
+          "clue": "Give the compiler alignment and contiguity guarantees to enable better vectorization/scheduling.",
+          "watch_for": ["bandwidth below expectation", "loads not vectorized", "misalignment penalties"],
+          "snippet": "import triton.language as tl\n\n@triton.jit\ndef hinted_load(X_ptr, Out_ptr, n_elements: tl.constexpr, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offsets = pid * BLOCK + tl.arange(0, BLOCK)\n    tl.multiple_of(offsets, 16)\n    tl.max_contiguous(offsets, 16)\n    mask = offsets < n_elements\n    x = tl.load(X_ptr + offsets, mask=mask, other=0.0)\n    tl.store(Out_ptr + offsets, x, mask=mask)\n",
+          "rewrite_moves": [
+            "Only assert multiple_of/max_contiguous when it is truly valid",
+            "Increase the hint factor to match your expected vector width / alignment"
+          ]
+        },
+        {
+          "id": "2d_tiling_block_ptr",
+          "category": "tiling_and_reuse",
+          "title": "2D tiling skeleton using make_block_ptr (matmul-style)",
+          "clue": "Block pointers express tiled memory access cleanly; helps compiler generate efficient blocked loads.",
+          "watch_for": ["matmul/attention-like access", "reuse within tile", "need structured 2D addressing"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef tile2d(A_ptr, B_ptr, C_ptr, M: tl.constexpr, N: tl.constexpr,\n           stride_am: tl.constexpr, stride_an: tl.constexpr,\n           stride_bm: tl.constexpr, stride_bn: tl.constexpr,\n           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):\n    pid_m = tl.program_id(0)\n    pid_n = tl.program_id(1)\n\n    a = tl.make_block_ptr(\n        base=A_ptr,\n        shape=(M, N),\n        strides=(stride_am, stride_an),\n        offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),\n        block_shape=(BLOCK_M, BLOCK_N),\n        order=(1, 0),\n    )\n    b = tl.make_block_ptr(\n        base=B_ptr,\n        shape=(M, N),\n        strides=(stride_bm, stride_bn),\n        offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),\n        block_shape=(BLOCK_M, BLOCK_N),\n        order=(1, 0),\n    )\n\n    Ablk = tl.load(a)\n    Bblk = tl.load(b)\n    tl.store(C_ptr + (pid_m * BLOCK_M) * stride_am + (pid_n * BLOCK_N) * stride_an, Ablk + Bblk)\n",
+          "rewrite_moves": [
+            "Use make_block_ptr for structured tiles; tune BLOCK_M/BLOCK_N",
+            "Order parameter controls layout preference; benchmark"
+          ]
+        },
+        {
+          "id": "autotune_configs",
+          "category": "autotuning",
+          "title": "Autotune block sizes and num_warps",
+          "clue": "Triton performance is extremely sensitive to BLOCK sizes and num_warps; autotune is often required.",
+          "watch_for": ["performance varies a lot with BLOCK", "unclear best num_warps", "different shapes need different configs"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.autotune(\n  configs=[\n    triton.Config({'BLOCK': 256}, num_warps=4),\n    triton.Config({'BLOCK': 512}, num_warps=8),\n    triton.Config({'BLOCK': 1024}, num_warps=8),\n  ],\n  key=['n_elements'],\n)\n@triton.jit\ndef axpy_kernel(X_ptr, Y_ptr, A, Out_ptr, n_elements: tl.constexpr, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offsets = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offsets < n_elements\n    x = tl.load(X_ptr + offsets, mask=mask, other=0.0)\n    y = tl.load(Y_ptr + offsets, mask=mask, other=0.0)\n    tl.store(Out_ptr + offsets, A * x + y, mask=mask)\n",
+          "rewrite_moves": [
+            "Use key to specialize per shape (e.g., M,N,K or seqlen, head_dim)",
+            "Tune num_stages alongside num_warps for pipelining"
+          ]
+        },
+        {
+          "id": "fuse_ops_to_reduce_bytes",
+          "category": "kernel_fusion",
+          "title": "Fuse elementwise ops to reduce memory traffic",
+          "clue": "Memory-bound workloads often win by fusing multiple pointwise ops into one kernel (read once, write once).",
+          "watch_for": ["multiple back-to-back pointwise kernels", "HBM BW near peak", "low arithmetic intensity"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef fused_bias_gelu(X_ptr, Bias_ptr, Y_ptr, n_elements: tl.constexpr, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offsets = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offsets < n_elements\n    x = tl.load(X_ptr + offsets, mask=mask, other=0.0)\n    b = tl.load(Bias_ptr + offsets, mask=mask, other=0.0)\n    z = x + b\n    # Approx GELU\n    y = 0.5 * z * (1.0 + tl.tanh(0.79788456 * (z + 0.044715 * z * z * z)))\n    tl.store(Y_ptr + offsets, y, mask=mask)\n",
+          "rewrite_moves": [
+            "Fuse adjacent pointwise ops; prefer one kernel over many",
+            "Ensure numeric approximations match tolerance requirements"
+          ]
+        },
+        {
+          "id": "reduce_then_broadcast_pattern",
+          "category": "reductions",
+          "title": "Block reduction pattern (sum over a tile)",
+          "clue": "Use tl.sum over a blocked tensor; keep the reduction axis static for better codegen.",
+          "watch_for": ["softmax/layernorm stats", "reductions dominate runtime", "need stable numerics"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef row_sum(X_ptr, Out_ptr, stride_xm: tl.constexpr, stride_xn: tl.constexpr,\n            M: tl.constexpr, N: tl.constexpr, BLOCK_N: tl.constexpr):\n    pid_m = tl.program_id(0)\n    cols = tl.arange(0, BLOCK_N)\n    row = pid_m\n    offs = row * stride_xm + cols * stride_xn\n    mask = (row < M) & (cols < N)\n    x = tl.load(X_ptr + offs, mask=mask, other=0.0)\n    s = tl.sum(x, axis=0)\n    tl.store(Out_ptr + row, s)\n",
+          "rewrite_moves": [
+            "If N is large, do multi-stage reduction (partial sums then finalize)",
+            "For stability, use max-subtraction (softmax style) when needed"
+          ]
+        },
+        {
+          "id": "software_pipelining_num_stages",
+          "category": "memory_latency_hiding",
+          "title": "Software pipelining with num_stages",
+          "clue": "Use num_stages to prefetch next tiles while computing current tile, hiding memory latency.",
+          "watch_for": ["memory latency dominates", "low compute utilization", "matmul/gemm kernels"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.autotune(\n    configs=[\n        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),\n        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=8),\n        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=2, num_warps=4),\n    ],\n    key=['M', 'N', 'K'],\n)\n@triton.jit\ndef matmul_pipelined(A_ptr, B_ptr, C_ptr, M, N, K,\n                     stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,\n                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n    # Triton compiler automatically inserts prefetch with num_stages > 1\n    pid_m = tl.program_id(0)\n    pid_n = tl.program_id(1)\n    # ... matmul logic with tl.dot\n",
+          "rewrite_moves": [
+            "num_stages=2-4 typically works well; profile to find optimal",
+            "Higher num_stages uses more registers/shared memory",
+            "Combine with num_warps tuning for best performance"
+          ]
+        },
+        {
+          "id": "persistent_kernel_pattern",
+          "category": "launch_overhead",
+          "title": "Persistent kernel pattern for small workloads",
+          "clue": "Single kernel launch processes multiple tiles in a loop to reduce launch overhead.",
+          "watch_for": ["many small kernel launches", "kernel launch overhead visible in profile", "batch of small operations"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef persistent_kernel(X_ptr, Y_ptr, n_elements: tl.constexpr,\n                       num_tiles: tl.constexpr, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    num_pids = tl.num_programs(0)\n    \n    # Each program processes multiple tiles\n    for tile_id in range(pid, num_tiles, num_pids):\n        offsets = tile_id * BLOCK + tl.arange(0, BLOCK)\n        mask = offsets < n_elements\n        x = tl.load(X_ptr + offsets, mask=mask, other=0.0)\n        y = x * 2.0  # Example computation\n        tl.store(Y_ptr + offsets, y, mask=mask)\n\n# Launch with fewer programs than tiles\n# grid = (min(num_tiles, 256),)\n",
+          "rewrite_moves": [
+            "Use when kernel launch overhead is significant (profile first)",
+            "Works well for batch processing multiple small tensors",
+            "Balance num_programs with work per program"
+          ]
+        },
+        {
+          "id": "atomic_accumulation",
+          "category": "reductions",
+          "title": "Atomic accumulation for cross-block reductions",
+          "clue": "Use tl.atomic_add when multiple blocks must accumulate to same output location.",
+          "watch_for": ["cross-block reduction needed", "histogram operations", "gradient accumulation"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef atomic_histogram(X_ptr, Hist_ptr, n_elements: tl.constexpr, num_bins: tl.constexpr, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offsets = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offsets < n_elements\n    \n    x = tl.load(X_ptr + offsets, mask=mask, other=0)\n    # Bin the values\n    bins = x % num_bins\n    \n    # Atomic add to histogram (one element at a time in loop)\n    for i in tl.static_range(BLOCK):\n        if mask[i]:\n            tl.atomic_add(Hist_ptr + bins[i], 1)\n\n# Note: For high contention, consider local accumulation first\n",
+          "rewrite_moves": [
+            "Minimize atomic contention by pre-aggregating locally",
+            "Consider sorting/grouping to batch atomic ops",
+            "Use tl.atomic_cas for compare-and-swap patterns"
+          ]
+        },
+        {
+          "id": "fp8_mixed_precision",
+          "category": "mixed_precision",
+          "title": "FP8 quantization and dequantization in Triton",
+          "clue": "Use FP8 (E4M3/E5M2) for memory-bound kernels to halve memory traffic vs FP16.",
+          "watch_for": ["memory-bound inference", "weight quantization needed", "activation quantization"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef fp8_dequant_matmul(A_fp8_ptr, B_fp8_ptr, C_ptr, scale_a, scale_b,\n                        M, N, K, stride_am, stride_ak, stride_bk, stride_bn,\n                        stride_cm, stride_cn,\n                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n    pid_m = tl.program_id(0)\n    pid_n = tl.program_id(1)\n    \n    # Load FP8 tiles and convert to FP16/FP32 for computation\n    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)\n    offs_k = tl.arange(0, BLOCK_K)\n    \n    a_ptrs = A_fp8_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak\n    b_ptrs = B_fp8_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn\n    \n    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for k in range(0, K, BLOCK_K):\n        # Load FP8 and cast to FP16 with scaling\n        a = tl.load(a_ptrs).to(tl.float16) * scale_a\n        b = tl.load(b_ptrs).to(tl.float16) * scale_b\n        acc += tl.dot(a, b)\n        a_ptrs += BLOCK_K * stride_ak\n        b_ptrs += BLOCK_K * stride_bk\n    \n    c = acc.to(tl.float16)\n    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn\n    tl.store(c_ptrs, c)\n",
+          "rewrite_moves": [
+            "Use E4M3 for weights, E5M2 for gradients (wider dynamic range)",
+            "Apply per-tensor or per-channel scaling factors",
+            "On MI300X, use native FP8 MFMA instructions for peak throughput"
+          ]
+        },
+        {
+          "id": "flash_attention_tiling",
+          "category": "attention",
+          "title": "Flash Attention tiling pattern in Triton",
+          "clue": "Tile attention computation to avoid materializing full NxN attention matrix.",
+          "watch_for": ["attention kernel", "O(N^2) memory usage", "long sequence length"],
+          "snippet": "import triton\nimport triton.language as tl\n\n@triton.jit\ndef flash_attention_fwd(\n    Q_ptr, K_ptr, V_ptr, Out_ptr,\n    softmax_scale,\n    stride_qz, stride_qh, stride_qm, stride_qk,\n    stride_kz, stride_kh, stride_kn, stride_kk,\n    stride_vz, stride_vh, stride_vn, stride_vk,\n    stride_oz, stride_oh, stride_om, stride_ok,\n    Z, H, N_CTX, D_HEAD,\n    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,\n):\n    # Tile over query blocks\n    start_m = tl.program_id(0)\n    off_hz = tl.program_id(1)\n    \n    # Initialize accumulators\n    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)  # row max\n    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)  # row sum\n    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)\n    \n    # Load Q block once\n    q = tl.load(Q_ptr + ...)  # Load Q tile\n    \n    # Iterate over K/V blocks\n    for start_n in range(0, N_CTX, BLOCK_N):\n        # Load K, V blocks\n        k = tl.load(K_ptr + ...)\n        v = tl.load(V_ptr + ...)\n        \n        # Compute QK^T\n        qk = tl.dot(q, tl.trans(k)) * softmax_scale\n        \n        # Online softmax update\n        m_ij = tl.max(qk, axis=1)\n        m_i_new = tl.maximum(m_i, m_ij)\n        alpha = tl.exp(m_i - m_i_new)\n        p = tl.exp(qk - m_i_new[:, None])\n        l_i = l_i * alpha + tl.sum(p, axis=1)\n        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)\n        m_i = m_i_new\n    \n    # Normalize and store\n    out = acc / l_i[:, None]\n    tl.store(Out_ptr + ..., out.to(tl.float16))\n",
+          "rewrite_moves": [
+            "Use online softmax to avoid storing full attention matrix",
+            "Tune BLOCK_M, BLOCK_N for your sequence length and head dim",
+            "Add causal masking with tl.where for decoder attention"
+          ]
+        }
+      ],
+      "llm_decision_heuristics": [
+        {
+          "id": "memory_bound_playbook_triton",
+          "if_signals": [
+            "HBM bandwidth near peak",
+            "kernel mostly tl.load/tl.store with few math ops",
+            "multiple pointwise kernels chained"
+          ],
+          "then_try": [
+            "Fuse pointwise ops (reduce bytes moved)",
+            "Use tl.multiple_of / tl.max_contiguous hints where valid",
+            "Increase BLOCK size for better memory throughput (then autotune)",
+            "Ensure offsets are contiguous (tl.arange) and use masks for tails"
+          ]
+        },
+        {
+          "id": "tiling_playbook_triton",
+          "if_signals": [
+            "reuse exists (matmul/attention-like)",
+            "many repeated loads from global",
+            "poor cache reuse"
+          ],
+          "then_try": [
+            "Switch to blocked program with 2D/3D tiling",
+            "Use make_block_ptr for structured tiles",
+            "Tune BLOCK sizes + num_warps + num_stages via autotune"
+          ]
+        },
+        {
+          "id": "autotune_playbook_triton",
+          "if_signals": [
+            "performance varies greatly with BLOCK/warps",
+            "shape-dependent best config",
+            "unknown best pipelining"
+          ],
+          "then_try": [
+            "Add @triton.autotune with configs grid",
+            "Key by relevant shape dims",
+            "Tune num_warps and num_stages"
+          ],
+          "doc_pointer": {
+            "name": "PyTorch tutorial: user-defined Triton kernels with torch.compile (includes autotune usage)",
+            "url": "https://docs.pytorch.org/tutorials/recipes/torch_compile_user_defined_triton_kernel_tutorial.html",
+            "citations": ["turn0search2"]
+          }
+        },
+        {
+          "id": "latency_hiding_playbook_triton",
+          "if_signals": [
+            "matmul/gemm kernel performance below expectation",
+            "memory latency visible in profile",
+            "low compute utilization despite high occupancy"
+          ],
+          "then_try": [
+            "Increase num_stages (2, 3, 4) for software pipelining",
+            "Use larger BLOCK_K to amortize memory latency",
+            "Ensure make_block_ptr for structured tile access",
+            "Profile with ROCM_DEBUG=1 to check prefetch behavior"
+          ]
+        },
+        {
+          "id": "attention_playbook_triton",
+          "if_signals": [
+            "attention kernel with O(N^2) memory",
+            "long sequence lengths (>2048)",
+            "memory bound attention computation"
+          ],
+          "then_try": [
+            "Implement Flash Attention tiling pattern",
+            "Use online softmax (track m_i, l_i running stats)",
+            "Tune BLOCK_M, BLOCK_N for sequence length",
+            "Add causal masking efficiently with tl.where",
+            "Consider using AMD AITER library for optimized attention"
+          ]
+        },
+        {
+          "id": "quantization_playbook_triton",
+          "if_signals": [
+            "inference workload",
+            "memory bandwidth bottleneck with FP16",
+            "weight compression needed"
+          ],
+          "then_try": [
+            "Use FP8 (E4M3 for weights, E5M2 for activations)",
+            "Apply per-tensor or per-channel scaling",
+            "Fuse dequant into compute kernel to avoid extra memory pass",
+            "On MI300X/MI350X, leverage native FP8 MFMA instructions"
+          ]
+        }
+      ]
+    }
+  }
+  

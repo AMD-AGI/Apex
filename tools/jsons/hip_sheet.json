@@ -1,0 +1,182 @@
+{
+    "hip_opt_snippets_rag": {
+      "scope": "HIP kernel optimization clues + tricks with code snippets (LLM/RAG friendly)",
+      "last_verified_date": "2026-01-15",
+      "source_backing": {
+        "performance_guidelines_url": "https://rocm.docs.amd.com/projects/HIP/en/latest/how-to/performance_guidelines.html",
+        "programming_patterns_url": "https://rocm.docs.amd.com/projects/HIP/en/latest/tutorial/programming-patterns.html",
+        "api_reference_url": "https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/index.html",
+        "citations": ["turn0search4", "turn0search2", "turn0search8"]
+      },
+      "snippets": [
+        {
+          "id": "coalesced_linear_access",
+          "category": "memory_bandwidth",
+          "title": "Coalesced global memory access (baseline)",
+          "clue": "Map threadIdx.x to consecutive addresses; avoid strided/scattered access.",
+          "watch_for": ["low achieved HBM bandwidth", "many global transactions per request", "poor L2 efficiency"],
+          "snippet": "__global__ void copy_coalesced(const float* __restrict__ in, float* __restrict__ out, int n) {\n  int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;\n  if (i < n) out[i] = in[i];\n}\n",
+          "rewrite_moves": [
+            "Linearize indexing (flatten multi-dim indices)",
+            "Reorder loops so contiguous dimension is mapped to x-thread dimension"
+          ]
+        },
+        {
+          "id": "grid_stride_loop",
+          "category": "parallel_execution",
+          "title": "Grid-stride loop",
+          "clue": "Handle arbitrary sizes; keep launch config stable; each thread processes multiple elements.",
+          "watch_for": ["many small launches", "n varies widely", "need scalability"],
+          "snippet": "__global__ void saxpy(float a, const float* __restrict__ x, float* __restrict__ y, int n) {\n  int tid = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;\n  int stride = (int)blockDim.x * (int)gridDim.x;\n  for (int i = tid; i < n; i += stride) y[i] = a * x[i] + y[i];\n}\n",
+          "rewrite_moves": [
+            "Replace one-element-per-thread kernels with grid-stride loops",
+            "Tune gridDim to cover enough work and hide latency"
+          ]
+        },
+        {
+          "id": "vectorized_float4",
+          "category": "memory_bandwidth",
+          "title": "Vectorized loads/stores (float4)",
+          "clue": "If aligned, use wider vector types to reduce instruction count and improve throughput.",
+          "watch_for": ["memory-bound kernels", "high instruction count per byte moved"],
+          "snippet": "__global__ void add_vec4(const float* __restrict__ a, const float* __restrict__ b,\n                         float* __restrict__ c, int n) {\n  int i4 = (((int)blockIdx.x * (int)blockDim.x) + (int)threadIdx.x) * 4;\n  if (i4 + 3 < n) {\n    const float4* A = reinterpret_cast<const float4*>(a);\n    const float4* B = reinterpret_cast<const float4*>(b);\n    float4* C = reinterpret_cast<float4*>(c);\n    int idx = i4 / 4;\n    float4 va = A[idx];\n    float4 vb = B[idx];\n    C[idx] = {va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w};\n  }\n}\n",
+          "rewrite_moves": [
+            "Add an aligned fast-path + scalar tail for remainder",
+            "Consider half2/bfloat162 when using fp16/bf16"
+          ]
+        },
+        {
+          "id": "shared_memory_tiling",
+          "category": "data_reuse_lds",
+          "title": "LDS/shared-memory tiling skeleton (GEMM-like)",
+          "clue": "Load tiles into shared memory (LDS), sync, compute, repeat; reduces global traffic.",
+          "watch_for": ["same elements reloaded repeatedly", "low arithmetic intensity", "global load bottleneck"],
+          "snippet": "template<int TILE>\n__global__ void gemm_tiled(const float* __restrict__ A, const float* __restrict__ B,\n                          float* __restrict__ C, int M, int N, int K) {\n  __shared__ float As[TILE][TILE];\n  __shared__ float Bs[TILE][TILE];\n  int row = (int)blockIdx.y * TILE + (int)threadIdx.y;\n  int col = (int)blockIdx.x * TILE + (int)threadIdx.x;\n  float acc = 0.0f;\n  for (int t = 0; t < K; t += TILE) {\n    As[threadIdx.y][threadIdx.x] = (row < M && t + threadIdx.x < K) ? A[row * K + (t + threadIdx.x)] : 0.0f;\n    Bs[threadIdx.y][threadIdx.x] = (col < N && t + threadIdx.y < K) ? B[(t + threadIdx.y) * N + col] : 0.0f;\n    __syncthreads();\n    #pragma unroll\n    for (int k = 0; k < TILE; ++k) acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];\n    __syncthreads();\n  }\n  if (row < M && col < N) C[row * N + col] = acc;\n}\n",
+          "rewrite_moves": [
+            "Tune TILE to balance reuse vs register/LDS pressure",
+            "Apply register blocking (each thread computes multiple outputs)",
+            "Consider prefetching next tile before __syncthreads (software pipelining)"
+          ]
+        },
+        {
+          "id": "wave_shuffle_reduce",
+          "category": "reductions",
+          "title": "Wave/warp shuffle reduction (intra-wave)",
+          "clue": "Use shuffles to reduce within a wavefront efficiently; reduce shared-memory use.",
+          "watch_for": ["reduction kernels", "softmax", "layernorm stats", "shared-memory reduction overhead"],
+          "snippet": "__device__ __forceinline__ float wave_reduce_sum(float v) {\n  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {\n    v += __shfl_down(v, offset);\n  }\n  return v;\n}\n",
+          "rewrite_moves": [
+            "Do a two-stage reduction: wave shuffle -> one value per wave -> final reduce",
+            "Minimize __syncthreads usage"
+          ]
+        },
+        {
+          "id": "predication_reduce_divergence",
+          "category": "control_flow",
+          "title": "Predication to reduce divergence",
+          "clue": "Replace small divergent branches with conditional expressions when safe.",
+          "watch_for": ["warp/wave divergence in hot path", "branch-heavy kernels"],
+          "snippet": "__global__ void relu_branchless(const float* __restrict__ x, float* __restrict__ y, int n) {\n  int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;\n  if (i < n) {\n    float v = x[i];\n    y[i] = v > 0.0f ? v : 0.0f;\n  }\n}\n",
+          "rewrite_moves": [
+            "Hoist uniform conditions outside the kernel",
+            "Group data so branches are coherent across lanes where possible"
+          ]
+        },
+        {
+          "id": "strength_reduce_index_math",
+          "category": "instruction_efficiency",
+          "title": "Strength-reduce / and % in index math",
+          "clue": "Replace divide/mod by shift/mask when power-of-two; hoist invariants out of loops.",
+          "watch_for": ["integer divide/mod in tight loops", "indexing dominates ISA"],
+          "snippet": "__global__ void idx_fast(const float* __restrict__ in, float* __restrict__ out, int n) {\n  int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;\n  if (i < n) {\n    int lane8 = i & 7;   // i % 8\n    int group = i >> 3;  // i / 8\n    out[i] = in[i] + (float)(lane8 + group);\n  }\n}\n",
+          "rewrite_moves": [
+            "Use bit tricks only when mathematically valid (power-of-two divisors)",
+            "Move repeated calculations into registers outside loops"
+          ]
+        },
+        {
+          "id": "register_pressure_scoping",
+          "category": "occupancy",
+          "title": "Reduce register pressure (shorter live ranges)",
+          "clue": "Shorten live ranges of temporaries; avoid excessive unrolling; split kernels if needed.",
+          "watch_for": ["low occupancy", "high VGPR usage", "latency-bound behavior"],
+          "snippet": "__global__ void pressure_example(const float* __restrict__ x, float* __restrict__ y, int n) {\n  int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;\n  if (i < n) {\n    float v = x[i];\n    { // limit lifetime of temps\n      float t1 = v * 1.1f;\n      float t2 = t1 + 2.2f;\n      v = t2;\n    }\n    y[i] = v;\n  }\n}\n",
+          "rewrite_moves": [
+            "Reduce unroll factors if registers explode",
+            "Avoid large per-thread arrays; use shared memory for shared data"
+          ]
+        },
+        {
+          "id": "async_overlap_streams",
+          "category": "system_runtime",
+          "title": "Overlap H2D/D2H transfers with compute using streams",
+          "clue": "Use hipMemcpyAsync + streams; overlap copies with kernels to hide transfer latency.",
+          "watch_for": ["CPU waiting for transfers", "no overlap in timeline trace"],
+          "snippet": "hipStream_t s;\nhipStreamCreate(&s);\nhipMemcpyAsync(d_in, h_in, bytes, hipMemcpyHostToDevice, s);\nhipLaunchKernelGGL(copy_coalesced, dim3(grid), dim3(block), 0, s, d_in, d_out, n);\nhipMemcpyAsync(h_out, d_out, bytes, hipMemcpyDeviceToHost, s);\nhipStreamSynchronize(s);\nhipStreamDestroy(s);\n",
+          "rewrite_moves": [
+            "Pipeline batches (double-buffering)",
+            "Avoid hipDeviceSynchronize in hot paths; prefer stream sync when needed"
+          ]
+        },
+        {
+          "id": "blocksize_autotune",
+          "category": "autotuning",
+          "title": "Autotune block size (quick knob sweep)",
+          "clue": "Best block size depends on register use, memory pattern, and occupancy—measure it.",
+          "watch_for": ["unknown optimal launch config", "performance sensitive to blockDim"],
+          "snippet": "int candidates[] = {128, 256, 512, 1024};\nfor (int bs : candidates) {\n  dim3 block(bs);\n  dim3 grid((n + bs - 1) / bs);\n  hipEvent_t start, stop;\n  hipEventCreate(&start); hipEventCreate(&stop);\n  hipEventRecord(start);\n  hipLaunchKernelGGL(copy_coalesced, grid, block, 0, 0, d_in, d_out, n);\n  hipEventRecord(stop);\n  hipEventSynchronize(stop);\n  float ms = 0.0f;\n  hipEventElapsedTime(&ms, start, stop);\n  hipEventDestroy(start); hipEventDestroy(stop);\n  // record ms per candidate\n}\n",
+          "rewrite_moves": [
+            "Add additional knobs: unroll factor, TILE size, vector width",
+            "Cache best configs per shape (M,N,K or n)"
+          ]
+        }
+      ],
+      "llm_decision_heuristics": [
+        {
+          "id": "memory_bound_playbook",
+          "if_signals": ["achieved bandwidth is high but compute utilization low", "arithmetic intensity low"],
+          "then_try": [
+            "coalesced access / contiguous mapping",
+            "vectorized loads/stores",
+            "reduce bytes moved (fuse kernels, avoid redundant loads)",
+            "shared-memory tiling for reuse"
+          ]
+        },
+        {
+          "id": "compute_bound_playbook",
+          "if_signals": ["bandwidth not saturated", "high ALU utilization", "lots of math per byte"],
+          "then_try": [
+            "increase ILP (measured unroll)",
+            "reduce divergence",
+            "use fast reduction primitives for normalization/softmax substeps",
+            "consider register blocking"
+          ]
+        },
+        {
+          "id": "low_occupancy_playbook",
+          "if_signals": ["low occupancy", "high register usage", "latency stalls"],
+          "then_try": [
+            "reduce unroll",
+            "shorten live ranges / refactor temporaries",
+            "smaller block size",
+            "split kernel or move shared data to LDS"
+          ]
+        },
+        {
+          "id": "launch_overhead_playbook",
+          "if_signals": ["many tiny kernels", "CPU dispatch dominates timeline"],
+          "then_try": [
+            "HIP Graphs to reduce overhead",
+            "kernel fusion",
+            "batched execution"
+          ],
+          "doc_pointer": {
+            "name": "HIP Graph API tutorial",
+            "url": "https://rocm.docs.amd.com/projects/HIP/en/latest/tutorial/graph_api.html",
+            "citations": ["turn0search12"]
+          }
+        }
+      ]
+    }
+  }
+  

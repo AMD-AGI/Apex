@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "magpie": {
+      "command": "python3",
+      "args": ["-m", "Magpie.mcp"],
+      "env": {
+        "PYTHONPATH": "./tools/magpie"
+      }
+    },
+    "gpu-info": {
+      "command": "python3",
+      "args": ["./tools/mcps/gpu_info/server.py"],
+      "env": {}
+    },
+    "source-finder": {
+      "command": "python3",
+      "args": ["./tools/mcps/source_finder/server.py"],
+      "env": {}
+    },
+    "fusion-advisor": {
+      "command": "python3",
+      "args": ["./tools/mcps/fusion_advisor/server.py"],
+      "env": {}
+    },
+    "kernel-rag": {
+      "command": "python3",
+      "args": ["./tools/mcps/rag_tool/server.py"],
+      "env": {
+        "MCP_ROCM_DIR": "./tools/rocm",
+        "MCP_DOC_DIR": "./tools/doc",
+        "MCP_JSONS_DIR": "./tools/jsons"
+      }
+    }
+  }
+}
