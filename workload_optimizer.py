@@ -18,7 +18,9 @@ Subcommands:
     score           Compute trajectory reward and push to leaderboard
     report          Generate markdown report and replication guide
     run             Full pipeline (all steps sequentially)
-    export-rl       Export trajectories to keystone-rl-training format
+    export-rl       Export trajectories to RL training dataset format
+    optimize-kernel Optimize a standalone kernel (no full pipeline needed)
+    grade-kernel    Grade an existing baseline + solution pair
 
 Usage:
     # Step-by-step (each step resumes from previous state):
@@ -40,6 +42,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -77,7 +80,7 @@ from score import (
 )
 from kernel_grader import grade_task, find_solution
 from reflector import reflect, should_continue
-from testcase_generator import generate_testcase
+from ground_truth import get_spec as get_ground_truth_spec, build_correctness_config
 from trajectory import WorkloadTrajectoryRecord, get_store
 from leaderboard import Leaderboard, LeaderboardEntry
 from kernel_bottleneck import (
@@ -463,10 +466,97 @@ def _register_session_handlers() -> None:
         _sig.signal(sig, _handler)
 
 
+def _apply_multi_file_patch(
+    solution_dir: Path, spec: str, library: str, gpu_arch: str,
+    backups: dict[Path, Path], write_manifest_fn, ast_module,
+) -> None:
+    """Apply a multi-file solution from a directory with a manifest.json.
+
+    The manifest maps relative file names to their install targets:
+      {"rmsnorm.py": "aiter.ops.triton.normalization.rmsnorm",
+       "__init__.py": "aiter.ops.triton.normalization.__init__"}
+
+    All files in the manifest are backed up and patched atomically -- if any
+    file fails, the entire group is rolled back.
+    """
+    manifest_path = solution_dir / "manifest.json"
+    if not manifest_path.exists():
+        print(f"    WARNING: Multi-file solution dir {solution_dir} has no manifest.json, skipping")
+        return
+
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"    REJECTED multi-file {spec}: bad manifest.json: {e}")
+        return
+
+    group_backups: list[tuple[Path, Path]] = []
+    group_ok = True
+
+    for filename, target_module in manifest.items():
+        src = solution_dir / filename
+        if not src.exists():
+            print(f"    REJECTED multi-file {spec}: missing file {filename}")
+            group_ok = False
+            break
+
+        if src.suffix == ".py":
+            try:
+                ast_module.parse(src.read_text())
+            except SyntaxError as e:
+                print(f"    REJECTED multi-file {spec}/{filename}: syntax error: {e}")
+                group_ok = False
+                break
+
+            installed_path = _resolve_module_to_path(target_module)
+            if not installed_path:
+                print(f"    WARNING: Cannot resolve {target_module} for {spec}/{filename}, skipping group")
+                group_ok = False
+                break
+
+            backup = Path(str(installed_path) + ".bak")
+            shutil.copy2(installed_path, backup)
+            shutil.copy2(src, installed_path)
+            _fixup_patched_imports(installed_path, library=library)
+            _clear_pycache(installed_path)
+            group_backups.append((installed_path, backup))
+            _SESSION_BACKUPS[str(installed_path)] = str(backup)
+            print(f"    Patched (multi): {installed_path} <- {filename}")
+        else:
+            print(f"    WARNING: Multi-file patch skipping non-.py file {filename}")
+
+    if not group_ok:
+        for installed_path, backup in group_backups:
+            shutil.copy2(backup, installed_path)
+            _clear_pycache(installed_path)
+            _SESSION_BACKUPS.pop(str(installed_path), None)
+        print(f"    Rolled back multi-file group for {spec}")
+        return
+
+    for installed_path, backup in group_backups:
+        backups[installed_path] = backup
+    write_manifest_fn()
+
+
+def _resolve_module_to_path(module_name: str) -> Optional[Path]:
+    """Resolve a dotted module name to its installed file path."""
+    import importlib
+    try:
+        spec = importlib.util.find_spec(module_name)
+        if spec and spec.origin:
+            return Path(spec.origin)
+    except (ModuleNotFoundError, ValueError):
+        pass
+    return None
+
+
 def _apply_kernel_patches(
     reinjected_dir: Path, gpu_arch: str = "gfx950",
 ) -> tuple[dict[Path, Path], "IO"]:
     """Patch installed kernel modules with optimized solutions.
+
+    Supports both single-file solutions (*_solution.py) and multi-file
+    solution directories (*_solution/ with manifest.json).
 
     Reads per-solution .library metadata files to determine which library
     to target. The manifest is written incrementally after each patch so
@@ -491,18 +581,19 @@ def _apply_kernel_patches(
             print("  No reinjected directory found -- nothing to patch")
             return backups, lock_fd
 
+        # Single-file solutions
         for solution_file in sorted(reinjected_dir.glob("*_solution.*")):
+            if solution_file.is_dir():
+                continue
             spec = solution_file.name.split("_solution")[0]
             suffix = solution_file.suffix
 
-            # Read library metadata (defaults to aiter for backward compat)
             lib_meta = solution_file.parent / f"{solution_file.name}.library"
             library = "aiter"
             if lib_meta.exists():
                 library = lib_meta.read_text().strip() or "aiter"
 
             if suffix == ".py":
-                # Syntax validation before patching
                 try:
                     _ast.parse(solution_file.read_text())
                 except SyntaxError as e:
@@ -537,6 +628,22 @@ def _apply_kernel_patches(
                     _write_manifest()
             else:
                 print(f"    WARNING: Unknown solution type {suffix} for {spec}")
+
+        # Multi-file solution directories
+        for solution_dir in sorted(reinjected_dir.glob("*_solution")):
+            if not solution_dir.is_dir():
+                continue
+            spec = solution_dir.name.split("_solution")[0]
+
+            lib_meta = solution_dir.parent / f"{solution_dir.name}.library"
+            library = "aiter"
+            if lib_meta.exists():
+                library = lib_meta.read_text().strip() or "aiter"
+
+            _apply_multi_file_patch(
+                solution_dir, spec, library, gpu_arch,
+                backups, _write_manifest, _ast,
+            )
 
     except Exception:
         _restore_kernel_patches(backups, lock_fd)
@@ -573,12 +680,12 @@ def _verify_patched_kernels(
     For each patched module:
       1. Verify it imports without error
       2. If a testcase.py exists in the corresponding task dir, run it
+      3. Run the library's own test suite via ground_truth MANUAL_REGISTRY
 
     Returns list of installed paths that failed verification (already rolled back).
     """
     import importlib
 
-    # Build reverse map from module path → (module_name, kernel_spec) across all libraries
     _MODULE_TO_SPEC: dict[str, str] = {}
     for kspec, lib_map in _KERNEL_SPEC_TO_MODULE.items():
         for _lib, mod_name in lib_map.items():
@@ -598,6 +705,24 @@ def _verify_patched_kernels(
             except (ModuleNotFoundError, ValueError):
                 continue
 
+        # Fallback: derive module name from filesystem path when static map misses
+        if module_name is None:
+            parts = installed_path.parts
+            sp_idx = next(
+                (i for i, p in enumerate(parts) if p == "site-packages"), None
+            )
+            if sp_idx is not None and installed_path.suffix == ".py":
+                mod_parts = list(parts[sp_idx + 1:])
+                if mod_parts:
+                    last = mod_parts[-1]
+                    if last.endswith(".py"):
+                        mod_parts[-1] = last[:-3]
+                    candidate = ".".join(mod_parts)
+                    if candidate.endswith(".__init__"):
+                        candidate = candidate[: -len(".__init__")]
+                    module_name = candidate
+                    print(f"    Derived module name: {module_name} (from path)")
+
         # 1. Import check
         if module_name:
             try:
@@ -613,7 +738,8 @@ def _verify_patched_kernels(
                 failed.append(installed_path)
                 continue
 
-        # 2. Testcase check
+        # 2. Testcase check (from task dir)
+        testcase_ran = False
         if hasattr(config, "output_dir"):
             task_id_patterns = [
                 f"workload__vllm__{spec_name}",
@@ -635,62 +761,54 @@ def _verify_patched_kernels(
                             _clear_pycache(installed_path)
                             print(f"    Rolled back: {installed_path}")
                             failed.append(installed_path)
+                            testcase_ran = True
                         else:
                             print(f"    VERIFIED testcase: {spec_name}")
+                            testcase_ran = True
                     except subprocess.TimeoutExpired:
                         print(f"    TIMEOUT testcase for {spec_name}")
                         shutil.copy2(backup_path, installed_path)
                         _clear_pycache(installed_path)
                         failed.append(installed_path)
+                        testcase_ran = True
                     break
 
+        if installed_path in failed:
+            continue
+
+        # 3. Library test verification via ground_truth MANUAL_REGISTRY
+        gt_spec = get_ground_truth_spec(spec_name)
+        if gt_spec and gt_spec.unit_test_command and gt_spec.source_library:
+            working_dir = REPO_ROOT / "tools" / "rocm" / gt_spec.source_library
+            if working_dir.is_dir():
+                print(f"    Running library test for {spec_name}: {gt_spec.unit_test_command}")
+                try:
+                    lib_result = subprocess.run(
+                        gt_spec.unit_test_command,
+                        shell=True,
+                        cwd=str(working_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                    )
+                    if lib_result.returncode != 0:
+                        print(f"    FAILED library test for {spec_name} "
+                              f"(exit {lib_result.returncode}): {lib_result.stderr[:300]}")
+                        shutil.copy2(backup_path, installed_path)
+                        _clear_pycache(installed_path)
+                        print(f"    Rolled back: {installed_path}")
+                        failed.append(installed_path)
+                    else:
+                        print(f"    VERIFIED library test: {spec_name}")
+                except subprocess.TimeoutExpired:
+                    print(f"    TIMEOUT library test for {spec_name} (180s)")
+                    shutil.copy2(backup_path, installed_path)
+                    _clear_pycache(installed_path)
+                    failed.append(installed_path)
+                except Exception as e:
+                    print(f"    WARNING: library test error for {spec_name}: {e}")
+
     return failed
-
-
-def _auto_correctness_check(installed_path: Path, backup_path: Path, module_name: str) -> bool:
-    """Best-effort numerical correctness check when no testcase.py exists.
-
-    Imports the module, calls known entry points with random inputs, and
-    compares baseline vs patched outputs. Returns True if outputs match or
-    if auto-detection fails gracefully.
-    """
-    try:
-        import importlib
-        import torch
-
-        # Restore baseline temporarily
-        shutil.copy2(backup_path, installed_path)
-        _clear_pycache(installed_path)
-        importlib.invalidate_caches()
-        baseline_mod = importlib.import_module(module_name)
-        baseline_mod = importlib.reload(baseline_mod)
-
-        # Find callable entry points (functions with 'kernel' or 'forward' in name)
-        entry_points = []
-        for attr_name in dir(baseline_mod):
-            if attr_name.startswith("_"):
-                continue
-            obj = getattr(baseline_mod, attr_name, None)
-            if callable(obj) and any(kw in attr_name.lower()
-                                      for kw in ("kernel", "forward", "fn")):
-                entry_points.append(attr_name)
-
-        if not entry_points:
-            # Can't auto-detect — skip gracefully
-            shutil.copy2(backup_path.with_suffix(""), installed_path)
-            return True
-
-        # Restore patched version
-        patched_source = installed_path.with_suffix(installed_path.suffix + ".patched_tmp")
-        shutil.copy2(backup_path, installed_path)  # baseline active
-        # We already have backup_path pointing to original, installed_path is baseline
-        # This is too complex for reliable auto-detection — skip gracefully
-        print(f"    Auto-correctness: skipped for {module_name} (complex entry point detection)")
-        return True
-
-    except Exception as e:
-        print(f"    Auto-correctness: error for {module_name}: {e}")
-        return True  # Don't block on auto-test failures
 
 
 # ---------------------------------------------------------------------------
@@ -977,6 +1095,64 @@ def _cleanup_stale_tmp(max_age_hours: float = 4.0, prefixes: tuple = ("magpie_be
         print(f"  [cleanup] Could not scan /tmp: {e}")
 
 
+_INFERENCEX_CHECKED = False
+
+
+def _ensure_inferencex_path(benchmark_config_path: str) -> None:
+    """Ensure the benchmark YAML has a valid inferencex_path.
+
+    Magpie's default falls back to /root/workspace/InferenceX (a Docker-only
+    path) when the config omits inferencex_path.  This auto-detects InferenceX
+    relative to MAGPIE_ROOT and injects it into the config YAML so users don't
+    have to configure it manually.  Runs at most once per process.
+    """
+    global _INFERENCEX_CHECKED
+    if _INFERENCEX_CHECKED:
+        return
+    _INFERENCEX_CHECKED = True
+
+    cfg_path = Path(benchmark_config_path)
+    if not cfg_path.exists():
+        return
+
+    with open(cfg_path) as f:
+        data = yaml.safe_load(f) or {}
+    bench = data.get("benchmark", data)
+
+    existing = bench.get("inferencex_path", "")
+    if existing and existing != "/root/workspace/InferenceX" and Path(existing).exists():
+        return
+
+    magpie_root = os.environ.get("MAGPIE_ROOT", "")
+    candidates = [
+        Path(magpie_root) / "InferenceX" if magpie_root else None,
+        REPO_ROOT.parent / "Magpie" / "InferenceX",
+        Path.home() / "InferenceX",
+    ]
+    resolved: Optional[Path] = None
+    for cand in candidates:
+        if cand and cand.is_dir():
+            resolved = cand
+            break
+
+    if not resolved:
+        if magpie_root:
+            print(f"  [auto-config] InferenceX not found. Clone it manually:\n"
+                  f"    git clone https://github.com/SemiAnalysisAI/InferenceX.git "
+                  f"{Path(magpie_root) / 'InferenceX'}")
+        return
+
+    # Update the in-memory YAML data and write it back properly
+    if "benchmark" in data:
+        data["benchmark"]["inferencex_path"] = str(resolved)
+    else:
+        data["inferencex_path"] = str(resolved)
+
+    with open(cfg_path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
+    print(f"  [auto-config] Set inferencex_path={resolved}")
+
+
 def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> dict:
     """Run benchmark N times and return result with averaged throughput + statistics.
 
@@ -985,6 +1161,7 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
     """
     import copy as _copy
 
+    _ensure_inferencex_path(config.benchmark_config)
     _cleanup_stale_tmp()
     gpu_health = _check_gpu_health()
 
@@ -1622,6 +1799,16 @@ def _fixup_patched_imports(filepath: Path, library: str = "aiter") -> None:
         filepath.write_text(text)
 
 
+_AITER_OPTIONAL_IMPORTS = {
+    "aiter.jit_config",
+    "aiter.aiter_device",
+    "aiter.test_common",
+    "aiter.test_utils",
+    "aiter.ops.triton.utils.logger",
+    "aiter.ops.triton.utils.testing",
+}
+
+
 def _fixup_aiter_imports_impl(text: str, filepath: Path, _re) -> str:
     """Aiter-specific import fixups."""
     fpath_str = str(filepath.resolve())
@@ -1632,19 +1819,28 @@ def _fixup_aiter_imports_impl(text: str, filepath: Path, _re) -> str:
     else:
         parts = ()
 
-    def _resolve_relative(match: _re.Match) -> str:
-        dots = match.group(1)
-        rest = match.group(2)
-        levels = len(dots)
-        if levels <= len(parts):
-            prefix = ".".join(["aiter"] + list(parts[:len(parts) - levels]))
-        else:
-            prefix = "aiter"
-        return f"from {prefix}.{rest}"
+    def _pkg_prefix(ndots: int) -> str:
+        """Map dot count to package prefix: . = current, .. = parent, etc.
+        Aiter parts are relative to the inner aiter/ so we prepend 'aiter'.
+        """
+        up = ndots - 1
+        keep = len(parts) - up
+        if keep >= 1:
+            return ".".join(["aiter"] + list(parts[:keep]))
+        return "aiter"
 
+    # Handle bare `from . import foo` FIRST
     text = _re.sub(
-        r'^from\s+(\.{1,})([\w.]+)\s+import',
-        lambda m: _resolve_relative(m) + " import",
+        r'^from\s+(\.{1,})\s+import',
+        lambda m: f"from {_pkg_prefix(len(m.group(1)))} import",
+        text,
+        flags=_re.MULTILINE,
+    )
+
+    # Handle `from .foo import bar` (require word char after dots)
+    text = _re.sub(
+        r'^from\s+(\.{1,})([\w][\w.]*)\s+import',
+        lambda m: f"from {_pkg_prefix(len(m.group(1)))}.{m.group(2)} import",
         text,
         flags=_re.MULTILINE,
     )
@@ -1668,16 +1864,21 @@ def _fixup_aiter_imports_impl(text: str, filepath: Path, _re) -> str:
             text,
             flags=_re.MULTILINE,
         )
-    for pat in [
-        r'^(from\s+aiter\s+import\s+.+)$',
-        r'^(import\s+aiter\s*)$',
-    ]:
-        text = _re.sub(
-            pat,
-            r'try:\n    \1\nexcept ImportError:\n    pass',
-            text,
-            flags=_re.MULTILINE,
-        )
+
+    # Only wrap known-optional aiter imports in try/except, not all of them
+    def _wrap_if_optional(match: _re.Match) -> str:
+        line = match.group(0)
+        for opt_mod in _AITER_OPTIONAL_IMPORTS:
+            if opt_mod in line:
+                return f"try:\n    {line}\nexcept ImportError:\n    pass"
+        return line
+
+    text = _re.sub(
+        r'^(?:from\s+aiter\s+import\s+.+|import\s+aiter\S*)$',
+        _wrap_if_optional,
+        text,
+        flags=_re.MULTILINE,
+    )
     return text
 
 
@@ -1687,23 +1888,30 @@ def _fixup_vllm_imports_impl(text: str, filepath: Path, _re) -> str:
     vllm_idx = fpath_str.find("/vllm/")
     if vllm_idx >= 0:
         after = fpath_str[vllm_idx + 1:]
-        parts = Path(after).parent.parts  # e.g. ('vllm', 'v1', 'attention', 'ops')
+        parts = Path(after).parent.parts  # e.g. ('vllm', 'v1', 'attention')
     else:
         parts = ()
 
-    def _resolve_relative(match: _re.Match) -> str:
-        dots = match.group(1)
-        rest = match.group(2)
-        levels = len(dots)
-        if levels <= len(parts):
-            prefix = ".".join(parts[:len(parts) - levels])
-        else:
-            prefix = "vllm"
-        return f"from {prefix}.{rest}"
+    def _pkg_prefix(ndots: int) -> str:
+        """Map dot count to package prefix: . = current, .. = parent, etc."""
+        up = ndots - 1
+        keep = len(parts) - up
+        if keep >= 1:
+            return ".".join(parts[:keep])
+        return "vllm"
 
+    # Handle bare `from . import foo` FIRST
     text = _re.sub(
-        r'^from\s+(\.{1,})([\w.]+)\s+import',
-        lambda m: _resolve_relative(m) + " import",
+        r'^from\s+(\.{1,})\s+import',
+        lambda m: f"from {_pkg_prefix(len(m.group(1)))} import",
+        text,
+        flags=_re.MULTILINE,
+    )
+
+    # Handle `from .foo import bar` (require word char after dots)
+    text = _re.sub(
+        r'^from\s+(\.{1,})([\w][\w.]*)\s+import',
+        lambda m: f"from {_pkg_prefix(len(m.group(1)))}.{m.group(2)} import",
         text,
         flags=_re.MULTILINE,
     )
@@ -1720,19 +1928,25 @@ def _fixup_sglang_imports_impl(text: str, filepath: Path, _re) -> str:
     else:
         parts = ()
 
-    def _resolve_relative(match: _re.Match) -> str:
-        dots = match.group(1)
-        rest = match.group(2)
-        levels = len(dots)
-        if levels <= len(parts):
-            prefix = ".".join(parts[:len(parts) - levels])
-        else:
-            prefix = "sglang"
-        return f"from {prefix}.{rest}"
+    def _pkg_prefix(ndots: int) -> str:
+        up = ndots - 1
+        keep = len(parts) - up
+        if keep >= 1:
+            return ".".join(parts[:keep])
+        return "sglang"
 
+    # Handle bare `from . import foo` FIRST
     text = _re.sub(
-        r'^from\s+(\.{1,})([\w.]+)\s+import',
-        lambda m: _resolve_relative(m) + " import",
+        r'^from\s+(\.{1,})\s+import',
+        lambda m: f"from {_pkg_prefix(len(m.group(1)))} import",
+        text,
+        flags=_re.MULTILINE,
+    )
+
+    # Handle `from .foo import bar` (require word char after dots)
+    text = _re.sub(
+        r'^from\s+(\.{1,})([\w][\w.]*)\s+import',
+        lambda m: f"from {_pkg_prefix(len(m.group(1)))}.{m.group(2)} import",
         text,
         flags=_re.MULTILINE,
     )
@@ -1829,7 +2043,6 @@ def _create_task_config(
 
     If no local baseline.py exists, creates a minimal one that copies the
     original source and adds a __main__ block for standalone execution.
-    Also generates a testcase.py for allclose correctness checking.
     """
     spec = kernel.matched_kernel_spec or "unknown"
     ext = ".py" if kernel.category == "triton" else ".hip"
@@ -1855,31 +2068,32 @@ def _create_task_config(
 
     kernel_python = getattr(config, "kernel_python", "") or _detect_kernel_python()
 
-    # Generate testcase.py for allclose correctness checking
-    correctness_cmd = f"{kernel_python} solution{ext}"
-    if ext == ".py" and baseline_path:
-        model_cfg = _load_model_config(benchmark_config) if benchmark_config else {}
-        if model_cfg:
-            resolved_baseline = Path(baseline_path)
-            if not resolved_baseline.is_absolute():
-                resolved_baseline = (task_dir / baseline_path).resolve()
-            try:
-                tc_path = generate_testcase(
-                    task_dir=task_dir,
-                    baseline_path=resolved_baseline,
-                    kernel_spec=spec,
-                    model_config=model_cfg,
-                )
-                correctness_cmd = f"{kernel_python} testcase.py"
-                print(f"    Generated testcase: {tc_path.name}")
-            except Exception as e:
-                print(f"    [warn] Could not generate testcase: {e}")
+    # Ground truth lookup via shared helper
+    gt_spec = get_ground_truth_spec(spec)
+    correctness_cfg, gt_mode = build_correctness_config(
+        gt_spec, rocm_root=REPO_ROOT / "tools" / "rocm",
+    )
+
+    if gt_mode == "pytorch":
+        correctness_cmd = f"{kernel_python} solution{ext}"
+        if gt_spec and gt_spec.pytorch_reference_code:
+            ref_path = task_dir / "reference.py"
+            ref_path.write_text(gt_spec.pytorch_reference_code)
+            if gt_spec.test_shapes_code:
+                shapes_path = task_dir / "test_shapes.py"
+                shapes_path.write_text(gt_spec.test_shapes_code)
+            print(f"    Correctness mode: pytorch (real reference from {gt_spec.source_library}/{gt_spec.source_file})")
+        else:
+            print(f"    Correctness mode: pytorch (baseline-vs-solution, no library reference found)")
+        correctness_cfg["command"] = correctness_cmd
+    else:
+        print(f"    Correctness mode: {gt_mode}")
 
     cfg = {
         "gpu": {"device": 0, "arch": config.gpu_arch},
         "baseline": {"path": baseline_path},
         "optimized": {"path": f"./solution{ext}"},
-        "correctness": {"command": correctness_cmd},
+        "correctness": correctness_cfg,
         "performance": {
             "command": kernel_python,
             "warmup_iterations": 10,
@@ -1890,6 +2104,7 @@ def _create_task_config(
             "framework": config.framework or "vllm",
             "generated_by": "workload_optimizer.py",
             "tamper_protected": True,
+            "correctness_mode": correctness_cfg.get("mode", "pytorch"),
         },
     }
 
@@ -2650,6 +2865,15 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
                           f"removed {len(bad_patches)} bad patch(es)")
                     result_meta = {"_bisect_removed": [str(p) for p in bad_patches]}
                     backups = good_patches
+
+                    # Re-verify surviving patches together after bisection
+                    post_bisect_failed = _verify_patched_kernels(backups, config)
+                    if post_bisect_failed:
+                        for fp in post_bisect_failed:
+                            backups.pop(fp, None)
+                        result_meta["_post_bisect_verify_failed"] = [
+                            str(p) for p in post_bisect_failed
+                        ]
                 else:
                     for fp in list(backups.keys()):
                         shutil.copy2(backups[fp], fp)
@@ -4073,7 +4297,7 @@ def cmd_run(args):
 
 
 def cmd_export_rl(args):
-    """Export scored trajectories to keystone-rl-training format."""
+    """Export scored trajectories to RL training dataset format."""
     from export_rl_dataset import export
     import glob as _glob
 
@@ -4101,6 +4325,701 @@ def cmd_export_rl(args):
         gpu_arch=args.gpu_arch,
     )
     print(f"\nExport complete: {summary}")
+
+
+# ---------------------------------------------------------------------------
+# Standalone kernel optimization / grading (no E2E pipeline required)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KernelStandaloneDefinition:
+    """Everything needed to optimize or grade a single kernel standalone."""
+    task_id: str = ""
+    kernel_path: str = ""
+    kernel_type: str = "triton"
+    kernel_name: str = ""
+    description: str = ""
+    gpu_arch: str = "gfx950"
+    framework: str = ""
+    solution_path: str = ""
+    ground_truth: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.task_id:
+            stem = Path(self.kernel_path).stem if self.kernel_path else "kernel"
+            self.task_id = f"standalone__{stem}"
+        if not self.kernel_name and self.kernel_path:
+            self.kernel_name = Path(self.kernel_path).stem
+
+    @property
+    def gt_mode(self) -> str:
+        return self.ground_truth.get("mode", "pytorch")
+
+
+_STANDALONE_TESTCASE_TEMPLATE = '''\
+#!/usr/bin/env python3
+"""Correctness testcase: compare solution vs real library PyTorch reference."""
+import importlib.util, os, sys, torch
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+ATOL, RTOL = 1e-3, 1e-3
+
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+def _find_fn(mod):
+    for n in ("forward", "baseline_fn", "kernel_fn"):
+        fn = getattr(mod, n, None)
+        if callable(fn):
+            return fn
+    for n in dir(mod):
+        if not n.startswith("_"):
+            obj = getattr(mod, n)
+            if callable(obj) and not isinstance(obj, type):
+                return obj
+    return None
+
+ref_mod = _load(os.path.join(_DIR, "reference.py"), "ref")
+sol_mod = _load(os.path.join(_DIR, "{sol_filename}"), "sol")
+
+ref_fn = _find_fn(ref_mod)
+sol_fn = _find_fn(sol_mod)
+
+try:
+    shapes_mod = _load(os.path.join(_DIR, "test_shapes.py"), "shapes")
+    test_inputs = shapes_mod.get_test_inputs()
+except Exception:
+    test_inputs = None
+
+if test_inputs is None:
+    import inspect
+    sig = inspect.signature(ref_fn)
+    nparams = len([p for p in sig.parameters.values()
+                   if p.default is inspect.Parameter.empty])
+    if nparams <= 1:
+        test_inputs = [(torch.randn(256, 4096, dtype=torch.float16, device="cuda"),)]
+    elif nparams == 2:
+        test_inputs = [(torch.randn(256, 4096, dtype=torch.float16, device="cuda"),
+                        torch.randn(4096, dtype=torch.float16, device="cuda"))]
+    else:
+        test_inputs = [(torch.randn(256, 4096, dtype=torch.float16, device="cuda"),) * nparams]
+
+all_ok = True
+for i, inputs in enumerate(test_inputs):
+    if not isinstance(inputs, (tuple, list)):
+        inputs = (inputs,)
+    with torch.no_grad():
+        ref_out = ref_fn(*inputs)
+        sol_out = sol_fn(*inputs)
+    if isinstance(ref_out, (tuple, list)):
+        ref_out = ref_out[0]
+    if isinstance(sol_out, (tuple, list)):
+        sol_out = sol_out[0]
+    if torch.allclose(ref_out.float(), sol_out.float(), atol=ATOL, rtol=RTOL):
+        md = (ref_out.float() - sol_out.float()).abs().max().item()
+        print(f"PASS [shape {{i}}]: max_diff={{md:.6e}}")
+    else:
+        md = (ref_out.float() - sol_out.float()).abs().max().item()
+        print(f"FAIL [shape {{i}}]: max_diff={{md:.6e}}")
+        all_ok = False
+
+if all_ok:
+    print("\\nAll correctness checks PASSED")
+    sys.exit(0)
+else:
+    print("\\nSome correctness checks FAILED")
+    sys.exit(1)
+'''
+
+
+def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
+    """Build KernelStandaloneDefinition from --kernel-spec YAML or CLI args."""
+    spec_path = getattr(args, "kernel_spec", None)
+
+    if spec_path:
+        with open(spec_path) as f:
+            raw = yaml.safe_load(f)
+        return KernelStandaloneDefinition(
+            task_id=raw.get("task_id", ""),
+            kernel_path=raw.get("kernel_path", ""),
+            kernel_type=raw.get("kernel_type", "triton"),
+            kernel_name=raw.get("kernel_name", ""),
+            description=raw.get("description", ""),
+            gpu_arch=raw.get("gpu_arch", getattr(args, "gpu", "gfx950")),
+            framework=raw.get("framework", ""),
+            solution_path=raw.get("solution_path", "") or getattr(args, "solution", "") or "",
+            ground_truth=raw.get("ground_truth", {}),
+        )
+
+    kernel_path = getattr(args, "kernel", "")
+    if not kernel_path:
+        raise ValueError("Either --kernel-spec or --kernel must be provided")
+
+    corr_mode = getattr(args, "correctness_mode", "pytorch")
+    gt: dict = {"mode": corr_mode}
+
+    if corr_mode == "pytorch":
+        ref_path = getattr(args, "reference", "")
+        if ref_path and Path(ref_path).exists():
+            gt["pytorch_reference_code"] = Path(ref_path).read_text()
+        shapes_path = getattr(args, "test_shapes", "")
+        if shapes_path and Path(shapes_path).exists():
+            gt["test_shapes_code"] = Path(shapes_path).read_text()
+        # Auto-enrich from MANUAL_REGISTRY if no explicit reference was given
+        if not gt.get("pytorch_reference_code"):
+            kname = getattr(args, "kernel_name", "")
+            if kname and get_ground_truth_spec is not None:
+                gt_spec = get_ground_truth_spec(kname)
+                if gt_spec and gt_spec.mode == "pytorch" and gt_spec.pytorch_reference_code:
+                    gt["pytorch_reference_code"] = gt_spec.pytorch_reference_code
+                    if gt_spec.test_shapes_code:
+                        gt["test_shapes_code"] = gt_spec.test_shapes_code
+                    print(f"    Auto-discovered PyTorch reference for '{kname}' from {gt_spec.source_library}")
+    elif corr_mode == "library_test":
+        gt["unit_test_command"] = getattr(args, "test_cmd", "")
+        gt["repo_url"] = getattr(args, "repo_url", "")
+        gt["working_directory"] = getattr(args, "working_directory", "")
+    elif corr_mode == "accordo":
+        acc_path = getattr(args, "accordo_config", "")
+        if acc_path and Path(acc_path).exists():
+            with open(acc_path) as f:
+                gt["accordo_config"] = yaml.safe_load(f)
+
+    return KernelStandaloneDefinition(
+        kernel_path=kernel_path,
+        kernel_type=getattr(args, "kernel_type", "triton"),
+        kernel_name=getattr(args, "kernel_name", ""),
+        description=getattr(args, "description", ""),
+        gpu_arch=getattr(args, "gpu", "gfx950"),
+        framework=getattr(args, "framework", ""),
+        solution_path=getattr(args, "solution", "") or "",
+        ground_truth=gt,
+    )
+
+
+def _create_standalone_task_config(
+    task_dir: Path,
+    kdef: KernelStandaloneDefinition,
+) -> Path:
+    """Create config.yaml for a standalone kernel task using ground truth mode."""
+    from ground_truth import GroundTruthSpec
+
+    kernel_python = _detect_kernel_python()
+    ext = ".py" if kdef.kernel_type in ("triton", "pytorch") else ".hip"
+    gt = kdef.ground_truth
+
+    baseline_path = f"./baseline{ext}"
+
+    # Build a temporary GroundTruthSpec so we can use the shared helper
+    tmp_spec = GroundTruthSpec(
+        kernel_type=kdef.kernel_name or kdef.kernel_type,
+        mode=gt.get("mode", "pytorch"),
+        pytorch_reference_code=gt.get("pytorch_reference_code", ""),
+        test_shapes_code=gt.get("test_shapes_code", ""),
+        unit_test_command=gt.get("unit_test_command", ""),
+        repo_url=gt.get("repo_url", ""),
+        accordo_config=gt.get("accordo_config", {}),
+        source_library=gt.get("source_library", ""),
+        source_file=gt.get("source_file", ""),
+    )
+    # For standalone, working_directory may come from CLI args directly
+    correctness_cfg, gt_mode = build_correctness_config(tmp_spec)
+    if gt_mode == "library_test" and gt.get("working_directory"):
+        correctness_cfg["working_directory"] = gt["working_directory"]
+
+    if gt_mode == "pytorch":
+        correctness_cmd = f"{kernel_python} solution{ext}"
+        ref_code = gt.get("pytorch_reference_code", "")
+        shapes_code = gt.get("test_shapes_code", "")
+        if ref_code:
+            ref_path = task_dir / "reference.py"
+            ref_preamble = "import torch\nimport math\n\n" if "torch" in ref_code and "import torch" not in ref_code else ""
+            ref_path.write_text(ref_preamble + ref_code)
+            if shapes_code:
+                shapes_path = task_dir / "test_shapes.py"
+                shapes_path.write_text(shapes_code)
+            tc_path = task_dir / "testcase.py"
+            sol_filename = f"solution{ext}"
+            tc_path.write_text(
+                _STANDALONE_TESTCASE_TEMPLATE.format(sol_filename=sol_filename)
+            )
+            correctness_cmd = f"{kernel_python} testcase.py"
+            print(f"    Generated testcase from real library reference: {tc_path.name}")
+        else:
+            # No real pytorch reference available -- do NOT generate synthetic code.
+            # Fall back to baseline-vs-solution comparison via Magpie.
+            print(f"    Correctness mode: pytorch (baseline-vs-solution, no library reference found)")
+
+        correctness_cfg["command"] = correctness_cmd
+
+    # Hash pipeline-generated correctness files so the grader can detect
+    # if the agent tampered with them (testcase.py, reference.py, etc.).
+    protected_hashes: dict[str, str] = {}
+    for fname in ("testcase.py", "reference.py", "test_shapes.py"):
+        fpath = task_dir / fname
+        if fpath.exists():
+            protected_hashes[fname] = hashlib.sha256(fpath.read_bytes()).hexdigest()
+
+    cfg = {
+        "gpu": {"device": 0, "arch": kdef.gpu_arch},
+        "baseline": {"path": baseline_path},
+        "optimized": {"path": f"./solution{ext}"},
+        "correctness": correctness_cfg,
+        "performance": {
+            "command": kernel_python,
+            "warmup_iterations": 10,
+            "iterations": 100,
+        },
+        "_pipeline_metadata": {
+            "kernel_type": kdef.kernel_name or kdef.kernel_type,
+            "framework": kdef.framework or "standalone",
+            "generated_by": "workload_optimizer.py:standalone",
+            "tamper_protected": True,
+            "correctness_mode": gt_mode,
+            "protected_file_hashes": protected_hashes,
+        },
+    }
+
+    config_path = task_dir / "config.yaml"
+    with open(config_path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+
+    return config_path
+
+
+def _build_standalone_kernel_prompt(
+    kdef: KernelStandaloneDefinition,
+    task_dir: Path,
+) -> str:
+    """Build an optimization prompt from a standalone kernel definition.
+
+    Works without profiler data, BottleneckKernel, or benchmark_config.
+    """
+    kernel_source = ""
+    baseline = task_dir / "baseline.py"
+    if not baseline.exists():
+        baseline = task_dir / "baseline.hip"
+    if baseline.exists():
+        kernel_source = _read_source_code(str(baseline))
+
+    spec = kdef.kernel_name or "kernel"
+    gpu_arch = kdef.gpu_arch or DEFAULT_TARGET
+
+    # Try to use the rich prompt system if the kernel matches a known spec
+    rich_prompt = ""
+    if spec in KERNEL_MAP:
+        rich_prompt = _try_build_rich_prompt(
+            spec, "standalone", kdef.framework or "vllm", gpu_arch, "aiter",
+        )
+
+    multi_strategy = _build_multi_strategy_block(spec) if spec in KERNEL_MAP else ""
+
+    arch_desc = ARCH_MAP.get(gpu_arch, "")
+    arch_section = f"## Target Architecture: {gpu_arch}\n{arch_desc}\n" if arch_desc else ""
+
+    gt = kdef.ground_truth
+    gt_mode = gt.get("mode", "pytorch")
+    correctness_section = f"**Correctness mode:** {gt_mode}\n"
+    if gt_mode == "pytorch":
+        if gt.get("pytorch_reference_code"):
+            correctness_section += f"""
+The PyTorch reference implementation is in `{task_dir}/reference.py`.
+Your solution must produce outputs matching this reference within tolerance (atol=1e-3, rtol=1e-3).
+Run `mcp__magpie__compare` with the config.yaml to validate correctness and measure speedup.
+"""
+        else:
+            correctness_section += f"""
+Correctness is checked by comparing your solution output against the baseline using torch.allclose.
+Use `mcp__source_finder__find_kernel_source` to locate the PyTorch reference implementation if needed.
+Run `mcp__magpie__compare` with the config.yaml to validate correctness and measure speedup.
+"""
+    elif gt_mode == "library_test":
+        correctness_section += f"""
+Correctness is verified by the library test suite:
+```
+{gt.get('unit_test_command', '')}
+```
+Your solution must pass **all** tests in this suite. The test command is run with your
+solution directory on PYTHONPATH, so your `solution.py` is importable during tests.
+After correctness passes, `mcp__magpie__compare` measures speedup.
+"""
+    elif gt_mode == "accordo":
+        correctness_section += """
+Correctness is verified at the HSA runtime level using Accordo.
+Your optimized binary must produce GPU buffer outputs matching the reference binary
+within the configured tolerance. This is for HIP/C++ kernels where source-level
+comparison is not feasible.
+"""
+
+    # Build skill recommendations based on kernel type
+    skill_recommendations = []
+    if kdef.kernel_type == "triton":
+        skill_recommendations = [
+            "tools/skills/triton-kernel-optimization/SKILL.md",
+            "tools/skills/triton-kernel-reflection-prompts/SKILL.md",
+        ]
+    elif kdef.kernel_type == "hip":
+        skill_recommendations = [
+            "tools/skills/hip-kernel-optimization/SKILL.md",
+            "tools/skills/mi300-hip-programming-insights/SKILL.md",
+        ]
+    elif kdef.kernel_type == "pytorch":
+        skill_recommendations = [
+            "tools/skills/pytorch-kernel-optimization/SKILL.md",
+        ]
+    skill_recommendations += [
+        "tools/skills/gpu-architecture-fundamentals/SKILL.md",
+        "tools/skills/mi300-cdna3-architecture/SKILL.md",
+    ]
+    skills_block = "\n".join(f"   - `{s}`" for s in skill_recommendations)
+
+    sol_ext = "py" if kdef.kernel_type != "hip" else "hip"
+
+    prompt = textwrap.dedent(f"""\
+# Kernel Optimization Task: {kdef.kernel_name or kdef.kernel_type}
+
+{kdef.description or f"Optimize the {kdef.kernel_type} kernel for AMD {gpu_arch}."}
+
+{arch_section}
+
+## Baseline Kernel
+
+**Type:** {kdef.kernel_type}
+**Framework:** {kdef.framework or 'standalone'}
+**Task directory:** `{task_dir}`
+
+```{'python' if kdef.kernel_type != 'hip' else 'cpp'}
+{kernel_source or '(no source available — read baseline from task directory)'}
+```
+
+{correctness_section}
+
+{multi_strategy}
+
+## Step-by-Step Optimization Process
+
+### Step 1: Understand the kernel
+Read the baseline source above. Identify the computational pattern (GEMM, attention,
+elementwise, reduction, MoE dispatch, etc.).
+
+### Step 2: Read relevant skills
+Before optimizing, read the skill files for domain knowledge:
+{skills_block}
+
+### Step 3: Use MCP tools for research
+
+**Find reference implementations (any library):**
+- Call `mcp__source_finder__find_kernel_source` with the kernel name to find implementations
+  across all ROCm libraries (aiter, CK, vLLM, MIOpen, hipBLASLt, sglang, etc.)
+- Call `mcp__source_finder__identify_kernel_origin` to determine which library this kernel
+  comes from and find alternative implementations
+- Call `mcp__source_finder__find_ck_template` if a Composable Kernel template exists
+
+**Get optimization patterns:**
+- Call `mcp__rag_server__get_optimization_playbook` for a step-by-step optimization plan
+  specific to this kernel type
+- Call `mcp__rag_server__search_kernel_optimization` for tiling, vectorization, fusion,
+  and other optimization patterns
+- Call `mcp__rag_server__get_optimization_snippet` for ready-to-use code snippets
+
+**Get architecture-specific hints:**
+- Call `mcp__gpu_info__get_arch_optimization_hints` for {gpu_arch}-specific tuning guidance
+  (MFMA sizes, LDS capacity, wavefront occupancy, etc.)
+- Call `mcp__gpu_info__get_gpu_specs` for memory bandwidth, compute throughput, cache sizes
+
+**Check fusion opportunities:**
+- Call `mcp__fusion_advisor__detect_fusion_opportunities` to find fusible operations
+- Call `mcp__fusion_advisor__generate_fused_kernel` to generate a fused implementation
+
+### Step 4: Profile and analyze
+- Call `mcp__kernel_perf__roofline_analysis` to determine if the kernel is memory-bound
+  or compute-bound — this determines the optimization strategy
+- Call `mcp__kernel_perf__profile_kernel` for execution time, occupancy, memory throughput
+
+### Step 5: Implement optimizations
+Based on the research above, implement MULTIPLE optimization strategies. Common approaches:
+- **Memory-bound kernels:** Improve coalescing, reduce global memory traffic, use LDS tiling
+- **Compute-bound kernels:** Increase MFMA utilization, reduce register pressure, improve occupancy
+- **Both:** Fuse adjacent operations, use vectorized loads/stores, optimize block/grid sizes
+
+### Step 6: Write solution and validate
+- Write the optimized kernel to: `{task_dir}/solution.{sol_ext}`
+- Call `mcp__magpie__compare` with `{task_dir}/config.yaml` to validate correctness and measure speedup
+- The config.yaml already has baseline path and correctness settings configured
+- If correctness fails, iterate: read the error, adjust the solution, re-validate
+
+### Step 7: Iterate for best speedup
+- Try at least 2-3 different optimization strategies
+- Keep the version with the highest speedup that passes correctness
+- Save the best solution to `{task_dir}/solution.{sol_ext}`
+
+## IMPORTANT Constraints
+- Your solution must be functionally equivalent to the baseline (same inputs -> same outputs).
+- Do NOT modify files outside `{task_dir}/`.
+- Do NOT add `if __name__ == "__main__":` blocks with fake benchmarks or `sys.exit(0)`.
+- Focus on real performance improvements, not just code style changes.
+- Include the kernel function with the same signature as the baseline.
+""")
+
+    if rich_prompt:
+        return rich_prompt + "\n\n" + prompt
+    return prompt
+
+
+def cmd_optimize_kernel(args):
+    """Optimize a standalone kernel using an AI agent."""
+    t0 = time.monotonic()
+    kdef = _parse_kernel_spec(args)
+
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(getattr(args, "output_dir", None) or str(results_dir / "output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    task_dir = output_dir / kdef.task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy baseline kernel to task directory
+    ext = ".py" if kdef.kernel_type in ("triton", "pytorch") else ".hip"
+    baseline_dst = task_dir / f"baseline{ext}"
+    if kdef.kernel_path and Path(kdef.kernel_path).exists():
+        shutil.copy2(kdef.kernel_path, baseline_dst)
+        print(f"  Copied baseline: {kdef.kernel_path} -> {baseline_dst.name}")
+    elif not baseline_dst.exists():
+        print(f"  [error] Kernel path does not exist: {kdef.kernel_path}")
+        return
+
+    # Build WorkloadConfig for the agent loop
+    config = WorkloadConfig(
+        max_iterations=getattr(args, "max_iterations", 5),
+        max_turns_per_iter=getattr(args, "max_turns", 25),
+        score_threshold=getattr(args, "score_threshold", 300.0),
+        agent_model=getattr(args, "agent_model", "") or "",
+        agent_version=getattr(args, "agent_version", "v1.0"),
+        agent_backend=getattr(args, "agent_backend", "claude"),
+        framework=kdef.framework,
+        gpu_arch=kdef.gpu_arch,
+        kernel_python=getattr(args, "kernel_python", ""),
+        output_dir=output_dir,
+        results_dir=results_dir,
+        dry_run=getattr(args, "dry_run", False),
+    )
+
+    print(f"\n{'='*60}")
+    print(f"  Standalone Kernel Optimization")
+    print(f"  Task:       {kdef.task_id}")
+    print(f"  Kernel:     {kdef.kernel_name or kdef.kernel_path}")
+    print(f"  Type:       {kdef.kernel_type}")
+    print(f"  Correctness: {kdef.gt_mode}")
+    print(f"  Agent:      {config.agent_backend} ({config.agent_model})")
+    print(f"  Task dir:   {task_dir}")
+    print(f"{'='*60}\n")
+
+    _create_standalone_task_config(task_dir, kdef)
+    prompt = _build_standalone_kernel_prompt(kdef, task_dir)
+
+    best_kr: Optional[KernelResult] = None
+    reflection_prompt = ""
+
+    for iteration in range(1, config.max_iterations + 1):
+        print(f"\n  --- Iteration {iteration}/{config.max_iterations} ---")
+
+        print("  Running agent...")
+        t_iter = time.monotonic()
+        messages, solution_written = _run_agent_iteration(
+            task_dir, prompt, config, iteration, reflection_prompt,
+        )
+        print(f"  Agent completed in {time.monotonic() - t_iter:.1f}s")
+
+        if not solution_written and find_solution(task_dir):
+            solution_written = True
+
+        if not solution_written:
+            print("  Agent did not write a solution.")
+            if iteration < config.max_iterations:
+                time.sleep(min(5 * iteration, 15))
+            continue
+
+        print("  Grading...")
+        kr = grade_task(task_dir, isolate_caches=True, gpu_device=0)
+        print(f"    compiled={kr.compiled} correct={kr.correct} "
+              f"speedup={kr.speedup:.2f}x score={kr.score:.0f}")
+        if kr.error:
+            print(f"    error: {kr.error[:200]}")
+
+        if best_kr is None or kr.score > best_kr.score:
+            best_kr = kr
+            best_sol = find_solution(task_dir)
+            if best_sol:
+                shutil.copy2(best_sol, task_dir / "solution_best.py")
+
+        if kr.score >= config.score_threshold:
+            print(f"  Target reached: score={kr.score:.0f}")
+            break
+
+        reflection_prompt = reflect(
+            kr, task_dir, iteration,
+            kernel_type=kdef.kernel_name or "kernel",
+            target_speedup=config.score_threshold / 100.0,
+            min_speedup=1.05,
+        )
+
+        if not should_continue(kr, iteration, config.max_iterations, config.score_threshold):
+            break
+
+    # Restore best
+    best_snapshot = task_dir / "solution_best.py"
+    if best_snapshot.exists():
+        shutil.copy2(best_snapshot, task_dir / "solution.py")
+
+    elapsed = time.monotonic() - t0
+    print(f"\n{'='*60}")
+    print(f"  Standalone Optimization Complete ({elapsed:.0f}s)")
+    if best_kr:
+        print(f"  compiled={best_kr.compiled} correct={best_kr.correct} "
+              f"speedup={best_kr.speedup:.2f}x score={best_kr.score:.0f}")
+    else:
+        print(f"  No successful grading result.")
+    print(f"  Task dir: {task_dir}")
+    print(f"{'='*60}")
+
+    # Save result summary
+    summary = {
+        "task_id": kdef.task_id,
+        "kernel_path": kdef.kernel_path,
+        "kernel_type": kdef.kernel_type,
+        "kernel_name": kdef.kernel_name,
+        "correctness_mode": kdef.gt_mode,
+        "agent_backend": config.agent_backend,
+        "agent_model": config.agent_model,
+        "compiled": best_kr.compiled if best_kr else False,
+        "correct": best_kr.correct if best_kr else False,
+        "speedup": best_kr.speedup if best_kr else 0.0,
+        "score": best_kr.score if best_kr else 0.0,
+        "elapsed_seconds": round(elapsed, 1),
+    }
+    summary_path = results_dir / "standalone_result.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  Result saved: {summary_path}")
+
+
+def cmd_grade_kernel(args):
+    """Grade an existing baseline + solution pair (no agent)."""
+    t0 = time.monotonic()
+    kdef = _parse_kernel_spec(args)
+
+    results_dir = Path(getattr(args, "results_dir", None) or ".")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(getattr(args, "output_dir", None) or str(results_dir / "output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    task_dir = output_dir / kdef.task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = ".py" if kdef.kernel_type in ("triton", "pytorch") else ".hip"
+
+    # Copy baseline
+    baseline_dst = task_dir / f"baseline{ext}"
+    if kdef.kernel_path and Path(kdef.kernel_path).exists():
+        shutil.copy2(kdef.kernel_path, baseline_dst)
+    elif not baseline_dst.exists():
+        print(f"  [error] Baseline kernel not found: {kdef.kernel_path}")
+        return
+
+    # Copy solution
+    sol_src = kdef.solution_path or getattr(args, "solution", "")
+    if not sol_src:
+        print("  [error] --solution is required for grade-kernel")
+        return
+    sol_dst = task_dir / f"solution{ext}"
+    if Path(sol_src).exists():
+        shutil.copy2(sol_src, sol_dst)
+    else:
+        print(f"  [error] Solution file not found: {sol_src}")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  Standalone Kernel Grading")
+    print(f"  Task:       {kdef.task_id}")
+    print(f"  Baseline:   {kdef.kernel_path}")
+    print(f"  Solution:   {sol_src}")
+    print(f"  Type:       {kdef.kernel_type}")
+    print(f"  Correctness: {kdef.gt_mode}")
+    print(f"{'='*60}\n")
+
+    _create_standalone_task_config(task_dir, kdef)
+
+    print("  Grading...")
+    kr = grade_task(task_dir, isolate_caches=True, gpu_device=0)
+
+    elapsed = time.monotonic() - t0
+    print(f"\n{'='*60}")
+    print(f"  Grading Complete ({elapsed:.1f}s)")
+    print(f"  compiled={kr.compiled}  correct={kr.correct}  "
+          f"speedup={kr.speedup:.2f}x  score={kr.score:.0f}")
+    if kr.error:
+        print(f"  error: {kr.error[:300]}")
+    print(f"{'='*60}")
+
+    summary = {
+        "task_id": kdef.task_id,
+        "baseline": kdef.kernel_path,
+        "solution": sol_src,
+        "kernel_type": kdef.kernel_type,
+        "correctness_mode": kdef.gt_mode,
+        "compiled": kr.compiled,
+        "correct": kr.correct,
+        "speedup": kr.speedup,
+        "score": kr.score,
+        "error": kr.error or "",
+        "elapsed_seconds": round(elapsed, 1),
+    }
+    summary_path = results_dir / "grade_result.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  Result saved: {summary_path}")
+
+    if getattr(args, "json_output", False):
+        print(json.dumps(summary, indent=2))
+
+
+def _add_kernel_spec_args(parser):
+    """Add --kernel-spec and individual CLI arg alternatives for kernel definitions."""
+    g = parser.add_argument_group("kernel specification")
+    g.add_argument("--kernel-spec", default=None,
+                   help="Path to kernel spec YAML file (full definition)")
+    g.add_argument("--kernel", default="",
+                   help="Path to baseline kernel file (alternative to --kernel-spec)")
+    g.add_argument("--kernel-type", default="triton",
+                   choices=["triton", "hip", "pytorch"],
+                   help="Kernel type: triton, hip, or pytorch (default: triton)")
+    g.add_argument("--kernel-name", default="",
+                   help="Human-readable kernel name (for prompts)")
+    g.add_argument("--description", default="",
+                   help="Description of the kernel for the agent prompt")
+    g.add_argument("--framework", default="",
+                   help="Framework context (vllm, sglang, etc.)")
+
+    c = parser.add_argument_group("correctness definition")
+    c.add_argument("--correctness-mode", default="pytorch",
+                   choices=["pytorch", "library_test", "accordo"],
+                   help="Correctness checking mode (default: pytorch)")
+    c.add_argument("--reference", default="",
+                   help="Path to PyTorch reference implementation file (pytorch mode)")
+    c.add_argument("--test-shapes", default="",
+                   help="Path to test shapes generator file (pytorch mode)")
+    c.add_argument("--test-cmd", default="",
+                   help="Unit test command (library_test mode)")
+    c.add_argument("--repo-url", default="",
+                   help="Repository URL (library_test mode)")
+    c.add_argument("--working-directory", default="",
+                   help="Working directory for library tests (library_test mode)")
+    c.add_argument("--accordo-config", default="",
+                   help="Path to Accordo config YAML (accordo mode)")
 
 
 # ---------------------------------------------------------------------------
@@ -4239,10 +5158,10 @@ def main():
     p.add_argument("--trajectory-store", default="file")
     p.add_argument("--leaderboard", action="store_true")
 
-    # ── export-rl: export trajectories to keystone-rl-training format ─────
+    # ── export-rl: export trajectories to RL training dataset format ──────
     p = subparsers.add_parser(
         "export-rl",
-        help="Export scored trajectories to keystone-rl-training format (tasks.json + optional SFT JSONL)",
+        help="Export scored trajectories to RL training dataset format (tasks.json + optional SFT JSONL)",
     )
     _add_common_args(p)
     p.add_argument("--trajectories-dir", type=str, default=None,
@@ -4257,6 +5176,46 @@ def main():
                    help="Minimum kernel score to include as a task")
     p.add_argument("--gpu-arch", type=str, default="gfx950",
                    help="Target GPU architecture (default: gfx950)")
+
+    # ── optimize-kernel: standalone kernel optimization with agent ─────
+    p = subparsers.add_parser(
+        "optimize-kernel",
+        help="Optimize a standalone kernel using an AI agent (no full pipeline needed)",
+    )
+    p.add_argument("-r", "--results-dir", required=True,
+                   help="Directory for results and artifacts")
+    p.add_argument("--output-dir",
+                   help="Directory for task outputs (default: results-dir/output)")
+    p.add_argument("--gpu", default="gfx950",
+                   help="Target GPU architecture (default: gfx950)")
+    p.add_argument("--kernel-python", default="",
+                   help="Python with torch+triton for kernel execution (auto-detected)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Simulate without GPU or API calls")
+    _add_kernel_spec_args(p)
+    _add_agent_args(p)
+
+    # ── grade-kernel: grade an existing baseline + solution pair ─────
+    p = subparsers.add_parser(
+        "grade-kernel",
+        help="Grade an existing baseline + solution pair (no agent, no pipeline)",
+    )
+    p.add_argument("-r", "--results-dir", default=".",
+                   help="Directory for results (default: current directory)")
+    p.add_argument("--output-dir",
+                   help="Directory for task outputs (default: results-dir/output)")
+    p.add_argument("--gpu", default="gfx950",
+                   help="Target GPU architecture (default: gfx950)")
+    p.add_argument("--kernel-python", default="",
+                   help="Python with torch+triton for kernel execution (auto-detected)")
+    p.add_argument("--dry-run", action="store_true")
+    _add_kernel_spec_args(p)
+    # grade-kernel only: --solution is intentionally NOT in _add_kernel_spec_args
+    # since optimize-kernel does not accept a pre-existing solution.
+    p.add_argument("--solution", default="",
+                   help="Path to the solution file to grade (required unless provided in --kernel-spec)")
+    p.add_argument("--json", dest="json_output", action="store_true",
+                   help="Print result as JSON to stdout")
 
     args = parser.parse_args()
 
@@ -4276,6 +5235,8 @@ def main():
         "report": cmd_report,
         "run": cmd_run,
         "export-rl": cmd_export_rl,
+        "optimize-kernel": cmd_optimize_kernel,
+        "grade-kernel": cmd_grade_kernel,
     }
     handlers[args.command](args)
 

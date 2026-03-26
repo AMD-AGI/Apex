@@ -8,6 +8,7 @@ Magpie installation is required.
 """
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -328,8 +329,10 @@ class TestMagpieBin:
         assert len(result) >= 1
 
     def test_magpie_on_path(self):
-        with patch.object(shutil, "which", return_value="/usr/bin/magpie"):
-            assert _magpie_bin() == ["magpie"]
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MAGPIE_ROOT", None)
+            with patch.object(shutil, "which", return_value="/usr/bin/magpie"):
+                assert _magpie_bin() == ["magpie"]
 
     def test_magpie_not_on_path_uses_local_or_module(self):
         with patch.object(shutil, "which", return_value=None):

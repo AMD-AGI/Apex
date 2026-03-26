@@ -4,13 +4,13 @@
 # GPU required for Magpie compare/benchmark.
 #
 # Build:
-#   docker build -f docker/Dockerfile.grader -t keystone-grader .
+#   docker build -f docker/Dockerfile.grader -t apex-grader .
 #
 # Run:
 #   docker run --rm \
 #     --device=/dev/kfd --device=/dev/dri --group-add video \
 #     -v $(pwd)/output:/workspace/output \
-#     keystone-grader \
+#     apex-grader \
 #     python -m kernel_grader --json
 
 FROM rocm/pytorch:rocm6.3_ubuntu22.04_py3.10_pytorch_release_2.4.0

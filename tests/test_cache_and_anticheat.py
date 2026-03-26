@@ -269,7 +269,7 @@ class TestGenerateConfig:
 
         config = config_generator.generate_config(task_dir, kernel_type="fused_moe")
         assert config["gpu"]["device"] == 0
-        assert config["correctness"]["mode"] == "magpie_builtin"
+        assert config["correctness"]["mode"] in ("pytorch", "library_test", "accordo")
         assert config["performance"]["mode"] == "magpie_builtin"
         assert config["_pipeline_metadata"]["kernel_type"] == "fused_moe"
         assert config["_pipeline_metadata"]["tamper_protected"] is True

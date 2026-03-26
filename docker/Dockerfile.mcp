@@ -4,10 +4,10 @@
 # as background processes. Used as a sidecar in K8s pods.
 #
 # Build:
-#   docker build -f docker/Dockerfile.mcp -t keystone-mcp .
+#   docker build -f docker/Dockerfile.mcp -t apex-mcp .
 #
 # Run:
-#   docker run --rm -v $(pwd)/tools:/workspace/tools keystone-mcp
+#   docker run --rm -v $(pwd)/tools:/workspace/tools apex-mcp
 
 FROM python:3.11-slim
 

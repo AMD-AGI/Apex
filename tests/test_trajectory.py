@@ -99,7 +99,7 @@ class TestFileStore:
         good = store.list_ids({"trajectory_quality": "good"})
         assert len(good) == 1
 
-    def test_export_for_rl(self, tmp_path):
+    def test_export_trajectories_jsonl(self, tmp_path):
         store = FileStore(base_dir=tmp_path)
         r1 = TrajectoryRecord(task_id="a", trajectory_quality="good")
         r2 = TrajectoryRecord(task_id="b", trajectory_quality="bad")
@@ -108,7 +108,7 @@ class TestFileStore:
             store.save(r)
 
         output = tmp_path / "export.jsonl"
-        count = store.export_for_rl(output, quality="good")
+        count = store.export_trajectories_jsonl(output, quality="good")
         assert count == 2
         lines = output.read_text().strip().split("\n")
         assert len(lines) == 2

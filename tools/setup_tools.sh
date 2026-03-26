@@ -107,7 +107,7 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Keystone Tools Setup"
+echo "  Apex Tools Setup"
 if [[ -n "$TARGET" ]]; then
     echo "  Target: $TARGET"
 else

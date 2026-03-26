@@ -1,8 +1,8 @@
 """
 export_rl_dataset.py — Export Apex trajectories to RL fine-tuning dataset.
 
-Converts Apex pipeline trajectories into the keystone-rl-training TaskRow
-schema with 3 ground truth modes (pytorch, library_test, accordo).
+Converts Apex pipeline trajectories into a TaskRow schema with 3 ground
+truth modes (pytorch, library_test, accordo).
 
 Also supports standalone mode: generate tasks directly from discovered
 kernel implementations + ground truth (no trajectories needed).
@@ -341,7 +341,7 @@ def export(
     extra_files: list[Path] | None = None,
     standalone: bool = False,
 ) -> dict:
-    """Export trajectories to keystone-rl-training dataset format.
+    """Export trajectories to RL training dataset format.
 
     Returns dict with counts: tasks_exported, sft_pairs_exported.
     """

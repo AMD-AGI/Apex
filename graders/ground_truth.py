@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import textwrap
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROCM_DIR = REPO_ROOT / "tools" / "rocm"
@@ -371,309 +374,100 @@ def scan_test_commands(
 
 
 # ── Manual registry for core kernel types ────────────────────────────────────
+#
+# Every entry here points to a REAL library test file that contains an actual
+# PyTorch reference function (torch_*, ref_*, reference_*).  Apex never
+# generates synthetic reference code -- it only uses references that already
+# exist in ROCm libraries.
+#
+# For "pytorch" mode entries the ref_function / input_generator names tell the
+# auto-extractor which function to pull from the test file.  The actual source
+# is read lazily via _extract_function_source() at discovery time so it always
+# reflects the latest library code.
 
 MANUAL_REGISTRY: dict[str, GroundTruthSpec] = {}
 
 
+class _RegistryEntry(NamedTuple):
+    kernel_type: str
+    mode: str
+    source_file: str
+    library: str
+    ref_func: str
+    input_func: str
+    test_cmd: str
+    difficulty: int
+    op_type: str
+
+
+_REGISTRY_ENTRIES: list[_RegistryEntry] = [
+    _RegistryEntry("rms_norm",         "pytorch",      "aiter/op_tests/triton_tests/normalization/test_rmsnorm.py",                      "aiter", "torch_rmsnorm",       "generate_rmsnorm_inputs", "",                                                                                 1, "memory_bound"),
+    _RegistryEntry("silu_mul",         "library_test", "aiter/op_tests/triton_tests/test_activation.py",                                 "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/test_activation.py",               1, "memory_bound"),
+    _RegistryEntry("fused_moe",        "pytorch",      "aiter/op_tests/triton_tests/moe/test_moe.py",                                   "aiter", "torch_moe_ref",       "",                        "",                                                                              3, "compute_bound"),
+    _RegistryEntry("flash_attn_prefill","pytorch",     "aiter/op_tests/triton_tests/attention/test_la.py",                               "aiter", "reference_attention", "",                        "",                                                                              3, "memory_bound"),
+    _RegistryEntry("paged_attn_decode","pytorch",      "aiter/op_tests/triton_tests/attention/test_unified_attention.py",                "aiter", "ref_paged_attn",      "",                        "",                                                                              3, "memory_bound"),
+    _RegistryEntry("gemm_bf16",        "library_test", "aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py",                    "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py",   2, "compute_bound"),
+    _RegistryEntry("gemm_w8a8",        "library_test", "aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py",                      "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py",     2, "compute_bound"),
+    _RegistryEntry("rope_embedding",   "pytorch",      "aiter/op_tests/test_rope.py",                                                   "aiter", "ref_rope_sbhd_fwd",   "",                        "",                                                                              2, "memory_bound"),
+    _RegistryEntry("act_quant_fp8",    "library_test", "aiter/op_tests/triton_tests/quant/test_quant.py",                               "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/quant/test_quant.py",              2, "compute_bound"),
+    _RegistryEntry("kv_cache_ops",     "library_test", "aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py",                    "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py",   2, "memory_bound"),
+    _RegistryEntry("all_reduce",       "library_test", "aiter/op_tests/multigpu_tests/test_quick_all_reduce.py",                        "aiter", "",                    "",                        "python -m pytest aiter/op_tests/multigpu_tests/test_quick_all_reduce.py",       2, "memory_bound"),
+    _RegistryEntry("mla_attn",         "pytorch",      "aiter/op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py",    "aiter", "reference_torch",     "",                        "",                                                                              3, "memory_bound"),
+    _RegistryEntry("layernorm",        "library_test", "aiter/op_tests/triton_tests/normalization/test_layernorm.py",                   "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/normalization/test_layernorm.py",  1, "memory_bound"),
+    _RegistryEntry("softmax",          "library_test", "aiter/op_tests/triton_tests/test_softmax.py",                                   "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/test_softmax.py",                  1, "memory_bound"),
+    _RegistryEntry("mla_decode_rope",  "pytorch",      "aiter/op_tests/triton_tests/attention/test_mla_decode_rope.py",                 "aiter", "ref_compute",         "",                        "",                                                                              3, "memory_bound"),
+]
+
+
 def _build_manual_registry() -> None:
-    """Populate MANUAL_REGISTRY with hand-curated specs for the 12 KERNEL_MAP
-    types. These take priority over auto-discovered ones."""
+    """Populate MANUAL_REGISTRY from _REGISTRY_ENTRIES.
 
-    entries = [
-        GroundTruthSpec(
-            kernel_type="rms_norm",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(x, weight, eps=1e-6):
-                    import torch
-                    x_f32 = x.float()
-                    rms = torch.sqrt(torch.mean(x_f32 * x_f32, dim=-1, keepdim=True) + eps)
-                    return (x_f32 / rms * weight.float()).to(x.dtype)
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [(128, 4096), (256, 8192), (512, 4096)]
-                    inputs = []
-                    for M, N in configs:
-                        x = torch.randn(M, N, dtype=torch.float16, device=device)
-                        weight = torch.randn(N, dtype=torch.float16, device=device)
-                        inputs.append((x, weight))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/triton_tests/normalization/test_rmsnorm.py",
-            source_library="aiter",
-            difficulty_level=1,
-            op_type="memory_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="silu_mul",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(x):
-                    import torch
-                    import torch.nn.functional as F
-                    d = x.shape[-1] // 2
-                    return F.silu(x[..., :d]) * x[..., d:]
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [(128, 8192), (256, 16384), (512, 8192)]
-                    inputs = []
-                    for M, N in configs:
-                        x = torch.randn(M, N * 2, dtype=torch.float16, device=device)
-                        inputs.append((x,))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/test_activation.py",
-            source_library="aiter",
-            difficulty_level=1,
-            op_type="memory_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="fused_moe",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(hidden_states, w1, w2, topk_weights, topk_ids):
-                    import torch
-                    import torch.nn.functional as F
-                    B, D = hidden_states.shape
-                    E, _, N = w1.shape
-                    K = topk_ids.shape[1]
-                    out = torch.zeros(B, D, dtype=hidden_states.dtype, device=hidden_states.device)
-                    for i in range(B):
-                        for j in range(K):
-                            eid = topk_ids[i, j].item()
-                            gate = F.silu(hidden_states[i] @ w1[eid].T)
-                            expert_out = gate @ w2[eid].T
-                            out[i] += topk_weights[i, j] * expert_out
-                    return out
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [
-                        (32, 4096, 14336, 8, 2),
-                        (64, 8192, 14336, 16, 4),
-                    ]
-                    inputs = []
-                    for B, D, N, E, K in configs:
-                        hidden = torch.randn(B, D, dtype=torch.float16, device=device)
-                        w1 = torch.randn(E, N, D, dtype=torch.float16, device=device)
-                        w2 = torch.randn(E, D, N, dtype=torch.float16, device=device)
-                        topk_w = torch.softmax(torch.randn(B, K, device=device), dim=-1).half()
-                        topk_ids = torch.randint(0, E, (B, K), device=device)
-                        inputs.append((hidden, w1, w2, topk_w, topk_ids))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/triton_tests/moe/test_moe.py",
-            source_library="aiter",
-            difficulty_level=3,
-            op_type="compute_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="flash_attn_prefill",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(q, k, v, causal=True):
-                    import torch
-                    import torch.nn.functional as F
-                    return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [
-                        (2, 16, 128, 128),
-                        (4, 32, 256, 128),
-                    ]
-                    inputs = []
-                    for B, H, S, D in configs:
-                        q = torch.randn(B, H, S, D, dtype=torch.float16, device=device)
-                        k = torch.randn(B, H, S, D, dtype=torch.float16, device=device)
-                        v = torch.randn(B, H, S, D, dtype=torch.float16, device=device)
-                        inputs.append((q, k, v))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/triton_tests/attention/test_prefill_attention.py",
-            source_library="aiter",
-            difficulty_level=3,
-            op_type="memory_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="paged_attn_decode",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(query, key_cache, value_cache, head_mapping, scale):
-                    import torch
-                    num_heads = query.shape[1]
-                    head_dim = query.shape[2]
-                    outputs = []
-                    for h in range(num_heads):
-                        q = query[:, h, :].unsqueeze(1)
-                        k = key_cache[:, h, :, :]
-                        v = value_cache[:, h, :, :]
-                        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-                        attn = torch.softmax(attn.float(), dim=-1).to(q.dtype)
-                        out = torch.matmul(attn, v)
-                        outputs.append(out.squeeze(1))
-                    return torch.stack(outputs, dim=1)
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [(1, 32, 128, 256), (4, 64, 128, 512)]
-                    inputs = []
-                    for B, H, D, S in configs:
-                        q = torch.randn(B, H, D, dtype=torch.float16, device=device)
-                        k = torch.randn(B, H, S, D, dtype=torch.float16, device=device)
-                        v = torch.randn(B, H, S, D, dtype=torch.float16, device=device)
-                        mapping = torch.arange(H, device=device)
-                        inputs.append((q, k, v, mapping, 1.0 / (D ** 0.5)))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/triton_tests/attention/test_pa_decode.py",
-            source_library="aiter",
-            difficulty_level=3,
-            op_type="memory_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="gemm_bf16",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(a, b):
-                    import torch
-                    return torch.matmul(a, b)
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [(1024, 4096, 4096), (2048, 8192, 4096), (4096, 4096, 8192)]
-                    inputs = []
-                    for M, K, N in configs:
-                        a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-                        b = torch.randn(K, N, dtype=torch.bfloat16, device=device)
-                        inputs.append((a, b))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py",
-            source_library="aiter",
-            difficulty_level=2,
-            op_type="compute_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="gemm_w8a8",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(a, b, a_scale, b_scale):
-                    import torch
-                    return torch.matmul(a.float() * a_scale, b.float() * b_scale)
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [(1024, 4096, 4096), (2048, 8192, 4096)]
-                    inputs = []
-                    for M, K, N in configs:
-                        a = torch.randint(-127, 127, (M, K), dtype=torch.int8, device=device)
-                        b = torch.randint(-127, 127, (K, N), dtype=torch.int8, device=device)
-                        a_s = torch.tensor(0.01, device=device)
-                        b_s = torch.tensor(0.01, device=device)
-                        inputs.append((a, b, a_s, b_s))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py",
-            source_library="aiter",
-            difficulty_level=2,
-            op_type="compute_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="rope_embedding",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(x, cos, sin):
-                    import torch
-                    x1 = x[..., : x.shape[-1] // 2]
-                    x2 = x[..., x.shape[-1] // 2 :]
-                    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [(2, 32, 128, 128), (4, 64, 256, 128)]
-                    inputs = []
-                    for B, H, S, D in configs:
-                        x = torch.randn(B, S, H, D, dtype=torch.float16, device=device)
-                        cos = torch.randn(S, D // 2, dtype=torch.float16, device=device)
-                        sin = torch.randn(S, D // 2, dtype=torch.float16, device=device)
-                        inputs.append((x, cos, sin))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/test_rope.py",
-            source_library="aiter",
-            difficulty_level=2,
-            op_type="memory_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="act_quant_fp8",
-            mode="pytorch",
-            pytorch_reference_code=textwrap.dedent("""\
-                def baseline_fn(x):
-                    import torch
-                    scale = x.abs().max() / 448.0
-                    x_q = (x / scale).clamp(-448, 448).to(torch.float8_e4m3fnuz)
-                    return x_q, scale
-            """).strip(),
-            test_shapes_code=textwrap.dedent("""\
-                def get_test_inputs(device='cuda'):
-                    import torch
-                    configs = [(128, 4096), (256, 8192), (512, 4096)]
-                    inputs = []
-                    for M, N in configs:
-                        x = torch.randn(M, N, dtype=torch.float16, device=device)
-                        inputs.append((x,))
-                    return inputs
-            """).strip(),
-            source_file="aiter/op_tests/triton_tests/quant/test_quant.py",
-            source_library="aiter",
-            difficulty_level=2,
-            op_type="compute_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="kv_cache_ops",
-            mode="library_test",
-            repo_url="https://github.com/ROCm/aiter",
-            unit_test_command="python -m pytest aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py",
-            source_file="aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py",
-            source_library="aiter",
-            difficulty_level=2,
-            op_type="memory_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="all_reduce",
-            mode="library_test",
-            repo_url="https://github.com/ROCm/aiter",
-            unit_test_command="python -m pytest aiter/op_tests/multigpu_tests/test_quick_all_reduce.py",
-            source_file="aiter/op_tests/multigpu_tests/test_quick_all_reduce.py",
-            source_library="aiter",
-            difficulty_level=2,
-            op_type="memory_bound",
-        ),
-        GroundTruthSpec(
-            kernel_type="mla_attn",
-            mode="library_test",
-            repo_url="https://github.com/ROCm/aiter",
-            unit_test_command="python -m pytest aiter/op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py",
-            source_file="aiter/op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py",
-            source_library="aiter",
-            difficulty_level=3,
-            op_type="memory_bound",
-        ),
-    ]
+    For 'pytorch' mode entries, we extract the actual reference function
+    source from the library test file (no synthetic code).  If the file
+    or function cannot be found, we downgrade to 'library_test' mode.
+    """
+    for entry in _REGISTRY_ENTRIES:
+        repo_url = REPO_URLS.get(entry.library, "")
+        mode = entry.mode
+        test_cmd = entry.test_cmd
 
-    for spec in entries:
-        MANUAL_REGISTRY[spec.kernel_type] = spec
+        if mode == "pytorch" and entry.ref_func:
+            filepath = ROCM_DIR / entry.source_file
+            ref_code = _extract_function_source(filepath, entry.ref_func) if filepath.exists() else None
+            inp_code = _extract_function_source(filepath, entry.input_func) if (filepath.exists() and entry.input_func) else None
+
+            if ref_code and len(ref_code.strip()) >= 10:
+                MANUAL_REGISTRY[entry.kernel_type] = GroundTruthSpec(
+                    kernel_type=entry.kernel_type,
+                    mode="pytorch",
+                    pytorch_reference_code=ref_code.strip(),
+                    test_shapes_code=(inp_code or "").strip(),
+                    source_file=entry.source_file,
+                    source_library=entry.library,
+                    difficulty_level=entry.difficulty,
+                    op_type=entry.op_type,
+                )
+                continue
+
+            logger.info(
+                "kernel_type=%s: could not extract ref function '%s' from %s; "
+                "downgrading to library_test mode",
+                entry.kernel_type, entry.ref_func, entry.source_file,
+            )
+            mode = "library_test"
+            if not test_cmd:
+                test_cmd = f"python -m pytest {entry.source_file}"
+
+        MANUAL_REGISTRY[entry.kernel_type] = GroundTruthSpec(
+            kernel_type=entry.kernel_type,
+            mode="library_test",
+            repo_url=repo_url,
+            unit_test_command=test_cmd or f"python -m pytest {entry.source_file}",
+            source_file=entry.source_file,
+            source_library=entry.library,
+            difficulty_level=entry.difficulty,
+            op_type=entry.op_type,
+        )
 
 
 _build_manual_registry()
@@ -883,6 +677,80 @@ def discover_all(
             results.append(spec)
 
     return results
+
+
+def build_correctness_config(
+    gt_spec: Optional[GroundTruthSpec],
+    rocm_root: Optional[Path] = None,
+) -> tuple[dict, str]:
+    """Build a correctness config dict from a GroundTruthSpec.
+
+    Returns (correctness_cfg, resolved_mode) where resolved_mode is the
+    effective mode after any fallbacks (e.g. pytorch -> library_test when
+    no reference code is available).
+
+    This is the single source of truth for correctness config construction,
+    used by config_generator, _create_task_config, and _create_standalone_task_config.
+    """
+    rocm_root = rocm_root or ROCM_DIR
+
+    if gt_spec is None:
+        return {"mode": "pytorch", "tolerance": 1e-3, "num_tests": 10}, "pytorch"
+
+    mode = gt_spec.mode
+
+    if mode == "accordo" and gt_spec.accordo_config:
+        accordo_inner = gt_spec.accordo_config.get("correctness", {})
+        return {
+            "mode": "accordo",
+            "backend": "accordo",
+            "accordo": accordo_inner.get("accordo", {}),
+        }, "accordo"
+
+    if mode == "accordo" and not gt_spec.accordo_config:
+        logger.warning(
+            "kernel_type=%s: mode is 'accordo' but accordo_config is missing; "
+            "falling through to library_test/pytorch",
+            gt_spec.kernel_type,
+        )
+
+    if mode == "library_test" and gt_spec.unit_test_command:
+        lib_dir = str(rocm_root / gt_spec.source_library) if gt_spec.source_library else ""
+        return {
+            "mode": "library_test",
+            "unit_test_command": gt_spec.unit_test_command,
+            "repo_url": gt_spec.repo_url,
+            "working_directory": lib_dir,
+        }, "library_test"
+
+    if mode == "library_test" and not gt_spec.unit_test_command:
+        logger.warning(
+            "kernel_type=%s: mode is 'library_test' but unit_test_command is empty; "
+            "falling through to pytorch",
+            gt_spec.kernel_type,
+        )
+
+    if mode == "pytorch" and gt_spec.pytorch_reference_code:
+        return {"mode": "pytorch", "tolerance": 1e-3, "num_tests": 10}, "pytorch"
+
+    if mode == "pytorch" and not gt_spec.pytorch_reference_code:
+        logger.warning(
+            "kernel_type=%s: mode is 'pytorch' but no reference code available; "
+            "attempting downgrade to library_test",
+            gt_spec.kernel_type,
+        )
+
+    if gt_spec.unit_test_command or gt_spec.source_file:
+        lib_dir = str(rocm_root / gt_spec.source_library) if gt_spec.source_library else ""
+        test_cmd = gt_spec.unit_test_command or f"python -m pytest {gt_spec.source_file}"
+        return {
+            "mode": "library_test",
+            "unit_test_command": test_cmd,
+            "repo_url": gt_spec.repo_url,
+            "working_directory": lib_dir,
+        }, "library_test"
+
+    return {"mode": "pytorch", "tolerance": 1e-3, "num_tests": 10}, "pytorch"
 
 
 def get_spec(kernel_type: str, rocm_dir: Path | None = None) -> Optional[GroundTruthSpec]:

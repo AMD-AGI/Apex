@@ -308,6 +308,22 @@ The mini eval (`eval.py`) uses a lightweight local grader that runs without Magp
 - **Documentation** — ROCm docs, MI355X architecture references, HIP/Triton tutorials
 - **Best-practice guides** — `hip_best_practices.md`, `triton_best_practices.md`
 
+## Kernel Reintegration (Hot-Patching)
+
+When the pipeline integrates optimized kernels for the final E2E benchmark, it **hot-patches** installed Python modules in site-packages. This is a temporary operation -- all patches are restored after benchmarking.
+
+**Currently supported (hot-patching):**
+
+- **aiter, vllm, sglang** -- Python/Triton `.py` kernels can be replaced in site-packages. Triton JIT re-compiles automatically on next invocation.
+- **aiter HIP** -- Standalone `.so` files (e.g., `activation_kernels.so`) can be recompiled with `hipcc` and swapped.
+
+**Not supported (requires source rebuild):**
+
+- **System C/C++ libraries** -- hipBLASLt, rocBLAS, composable_kernel (CK), MIOpen, rccl are system-level shared libraries that cannot be individually hot-patched. Optimizations for these libraries can be developed and tested standalone using `optimize-kernel` + Accordo, but cannot be reinjected into the E2E pipeline without rebuilding the library from source.
+- **Monolithic `_C.so`** -- vLLM, sglang, and PyTorch HIP kernels compile into a single `_C.so` binary and cannot be individually replaced.
+
+This is a known limitation. System library rebuild support is planned for future work.
+
 ## Development
 
 ```bash

@@ -245,14 +245,14 @@ python3 workload_optimizer.py report -r <RESULTS_DIR> -b <BENCH_CONFIG>
 
 Produces: `report.md`, `replication_guide.md`.
 
-### `export-rl` — Export trajectories to keystone-rl-training format
+### `export-rl` — Export trajectories to RL training dataset format
 
-Converts scored trajectories into keystone-compatible `tasks.json` (for GRPO training)
+Converts scored trajectories into `tasks.json` (for GRPO training)
 and optional `sft_warmstart.jsonl` (for SFT warm-start).
 
 ```bash
 # Basic export (tasks.json only)
-python3 workload_optimizer.py export-rl -r <RESULTS_DIR> --export-output-dir /path/to/keystone/data/
+python3 workload_optimizer.py export-rl -r <RESULTS_DIR> --export-output-dir /path/to/rl_training/data/
 
 # With SFT warm-start pairs from good trajectories
 python3 workload_optimizer.py export-rl -r <RESULTS_DIR> --export-output-dir /path/to/output/ --sft --quality good
@@ -271,10 +271,169 @@ Or programmatically via `TrajectoryStore`:
 ```python
 from trajectory import FileStore
 store = FileStore(base_dir=Path("trajectories"))
-store.export_for_keystone_rl(output_dir=Path("/output"), include_sft=True)
+store.export_for_rl(output_dir=Path("/output"), include_sft=True)
 ```
 
 Produces: `tasks.json`, `export_metadata.json`, optionally `sft_warmstart.jsonl`.
+
+### `optimize-kernel` — standalone kernel optimization with agent
+
+Optimize any kernel from any library (aiter, vLLM, sglang, torch, MIOpen, CK, etc.)
+without running the full E2E model pipeline. The agent receives the baseline kernel,
+MCP tools, and correctness definition, then iterates to produce an optimized solution.
+
+```bash
+# Triton kernel with PyTorch reference correctness
+python3 workload_optimizer.py optimize-kernel \
+  --kernel /path/to/my_kernel.py \
+  --kernel-type triton \
+  --kernel-name rms_norm \
+  --correctness-mode pytorch \
+  --reference /path/to/reference.py \
+  -r /path/to/results \
+  --max-iterations 3 --max-turns 25
+
+# Triton kernel with library test suite correctness
+python3 workload_optimizer.py optimize-kernel \
+  --kernel /path/to/fused_moe.py \
+  --kernel-type triton \
+  --kernel-name fused_moe \
+  --correctness-mode library_test \
+  --test-cmd "python -m pytest tests/test_fused_moe.py -x" \
+  -r /path/to/results \
+  --max-iterations 3
+
+# HIP kernel with Accordo HSA-level correctness
+python3 workload_optimizer.py optimize-kernel \
+  --kernel /path/to/gemm.hip \
+  --kernel-type hip \
+  --kernel-name gemm_fp16 \
+  --correctness-mode accordo \
+  -r /path/to/results
+
+# From a YAML spec file (all fields in one file)
+python3 workload_optimizer.py optimize-kernel \
+  --kernel-spec /path/to/kernel_spec.yaml \
+  -r /path/to/results \
+  --max-iterations 3
+
+# Use Codex instead of Claude
+python3 workload_optimizer.py optimize-kernel \
+  --kernel /path/to/kernel.py \
+  --kernel-name my_kernel \
+  --correctness-mode pytorch \
+  --reference /path/to/ref.py \
+  -r /path/to/results \
+  --agent-backend codex
+```
+
+**YAML spec file format:**
+
+```yaml
+task_id: my_custom_norm         # optional (auto-derived from kernel filename)
+kernel_path: /path/to/baseline_norm.py
+kernel_type: triton             # triton | hip | pytorch
+kernel_name: rms_norm
+description: "Optimize RMSNorm for MI355X"
+gpu_arch: gfx950
+framework: vllm                 # optional context
+solution_path: /path/to/solution.py  # only for grade-kernel
+ground_truth:
+  mode: pytorch                 # pytorch | library_test | accordo
+  pytorch_reference_code: |
+    def baseline_fn(x, weight, eps=1e-6):
+        import torch
+        return (x.float() / torch.sqrt(torch.mean(x.float()**2, -1, True) + eps) * weight.float()).to(x.dtype)
+  test_shapes_code: |
+    def get_test_inputs():
+        import torch
+        return [(torch.randn(4, 64, dtype=torch.float16, device="cuda"),
+                 torch.randn(64, dtype=torch.float16, device="cuda"))]
+```
+
+**Library test mode spec:**
+
+```yaml
+ground_truth:
+  mode: library_test
+  unit_test_command: "python -m pytest tests/test_fused_moe.py -x"
+  repo_url: "https://github.com/ROCm/aiter"
+```
+
+**Accordo mode spec:**
+
+```yaml
+ground_truth:
+  mode: accordo
+  accordo_config:
+    correctness:
+      backend: accordo
+      accordo:
+        kernel_name: gemm_fp16
+        reference_binary: build/ref_gemm
+        optimized_binary: build/opt_gemm
+        tolerance: 0.001
+```
+
+Produces: `<RESULTS_DIR>/standalone_result.json`, task dir with `baseline.py`,
+`solution.py`, `solution_best.py`, `config.yaml`.
+
+### `grade-kernel` — grade an existing baseline + solution pair
+
+Grade a kernel optimization without running an agent. Useful for scoring your own
+manual optimization or checking if a solution passes correctness.
+
+```bash
+# Grade with PyTorch reference
+python3 workload_optimizer.py grade-kernel \
+  --kernel /path/to/baseline.py \
+  --solution /path/to/solution.py \
+  --kernel-type triton \
+  --correctness-mode pytorch \
+  --reference /path/to/reference.py \
+  -r /path/to/results --json
+
+# Grade with library test
+python3 workload_optimizer.py grade-kernel \
+  --kernel /path/to/baseline.py \
+  --solution /path/to/solution.py \
+  --correctness-mode library_test \
+  --test-cmd "python -m pytest tests/test_norm.py -x" \
+  -r /path/to/results --json
+
+# Grade from YAML spec (includes solution_path)
+python3 workload_optimizer.py grade-kernel \
+  --kernel-spec /path/to/spec.yaml \
+  -r /path/to/results --json
+```
+
+`--json` prints the result as structured JSON:
+```json
+{
+  "task_id": "standalone__baseline",
+  "compiled": true,
+  "correct": true,
+  "speedup": 1.23,
+  "score": 243.0,
+  "correctness_mode": "pytorch"
+}
+```
+
+Produces: `<RESULTS_DIR>/grade_result.json`.
+
+### 3-mode correctness system
+
+The pipeline supports three correctness verification modes for kernel grading:
+
+| Mode | How it works | When to use |
+|------|-------------|-------------|
+| **pytorch** | Runs `torch.allclose(baseline_output, solution_output)` using a PyTorch reference implementation and test shapes | Default. Use when a pure-Python/PyTorch reference exists |
+| **library_test** | Runs the library's own test suite (e.g. `pytest tests/test_fused_moe.py`) with the solution on `PYTHONPATH` | Use when the kernel belongs to a library with existing tests (aiter, vLLM, etc.) |
+| **accordo** | Validates GPU buffer outputs at the HSA runtime level using the Accordo tool | Use for HIP/C++ kernels where source-level comparison is not feasible |
+
+The mode is set via `--correctness-mode` (CLI) or `ground_truth.mode` (YAML spec).
+The `graders/ground_truth.py` registry auto-detects the correct mode for known kernel
+types (e.g. `fused_moe` → pytorch, `kv_cache_ops` → library_test).
 
 ## Key flags reference
 
@@ -294,6 +453,15 @@ Produces: `tasks.json`, `export_metadata.json`, optionally `sft_warmstart.jsonl`
 | `--sft` | export-rl | Also emit SFT warm-start JSONL |
 | `--quality good` | export-rl | Filter SFT trajectories by quality |
 | `--min-score 100` | export-rl | Minimum kernel score to include |
+| `--kernel-spec <YAML>` | optimize-kernel, grade-kernel | YAML file with full kernel definition |
+| `--kernel <PATH>` | optimize-kernel, grade-kernel | Path to baseline kernel file |
+| `--kernel-type triton` | optimize-kernel, grade-kernel | Kernel type: triton, hip, or pytorch |
+| `--kernel-name <NAME>` | optimize-kernel, grade-kernel | Human-readable kernel name |
+| `--correctness-mode pytorch` | optimize-kernel, grade-kernel | Correctness: pytorch, library_test, or accordo |
+| `--reference <PATH>` | optimize-kernel, grade-kernel | PyTorch reference implementation (pytorch mode) |
+| `--test-cmd <CMD>` | optimize-kernel, grade-kernel | Unit test command (library_test mode) |
+| `--solution <PATH>` | grade-kernel | Path to the solution file to grade |
+| `--json` | grade-kernel | Print result as JSON to stdout |
 
 ## Architecture
 
@@ -313,13 +481,15 @@ Produces: `tasks.json`, `export_metadata.json`, optionally `sft_warmstart.jsonl`
 
 - **`agents/backends.py`** — Dual agent backend (Claude Code via `claude-agent-sdk`, Codex via `codex exec` CLI)
 
-- **`workload_optimizer.py`** — Full pipeline orchestrator with subcommands: `benchmark`, `identify`, `optimize`, `grade`, `integrate`, `benchmark-final`, `score`, `report`, `run` (all-in-one), `export-rl` (keystone RL dataset export)
+- **`workload_optimizer.py`** — Full pipeline orchestrator with subcommands: `benchmark`, `identify`, `optimize`, `grade`, `integrate`, `benchmark-final`, `score`, `report`, `run` (all-in-one), `export-rl` (RL dataset export), `optimize-kernel` (standalone kernel optimization), `grade-kernel` (standalone kernel grading)
+
+- **`graders/ground_truth.py`** — 3-mode correctness registry (pytorch, library_test, accordo) with auto-discovery and manual specs for known kernels
 
 - **`eval.py`** — Lightweight CPU-only eval that exercises the full pipeline without GPU or Magpie
 
-- **`trajectory.py`** — Captures full agent runs (messages, tool calls, solutions, scores) with pluggable backends: FileStore, CouchDB, S3. Includes `export_for_keystone_rl()` on `TrajectoryStore` for direct keystone-compatible export.
+- **`trajectory.py`** — Captures full agent runs (messages, tool calls, solutions, scores) with pluggable backends: FileStore, CouchDB, S3. Includes `export_for_rl()` on `TrajectoryStore` for direct RL-compatible export.
 
-- **`export_rl_dataset.py`** — Converts scored trajectories into keystone-rl-training format (`tasks.json` + optional `sft_warmstart.jsonl`). Also available via `workload_optimizer.py export-rl`.
+- **`export_rl_dataset.py`** — Converts scored trajectories into RL training dataset format (`tasks.json` + optional `sft_warmstart.jsonl`). Also available via `workload_optimizer.py export-rl`.
 
 - **`leaderboard.py`** — Tracks agent performance across runs for RL comparison
 
@@ -448,7 +618,7 @@ Each pipeline run starts with a guaranteed clean baseline:
 
 ## Pipeline robustness features
 
-- **Bisection rollback**: When smoke test fails, the pipeline bisects to find the bad patch instead of rolling back everything. Good patches are kept.
+- **Bisection rollback**: When smoke test fails, the pipeline bisects to find the bad patch instead of rolling back everything. Good patches are kept. After bisection, surviving patches are re-verified as a group.
 - **GPU health check**: Validates GPU temperature/clocks before benchmarks. Warns on throttling (>85°C).
 - **Baseline drift detection**: Quick re-baseline at final benchmark time catches thermal drift (>15% warns).
 - **Solution syntax validation**: `ast.parse` check before patching catches truncated/corrupt agent output.
@@ -456,6 +626,33 @@ Each pipeline run starts with a guaranteed clean baseline:
 - **Stale lock detection**: Patch lock includes PID; stale locks from crashed processes are auto-broken.
 - **Unmatched kernel warnings**: Pipeline warns when high-impact kernels (>2% GPU time) have no spec mapping.
 - **Environment snapshot**: All `VLLM_ROCM_USE_AITER_*` env vars and package versions captured in trajectory.
+- **Library test verification**: After hot-patching, the library's own test suite (from `MANUAL_REGISTRY`) is run to catch subtle correctness issues beyond import checks.
+- **Multi-file patching**: Solutions can be a directory with `manifest.json` mapping multiple files to their install targets, supporting kernel + dispatch table changes.
+
+## Kernel reintegration scope
+
+Reintegration (hot-patching) replaces installed `.py` or `.so` files in site-packages with optimized solutions during the final benchmark. **Current support:**
+
+| Library | Patchable | Method |
+|---------|-----------|--------|
+| **aiter** (Triton) | Yes | Replace `.py` in site-packages, Triton JIT re-compiles |
+| **aiter** (HIP) | Partial | Only standalone `.so` files (not monolithic `_C.so`) |
+| **vllm** (Triton) | Yes | Replace `.py`, resolve relative imports to absolute |
+| **sglang** (Triton) | Yes | Replace `.py`, resolve relative imports to absolute |
+| **vllm/sglang** (HIP) | No | Compiled into monolithic `_C.so` |
+| **pytorch** (HIP) | No | Compiled into monolithic `_C.so` |
+
+**System-level C/C++ libraries are NOT patchable:**
+
+| Library | Why not patchable |
+|---------|-------------------|
+| **hipBLASLt** | System shared library (`libhipblaslt.so`), used by `torch._scaled_mm` |
+| **rocBLAS** | System shared library (`librocblas.so`), used by `torch.mm` |
+| **composable_kernel** | Compiled into aiter's C extensions |
+| **MIOpen** | System shared library (`libMIOpen.so`) |
+| **rccl** | Communication library, not a compute kernel |
+
+These system libraries can be optimized standalone (via `optimize-kernel` + Accordo) but cannot be reinjected into E2E benchmarks without rebuilding from source. This is planned for future support.
 
 ## State management
 
@@ -543,3 +740,88 @@ full pipeline for gptoss120b", follow these steps **without asking for more deta
    ```
 6. After each step, verify it succeeded before proceeding to the next.
 7. Print a summary of final results (TPS improvement, kernel-level speedups, report location).
+
+## Default workflow — kernel-level optimization
+
+When the user says "optimize this kernel", "optimize my fused_moe", or provides a
+kernel file to optimize — **without** a full model benchmark — follow these steps:
+
+1. Set up environment (see above).
+2. Identify what the user provided:
+   - A kernel file path → use `--kernel`
+   - A YAML spec → use `--kernel-spec`
+   - A kernel name from a library → use `source-finder` MCP to locate the source file
+3. Determine the correctness mode based on user instruction:
+   - User says "find pytorch source" / "use pytorch reference" / "compare against torch" → `--correctness-mode pytorch`
+     - Use `source-finder` MCP (`find_kernel_source`, `identify_kernel_origin`) to locate the PyTorch reference implementation
+     - Pass the reference file via `--reference`
+   - User says "use library tests" / "use pytest" / "run test suite" → `--correctness-mode library_test`
+     - Pass the test command via `--test-cmd`
+   - User says "use accordo" / "HSA-level validation" → `--correctness-mode accordo`
+   - If user doesn't specify → default to `pytorch`
+4. Run the standalone optimization:
+   ```bash
+   RESULTS=$HOME/kernel_results_<name>
+
+   python3 workload_optimizer.py optimize-kernel \
+     --kernel /path/to/kernel.py \
+     --kernel-type triton \
+     --kernel-name <name> \
+     --correctness-mode <mode> \
+     --reference /path/to/ref.py \  # if pytorch mode
+     --test-cmd "pytest tests/..." \  # if library_test mode
+     -r $RESULTS \
+     --max-iterations 3 --max-turns 25
+   ```
+5. After completion, print the result from `$RESULTS/standalone_result.json`.
+
+### Grading workflow
+
+When the user says "grade my kernel optimization" or "score this solution":
+
+```bash
+python3 workload_optimizer.py grade-kernel \
+  --kernel /path/to/baseline.py \
+  --solution /path/to/solution.py \
+  --kernel-type triton \
+  --correctness-mode pytorch \
+  --reference /path/to/ref.py \
+  -r $RESULTS --json
+```
+
+### MCP tools to use during kernel optimization
+
+The agent has 7 MCP servers available. Use them actively for kernel-level work:
+
+| MCP | Tool | When to call |
+|-----|------|-------------|
+| **source-finder** | `find_kernel_source` | Find the baseline kernel source across all ROCm libraries (aiter, CK, vLLM, MIOpen, hipBLASLt, etc.) |
+| **source-finder** | `identify_kernel_origin` | Determine which library a kernel comes from |
+| **source-finder** | `find_ck_template` | Find Composable Kernel template implementations |
+| **rag-server** | `get_optimization_playbook` | Get a step-by-step optimization playbook for the kernel type |
+| **rag-server** | `search_kernel_optimization` | Search for optimization patterns (tiling, vectorization, etc.) |
+| **rag-server** | `get_optimization_snippet` | Get a ready-to-use code snippet for a specific optimization |
+| **gpu-info** | `get_arch_optimization_hints` | Get MI355X / CDNA4 specific optimization hints |
+| **gpu-info** | `get_gpu_specs` | Get target GPU memory bandwidth, compute, cache sizes |
+| **fusion-advisor** | `detect_fusion_opportunities` | Find fusion opportunities in the kernel |
+| **fusion-advisor** | `generate_fused_kernel` | Generate a fused kernel implementation |
+| **kernel-perf** | `roofline_analysis` | Determine if kernel is memory-bound or compute-bound |
+| **kernel-perf** | `profile_kernel` | Profile execution time, occupancy, memory throughput |
+| **magpie** | `compare` | Validate correctness and measure speedup vs baseline |
+
+### Any kernel from any library
+
+The standalone optimization supports kernels from **any** library:
+
+| Library | Kernel types | Example spec names |
+|---------|-------------|-------------------|
+| **aiter** | Triton, HIP | fused_moe, paged_attn_decode, rms_norm, flash_attn_prefill |
+| **vLLM** | Triton, HIP | gemm_bf16, activation, moe_align |
+| **sglang** | Triton | fused_moe, flashinfer_attn |
+| **torch/PyTorch** | PyTorch, C++ | scaled_dot_product_attention, layer_norm |
+| **MIOpen** | HIP, C++ | conv_fwd, batchnorm |
+| **composable_kernel** | C++ templates | gemm, batched_gemm, grouped_conv |
+| **hipBLASLt** | HIP | gemm with epilogue fusion |
+| **rccl** | HIP | allreduce, allgather |
+
+Use `source-finder` MCP to locate the exact source files across these libraries.

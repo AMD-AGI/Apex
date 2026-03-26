@@ -27,6 +27,7 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).parent.parent
 
+sys.path.insert(0, str(REPO_ROOT / "graders"))
 sys.path.insert(0, str(REPO_ROOT / "prompts"))
 try:
     from kernel_prompt import KERNEL_MAP, KernelSpec
@@ -41,6 +42,12 @@ except ImportError:
         vllm_path: str = ""
         sglang_path: str = ""
         triton: bool = False
+
+try:
+    from ground_truth import get_spec as get_ground_truth_spec, build_correctness_config
+except ImportError:
+    get_ground_truth_spec = None  # type: ignore[assignment]
+    build_correctness_config = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +221,16 @@ def generate_config(
     sol_relpath = f"./{solution.name}" if solution else "./solution.py"
     sol_hash = _solution_hash(solution) if solution else ""
 
+    # Ground truth mode selection via shared helper
+    gt_spec = get_ground_truth_spec(kernel_type) if get_ground_truth_spec else None
+    if build_correctness_config is not None:
+        correctness_cfg, gt_mode = build_correctness_config(
+            gt_spec, rocm_root=REPO_ROOT / "tools" / "rocm",
+        )
+    else:
+        correctness_cfg = {"mode": "pytorch", "tolerance": 1e-3, "num_tests": 10}
+        gt_mode = "pytorch"
+
     config = {
         "gpu": {
             "device": gpu_device,
@@ -225,11 +242,7 @@ def generate_config(
         "optimized": {
             "path": sol_relpath,
         },
-        "correctness": {
-            "mode": "magpie_builtin",
-            "tolerance": 1e-3,
-            "num_tests": 10,
-        },
+        "correctness": correctness_cfg,
         "performance": {
             "mode": "magpie_builtin",
             "warmup_iterations": 10,
@@ -241,6 +254,7 @@ def generate_config(
             "generated_by": "config_generator.py",
             "solution_hash": sol_hash,
             "tamper_protected": True,
+            "correctness_mode": gt_mode,
         },
     }
 

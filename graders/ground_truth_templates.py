@@ -7,7 +7,7 @@ Each kernel_spec in Apex's KernelSpec registry gets a template that produces:
   - cpu_baseline_code: source of ``baseline_fn(*inputs) -> flat 1-D tensor``
   - test_shapes_code:  source of ``get_test_inputs(device) -> list[tuple]``
 
-These are used by keystone-rl-training's evaluator to check correctness of
+These are used by the RL evaluator to check correctness of
 model-generated Triton kernels during GRPO training.
 
 Usage:
@@ -84,7 +84,7 @@ def get_instruction(kernel_spec: str, gpu_arch: str = "gfx950") -> str:
 
 # ── Ground truth templates ───────────────────────────────────────────────────
 # Each value is a dict with "cpu_baseline_code" and "test_shapes_code" strings.
-# These are designed to be safe for exec() in keystone's evaluator sandbox.
+# These are designed to be safe for exec() in the RL evaluator sandbox.
 
 _TEMPLATES: dict[str, dict[str, str]] = {}
 
