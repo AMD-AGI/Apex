@@ -38,23 +38,43 @@ prompt constructor  →  LLM agent  →  output/  →  grader  →  score
 ## Repository Structure
 
 ```
-rl-env-kernel-optimization/
+Apex/
+├── workload_optimizer.py    # Main pipeline CLI (benchmark → identify → optimize → grade → integrate → score → report)
 ├── eval.py                  # End-to-end mini eval (CPU, no GPU required)
 ├── setup.sh                 # One-shot environment setup
+├── knowledge_base.json      # Persistent cross-run optimization knowledge
+├── mcp_config.json          # MCP server configuration (5 bundled servers)
+│
+├── agents/
+│   └── backends.py          # Claude Code SDK + Codex CLI agent runner
+│
+├── pipeline/
+│   ├── knowledge_base.py    # Cross-kernel/cross-run learning store
+│   ├── reflector.py         # Agent self-reflection between iterations
+│   ├── trajectory.py        # Trajectory recording (file / CouchDB / S3)
+│   ├── leaderboard.py       # Leaderboard tracking (file / CouchDB)
+│   ├── kernel_bottleneck.py # Profiling data parser, kernel classification
+│   └── export_rl_dataset.py # RL/SFT dataset export from trajectories
 │
 ├── prompts/
-│   ├── models.py            # Registry of 19 open-source LLMs (Llama, DeepSeek, Qwen, …)
-│   ├── configs.py           # Inference configurations (batch size, dtype, …)
+│   ├── models.py            # Registry of 20 open-source LLMs (Llama, DeepSeek, Qwen, GPT OSS 120B, …)
+│   ├── configs.py           # 17 inference configurations (MLPerf, InferenceMAX, custom)
 │   ├── kernel_prompt.py     # Kernel-level prompt constructor (model × kernel pairs)
 │   └── model_prompt.py      # Model-level prompt constructor (end-to-end eval)
 │
 ├── graders/
 │   ├── score.py             # Scoring formula + Magpie helpers
 │   ├── kernel_grader.py     # Grades kernel-level output/ tasks via Magpie
-│   └── model_grader.py      # Grades end-to-end model throughput via Magpie
+│   ├── model_grader.py      # Grades end-to-end model throughput via Magpie
+│   ├── ground_truth.py      # ROCm kernel discovery + ground truth specs
+│   ├── config_generator.py  # Magpie config.yaml generation + validation
+│   └── cache_manager.py     # Cache isolation for reproducible grading
 │
 ├── tools/
-│   └── setup_tools.sh       # Installs Magpie and RAG tool
+│   ├── setup_tools.sh       # Installs Magpie, MCP servers, skills
+│   ├── skills/              # 13 domain skills (SKILL.md files)
+│   ├── mcps/                # MCP server source (source-finder, rag, fusion-advisor, gpu-info)
+│   └── jsons/               # ROCm metadata indexes
 │
 ├── files/
 │   ├── setup_files.sh       # Clones ROCm repos and downloads documentation
@@ -62,10 +82,6 @@ rl-env-kernel-optimization/
 │   └── triton_best_practices.md
 │
 ├── tests/                   # pytest suite for all components
-│   ├── test_prompts.py
-│   ├── test_graders.py
-│   ├── test_tools.py
-│   └── test_files.py
 │
 └── output/                  # Agent writes all solutions here (git-ignored)
     └── <task_id>/

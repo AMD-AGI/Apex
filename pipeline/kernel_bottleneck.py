@@ -19,12 +19,15 @@ Categories:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "prompts"))
 
@@ -226,7 +229,8 @@ def _extract_from_per_run_reports(
         try:
             with open(rf) as f:
                 run_data = json.load(f)
-        except Exception:
+        except Exception as e:
+            _log.debug("bottleneck JSON parse failed for %s: %s", rf, e)
             continue
 
         found = False

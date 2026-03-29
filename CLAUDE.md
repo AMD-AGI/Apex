@@ -176,7 +176,7 @@ Shows a table like:
 
 Spawns a Claude Code sub-agent per kernel. Each gets the rich prompt from
 `prompts/kernel_prompt.py` (MCP tables, skills, source locations, arch hints)
-plus actual baseline source code. The sub-agent has 7 MCPs via `mcp_config.json`.
+plus actual baseline source code. The sub-agent has 5 bundled MCPs via `mcp_config.json` (plus 2 optional external servers: kernel-perf, asm-tools).
 
 ```bash
 # Optimize ALL identified triton kernels (dynamic, no hardcoding)
@@ -477,7 +477,6 @@ types (e.g. `fused_moe` → pytorch, `kv_cache_ops` → library_test).
   - `score.py`: Scoring formula, Magpie result parsing, helper functions
   - `kernel_grader.py`: Grades individual kernel solutions
   - `model_grader.py`: Grades end-to-end model throughput
-  - `ground_truth_templates.py`: Per-kernel-type CPU baseline and test-shape generators for RL training export (12 kernel types)
 
 - **`agents/backends.py`** — Dual agent backend (Claude Code via `claude-agent-sdk`, Codex via `codex exec` CLI)
 
@@ -802,7 +801,7 @@ python3 workload_optimizer.py grade-kernel \
 
 ### MCP tools to use during kernel optimization
 
-The agent has 7 MCP servers available. Use them actively for kernel-level work:
+The agent has 5 bundled MCP servers (plus 2 optional external: kernel-perf, asm-tools). Use them actively for kernel-level work:
 
 | MCP | Tool | When to call |
 |-----|------|-------------|

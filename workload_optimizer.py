@@ -45,6 +45,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import re as _re_mod
 import shutil
@@ -58,6 +59,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 import yaml
 
@@ -215,8 +218,22 @@ _HIP_SPEC_TO_SO: dict[str, dict[str, str]] = {
 
 _MONOLITHIC_SO_LIBRARIES = {"vllm", "pytorch", "sglang"}
 
-PATCH_LOCK_PATH = Path("/tmp/magpie_kernel_patch.lock")
-PATCH_MANIFEST_PATH = Path("/tmp/magpie_kernel_patch_manifest.json")
+_DEFAULT_PATCH_DIR = Path("/tmp")
+
+
+def _patch_lock_path(results_dir: Path | None = None) -> Path:
+    d = results_dir or _DEFAULT_PATCH_DIR
+    return d / "magpie_kernel_patch.lock"
+
+
+def _patch_manifest_path(results_dir: Path | None = None) -> Path:
+    d = results_dir or _DEFAULT_PATCH_DIR
+    return d / "magpie_kernel_patch_manifest.json"
+
+
+# Backwards-compat aliases (used when no results_dir is known)
+PATCH_LOCK_PATH = _patch_lock_path()
+PATCH_MANIFEST_PATH = _patch_manifest_path()
 
 MIN_SPEEDUP_FOR_REINJECTION = 1.05
 SMOKE_TEST_REGRESSION_THRESHOLD = 0.5
@@ -291,8 +308,8 @@ def _find_installed_so(kernel_spec: str, library: str = "aiter") -> Optional[Pat
         pkg_dir = Path(pkg.__file__).parent
         for so in pkg_dir.rglob(f"*{so_name}*.so"):
             return so
-    except (ImportError, Exception):
-        pass
+    except Exception as e:
+        _log.debug("SO lookup for %s failed: %s", so_name, e)
     return None
 
 
@@ -380,8 +397,8 @@ def _release_patch_lock(lock_fd) -> None:
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("patch lock release failed: %s", e)
     PATCH_LOCK_PATH.unlink(missing_ok=True)
     PATCH_MANIFEST_PATH.unlink(missing_ok=True)
 
@@ -1534,7 +1551,8 @@ class WorkloadConfig:
             try:
                 from agents.backends import resolve_default_model
                 self.agent_model = resolve_default_model(self.agent_backend)
-            except Exception:
+            except Exception as e:
+                _log.debug("resolve_default_model failed, using fallback: %s", e)
                 from agents.backends import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
                 self.agent_model = (
                     DEFAULT_CODEX_MODEL if self.agent_backend == "codex"
@@ -1755,7 +1773,8 @@ def _load_gap_analysis_cache(
         return []
     try:
         entries = json.loads(cache_path.read_text())
-    except Exception:
+    except Exception as e:
+        _log.warning("corrupt gap analysis cache %s: %s", cache_path, e)
         return []
     kernels = []
     for e in entries:
@@ -2253,7 +2272,8 @@ def _profile_baseline_kernel(
         section += "\nUse this data to identify whether the kernel is compute-bound or memory-bound.\n"
         return section
 
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+    except Exception as e:
+        _log.warning("baseline profiling failed: %s", e)
         return ""
 
 
@@ -2361,12 +2381,12 @@ def _build_correctness_ref_section(task_dir: Path, kernel_spec: str) -> str:
                                     lines.append("\nTest function signatures:")
                                     for s in sigs[:10]:
                                         lines.append(f"  - `{s}`")
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                _log.debug("test signature extraction failed: %s", e)
                             break
                     return "\n".join(lines)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("correctness ref section build failed: %s", e)
 
     return ""
 
@@ -2561,6 +2581,7 @@ def _run_agent_iteration(
     config: WorkloadConfig,
     iteration: int,
     previous_reflection: str = "",
+    model_override: str = "",
 ) -> tuple[list[dict], bool]:
     full_prompt = prompt
     if previous_reflection:
@@ -2582,7 +2603,7 @@ def _run_agent_iteration(
         messages, solution_written = run_agent_task(
             prompt=full_prompt,
             cwd=task_dir,
-            model=config.agent_model,
+            model=model_override or config.agent_model,
             max_turns=config.max_turns_per_iter,
             agent=config.agent_backend,
             system_prompt=SYSTEM_PROMPT,
@@ -2614,6 +2635,7 @@ def _estimate_kernel_difficulty(kernel: BottleneckKernel) -> str:
 
 import threading
 _GPU_GRADE_LOCK = threading.Lock()
+_BUDGET_LOCK = threading.Lock()
 
 
 def _optimize_kernel(
@@ -2646,10 +2668,6 @@ def _optimize_kernel(
         effective_model = config.agent_model_complex
         print(f"    Using complex model: {effective_model}")
 
-    # Apply effective model for this kernel
-    original_model = config.agent_model
-    config.agent_model = effective_model
-
     origin_lib = kernel.origin_library if kernel.origin_library != "unknown" else "aiter"
     opt_result = KernelOptResult(
         kernel_name=kernel.name,
@@ -2675,8 +2693,8 @@ def _optimize_kernel(
         if completed_results:
             cross = kb.cross_kernel_insights(spec, completed_results)
             kb_section += cross
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("knowledge base prompt injection failed: %s", e)
 
     prompt = _build_kernel_prompt(kernel, config, benchmark_config, task_dir)
     if kb_section:
@@ -2690,14 +2708,13 @@ def _optimize_kernel(
 
     # Budget: base iterations + bonus from early-finish kernels
     effective_max_iter = config.max_iterations
-    if remaining_budget:
-        try:
-            bonus = remaining_budget.pop(0)
-            effective_max_iter += bonus
-            if bonus > 0:
-                print(f"    Budget bonus: +{bonus} iterations (total: {effective_max_iter})")
-        except IndexError:
-            pass
+    if remaining_budget is not None:
+        with _BUDGET_LOCK:
+            if remaining_budget:
+                bonus = remaining_budget.pop(0)
+                effective_max_iter += bonus
+                if bonus > 0:
+                    print(f"    Budget bonus: +{bonus} iterations (total: {effective_max_iter})")
 
     pre_existing_solution = find_solution(task_dir)
     if pre_existing_solution:
@@ -2714,6 +2731,7 @@ def _optimize_kernel(
             t0 = time.monotonic()
             messages, solution_written = _run_agent_iteration(
                 task_dir, prompt, config, iteration, reflection_prompt,
+                model_override=effective_model,
             )
             agent_time = time.monotonic() - t0
             for msg in messages:
@@ -2798,10 +2816,8 @@ def _optimize_kernel(
     # Return unused iterations to the budget pool
     unused = effective_max_iter - (opt_result.iterations_used or effective_max_iter)
     if unused > 0 and remaining_budget is not None:
-        remaining_budget.append(unused)
-
-    # Restore model
-    config.agent_model = original_model
+        with _BUDGET_LOCK:
+            remaining_budget.append(unused)
 
     # Restore best solution if a later iteration overwrote it
     best_snapshot = task_dir / "solution_best.py"
@@ -2855,11 +2871,11 @@ def _optimize_kernel(
             opt_result.__dict__,
             kernel_type=kernel.category or "triton",
             gpu_arch=config.gpu_arch,
-            agent_model=config.agent_model,
+            agent_model=effective_model,
             solution_code=sol_code,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("knowledge base record failed: %s", e)
 
     return opt_result
 
@@ -3044,8 +3060,8 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
             state_path = config.effective_results_dir / "pipeline_state.json"
             try:
                 baseline_result = json.loads(state_path.read_text()).get("baseline_result", {})
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("baseline result load from state failed: %s", e)
         result = dict(baseline_result) if baseline_result else {
             "success": True,
             "throughput": {"output_throughput": baseline_tps, "total_token_throughput": baseline_tps * 2},
@@ -3553,9 +3569,13 @@ def _generate_replication_guide(
 # ---------------------------------------------------------------------------
 
 def run_workload_optimization(config: WorkloadConfig) -> WorkloadTrajectoryRecord:
+    global PATCH_LOCK_PATH, PATCH_MANIFEST_PATH
     t_start = time.monotonic()
     results_dir = config.effective_results_dir
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    PATCH_LOCK_PATH = _patch_lock_path(results_dir)
+    PATCH_MANIFEST_PATH = _patch_manifest_path(results_dir)
 
     log_path = results_dir / "run.log"
     log_file = open(log_path, "w")
@@ -4672,6 +4692,13 @@ sol_mod = _load(os.path.join(_DIR, "{sol_filename}"), "sol")
 ref_fn = _find_fn(ref_mod)
 sol_fn = _find_fn(sol_mod)
 
+if ref_fn is None:
+    print("FAIL: Could not find a callable function in reference.py")
+    sys.exit(1)
+if sol_fn is None:
+    print("FAIL: Could not find a callable function in solution")
+    sys.exit(1)
+
 try:
     shapes_mod = _load(os.path.join(_DIR, "test_shapes.py"), "shapes")
     test_inputs = shapes_mod.get_test_inputs()
@@ -5557,6 +5584,8 @@ def main():
                    help="Path to the solution file to grade (required unless provided in --kernel-spec)")
     p.add_argument("--json", dest="json_output", action="store_true",
                    help="Print result as JSON to stdout")
+    p.add_argument("--tampering-speedup-cap", type=float, default=0.0,
+                   help="Configurable speedup cap when benchmark tampering detected (0=default 1.0x)")
 
     args = parser.parse_args()
 

@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
+
+_log = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from models import MODELS, ModelConfig, moe_models, by_attention
@@ -56,8 +59,8 @@ def detect_gpu() -> str:
             return "gfx940"
         if "MI250" in out:
             return "gfx90a"
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("GPU detection failed, using default %s: %s", DEFAULT_TARGET, e)
     return DEFAULT_TARGET
 
 

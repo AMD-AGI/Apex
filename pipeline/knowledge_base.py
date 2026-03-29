@@ -127,19 +127,29 @@ class KnowledgeBase:
         tmp.replace(self._path)
 
     def record(self, outcome: OptimizationOutcome) -> None:
-        """Append an optimization outcome to the knowledge base."""
-        fd = None
+        """Append an optimization outcome to the knowledge base.
+
+        Uses a single fd for the full read-modify-write cycle so the fcntl
+        lock actually guards against concurrent writers.
+        """
+        self._path.touch(exist_ok=True)
+        fd = open(self._path, "r+")
         try:
-            self._path.touch(exist_ok=True)
-            fd = open(self._path, "r+")
             fcntl.flock(fd, fcntl.LOCK_EX)
-            data = self._load()
+            fd.seek(0)
+            raw = fd.read()
+            try:
+                data = json.loads(raw) if raw.strip() else []
+            except json.JSONDecodeError:
+                data = []
             data.append(outcome.to_dict())
-            self._save(data)
+            fd.seek(0)
+            fd.truncate()
+            json.dump(data, fd, indent=2, default=str)
+            fd.flush()
         finally:
-            if fd:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                fd.close()
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            fd.close()
 
     def query(
         self,
