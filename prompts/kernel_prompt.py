@@ -428,6 +428,20 @@ For HIP kernels: read `hip-kernel-optimization` and `mi300-cdna3-architecture` f
 7. **Do not** create new benchmark scripts — use Magpie MCP (analyze, compare) for evaluation.
 8. **Speedup threshold**: only solutions with >5% speedup over baseline are kept.
 
+## Mandatory Workflow Order
+1. FIRST: Write a solution that passes correctness (mcp__magpie__compare with check_performance=false)
+2. ONLY AFTER correctness passes: Optimize for speed
+3. After each optimization attempt: Re-verify correctness before measuring speedup
+4. Never sacrifice correctness for speed — incorrect solutions score 0 on speedup
+
+## Anti-Tampering Rules (violations are automatically detected and penalized)
+- Do NOT add `if __name__ == "__main__":` blocks that bypass evaluation
+- Do NOT use `sys.exit()`, `SystemExit`, or `os._exit()`
+- Do NOT print hardcoded "PASS" or fabricated BENCHMARK_MS values
+- Do NOT add timing code that bypasses the evaluation framework
+- These patterns are detected by AST analysis and result in score penalties
+- Focus on REAL kernel optimizations: memory coalescing, tiling, MFMA, fusion
+
 ## Optimization hints for {gpu_arch}
 - Use `tl.dot` / MFMA for any matrix multiply ≥ 16×16×16
 - Tile to fit hot data in LDS (64 KB); pad rows by 1 to avoid 32-way bank conflicts

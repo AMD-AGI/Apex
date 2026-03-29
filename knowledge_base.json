@@ -1,0 +1,342 @@
+[
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:33:25",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:34:50",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:36:17",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:37:43",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:38:55",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:39:15",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:40:22",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:40:41",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:41:49",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:43:05",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:43:15",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:44:31",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:44:47",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:45:59",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:46:14",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:47:26",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:47:59",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 1.0,
+    "correct": true,
+    "score": 220.0,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T12:49:06",
+    "solution_snippet": "import numpy as np\n\ndef kernel_fn(*args, **kwargs):\n    return args[0] if args else None\n",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "paged_attn_decode",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "custom_optimization",
+    "strategy_description": "Custom kernel optimization",
+    "speedup": 0.9936163292749254,
+    "correct": true,
+    "score": 169.36163292749254,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T19:32:22",
+    "solution_snippet": "# SPDX-License-Identifier: MIT\n# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.\n#\n# Optimized paged attention decode for Llama-3.2-1B-Instruct on MI355X (gfx950)\n#\n# Optimization strategy (Iteration 2):\n#  1. Keep SEQ_PARTITION_SIZE = 1024 exactly (prevents Triton JIT re-specialisation)\n#  2. num_stages=3 for all kernel launches \u2014 on CDNA4's 8.0 TB/s HBM, prefetching\n#     2 KV blocks ahead (instead of 1) better hides the ~100-200 ns HBM latency\n#     in the KV-block ",
+    "key_insight": "Custom kernel optimization",
+    "tags": [
+      "custom"
+    ]
+  },
+  {
+    "kernel_spec": "fused_moe",
+    "kernel_type": "triton",
+    "gpu_arch": "gfx950",
+    "strategy_used": "kernel_fusion",
+    "strategy_description": "Fused multiple operations into a single kernel",
+    "speedup": 1.0331391142816424,
+    "correct": true,
+    "score": 226.62782285632846,
+    "agent_model": "claude-sonnet-4-6",
+    "timestamp": "2026-03-28T20:08:47",
+    "solution_snippet": "# SPDX-License-Identifier: MIT\n# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.\n#\n# Optimized fused_moe for AMD MI355X (gfx950 / CDNA4)\n#\n# Key optimizations over baseline:\n# 1. Add pure BF16 / FP16 1-stage path for gfx950 \u2014 baseline only had this on gfx942,\n#    so all bf16 workloads fell through to the slower 2-stage CK path.\n#    1-stage avoids: writing intermediate activations to HBM, a second quant step,\n#    and an extra kernel-launch round-trip.  For decode bat",
+    "key_insight": "Fused multiple operations into a single kernel",
+    "tags": [
+      "fusion"
+    ]
+  }
+]

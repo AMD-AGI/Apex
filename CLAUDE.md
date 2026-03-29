@@ -628,6 +628,17 @@ Each pipeline run starts with a guaranteed clean baseline:
 - **Environment snapshot**: All `VLLM_ROCM_USE_AITER_*` env vars and package versions captured in trajectory.
 - **Library test verification**: After hot-patching, the library's own test suite (from `MANUAL_REGISTRY`) is run to catch subtle correctness issues beyond import checks.
 - **Multi-file patching**: Solutions can be a directory with `manifest.json` mapping multiple files to their install targets, supporting kernel + dispatch table changes.
+- **Benchmark caching**: Use `--benchmark-cache-hours N` to skip re-running the ~30-minute E2E benchmark if a cached result exists for the same config YAML.
+- **Parallel kernel optimization**: `--parallel-kernels N` runs up to N agent sessions concurrently. GPU grading is serialized.
+- **Smart iteration**: No-progress early termination (stall detection: delta <5% for 2 consecutive iterations) and budget reallocation to remaining kernels.
+- **Agent model routing**: `--agent-model-simple` / `--agent-model-complex` override per-kernel based on difficulty classification (simple/moderate/complex).
+- **Knowledge base**: `knowledge_base.json` records all optimization outcomes (strategy, speedup, insight). Past insights are injected into agent prompts automatically.
+- **Anti-tampering prompts**: Explicit rules in all prompt templates warn agents about AST-based benchmark tampering detection and penalties.
+- **Correctness-first workflow**: Prompts enforce a mandatory correctness → speed optimization order.
+- **Speedup measurement reliability**: Multiple profiling runs with outlier rejection (trim top/bottom 10%, use median). High-variance warning when std > 20% of mean.
+- **Structured profiling feedback**: rocprof metrics parsed into a Performance Scorecard (bandwidth %, compute %, occupancy, recommendation) in reflection prompts.
+- **Reference injection**: PyTorch reference code and library test function signatures are injected inline in agent prompts for better correctness.
+- **Configurable tampering cap**: `--tampering-speedup-cap X` overrides the default 1.0x speedup cap when benchmark tampering is detected.
 
 ## Kernel reintegration scope
 

@@ -12,6 +12,7 @@ Includes profiler data, Magpie compare details, and dual speedup thresholds
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -194,6 +195,108 @@ def _read_solution(task_dir: Path) -> str:
     return "# (solution file not found)"
 
 
+def _read_baseline_head(task_dir: Path, max_lines: int = 100) -> str:
+    """Read the first N lines of the baseline for reference in reflections."""
+    baseline = task_dir / "baseline.py"
+    if not baseline.exists():
+        return ""
+    try:
+        lines = baseline.read_text().splitlines()[:max_lines]
+        code = "\n".join(lines)
+        if len(lines) == max_lines:
+            code += "\n# ... (truncated) ..."
+        return code
+    except OSError:
+        return ""
+
+
+def _parse_rocprof_metrics(profile_data: str) -> dict:
+    """Extract structured metrics from rocprof-compute output.
+
+    Returns a dict with keys: bandwidth_pct, compute_pct, occupancy,
+    top_instructions, recommendation.
+    """
+    if not profile_data:
+        return {}
+
+    metrics: dict = {}
+
+    bw_match = re.search(
+        r"(?:HBM|Memory)\s*(?:BW|Bandwidth)[^:]*:\s*([\d.]+)\s*%", profile_data, re.IGNORECASE
+    )
+    if bw_match:
+        metrics["bandwidth_pct"] = float(bw_match.group(1))
+
+    compute_match = re.search(
+        r"(?:Compute|MFMA|VALU)[^:]*(?:utilization|util)[^:]*:\s*([\d.]+)\s*%",
+        profile_data, re.IGNORECASE,
+    )
+    if compute_match:
+        metrics["compute_pct"] = float(compute_match.group(1))
+
+    occ_match = re.search(
+        r"(?:Occupancy|Waves?\s*/\s*CU)[^:]*:\s*([\d.]+)", profile_data, re.IGNORECASE
+    )
+    if occ_match:
+        metrics["occupancy"] = float(occ_match.group(1))
+
+    instr_types = []
+    for label in ("VMEM", "SMEM", "VALU", "MFMA", "SOP", "LDS"):
+        if re.search(rf"\b{label}\b", profile_data, re.IGNORECASE):
+            instr_types.append(label)
+    if instr_types:
+        metrics["top_instructions"] = instr_types
+
+    bw = metrics.get("bandwidth_pct", 0)
+    comp = metrics.get("compute_pct", 0)
+    if bw > 0 or comp > 0:
+        if bw > comp:
+            metrics["recommendation"] = (
+                "This kernel is memory-bound. Focus on coalescing, "
+                "vectorized loads, and reducing global memory traffic."
+            )
+        else:
+            metrics["recommendation"] = (
+                "This kernel is compute-bound. Focus on MFMA utilization, "
+                "loop unrolling, and reducing instruction count."
+            )
+
+    return metrics
+
+
+def _format_performance_scorecard(profile_data: str) -> str:
+    """Format rocprof metrics into a structured Performance Scorecard."""
+    metrics = _parse_rocprof_metrics(profile_data)
+    if not metrics:
+        return ""
+
+    lines = ["\n### Performance Scorecard"]
+
+    bw = metrics.get("bandwidth_pct")
+    if bw is not None:
+        tag = "BOTTLENECK" if bw > 60 else "room to improve" if bw > 30 else "underutilized"
+        lines.append(f"- Memory bandwidth: {bw:.0f}% of peak (~6.5 TB/s) — {tag}")
+
+    comp = metrics.get("compute_pct")
+    if comp is not None:
+        tag = "BOTTLENECK" if comp > 60 else "room to improve" if comp > 30 else "underutilized"
+        lines.append(f"- Compute (MFMA): {comp:.0f}% of peak — {tag}")
+
+    occ = metrics.get("occupancy")
+    if occ is not None:
+        lines.append(f"- Occupancy: {occ:.0f} waves/CU (max ~16)")
+
+    instrs = metrics.get("top_instructions")
+    if instrs:
+        lines.append(f"- Key instruction categories: {', '.join(instrs)}")
+
+    rec = metrics.get("recommendation")
+    if rec:
+        lines.append(f"- **Recommendation:** {rec}")
+
+    return "\n".join(lines) + "\n"
+
+
 def _get_hints(kernel_type: str) -> str:
     """Return kernel-type-specific optimisation hints."""
     hints_map = {
@@ -268,6 +371,21 @@ def _extract_compare_details(raw: dict) -> str:
         if isinstance(o_corr, dict) and o_corr.get("errors"):
             lines.append(f"\n### Correctness errors\n  {o_corr['errors']}")
 
+        if isinstance(o_corr, dict):
+            for key in ("max_abs_error", "mean_abs_error", "max_rel_error"):
+                val = o_corr.get(key)
+                if val is not None:
+                    lines.append(f"  - {key}: {val}")
+
+    max_err = raw.get("max_absolute_error") or raw.get("max_abs_error")
+    mean_err = raw.get("mean_absolute_error") or raw.get("mean_abs_error")
+    if max_err is not None or mean_err is not None:
+        lines.append("\n### Numerical Diff")
+        if max_err is not None:
+            lines.append(f"  - max_abs_error: {max_err}")
+        if mean_err is not None:
+            lines.append(f"  - mean_abs_error: {mean_err}")
+
     return "\n".join(lines)
 
 
@@ -279,6 +397,7 @@ def reflect(
     target_speedup: float = 3.0,
     min_speedup: float = 1.05,
     profile_data: str = "",
+    previous_speedup: float = 0.0,
 ) -> str:
     """Generate a reflection prompt based on the grading result.
 
@@ -290,14 +409,27 @@ def reflect(
         target_speedup: Stretch goal speedup.
         min_speedup: Minimum speedup for re-injection (integration threshold).
         profile_data: Optional rocprof profiling output for the solution.
+        previous_speedup: Speedup from prior iteration (for delta tracking).
     """
     solution_code = _read_solution(task_dir)
     hints = _get_hints(kernel_type)
-    error = kernel_result.error or ""
+    error = (kernel_result.error or "")[:1000]
     compare_details = _extract_compare_details(kernel_result.raw or {})
+
     profile_section = ""
     if profile_data:
-        profile_section = f"\n### Profiling of Your Solution (Iteration {iteration})\n{profile_data}"
+        scorecard = _format_performance_scorecard(profile_data)
+        profile_section = (
+            f"\n### Profiling of Your Solution (Iteration {iteration})\n"
+            f"{profile_data}\n{scorecard}"
+        )
+
+    baseline_ref = _read_baseline_head(task_dir)
+    baseline_section = ""
+    if baseline_ref:
+        baseline_section = (
+            f"\n### Baseline for Reference\n```python\n{baseline_ref}\n```\n"
+        )
 
     if not kernel_result.compiled:
         return COMPILE_REFLECTION.format(
@@ -305,7 +437,7 @@ def reflect(
             error=error,
             solution=solution_code,
             hints=hints,
-        )
+        ) + baseline_section
 
     if not kernel_result.correct:
         return CORRECTNESS_REFLECTION.format(
@@ -313,7 +445,7 @@ def reflect(
             error=error,
             solution=solution_code,
             hints=hints,
-        )
+        ) + baseline_section
 
     raw = kernel_result.raw or {}
     baseline_ms = float(raw.get("baseline_ms", 0) or 0)
@@ -331,7 +463,7 @@ def reflect(
             compare_details=compare_details,
             profile_section=profile_section,
             hints=hints,
-        )
+        ) + baseline_section
 
     if kernel_result.speedup < min_speedup:
         return BELOW_THRESHOLD_REFLECTION.format(
@@ -344,7 +476,7 @@ def reflect(
             compare_details=compare_details,
             profile_section=profile_section,
             hints=hints,
-        )
+        ) + baseline_section
 
     return IMPROVEMENT_REFLECTION.format(
         iteration=iteration,
@@ -358,7 +490,7 @@ def reflect(
         compare_details=compare_details,
         profile_section=profile_section,
         hints=hints,
-    )
+    ) + baseline_section
 
 
 def should_continue(
@@ -366,10 +498,18 @@ def should_continue(
     iteration: int,
     max_iterations: int,
     score_threshold: float = 300.0,
+    previous_speedup: float = 0.0,
+    stall_count: int = 0,
 ) -> bool:
-    """Decide whether to run another optimisation iteration."""
+    """Decide whether to run another optimisation iteration.
+
+    Returns False early if the kernel has stalled (delta < 5% for 2+
+    consecutive iterations) to save agent budget.
+    """
     if iteration >= max_iterations:
         return False
     if kernel_result.score >= score_threshold:
+        return False
+    if stall_count >= 2:
         return False
     return True

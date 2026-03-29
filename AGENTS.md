@@ -628,6 +628,17 @@ Each pipeline run starts with a guaranteed clean baseline:
 - **Environment snapshot**: All `VLLM_ROCM_USE_AITER_*` env vars and package versions captured in trajectory.
 - **Library test verification**: After hot-patching, the library's own test suite (from `MANUAL_REGISTRY`) is run to catch subtle correctness issues beyond import checks.
 - **Multi-file patching**: Solutions can be a directory with `manifest.json` mapping multiple files to their install targets, supporting kernel + dispatch table changes.
+- **Benchmark caching**: `--benchmark-cache-hours N` caches baseline benchmark results to skip re-running.
+- **Parallel kernel optimization**: `--parallel-kernels N` runs up to N agent sessions concurrently. GPU grading is serialized.
+- **Smart iteration**: No-progress early termination (stall detection: delta <5% for 2 consecutive iterations) with budget reallocation.
+- **Agent model routing**: `--agent-model-simple` / `--agent-model-complex` for per-kernel model override based on difficulty.
+- **Knowledge base**: `knowledge_base.json` records optimization outcomes; past insights injected into agent prompts automatically.
+- **Anti-tampering prompts**: Explicit anti-tampering rules in all prompt templates with AST-based detection.
+- **Correctness-first workflow**: Mandatory correctness → speed optimization order enforced in prompts.
+- **Speedup measurement reliability**: Multiple profiling runs with outlier rejection and high-variance warnings.
+- **Structured profiling feedback**: rocprof metrics parsed into Performance Scorecard in reflection prompts.
+- **Reference injection**: PyTorch reference code and library test function signatures injected inline in agent prompts.
+- **Configurable tampering cap**: `--tampering-speedup-cap X` overrides default speedup cap when benchmark tampering detected.
 
 ## Kernel reintegration scope
 

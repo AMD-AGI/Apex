@@ -308,6 +308,59 @@ The mini eval (`eval.py`) uses a lightweight local grader that runs without Magp
 - **Documentation** — ROCm docs, MI355X architecture references, HIP/Triton tutorials
 - **Best-practice guides** — `hip_best_practices.md`, `triton_best_practices.md`
 
+## Pipeline Improvements
+
+### Benchmark caching
+
+Use `--benchmark-cache-hours N` to cache E2E baseline benchmark results. If a cached result exists and is younger than N hours for the same config YAML, the pipeline skips the ~30-minute benchmark run:
+
+```bash
+python3 workload_optimizer.py run -r $RESULTS -b $BENCH_CONFIG --benchmark-cache-hours 4
+```
+
+### Parallel kernel optimization
+
+Use `--parallel-kernels N` to optimize up to N kernels simultaneously. Agent reasoning is API-bound (no GPU), so parallelism is safe. GPU grading is serialized via a lock:
+
+```bash
+python3 workload_optimizer.py run -r $RESULTS -b $BENCH_CONFIG --parallel-kernels 2
+```
+
+### Smart iteration strategy
+
+The pipeline now detects stalled kernels (speedup delta < 5% for 2 consecutive iterations) and stops early, returning unused iteration budget to other kernels.
+
+### Agent model routing
+
+Use `--agent-model-simple` and `--agent-model-complex` to assign different models based on kernel difficulty (simple: rms_norm, silu_mul; complex: fused_moe, flash_attn):
+
+```bash
+python3 workload_optimizer.py optimize -r $RESULTS \
+  --agent-model-simple claude-sonnet-4-20250514 \
+  --agent-model-complex claude-opus-4-6
+```
+
+### Knowledge base
+
+All optimization outcomes are recorded in `knowledge_base.json` at the repo root. Past insights are automatically injected into agent prompts for cross-kernel and cross-run learning. The knowledge base tracks strategies used, speedups achieved, and key insights.
+
+### Anti-tampering rules
+
+The pipeline includes AST-based benchmark tampering detection that penalizes:
+- `SystemExit` / `sys.exit()` inside `__main__` guards
+- Hardcoded `PASS` output or fabricated `BENCHMARK_MS` values
+- Agents are explicitly warned about these rules in all prompt templates
+
+Use `--tampering-speedup-cap X` to configure the speedup cap when tampering is detected (default: 1.0x).
+
+### Scoring formula
+
+```
+score = compiled × 20  +  correct × 100  +  speedup × 100
+```
+
+Where `speedup = baseline_ms / optimized_ms`. Only correct solutions count the speedup component.
+
 ## Kernel Reintegration (Hot-Patching)
 
 When the pipeline integrates optimized kernels for the final E2E benchmark, it **hot-patches** installed Python modules in site-packages. This is a temporary operation -- all patches are restored after benchmarking.
