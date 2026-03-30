@@ -393,6 +393,22 @@ When the pipeline integrates optimized kernels for the final E2E benchmark, it *
 
 This is a known limitation. System library rebuild support is planned for future work.
 
+## Building CK Examples (Optional, for Accordo Validation)
+
+Composable Kernel (CK) examples provide compiled HIP binaries that Accordo can use for HSA-level correctness validation. Building is optional -- only needed if you want to use `--correctness-mode accordo` with real CK kernels.
+
+```bash
+bash tools/build_ck.sh --gpu-targets gfx950
+```
+
+This builds only the example binaries (~10-30 minutes depending on GPU target count). Binaries are placed in `tools/rocm/composable_kernel/build/bin/`.
+
+Options:
+- `--gpu-targets <arch>` -- GPU architecture (default: auto-detect via `rocminfo` or `gfx950`)
+- `--jobs N` / `-j N` -- Parallel build jobs (default: `nproc`)
+
+Once built, the Accordo config discovery in `graders/ground_truth.py` will automatically detect and use available CK binaries for validation.
+
 ## Development
 
 ```bash

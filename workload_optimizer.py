@@ -2150,7 +2150,9 @@ def _create_task_config(
             ref_path.write_text(gt_spec.pytorch_reference_code)
             if gt_spec.test_shapes_code:
                 shapes_path = task_dir / "test_shapes.py"
-                shapes_path.write_text(gt_spec.test_shapes_code)
+                shapes_path.write_text(
+                    _wrap_shapes_code(gt_spec.test_shapes_code, gt_spec.input_func_name)
+                )
             print(f"    Correctness mode: pytorch (real reference from {gt_spec.source_library}/{gt_spec.source_file})")
         else:
             print(f"    Correctness mode: pytorch (baseline-vs-solution, no library reference found)")
@@ -4660,6 +4662,34 @@ class KernelStandaloneDefinition:
         return self.ground_truth.get("mode", "pytorch")
 
 
+def _wrap_shapes_code(shapes_code: str, input_func_name: str) -> str:
+    """Wrap extracted shapes code with proper imports and a get_test_inputs() wrapper.
+
+    The testcase template calls shapes_mod.get_test_inputs() (no args).
+    Registry-extracted code has functions like generate_rmsnorm_inputs(M, N, dtype)
+    that need to be wrapped with default arguments.
+    """
+    parts = ["import torch\n"]
+    if "import torch" not in shapes_code:
+        pass  # already prepending torch import
+    else:
+        parts = []  # shapes_code already has import torch
+    parts.append(shapes_code.rstrip())
+
+    if input_func_name and input_func_name in shapes_code:
+        parts.append(
+            f"\n\ndef get_test_inputs():\n"
+            f"    return [{input_func_name}(256, 4096, torch.float16)]\n"
+        )
+    elif "def get_test_inputs" not in shapes_code:
+        parts.append(
+            "\n\ndef get_test_inputs():\n"
+            "    return [(torch.randn(256, 4096, dtype=torch.float16, device='cuda'),)]\n"
+        )
+
+    return "\n".join(parts)
+
+
 _STANDALONE_TESTCASE_TEMPLATE = '''\
 #!/usr/bin/env python3
 """Correctness testcase: compare solution vs real library PyTorch reference."""
@@ -4674,7 +4704,11 @@ def _load(path, name):
     spec.loader.exec_module(mod)
     return mod
 
-def _find_fn(mod):
+def _find_fn(mod, hint=""):
+    if hint:
+        fn = getattr(mod, hint, None)
+        if callable(fn):
+            return fn
     for n in ("forward", "baseline_fn", "kernel_fn"):
         fn = getattr(mod, n, None)
         if callable(fn):
@@ -4689,8 +4723,8 @@ def _find_fn(mod):
 ref_mod = _load(os.path.join(_DIR, "reference.py"), "ref")
 sol_mod = _load(os.path.join(_DIR, "{sol_filename}"), "sol")
 
-ref_fn = _find_fn(ref_mod)
-sol_fn = _find_fn(sol_mod)
+ref_fn = _find_fn(ref_mod, "{ref_func_name}")
+sol_fn = _find_fn(sol_mod, "{sol_func_name}")
 
 if ref_fn is None:
     print("FAIL: Could not find a callable function in reference.py")
@@ -4699,6 +4733,29 @@ if sol_fn is None:
     print("FAIL: Could not find a callable function in solution")
     sys.exit(1)
 
+import inspect
+_COMMON_DEFAULTS = {{
+    "epsilon": 1e-6, "eps": 1e-6, "atol": 1e-3, "rtol": 1e-3,
+    "out_dtype": torch.float16, "dtype": torch.float16,
+}}
+
+def _safe_call(fn, inputs):
+    """Call fn with inputs, padding missing required args from known defaults."""
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+    n_required = len([p for p in params if p.default is inspect.Parameter.empty])
+    if len(inputs) >= n_required:
+        return fn(*inputs[:n_required])
+    args = list(inputs)
+    for p in params[len(args):]:
+        if p.default is not inspect.Parameter.empty:
+            args.append(p.default)
+        elif p.name in _COMMON_DEFAULTS:
+            args.append(_COMMON_DEFAULTS[p.name])
+        else:
+            break
+    return fn(*args)
+
 try:
     shapes_mod = _load(os.path.join(_DIR, "test_shapes.py"), "shapes")
     test_inputs = shapes_mod.get_test_inputs()
@@ -4706,7 +4763,6 @@ except Exception:
     test_inputs = None
 
 if test_inputs is None:
-    import inspect
     sig = inspect.signature(ref_fn)
     nparams = len([p for p in sig.parameters.values()
                    if p.default is inspect.Parameter.empty])
@@ -4723,8 +4779,8 @@ for i, inputs in enumerate(test_inputs):
     if not isinstance(inputs, (tuple, list)):
         inputs = (inputs,)
     with torch.no_grad():
-        ref_out = ref_fn(*inputs)
-        sol_out = sol_fn(*inputs)
+        ref_out = _safe_call(ref_fn, inputs)
+        sol_out = _safe_call(sol_fn, inputs)
     if isinstance(ref_out, (tuple, list)):
         ref_out = ref_out[0]
     if isinstance(sol_out, (tuple, list)):
@@ -4788,6 +4844,13 @@ def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
                     gt["pytorch_reference_code"] = gt_spec.pytorch_reference_code
                     if gt_spec.test_shapes_code:
                         gt["test_shapes_code"] = gt_spec.test_shapes_code
+                    if gt_spec.ref_func_name:
+                        gt["ref_func_name"] = gt_spec.ref_func_name
+                    if gt_spec.sol_entry_func:
+                        gt["sol_entry_func"] = gt_spec.sol_entry_func
+                    if gt_spec.input_func_name:
+                        gt["input_func_name"] = gt_spec.input_func_name
+                    gt["source_library"] = gt_spec.source_library
                     print(f"    Auto-discovered PyTorch reference for '{kname}' from {gt_spec.source_library}")
     elif corr_mode == "library_test":
         gt["unit_test_command"] = getattr(args, "test_cmd", "")
@@ -4851,11 +4914,20 @@ def _create_standalone_task_config(
             ref_path.write_text(ref_preamble + ref_code)
             if shapes_code:
                 shapes_path = task_dir / "test_shapes.py"
-                shapes_path.write_text(shapes_code)
+                input_func_name = gt.get("input_func_name", "")
+                shapes_path.write_text(
+                    _wrap_shapes_code(shapes_code, input_func_name)
+                )
             tc_path = task_dir / "testcase.py"
             sol_filename = f"solution{ext}"
+            ref_func_name = gt.get("ref_func_name", "")
+            sol_func_name = gt.get("sol_entry_func", "")
             tc_path.write_text(
-                _STANDALONE_TESTCASE_TEMPLATE.format(sol_filename=sol_filename)
+                _STANDALONE_TESTCASE_TEMPLATE.format(
+                    sol_filename=sol_filename,
+                    ref_func_name=ref_func_name,
+                    sol_func_name=sol_func_name,
+                )
             )
             correctness_cmd = f"{kernel_python} testcase.py"
             print(f"    Generated testcase from real library reference: {tc_path.name}")

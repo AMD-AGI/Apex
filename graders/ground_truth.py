@@ -86,6 +86,9 @@ class GroundTruthSpec:
     source_library: str = ""
     difficulty_level: int = 2
     op_type: str = "memory_bound"
+    ref_func_name: str = ""
+    sol_entry_func: str = ""
+    input_func_name: str = ""
 
     def to_ground_truth_dict(self) -> dict:
         """Return the ground_truth sub-dict for the dataset schema."""
@@ -395,27 +398,29 @@ class _RegistryEntry(NamedTuple):
     library: str
     ref_func: str
     input_func: str
+    sol_entry_func: str
     test_cmd: str
     difficulty: int
     op_type: str
 
 
 _REGISTRY_ENTRIES: list[_RegistryEntry] = [
-    _RegistryEntry("rms_norm",         "pytorch",      "aiter/op_tests/triton_tests/normalization/test_rmsnorm.py",                      "aiter", "torch_rmsnorm",       "generate_rmsnorm_inputs", "",                                                                                 1, "memory_bound"),
-    _RegistryEntry("silu_mul",         "library_test", "aiter/op_tests/triton_tests/test_activation.py",                                 "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/test_activation.py",               1, "memory_bound"),
-    _RegistryEntry("fused_moe",        "pytorch",      "aiter/op_tests/triton_tests/moe/test_moe.py",                                   "aiter", "torch_moe_ref",       "",                        "",                                                                              3, "compute_bound"),
-    _RegistryEntry("flash_attn_prefill","pytorch",     "aiter/op_tests/triton_tests/attention/test_la.py",                               "aiter", "reference_attention", "",                        "",                                                                              3, "memory_bound"),
-    _RegistryEntry("paged_attn_decode","pytorch",      "aiter/op_tests/triton_tests/attention/test_unified_attention.py",                "aiter", "ref_paged_attn",      "",                        "",                                                                              3, "memory_bound"),
-    _RegistryEntry("gemm_bf16",        "library_test", "aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py",                    "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py",   2, "compute_bound"),
-    _RegistryEntry("gemm_w8a8",        "library_test", "aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py",                      "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py",     2, "compute_bound"),
-    _RegistryEntry("rope_embedding",   "pytorch",      "aiter/op_tests/test_rope.py",                                                   "aiter", "ref_rope_sbhd_fwd",   "",                        "",                                                                              2, "memory_bound"),
-    _RegistryEntry("act_quant_fp8",    "library_test", "aiter/op_tests/triton_tests/quant/test_quant.py",                               "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/quant/test_quant.py",              2, "compute_bound"),
-    _RegistryEntry("kv_cache_ops",     "library_test", "aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py",                    "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py",   2, "memory_bound"),
-    _RegistryEntry("all_reduce",       "library_test", "aiter/op_tests/multigpu_tests/test_quick_all_reduce.py",                        "aiter", "",                    "",                        "python -m pytest aiter/op_tests/multigpu_tests/test_quick_all_reduce.py",       2, "memory_bound"),
-    _RegistryEntry("mla_attn",         "pytorch",      "aiter/op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py",    "aiter", "reference_torch",     "",                        "",                                                                              3, "memory_bound"),
-    _RegistryEntry("layernorm",        "library_test", "aiter/op_tests/triton_tests/normalization/test_layernorm.py",                   "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/normalization/test_layernorm.py",  1, "memory_bound"),
-    _RegistryEntry("softmax",          "library_test", "aiter/op_tests/triton_tests/test_softmax.py",                                   "aiter", "",                    "",                        "python -m pytest aiter/op_tests/triton_tests/test_softmax.py",                  1, "memory_bound"),
-    _RegistryEntry("mla_decode_rope",  "pytorch",      "aiter/op_tests/triton_tests/attention/test_mla_decode_rope.py",                 "aiter", "ref_compute",         "",                        "",                                                                              3, "memory_bound"),
+    #                                                                                                                                              ref_func               input_func                 sol_entry_func         test_cmd                                                                        diff  op_type
+    _RegistryEntry("rms_norm",         "pytorch",      "aiter/op_tests/triton_tests/normalization/test_rmsnorm.py",                      "aiter", "torch_rmsnorm",       "generate_rmsnorm_inputs", "rms_norm",            "",                                                                                 1, "memory_bound"),
+    _RegistryEntry("silu_mul",         "library_test", "aiter/op_tests/triton_tests/test_activation.py",                                 "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/triton_tests/test_activation.py",               1, "memory_bound"),
+    _RegistryEntry("fused_moe",        "pytorch",      "aiter/op_tests/triton_tests/moe/test_moe.py",                                   "aiter", "torch_moe_ref",       "",                        "",                    "",                                                                              3, "compute_bound"),
+    _RegistryEntry("flash_attn_prefill","pytorch",     "aiter/op_tests/triton_tests/attention/test_la.py",                               "aiter", "reference_attention", "",                        "",                    "",                                                                              3, "memory_bound"),
+    _RegistryEntry("paged_attn_decode","pytorch",      "aiter/op_tests/triton_tests/attention/test_unified_attention.py",                "aiter", "ref_paged_attn",      "",                        "",                    "",                                                                              3, "memory_bound"),
+    _RegistryEntry("gemm_bf16",        "library_test", "aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py",                    "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py",   2, "compute_bound"),
+    _RegistryEntry("gemm_w8a8",        "library_test", "aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py",                      "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py",     2, "compute_bound"),
+    _RegistryEntry("rope_embedding",   "pytorch",      "aiter/op_tests/test_rope.py",                                                   "aiter", "ref_rope_sbhd_fwd",   "",                        "",                    "",                                                                              2, "memory_bound"),
+    _RegistryEntry("act_quant_fp8",    "library_test", "aiter/op_tests/triton_tests/quant/test_quant.py",                               "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/triton_tests/quant/test_quant.py",              2, "compute_bound"),
+    _RegistryEntry("kv_cache_ops",     "library_test", "aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py",                    "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py",   2, "memory_bound"),
+    _RegistryEntry("all_reduce",       "library_test", "aiter/op_tests/multigpu_tests/test_quick_all_reduce.py",                        "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/multigpu_tests/test_quick_all_reduce.py",       2, "memory_bound"),
+    _RegistryEntry("mla_attn",         "pytorch",      "aiter/op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py",    "aiter", "reference_torch",     "",                        "",                    "",                                                                              3, "memory_bound"),
+    _RegistryEntry("layernorm",        "library_test", "aiter/op_tests/triton_tests/normalization/test_layernorm.py",                   "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/triton_tests/normalization/test_layernorm.py",  1, "memory_bound"),
+    _RegistryEntry("softmax",          "library_test", "aiter/op_tests/triton_tests/test_softmax.py",                                   "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/triton_tests/test_softmax.py",                  1, "memory_bound"),
+    _RegistryEntry("mla_decode_rope",  "pytorch",      "aiter/op_tests/triton_tests/attention/test_mla_decode_rope.py",                 "aiter", "ref_compute",         "",                        "",                    "",                                                                              3, "memory_bound"),
 ]
 
 
@@ -446,6 +451,9 @@ def _build_manual_registry() -> None:
                     source_library=entry.library,
                     difficulty_level=entry.difficulty,
                     op_type=entry.op_type,
+                    ref_func_name=entry.ref_func,
+                    sol_entry_func=entry.sol_entry_func,
+                    input_func_name=entry.input_func,
                 )
                 continue
 
@@ -487,6 +495,7 @@ def scan_hip_kernels_for_accordo(
 
     # CK examples: each numbered directory is a distinct kernel operation
     ck_examples = rocm_dir / "composable_kernel" / "example"
+    ck_build_bin = rocm_dir / "composable_kernel" / "build" / "bin"
     if ck_examples.exists():
         for example_dir in sorted(ck_examples.iterdir()):
             if not example_dir.is_dir():
@@ -498,20 +507,24 @@ def scan_hip_kernels_for_accordo(
                 continue
             kernel_name = parts[1]  # e.g. "gemm", "grouped_gemm"
 
-            # Find any binary targets (from CMakeLists.txt)
-            cmake = example_dir / "CMakeLists.txt"
             binary_name = f"example_{name}"
+
+            # Prefer absolute path to built binary if it exists
+            built_binary = ck_build_bin / binary_name
+            is_built = built_binary.exists() and built_binary.stat().st_mode & 0o111
+            ref_binary_path = str(built_binary) if is_built else f"build/bin/{binary_name}"
 
             accordo_config = {
                 "correctness": {
                     "backend": "accordo",
                     "accordo": {
                         "kernel_name": kernel_name,
-                        "reference_binary": f"build/bin/{binary_name}",
+                        "reference_binary": ref_binary_path,
                         "optimized_binary": f"build/bin/{binary_name}_opt",
                         "tolerance": 0.001,
                         "timeout_seconds": 60,
-                        "working_directory": "${CK_HOME}",
+                        "working_directory": str(rocm_dir / "composable_kernel") if is_built else "${CK_HOME}",
+                        "built": is_built,
                     },
                 }
             }
