@@ -457,7 +457,7 @@ def _run_accordo_check(
     ref_binary = accordo_cfg.get("reference_binary", "")
     opt_binary = accordo_cfg.get("optimized_binary", "")
     tolerance = accordo_cfg.get("tolerance", 0.001)
-    _MAX_ACCORDO_TIMEOUT = 1800  # 30 min hard cap
+    _MAX_ACCORDO_TIMEOUT = 900  # 15 min hard cap
     acc_timeout = min(int(accordo_cfg.get("timeout_seconds", timeout)), _MAX_ACCORDO_TIMEOUT)
     acc_working_dir = accordo_cfg.get("working_directory", working_dir) or working_dir
 
@@ -549,6 +549,62 @@ def _run_accordo_check(
         print(f"    [grader] accordo CLI not found (race condition)", file=sys.stderr)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Magpie performance measurement for non-pytorch modes
+# ---------------------------------------------------------------------------
+
+def _try_magpie_perf_measurement(
+    raw: dict,
+    baseline_path: str,
+    optimized_path: str,
+    task_dir: Path,
+    compare_timeout: int,
+    solution: Path,
+    testcase_cmd: str | None = None,
+) -> None:
+    """Attempt Magpie compare for performance measurement only.
+
+    Called after library_test or accordo has already determined correctness.
+    If Magpie provides timing data, injects ``_magpie_speedup`` into *raw*
+    so that ``_finalize_grading_result`` uses Magpie numbers instead of the
+    less-precise script-level benchmark.  The domain-specific correctness
+    verdict is never overridden.
+
+    *testcase_cmd* tells Magpie how to invoke the kernel for benchmarking.
+    Without it Magpie may skip the performance phase entirely.
+    """
+    if not baseline_path or not Path(baseline_path).exists():
+        return
+    if not optimized_path or not Path(optimized_path).exists():
+        return
+
+    kernel_type = _detect_kernel_type(solution)
+    try:
+        magpie_raw = run_magpie_compare(
+            baseline_path=baseline_path,
+            optimized_path=optimized_path,
+            testcase_cmd=testcase_cmd,
+            kernel_type=kernel_type,
+            working_dir=str(task_dir.resolve()),
+            timeout=compare_timeout,
+        )
+        if "error" not in magpie_raw:
+            _, _, speedup = parse_compare_result(magpie_raw)
+            if speedup > 0:
+                raw["_magpie_speedup"] = speedup
+                raw["_magpie_perf_source"] = "magpie_compare"
+                print(f"    [grader] Magpie perf measurement: {speedup:.3f}x",
+                      file=sys.stderr)
+            else:
+                print("    [grader] Magpie perf: no timing data returned",
+                      file=sys.stderr)
+        else:
+            print(f"    [grader] Magpie perf skipped: {magpie_raw['error']}",
+                  file=sys.stderr)
+    except Exception as exc:
+        print(f"    [grader] Magpie perf failed: {exc}", file=sys.stderr)
 
 
 def grade_task(
@@ -651,6 +707,13 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
     if not Path(optimized_path).is_absolute():
         optimized_path = str((task_dir / optimized_path).resolve())
 
+    # Testcase command for Magpie perf (correctness or performance section)
+    magpie_testcase_cmd = (
+        corr_cfg.get("command")
+        or cfg.get("performance", {}).get("command")
+        or None
+    )
+
     # ── Mode 2: Library test ─────────────────────────────────────────────
     if corr_mode == "library_test":
         unit_test_cmd = corr_cfg.get("unit_test_command", "")
@@ -669,6 +732,13 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
             timeout=compare_timeout,
         )
 
+        if raw.get("correct") and baseline_path:
+            _try_magpie_perf_measurement(
+                raw, baseline_path, optimized_path,
+                task_dir, compare_timeout, solution,
+                testcase_cmd=magpie_testcase_cmd,
+            )
+
         return _finalize_grading_result(
             task_id, raw, cfg, task_dir,
             baseline_path, optimized_path, solution, compare_timeout,
@@ -684,6 +754,13 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
             working_dir=acc_working_dir,
             timeout=compare_timeout,
         )
+
+        if raw.get("correct") and baseline_path:
+            _try_magpie_perf_measurement(
+                raw, baseline_path, optimized_path,
+                task_dir, compare_timeout, solution,
+                testcase_cmd=magpie_testcase_cmd,
+            )
 
         return _finalize_grading_result(
             task_id, raw, cfg, task_dir,
