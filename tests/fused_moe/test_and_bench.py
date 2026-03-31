@@ -47,8 +47,8 @@ def make_test_data(num_tokens=256, hidden_dim=4096, ffn_dim=14336,
 
 # ── Correctness test ─────────────────────────────────────────────────────────
 
-def test_correctness(mod, label="kernel"):
-    """Test a module's fused_moe_forward against the PyTorch reference."""
+def check_correctness(mod, label="kernel"):
+    """Check a module's fused_moe_forward against the PyTorch reference."""
     from baseline_fused_moe import moe_reference
 
     for num_tokens in [16, 64, 256]:
@@ -143,7 +143,7 @@ def main():
     # Correctness
     if not args.bench_only:
         try:
-            ok, msg = test_correctness(solution)
+            ok, msg = check_correctness(solution)
             result["correct"] = ok
             if not ok:
                 result["error"] = msg

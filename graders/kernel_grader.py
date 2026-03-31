@@ -26,8 +26,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -238,6 +242,371 @@ def _measure_speedup(cfg: dict, task_dir: Path, baseline_path: str, optimized_pa
     return 0.0
 
 
+def _apply_gaming_penalties(
+    raw: dict,
+    solution: Path,
+    baseline_path: str,
+    compiled: bool,
+    correct: bool,
+    speedup: float,
+) -> tuple[bool, float]:
+    """Detect benchmark gaming and apply correctness/speedup penalties.
+
+    Returns (adjusted_correct, adjusted_speedup).
+    """
+    gaming_warnings = _detect_benchmark_gaming(solution, baseline_path) if baseline_path else []
+    if not gaming_warnings:
+        return correct, speedup
+
+    for gw in gaming_warnings:
+        print(f"    [grader] GAMING DETECTED: {gw}", file=sys.stderr)
+    raw["_gaming_warnings"] = gaming_warnings
+
+    has_fake_pass = any("hardcoded PASS" in w for w in gaming_warnings)
+    has_fake_benchmark = any("hardcoded BENCHMARK_MS" in w for w in gaming_warnings)
+
+    if has_fake_pass:
+        correct = False
+        raw["_correctness_rejected_for_gaming"] = True
+        print("    [grader] Marking correct=False: solution faked PASS output",
+              file=sys.stderr)
+    if has_fake_benchmark and speedup > 1.0:
+        print(f"    [grader] Capping speedup from {speedup:.2f}x to 1.0x: "
+              f"fabricated benchmark number", file=sys.stderr)
+        speedup = 1.0
+        raw["_speedup_capped_for_gaming"] = True
+
+    return correct, speedup
+
+
+def _finalize_grading_result(
+    task_id: str,
+    raw: dict,
+    cfg: dict,
+    task_dir: Path,
+    baseline_path: str,
+    optimized_path: str,
+    solution: Path,
+    compare_timeout: int,
+) -> KernelResult:
+    """Shared post-processing: measure speedup, detect gaming, build KernelResult.
+
+    Used by all three correctness modes (pytorch, library_test, accordo).
+    If raw already contains a pre-computed speedup (via _magpie_speedup), that
+    value is used instead of re-running _measure_speedup.
+    """
+    compiled = raw.get("compiled", False)
+    correct = raw.get("correct", False)
+    speedup = raw.pop("_magpie_speedup", 0.0)
+
+    if compiled and correct and speedup <= 0:
+        speedup = _measure_speedup(cfg, task_dir, baseline_path, optimized_path)
+        if speedup <= 0:
+            speedup = 1.0
+            raw["_no_perf_data"] = True
+            print("    [grader] No performance data; assuming 1.0x", file=sys.stderr)
+
+    correct, speedup = _apply_gaming_penalties(
+        raw, solution, baseline_path, compiled, correct, speedup,
+    )
+
+    return KernelResult(
+        task_id=task_id,
+        compiled=compiled,
+        correct=correct,
+        speedup=speedup,
+        raw=raw,
+        error=raw.get("error", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode 2: Library test correctness
+# ---------------------------------------------------------------------------
+
+_TRUSTED_TEST_CMD_PREFIXES = (
+    "python -m pytest",
+    "pytest",
+    "python -m unittest",
+    "python -c",
+)
+
+
+def _run_library_test(
+    unit_test_cmd: str,
+    working_dir: str,
+    solution_path: Path,
+    timeout: int = 300,
+) -> dict:
+    """Run a library's own test suite to check correctness.
+
+    Executes the unit_test_command (typically pytest) as a subprocess.
+    The solution directory is prepended to PYTHONPATH so the library tests
+    can import the optimized kernel.
+
+    Only commands starting with known-safe prefixes are allowed to use
+    shell=True.  Arbitrary shell commands from agent-generated configs
+    are rejected.
+
+    Returns a dict with 'compiled', 'correct', and diagnostic info.
+    """
+    result: dict = {"_correctness_mode": "library_test"}
+    if not unit_test_cmd.strip():
+        result["error"] = "empty unit_test_command"
+        return result
+
+    stripped = unit_test_cmd.strip()
+    if not any(stripped.startswith(p) for p in _TRUSTED_TEST_CMD_PREFIXES):
+        result["compiled"] = False
+        result["correct"] = False
+        result["error"] = (
+            f"unit_test_command rejected: must start with one of "
+            f"{_TRUSTED_TEST_CMD_PREFIXES}. Got: {stripped[:80]}"
+        )
+        print(f"    [grader] REJECTED untrusted test command: {stripped[:80]}", file=sys.stderr)
+        return result
+
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    sol_dir = str(solution_path.parent.resolve())
+    env["PYTHONPATH"] = f"{sol_dir}:{existing}" if existing else sol_dir
+
+    # Use shell mode for commands with shell constructs
+    _shell_chars = ("|", "&&", "||", ";", "$", "`", ">", "<")
+    use_shell = any(ch in unit_test_cmd for ch in _shell_chars)
+    cmd: str | list[str] = unit_test_cmd if use_shell else shlex.split(unit_test_cmd)
+
+    print(f"    [grader] library_test: {unit_test_cmd}", file=sys.stderr)
+    print(f"    [grader] working_dir: {working_dir}", file=sys.stderr)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=working_dir if working_dir else None,
+            env=env,
+            shell=use_shell,
+        )
+
+        result["exit_code"] = proc.returncode
+        result["stdout"] = proc.stdout[-2000:] if len(proc.stdout) > 2000 else proc.stdout
+        result["stderr"] = proc.stderr[-2000:] if len(proc.stderr) > 2000 else proc.stderr
+
+        if proc.returncode == 0:
+            result["compiled"] = True
+            result["correct"] = True
+            passed = re.search(r"(\d+)\s+passed", proc.stdout)
+            if passed:
+                result["tests_passed"] = int(passed.group(1))
+            print(f"    [grader] library_test PASSED", file=sys.stderr)
+        else:
+            result["compiled"] = True
+            result["correct"] = False
+            failed = re.search(r"(\d+)\s+failed", proc.stdout)
+            if failed:
+                result["tests_failed"] = int(failed.group(1))
+            error_match = re.search(r"(ERRORS?|FAILED)\s*.*", proc.stdout)
+            result["error"] = error_match.group(0)[:200] if error_match else f"exit code {proc.returncode}"
+            print(f"    [grader] library_test FAILED (exit {proc.returncode})", file=sys.stderr)
+
+    except subprocess.TimeoutExpired:
+        result["compiled"] = True
+        result["correct"] = False
+        result["error"] = f"library_test timed out ({timeout}s)"
+        print(f"    [grader] library_test TIMEOUT ({timeout}s)", file=sys.stderr)
+    except FileNotFoundError as e:
+        result["compiled"] = False
+        result["correct"] = False
+        result["error"] = f"command not found: {e}"
+        print(f"    [grader] library_test command not found: {e}", file=sys.stderr)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Mode 3: Accordo HSA-level correctness
+# ---------------------------------------------------------------------------
+
+def _run_accordo_check(
+    accordo_cfg: dict,
+    working_dir: str,
+    timeout: int = 300,
+) -> dict:
+    """Run Accordo HSA-level validation for HIP/C++ kernels.
+
+    Invokes `accordo validate` CLI to compare GPU buffer outputs between
+    reference and optimized binaries at the HSA runtime level.
+
+    Returns a dict with 'compiled', 'correct', and diagnostic info.
+    """
+    result: dict = {"_correctness_mode": "accordo"}
+
+    if not shutil.which("accordo"):
+        result["compiled"] = False
+        result["correct"] = False
+        result["error"] = (
+            "'accordo' CLI not found on PATH. Install IntelliKit Accordo "
+            "(pip install intellikit[accordo])."
+        )
+        print(f"    [grader] accordo CLI not found", file=sys.stderr)
+        return result
+
+    kernel_name = accordo_cfg.get("kernel_name", "")
+    ref_binary = accordo_cfg.get("reference_binary", "")
+    opt_binary = accordo_cfg.get("optimized_binary", "")
+    tolerance = accordo_cfg.get("tolerance", 0.001)
+    _MAX_ACCORDO_TIMEOUT = 900  # 15 min hard cap
+    acc_timeout = min(int(accordo_cfg.get("timeout_seconds", timeout)), _MAX_ACCORDO_TIMEOUT)
+    acc_working_dir = accordo_cfg.get("working_directory", working_dir) or working_dir
+
+    acc_working_dir = os.path.expandvars(acc_working_dir)
+
+    if not kernel_name:
+        result["error"] = "accordo config missing 'kernel_name'"
+        return result
+    if not ref_binary or not opt_binary:
+        result["error"] = "accordo config missing 'reference_binary' or 'optimized_binary'"
+        return result
+
+    cmd = [
+        "accordo", "validate",
+        "--kernel-name", kernel_name,
+        "--ref-binary", ref_binary,
+        "--opt-binary", opt_binary,
+        "--tolerance", str(tolerance),
+        "--timeout", str(int(acc_timeout)),
+        "--working-dir", acc_working_dir,
+        "--log-level", "INFO",
+    ]
+
+    kernel_args = accordo_cfg.get("kernel_args")
+    if kernel_args:
+        if isinstance(kernel_args, list):
+            args_str = ",".join(f"{name}:{typ}" for name, typ in kernel_args)
+        else:
+            args_str = str(kernel_args)
+        cmd.extend(["--kernel-args", args_str])
+
+    print(f"    [grader] accordo: {' '.join(cmd)}", file=sys.stderr)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=int(acc_timeout) * 2 + 60,
+            cwd=acc_working_dir,
+        )
+
+        result["exit_code"] = proc.returncode
+        result["stdout"] = proc.stdout[-2000:] if len(proc.stdout) > 2000 else proc.stdout
+        result["stderr"] = proc.stderr[-2000:] if len(proc.stderr) > 2000 else proc.stderr
+
+        # Accordo outputs JSON on stdout (may have non-JSON prefix from binary)
+        stdout_text = proc.stdout.strip()
+        json_start = stdout_text.find("{")
+        if json_start > 0:
+            stdout_text = stdout_text[json_start:]
+        try:
+            output = json.loads(stdout_text)
+            result["accordo_output"] = output
+            is_valid = output.get("is_valid", output.get("valid", False))
+            result["compiled"] = True
+            result["correct"] = is_valid
+            if is_valid:
+                result["num_arrays_validated"] = output.get("num_arrays_validated", 0)
+                print(f"    [grader] accordo PASSED ({result['num_arrays_validated']} arrays validated)",
+                      file=sys.stderr)
+            else:
+                result["num_mismatches"] = output.get("num_mismatches", 0)
+                result["error"] = f"accordo validation failed: {output.get('num_mismatches', '?')} mismatches"
+                print(f"    [grader] accordo FAILED ({result['num_mismatches']} mismatches)",
+                      file=sys.stderr)
+        except (json.JSONDecodeError, ValueError):
+            if proc.returncode == 0:
+                result["compiled"] = True
+                result["correct"] = True
+                print(f"    [grader] accordo PASSED (non-JSON output)", file=sys.stderr)
+            else:
+                result["compiled"] = True
+                result["correct"] = False
+                result["error"] = f"accordo failed (exit {proc.returncode})"
+                print(f"    [grader] accordo FAILED (exit {proc.returncode})", file=sys.stderr)
+
+    except subprocess.TimeoutExpired:
+        result["compiled"] = True
+        result["correct"] = False
+        result["error"] = f"accordo timed out ({acc_timeout}s)"
+        print(f"    [grader] accordo TIMEOUT ({acc_timeout}s)", file=sys.stderr)
+    except FileNotFoundError:
+        # Shouldn't reach here — shutil.which guard above catches this.
+        # Kept as safety net for race conditions (binary removed between check and exec).
+        result["compiled"] = False
+        result["correct"] = False
+        result["error"] = "'accordo' CLI not found"
+        print(f"    [grader] accordo CLI not found (race condition)", file=sys.stderr)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Magpie performance measurement for non-pytorch modes
+# ---------------------------------------------------------------------------
+
+def _try_magpie_perf_measurement(
+    raw: dict,
+    baseline_path: str,
+    optimized_path: str,
+    task_dir: Path,
+    compare_timeout: int,
+    solution: Path,
+    testcase_cmd: str | None = None,
+) -> None:
+    """Attempt Magpie compare for performance measurement only.
+
+    Called after library_test or accordo has already determined correctness.
+    If Magpie provides timing data, injects ``_magpie_speedup`` into *raw*
+    so that ``_finalize_grading_result`` uses Magpie numbers instead of the
+    less-precise script-level benchmark.  The domain-specific correctness
+    verdict is never overridden.
+
+    *testcase_cmd* tells Magpie how to invoke the kernel for benchmarking.
+    Without it Magpie may skip the performance phase entirely.
+    """
+    if not baseline_path or not Path(baseline_path).exists():
+        return
+    if not optimized_path or not Path(optimized_path).exists():
+        return
+
+    kernel_type = _detect_kernel_type(solution)
+    try:
+        magpie_raw = run_magpie_compare(
+            baseline_path=baseline_path,
+            optimized_path=optimized_path,
+            testcase_cmd=testcase_cmd,
+            kernel_type=kernel_type,
+            working_dir=str(task_dir.resolve()),
+            timeout=compare_timeout,
+        )
+        if "error" not in magpie_raw:
+            _, _, speedup = parse_compare_result(magpie_raw)
+            if speedup > 0:
+                raw["_magpie_speedup"] = speedup
+                raw["_magpie_perf_source"] = "magpie_compare"
+                print(f"    [grader] Magpie perf measurement: {speedup:.3f}x",
+                      file=sys.stderr)
+            else:
+                print("    [grader] Magpie perf: no timing data returned",
+                      file=sys.stderr)
+        else:
+            print(f"    [grader] Magpie perf skipped: {magpie_raw['error']}",
+                  file=sys.stderr)
+    except Exception as exc:
+        print(f"    [grader] Magpie perf failed: {exc}", file=sys.stderr)
+
+
 def grade_task(
     task_dir: Path,
     isolate_caches: bool = True,
@@ -293,47 +662,137 @@ def grade_task(
 
 
 def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path) -> KernelResult:
-    """Core grading logic (runs inside or outside cache isolation)."""
+    """Core grading logic (runs inside or outside cache isolation).
+
+    Dispatches to the appropriate correctness mode based on config.yaml:
+      - pytorch (default): magpie compare with testcase_cmd
+      - library_test: run library's own test suite
+      - accordo: HSA-level binary comparison via Accordo CLI
+    """
     cfg = _parse_config(config)
 
     baseline_path = cfg.get("baseline", {}).get("path", "")
+
+    corr_cfg = cfg.get("correctness", {})
+    corr_mode = corr_cfg.get("mode", "pytorch")
+
+    meta = cfg.get("_pipeline_metadata", {})
+    framework = meta.get("framework", "")
+    has_heavy_imports = framework in ("vllm", "sglang")
+    compare_timeout = 600 if has_heavy_imports else 300
+
+    # Resolve baseline path (shared across all modes that need it)
+    if baseline_path:
+        if not Path(baseline_path).is_absolute():
+            baseline_path = str((task_dir / baseline_path).resolve())
+
+        if not Path(baseline_path).exists():
+            for fallback_name in ("baseline_ref.py", "baseline.py", "baseline_ref.hip", "baseline.hip"):
+                fallback = task_dir / fallback_name
+                if fallback.exists():
+                    baseline_path = str(fallback.resolve())
+                    print(f"    [grader] Configured baseline missing, using {fallback_name}", file=sys.stderr)
+                    break
+            else:
+                rocm_root = REPO_ROOT / "tools" / "rocm"
+                raw_bp = cfg.get("baseline", {}).get("path", "")
+                for prefix in ("", "vllm/", "aiter/"):
+                    candidate = rocm_root / prefix / raw_bp
+                    if candidate.exists():
+                        baseline_path = str(candidate.resolve())
+                        print(f"    [grader] Resolved baseline via tools/rocm/{prefix}", file=sys.stderr)
+                        break
+
+    optimized_path = cfg.get("optimized", {}).get("path", str(solution))
+    if not Path(optimized_path).is_absolute():
+        optimized_path = str((task_dir / optimized_path).resolve())
+
+    # Testcase command for Magpie perf (correctness or performance section)
+    magpie_testcase_cmd = (
+        corr_cfg.get("command")
+        or cfg.get("performance", {}).get("command")
+        or None
+    )
+
+    # ── Mode 2: Library test ─────────────────────────────────────────────
+    if corr_mode == "library_test":
+        unit_test_cmd = corr_cfg.get("unit_test_command", "")
+        lib_working_dir = corr_cfg.get("working_directory", str(task_dir.resolve()))
+
+        if not unit_test_cmd:
+            return KernelResult(
+                task_id=task_id,
+                error="library_test mode but no unit_test_command in config",
+            )
+
+        raw = _run_library_test(
+            unit_test_cmd=unit_test_cmd,
+            working_dir=lib_working_dir,
+            solution_path=solution,
+            timeout=compare_timeout,
+        )
+
+        if raw.get("correct") and baseline_path:
+            _try_magpie_perf_measurement(
+                raw, baseline_path, optimized_path,
+                task_dir, compare_timeout, solution,
+                testcase_cmd=magpie_testcase_cmd,
+            )
+
+        return _finalize_grading_result(
+            task_id, raw, cfg, task_dir,
+            baseline_path, optimized_path, solution, compare_timeout,
+        )
+
+    # ── Mode 3: Accordo HSA-level ────────────────────────────────────────
+    if corr_mode == "accordo":
+        accordo_inner = corr_cfg.get("accordo", {})
+        acc_working_dir = corr_cfg.get("working_directory", str(task_dir.resolve()))
+
+        raw = _run_accordo_check(
+            accordo_cfg=accordo_inner,
+            working_dir=acc_working_dir,
+            timeout=compare_timeout,
+        )
+
+        if raw.get("correct") and baseline_path:
+            _try_magpie_perf_measurement(
+                raw, baseline_path, optimized_path,
+                task_dir, compare_timeout, solution,
+                testcase_cmd=magpie_testcase_cmd,
+            )
+
+        return _finalize_grading_result(
+            task_id, raw, cfg, task_dir,
+            baseline_path, optimized_path, solution, compare_timeout,
+        )
+
+    # ── Mode 1: PyTorch / Magpie compare (default) ───────────────────────
     if not baseline_path:
         return KernelResult(
             task_id=task_id,
             error="config.yaml missing baseline.path",
         )
 
-    if not Path(baseline_path).is_absolute():
-        baseline_path = str((task_dir / baseline_path).resolve())
+    # Verify pipeline-generated correctness files haven't been tampered with
+    protected_hashes = meta.get("protected_file_hashes", {})
+    for fname, expected_hash in protected_hashes.items():
+        fpath = task_dir / fname
+        if not fpath.exists():
+            return KernelResult(
+                task_id=task_id,
+                error=f"tamper check: pipeline file {fname} was deleted by agent",
+            )
+        actual_hash = hashlib.sha256(fpath.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            print(f"    [grader] TAMPER DETECTED: {fname} was modified by agent", file=sys.stderr)
+            return KernelResult(
+                task_id=task_id,
+                error=f"tamper check: {fname} was modified (expected {expected_hash[:12]}..., got {actual_hash[:12]}...)",
+            )
 
-    if not Path(baseline_path).exists():
-        for fallback_name in ("baseline_ref.py", "baseline.py", "baseline_ref.hip", "baseline.hip"):
-            fallback = task_dir / fallback_name
-            if fallback.exists():
-                baseline_path = str(fallback.resolve())
-                print(f"    [grader] Configured baseline missing, using {fallback_name}", file=sys.stderr)
-                break
-        else:
-            rocm_root = REPO_ROOT / "tools" / "rocm"
-            raw = cfg.get("baseline", {}).get("path", "")
-            for prefix in ("", "vllm/", "aiter/"):
-                candidate = rocm_root / prefix / raw
-                if candidate.exists():
-                    baseline_path = str(candidate.resolve())
-                    print(f"    [grader] Resolved baseline via tools/rocm/{prefix}", file=sys.stderr)
-                    break
-
-    optimized_path = cfg.get("optimized", {}).get("path", str(solution))
-    if not Path(optimized_path).is_absolute():
-        optimized_path = str((task_dir / optimized_path).resolve())
-
-    testcase_cmd = cfg.get("correctness", {}).get("command")
+    testcase_cmd = corr_cfg.get("command")
     kernel_type = _detect_kernel_type(solution)
-
-    meta = cfg.get("_pipeline_metadata", {})
-    framework = meta.get("framework", "")
-    has_heavy_imports = framework in ("vllm", "sglang")
-    compare_timeout = 600 if has_heavy_imports else 300
 
     raw = run_magpie_compare(
         baseline_path=baseline_path,
@@ -349,6 +808,7 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
 
     compiled, correct, speedup = parse_compare_result(raw)
 
+    # Magpie may not report timing; fall back to script-level benchmarking
     if compiled and correct and speedup <= 0:
         perf_cfg = cfg.get("performance", {})
         perf_cmd = perf_cfg.get("command", "")
@@ -364,29 +824,15 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
             raw["optimized_ms"] = round(o_ms, 4)
             raw["_benchmark_speedup"] = round(speedup, 4)
 
-    if compiled and correct and speedup <= 0:
-        speedup = 1.0
-        raw["_no_perf_data"] = True
-        print(f"    [grader] No performance data available; assuming 1.0x (baseline parity)",
-              file=sys.stderr)
+    # Store Magpie results into raw so _finalize_grading_result can use them
+    raw["compiled"] = compiled
+    raw["correct"] = correct
+    if speedup > 0:
+        raw["_magpie_speedup"] = speedup
 
-    gaming_warnings = _detect_benchmark_gaming(solution, baseline_path)
-    if gaming_warnings:
-        for gw in gaming_warnings:
-            print(f"    [grader] GAMING DETECTED: {gw}", file=sys.stderr)
-        raw["_gaming_warnings"] = gaming_warnings
-        if speedup > 1.5:
-            print(f"    [grader] Capping speedup from {speedup:.2f}x to 1.0x due to gaming",
-                  file=sys.stderr)
-            speedup = 1.0
-            raw["_speedup_capped_for_gaming"] = True
-
-    return KernelResult(
-        task_id=task_id,
-        compiled=compiled,
-        correct=correct,
-        speedup=speedup,
-        raw=raw,
+    return _finalize_grading_result(
+        task_id, raw, cfg, task_dir,
+        baseline_path, optimized_path, solution, compare_timeout,
     )
 
 

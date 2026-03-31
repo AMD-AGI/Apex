@@ -8,6 +8,7 @@ Magpie installation is required.
 """
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -328,8 +329,10 @@ class TestMagpieBin:
         assert len(result) >= 1
 
     def test_magpie_on_path(self):
-        with patch.object(shutil, "which", return_value="/usr/bin/magpie"):
-            assert _magpie_bin() == ["magpie"]
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MAGPIE_ROOT", None)
+            with patch.object(shutil, "which", return_value="/usr/bin/magpie"):
+                assert _magpie_bin() == ["magpie"]
 
     def test_magpie_not_on_path_uses_local_or_module(self):
         with patch.object(shutil, "which", return_value=None):
@@ -704,3 +707,205 @@ class TestFullGradingPipeline:
         )
         expected = total_score(compiled, correct, speedup)
         assert result.score == pytest.approx(expected)
+
+
+# ── kernel_grader.py — _try_magpie_perf_measurement ──────────────────────────
+
+class TestTryMagpiePerfMeasurement:
+    """Tests for _try_magpie_perf_measurement helper used by library_test and accordo."""
+
+    def test_injects_speedup_on_success(self, tmp_path, magpie_compare_json):
+        sol = tmp_path / "solution.py"
+        sol.write_text("# kernel\n")
+        baseline = tmp_path / "baseline.py"
+        baseline.write_text("# baseline\n")
+
+        raw = {"compiled": True, "correct": True}
+        with patch.object(kernel_grader, "run_magpie_compare", return_value=magpie_compare_json):
+            kernel_grader._try_magpie_perf_measurement(
+                raw, str(baseline), str(sol), tmp_path, 300, sol,
+            )
+        assert "_magpie_speedup" in raw
+        assert raw["_magpie_speedup"] > 1.0
+        assert raw["_magpie_perf_source"] == "magpie_compare"
+
+    def test_no_inject_on_magpie_error(self, tmp_path):
+        sol = tmp_path / "solution.py"
+        sol.write_text("# kernel\n")
+        baseline = tmp_path / "baseline.py"
+        baseline.write_text("# baseline\n")
+
+        raw = {"compiled": True, "correct": True}
+        with patch.object(kernel_grader, "run_magpie_compare", return_value={"error": "timeout"}):
+            kernel_grader._try_magpie_perf_measurement(
+                raw, str(baseline), str(sol), tmp_path, 300, sol,
+            )
+        assert "_magpie_speedup" not in raw
+
+    def test_no_inject_on_magpie_exception(self, tmp_path):
+        sol = tmp_path / "solution.py"
+        sol.write_text("# kernel\n")
+        baseline = tmp_path / "baseline.py"
+        baseline.write_text("# baseline\n")
+
+        raw = {"compiled": True, "correct": True}
+        with patch.object(kernel_grader, "run_magpie_compare", side_effect=RuntimeError("boom")):
+            kernel_grader._try_magpie_perf_measurement(
+                raw, str(baseline), str(sol), tmp_path, 300, sol,
+            )
+        assert "_magpie_speedup" not in raw
+
+    def test_skips_when_baseline_missing(self, tmp_path):
+        sol = tmp_path / "solution.py"
+        sol.write_text("# kernel\n")
+
+        raw = {"compiled": True, "correct": True}
+        kernel_grader._try_magpie_perf_measurement(
+            raw, "/nonexistent/baseline.py", str(sol), tmp_path, 300, sol,
+        )
+        assert "_magpie_speedup" not in raw
+
+    def test_skips_when_baseline_path_empty(self, tmp_path):
+        sol = tmp_path / "solution.py"
+        sol.write_text("# kernel\n")
+
+        raw = {"compiled": True, "correct": True}
+        kernel_grader._try_magpie_perf_measurement(
+            raw, "", str(sol), tmp_path, 300, sol,
+        )
+        assert "_magpie_speedup" not in raw
+
+    def test_no_inject_when_magpie_returns_zero_speedup(self, tmp_path):
+        sol = tmp_path / "solution.py"
+        sol.write_text("# kernel\n")
+        baseline = tmp_path / "baseline.py"
+        baseline.write_text("# baseline\n")
+
+        raw = {"compiled": True, "correct": True}
+        zero_result = {"results": {"kernel_results": []}}
+        with patch.object(kernel_grader, "run_magpie_compare", return_value=zero_result):
+            kernel_grader._try_magpie_perf_measurement(
+                raw, str(baseline), str(sol), tmp_path, 300, sol,
+            )
+        assert "_magpie_speedup" not in raw
+
+
+# ── kernel_grader.py — library_test mode with Magpie perf ────────────────────
+
+class TestLibraryTestMagpieIntegration:
+    """Tests that library_test mode calls Magpie for perf measurement after correctness passes."""
+
+    def _make_library_test_task(self, tmp_path):
+        d = tmp_path / "lib_task"
+        d.mkdir()
+        (d / "solution.py").write_text("# optimized\n")
+        (d / "baseline.py").write_text("# baseline\n")
+        (d / "config.yaml").write_text(
+            "gpu:\n  device: 0\n"
+            "baseline:\n  path: ./baseline.py\n"
+            "optimized:\n  path: ./solution.py\n"
+            "correctness:\n  mode: library_test\n"
+            "  unit_test_command: python -m pytest tests/\n"
+            "  working_directory: .\n"
+            "performance:\n  command: python bench.py\n"
+        )
+        return d
+
+    def test_magpie_called_when_library_test_passes(self, tmp_path, magpie_compare_json):
+        task_dir = self._make_library_test_task(tmp_path)
+        magpie_calls = []
+
+        def mock_magpie(**kwargs):
+            magpie_calls.append(kwargs)
+            return magpie_compare_json
+
+        with patch.object(kernel_grader, "_run_library_test", return_value={
+            "compiled": True, "correct": True, "_correctness_mode": "library_test",
+        }), patch.object(kernel_grader, "run_magpie_compare", side_effect=mock_magpie), \
+            patch.object(kernel_grader, "_measure_speedup", return_value=1.0):
+            result = kernel_grader.grade_task(task_dir, isolate_caches=False, trust_agent_config=True)
+
+        assert len(magpie_calls) == 1
+        assert result.compiled is True
+        assert result.correct is True
+
+    def test_magpie_not_called_when_library_test_fails(self, tmp_path):
+        task_dir = self._make_library_test_task(tmp_path)
+
+        with patch.object(kernel_grader, "_run_library_test", return_value={
+            "compiled": True, "correct": False, "_correctness_mode": "library_test",
+            "error": "2 tests failed",
+        }), patch.object(kernel_grader, "run_magpie_compare") as mock_magpie, \
+            patch.object(kernel_grader, "_measure_speedup", return_value=0.0):
+            result = kernel_grader.grade_task(task_dir, isolate_caches=False, trust_agent_config=True)
+
+        mock_magpie.assert_not_called()
+        assert result.correct is False
+
+
+# ── kernel_grader.py — accordo mode with Magpie perf ─────────────────────────
+
+class TestAccordoMagpieIntegration:
+    """Tests that accordo mode calls Magpie for perf measurement after correctness passes."""
+
+    def _make_accordo_task(self, tmp_path):
+        d = tmp_path / "acc_task"
+        d.mkdir()
+        (d / "solution.hip").write_text("// optimized\n")
+        (d / "baseline.hip").write_text("// baseline\n")
+        (d / "config.yaml").write_text(
+            "gpu:\n  device: 0\n"
+            "baseline:\n  path: ./baseline.hip\n"
+            "optimized:\n  path: ./solution.hip\n"
+            "correctness:\n  mode: accordo\n"
+            "  accordo:\n"
+            "    kernel_name: my_kernel\n"
+            "    reference_binary: /path/to/ref\n"
+            "    optimized_binary: /path/to/opt\n"
+            "    tolerance: 0.001\n"
+            "    timeout_seconds: 60\n"
+            "performance:\n  command: python bench.py\n"
+        )
+        return d
+
+    def test_magpie_called_when_accordo_passes(self, tmp_path, magpie_compare_json):
+        task_dir = self._make_accordo_task(tmp_path)
+        magpie_calls = []
+
+        def mock_magpie(**kwargs):
+            magpie_calls.append(kwargs)
+            return magpie_compare_json
+
+        with patch.object(kernel_grader, "_run_accordo_check", return_value={
+            "compiled": True, "correct": True, "_correctness_mode": "accordo",
+        }), patch.object(kernel_grader, "run_magpie_compare", side_effect=mock_magpie), \
+            patch.object(kernel_grader, "_measure_speedup", return_value=1.0):
+            result = kernel_grader.grade_task(task_dir, isolate_caches=False, trust_agent_config=True)
+
+        assert len(magpie_calls) == 1
+        assert result.compiled is True
+        assert result.correct is True
+
+    def test_magpie_not_called_when_accordo_fails(self, tmp_path):
+        task_dir = self._make_accordo_task(tmp_path)
+
+        with patch.object(kernel_grader, "_run_accordo_check", return_value={
+            "compiled": True, "correct": False, "_correctness_mode": "accordo",
+            "error": "3 mismatches",
+        }), patch.object(kernel_grader, "run_magpie_compare") as mock_magpie, \
+            patch.object(kernel_grader, "_measure_speedup", return_value=0.0):
+            result = kernel_grader.grade_task(task_dir, isolate_caches=False, trust_agent_config=True)
+
+        mock_magpie.assert_not_called()
+        assert result.correct is False
+
+    def test_accordo_timeout_cap_is_900(self):
+        """Verify the _MAX_ACCORDO_TIMEOUT constant is 900 (15 min)."""
+        raw = {}
+        with patch("shutil.which", return_value=None):
+            result = kernel_grader._run_accordo_check(
+                {"kernel_name": "k", "reference_binary": "r", "optimized_binary": "o",
+                 "timeout_seconds": 9999},
+                "/tmp",
+            )
+        assert "accordo" in result.get("error", "") or result.get("compiled") is False

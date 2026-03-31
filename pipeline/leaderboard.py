@@ -173,10 +173,12 @@ class _FileLeaderboard:
 class _CouchDBLeaderboard:
     """CouchDB-backed leaderboard."""
 
+    _LEGACY_DB_NAME = "keystone-leaderboard"
+
     def __init__(
         self,
         url: str | None = None,
-        db_name: str = "keystone-leaderboard",
+        db_name: str = "apex-leaderboard",
         auth: tuple[str, str] | None = None,
         **_: Any,
     ):
@@ -191,6 +193,14 @@ class _CouchDBLeaderboard:
     def _ensure_db(self) -> None:
         try:
             import requests
+            resp = requests.head(f"{self.url}/{self.db_name}", auth=self.auth, timeout=5)
+            if resp.status_code == 404 and self.db_name != self._LEGACY_DB_NAME:
+                legacy_resp = requests.head(
+                    f"{self.url}/{self._LEGACY_DB_NAME}", auth=self.auth, timeout=5,
+                )
+                if legacy_resp.status_code == 200:
+                    self.db_name = self._LEGACY_DB_NAME
+                    return
             requests.put(f"{self.url}/{self.db_name}", auth=self.auth, timeout=5)
         except Exception:
             pass

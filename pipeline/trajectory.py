@@ -183,10 +183,10 @@ class TrajectoryStore(ABC):
     def list_ids(self, filters: dict | None = None) -> list[str]:
         """List trajectory IDs, optionally filtered."""
 
-    def export_for_rl(
+    def export_trajectories_jsonl(
         self, output_path: Path, quality: str | None = None, fmt: str = "jsonl"
     ) -> int:
-        """Export trajectories to a file for RL training. Returns count exported."""
+        """Export trajectories to a JSONL file for RL training. Returns count exported."""
         ids = self.list_ids({"trajectory_quality": quality} if quality else None)
         count = 0
         with open(output_path, "w") as f:
@@ -201,7 +201,7 @@ class TrajectoryStore(ABC):
                 count += 1
         return count
 
-    def export_for_keystone_rl(
+    def export_for_rl(
         self,
         output_dir: Path,
         results_dirs: list[Path] | None = None,
@@ -211,7 +211,7 @@ class TrajectoryStore(ABC):
         gpu_arch: str = "gfx950",
         standalone: bool = False,
     ) -> dict:
-        """Export trajectories to keystone-rl-training format.
+        """Export trajectories to RL training dataset format.
 
         Delegates to export_rl_dataset.export() after loading all workload
         trajectories from this store.
@@ -297,10 +297,12 @@ class FileStore(TrajectoryStore):
 class CouchDBStore(TrajectoryStore):
     """Store trajectories in CouchDB (integrates with existing Grafana infra)."""
 
+    _LEGACY_DB_NAME = "keystone-trajectories"
+
     def __init__(
         self,
         url: str | None = None,
-        db_name: str = "keystone-trajectories",
+        db_name: str = "apex-trajectories",
         auth: tuple[str, str] | None = None,
     ):
         self.url = (url or os.environ.get("COUCHDB_URL", "http://localhost:5984")).rstrip("/")
@@ -314,6 +316,14 @@ class CouchDBStore(TrajectoryStore):
     def _ensure_db(self) -> None:
         try:
             import requests
+            resp = requests.head(f"{self.url}/{self.db_name}", auth=self.auth, timeout=5)
+            if resp.status_code == 404 and self.db_name != self._LEGACY_DB_NAME:
+                legacy_resp = requests.head(
+                    f"{self.url}/{self._LEGACY_DB_NAME}", auth=self.auth, timeout=5,
+                )
+                if legacy_resp.status_code == 200:
+                    self.db_name = self._LEGACY_DB_NAME
+                    return
             requests.put(f"{self.url}/{self.db_name}", auth=self.auth, timeout=5)
         except Exception:
             pass
@@ -372,7 +382,10 @@ class S3Store(TrajectoryStore):
         prefix: str = "trajectories/",
         region: str | None = None,
     ):
-        self.bucket = bucket or os.environ.get("TRAJECTORY_S3_BUCKET", "keystone-trajectories")
+        self.bucket = bucket or os.environ.get(
+            "TRAJECTORY_S3_BUCKET",
+            os.environ.get("KEYSTONE_TRAJECTORY_S3_BUCKET", "apex-trajectories"),
+        )
         self.prefix = prefix
         self.region = region or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
         self._file_fallback = FileStore()
@@ -426,7 +439,7 @@ def get_store(backend: str = "file", **kwargs: Any) -> TrajectoryStore:
     return FileStore(**kwargs)
 
 
-def export_for_keystone_rl(
+def export_for_rl(
     output_dir: Path,
     results_dirs: list[Path] | None = None,
     quality: str | None = None,
@@ -437,9 +450,9 @@ def export_for_keystone_rl(
     trajectories_dir: Path | None = None,
     standalone: bool = False,
 ) -> dict:
-    """Module-level convenience wrapper around TrajectoryStore.export_for_keystone_rl."""
+    """Module-level convenience wrapper around TrajectoryStore.export_for_rl."""
     store = FileStore(base_dir=trajectories_dir or base_dir)
-    return store.export_for_keystone_rl(
+    return store.export_for_rl(
         output_dir=output_dir,
         results_dirs=results_dirs,
         quality=quality,

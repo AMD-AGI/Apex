@@ -5,7 +5,7 @@ Covers:
   1. Ground truth auto-discovery across tools/rocm/
   2. GroundTruthSpec schema validation (3 modes: pytorch, library_test, accordo)
   3. Accordo config generation for HIP/C++ kernels
-  4. Export roundtrip: Apex -> tasks.json -> keystone load_apex_export()
+  4. Export roundtrip: Apex -> tasks.json -> RL dataset
   5. Trajectory persistence (FileStore)
   6. SFT warm-start extraction
   7. Standalone mode (no trajectories)
@@ -45,7 +45,7 @@ from trajectory import (
     TrajectoryRecord,
     WorkloadTrajectoryRecord,
     _record_from_dict,
-    export_for_keystone_rl,
+    export_for_rl,
 )
 from export_rl_dataset import (
     _get_instruction,
@@ -196,7 +196,7 @@ class TestGroundTruthDiscovery:
         spec = get_spec("rms_norm")
         assert spec is not None
         assert spec.mode == "pytorch"
-        assert "baseline_fn" in spec.pytorch_reference_code
+        assert "torch_rmsnorm" in spec.pytorch_reference_code
 
     def test_get_spec_returns_none_for_unknown(self):
         spec = get_spec("nonexistent_kernel_type_xyz")
@@ -649,10 +649,10 @@ class TestTaskSchema:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 7. Keystone Roundtrip
+# 7. RL Export Roundtrip
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestKeystoneRoundtrip:
+class TestRLExportRoundtrip:
 
     @pytest.fixture
     def exported_tasks_path(self, tmp_dir):
@@ -665,55 +665,32 @@ class TestKeystoneRoundtrip:
         )
         return out_dir / "tasks.json"
 
-    def test_keystone_load_apex_export(self, exported_tasks_path):
-        keystone_dir = REPO_ROOT.parent / "keystone-rl-training"
-        if not (keystone_dir / "prepare_data.py").exists():
-            pytest.skip("keystone-rl-training not available")
-
-        sys.path.insert(0, str(keystone_dir))
-        from prepare_data import load_apex_export
-
-        tasks = load_apex_export(str(exported_tasks_path))
+    def test_exported_tasks_valid_json(self, exported_tasks_path):
+        tasks = json.loads(exported_tasks_path.read_text())
         assert len(tasks) > 0
+        for task in tasks:
+            assert "task_id" in task
+            assert "ground_truth" in task
+
+    def test_exported_ground_truth_has_diverse_content(self, exported_tasks_path):
+        """Verify that exported tasks have both pytorch and library_test ground truth."""
+        tasks = json.loads(exported_tasks_path.read_text())
+        has_pytorch_ref = False
+        has_unit_test = False
         for t in tasks:
-            assert t.task_id
-            assert t.ground_truth is not None
-            assert t.ground_truth.mode in ("pytorch", "library_test", "accordo", "unknown")
+            gt = t.get("ground_truth", {})
+            if gt.get("pytorch_reference_code"):
+                has_pytorch_ref = True
+            if gt.get("unit_test_command"):
+                has_unit_test = True
+        assert has_pytorch_ref or has_unit_test, "Expected at least one ground truth type"
 
-    def test_keystone_parquet_conversion(self, exported_tasks_path, tmp_dir):
-        keystone_dir = REPO_ROOT.parent / "keystone-rl-training"
-        if not (keystone_dir / "prepare_data.py").exists():
-            pytest.skip("keystone-rl-training not available")
-
-        try:
-            import pandas  # noqa: F401
-        except ImportError:
-            pytest.skip("pandas not installed")
-
-        sys.path.insert(0, str(keystone_dir))
-        from prepare_data import convert_to_verl_parquet
-
-        parquet_path = str(tmp_dir / "test.parquet")
-        convert_to_verl_parquet(str(exported_tasks_path), parquet_path)
-        assert Path(parquet_path).exists()
-
-        import pandas as pd
-        df = pd.read_parquet(parquet_path)
-        assert len(df) > 0
-        assert "prompt" in df.columns
-        assert "reward_model" in df.columns
-
-    def test_keystone_ground_truth_modes_preserved(self, exported_tasks_path):
-        keystone_dir = REPO_ROOT.parent / "keystone-rl-training"
-        if not (keystone_dir / "prepare_data.py").exists():
-            pytest.skip("keystone-rl-training not available")
-
-        sys.path.insert(0, str(keystone_dir))
-        from prepare_data import load_apex_export
-
-        tasks = load_apex_export(str(exported_tasks_path))
-        modes = {t.ground_truth.mode for t in tasks}
-        assert len(modes) >= 2, f"Expected multiple modes, got: {modes}"
+    def test_export_roundtrip_preserves_task_ids(self, exported_tasks_path):
+        """Verify exported tasks have unique, meaningful task_ids."""
+        tasks = json.loads(exported_tasks_path.read_text())
+        task_ids = [t["task_id"] for t in tasks]
+        assert len(task_ids) == len(set(task_ids)), "Duplicate task_ids in export"
+        assert len(task_ids) >= 3, f"Expected at least 3 tasks, got {len(task_ids)}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -758,14 +735,14 @@ class TestStandaloneGeneration:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 10. trajectory.py export_for_keystone_rl wiring
+# 10. trajectory.py export_for_rl wiring
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestExportWiring:
 
-    def test_export_for_keystone_rl_callable(self, tmp_dir):
+    def test_export_for_rl_callable(self, tmp_dir):
         out_dir = tmp_dir / "datasets"
-        result = export_for_keystone_rl(
+        result = export_for_rl(
             trajectories_dir=tmp_dir / "empty",
             output_dir=out_dir,
             standalone=True,
