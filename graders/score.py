@@ -791,3 +791,63 @@ def parse_benchmark_result(raw: dict) -> float:
         return optimized_tps / baseline_tps
 
     return 0.0
+
+
+# ── Gated reward wrapper ─────────────────────────────────────────────────────
+
+def compute_reward_gated(
+    solution_str: str,
+    ground_truth: dict,
+    magpie_result: dict,
+    kernel_backend: str = "triton",
+    require_tags: bool = True,
+    use_gated: bool = True,
+) -> float:
+    """
+    Compute the RL training reward, optionally using the gated pipeline.
+
+    When ``use_gated=True``, delegates to
+    ``reward_fn.compute_gated_reward()`` which provides dense gradient
+    signal via multi-stage gating and anti-reward-hacking protections.
+
+    When ``use_gated=False``, falls back to the legacy AgentKernelArena
+    formula: ``compiled*20 + correct*100 + speedup*100``.
+
+    Parameters
+    ----------
+    solution_str : str
+        Raw solution text (may include ``<think>``/``<answer>`` tags).
+    ground_truth : dict
+        Ground truth metadata (allowed_imports, op_type, etc.).
+    magpie_result : dict
+        Evaluation results from Magpie. Expected keys: ``compiled``,
+        ``correctness_score``, ``baseline_ms``, ``optimized_ms``.
+        Optional: ``hacking_detected``, ``timed_out``.
+    kernel_backend : str
+        Backend identifier (``"triton"`` or ``"hip"``).
+    require_tags : bool
+        Whether ``<answer>`` tags are required for format reward.
+    use_gated : bool
+        If ``False``, use legacy scoring instead.
+
+    Returns
+    -------
+    float
+        Scalar reward value.
+    """
+    if not use_gated:
+        compiled = magpie_result.get("compiled", False)
+        correct = magpie_result.get("correctness_score", 0.0) > 0.5
+        baseline_ms = magpie_result.get("baseline_ms", 0.0)
+        optimized_ms = magpie_result.get("optimized_ms", 0.0)
+        spd = (baseline_ms / optimized_ms) if optimized_ms > 0 else 0.0
+        return total_score(compiled, correct, spd)
+
+    from reward_fn import compute_gated_reward  # lazy import to avoid circular deps
+    return compute_gated_reward(
+        solution_str=solution_str,
+        ground_truth=ground_truth,
+        eval_result=magpie_result,
+        kernel_backend=kernel_backend,
+        require_tags=require_tags,
+    )
