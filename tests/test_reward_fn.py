@@ -315,20 +315,66 @@ class TestPerformanceReward:
 # ── Runtime hacking detection ────────────────────────────────────────────────
 
 class TestRuntimeHacking:
+    def test_nan_output_detected(self):
+        baseline_stats = {"std": 1.0, "mean": 5.0}
+        optimized_stats = {"std": 0.8, "mean": 5.0, "has_nan": True}
+        detected, reason = detect_runtime_hacking(baseline_stats, optimized_stats, 0.5)
+        assert detected is True
+        assert "nan" in reason.lower()
+
+    def test_inf_output_detected(self):
+        baseline_stats = {"std": 1.0, "mean": 5.0}
+        optimized_stats = {"std": 0.8, "mean": 5.0, "has_inf": True}
+        detected, reason = detect_runtime_hacking(baseline_stats, optimized_stats, 0.5)
+        assert detected is True
+        assert "inf" in reason.lower()
+
     def test_constant_output_detected(self):
         baseline_stats = {"std": 1.0, "mean": 5.0}
         optimized_stats = {"std": 0.0, "mean": 5.0}
-        assert detect_runtime_hacking(baseline_stats, optimized_stats, 0.5) is True
+        detected, reason = detect_runtime_hacking(baseline_stats, optimized_stats, 0.5)
+        assert detected is True
+        assert "constant" in reason
+
+    def test_identity_passthrough_detected(self):
+        baseline_stats = {"std": 1.0, "mean": 5.0, "matches_input": False}
+        optimized_stats = {"std": 0.8, "mean": 4.9, "matches_input": True}
+        detected, reason = detect_runtime_hacking(baseline_stats, optimized_stats, 0.5)
+        assert detected is True
+        assert "identity" in reason
+
+    def test_identity_not_flagged_when_golden_also_matches(self):
+        """Legitimate copy kernels: golden also matches input."""
+        baseline_stats = {"std": 1.0, "mean": 5.0, "matches_input": True}
+        optimized_stats = {"std": 0.8, "mean": 4.9, "matches_input": True}
+        detected, _ = detect_runtime_hacking(baseline_stats, optimized_stats, 0.5)
+        assert detected is False
 
     def test_normal_output_passes(self):
         baseline_stats = {"std": 1.0, "mean": 5.0}
         optimized_stats = {"std": 0.8, "mean": 4.9}
-        assert detect_runtime_hacking(baseline_stats, optimized_stats, 0.5) is False
+        detected, reason = detect_runtime_hacking(baseline_stats, optimized_stats, 0.5, baseline_ms=1.0)
+        assert detected is False
+        assert reason == ""
 
     def test_suspiciously_fast_detected(self):
+        """optimized_ms < baseline_ms * 0.01 with baseline > 0.1ms."""
         baseline_stats = {"std": 1.0, "mean": 5.0}
         optimized_stats = {"std": 0.8, "mean": 4.9}
-        assert detect_runtime_hacking(baseline_stats, optimized_stats, 0.0005) is True
+        detected, reason = detect_runtime_hacking(
+            baseline_stats, optimized_stats, optimized_ms=0.0005, baseline_ms=1.0
+        )
+        assert detected is True
+        assert "suspiciously_fast" in reason
+
+    def test_suspiciously_fast_not_flagged_for_fast_baseline(self):
+        """baseline_ms <= 0.1 skips the relative speed check."""
+        baseline_stats = {"std": 1.0, "mean": 5.0}
+        optimized_stats = {"std": 0.8, "mean": 4.9}
+        detected, _ = detect_runtime_hacking(
+            baseline_stats, optimized_stats, optimized_ms=0.0005, baseline_ms=0.05
+        )
+        assert detected is False
 
 
 # ── End-to-end reward (compute_gated_reward) ─────────────────────────────────

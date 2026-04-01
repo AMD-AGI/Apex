@@ -229,37 +229,61 @@ def detect_runtime_hacking(
     baseline_output_stats: dict,
     optimized_output_stats: dict,
     optimized_ms: float,
-) -> bool:
+    baseline_ms: float = 0.0,
+) -> tuple[bool, str]:
     """
     Post-evaluation hacking detection.
+
+    Mirrors Keystone's ``detect_runtime_hacking()`` checks but operates
+    on pre-computed statistics dicts rather than raw torch tensors, so
+    this module stays torch-free.
 
     Parameters
     ----------
     baseline_output_stats : dict
         Statistics of the baseline kernel output. Expected keys:
         ``"std"`` (float), ``"mean"`` (float).
+        Optional: ``"has_nan"`` (bool), ``"has_inf"`` (bool),
+        ``"matches_input"`` (bool).
     optimized_output_stats : dict
         Statistics of the optimized kernel output. Same keys.
     optimized_ms : float
         Optimized kernel execution time in milliseconds.
+    baseline_ms : float
+        Baseline kernel execution time in milliseconds.
 
     Returns
     -------
-    bool
-        ``True`` if hacking detected, ``False`` otherwise.
+    tuple[bool, str]
+        ``(True, reason)`` if hacking detected, ``(False, "")`` otherwise.
     """
+    # 1. NaN / Inf in optimized output
+    if optimized_output_stats.get("has_nan", False):
+        return True, "nan_inf_output: kernel produces NaN values"
+    if optimized_output_stats.get("has_inf", False):
+        return True, "nan_inf_output: kernel produces Inf values"
+
+    # 2. Constant output when reference is non-trivial
     opt_std = optimized_output_stats.get("std", float("inf"))
     base_std = baseline_output_stats.get("std", 0.0)
+    if opt_std < 1e-6 and base_std > 1e-3:
+        return True, "constant_output: kernel returns near-constant tensor"
 
-    # Constant output: optimized produces near-constant but baseline doesn't
-    if opt_std < 1e-10 and base_std > 1e-3:
-        return True
+    # 3. Identity / pass-through: output matches an input but golden doesn't
+    if (
+        optimized_output_stats.get("matches_input", False)
+        and not baseline_output_stats.get("matches_input", False)
+    ):
+        return True, "identity_kernel: output matches input unchanged"
 
-    # Suspiciously fast: kernel runs in < 1us for non-trivial operations
-    if optimized_ms < 0.001:
-        return True
+    # 4. Suspiciously fast (relative threshold, matching Keystone)
+    if baseline_ms > 0.1 and optimized_ms > 0 and optimized_ms < baseline_ms * 0.01:
+        return (
+            True,
+            f"suspiciously_fast: {optimized_ms:.4f}ms vs baseline {baseline_ms:.4f}ms",
+        )
 
-    return False
+    return False, ""
 
 
 # ── Main reward function ──────────────────────────────────────────────────────
