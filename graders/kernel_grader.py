@@ -88,10 +88,14 @@ def find_solution(task_dir: Path) -> Path | None:
     return None
 
 
-def _detect_benchmark_gaming(solution_path: Path, baseline_path: str) -> list[str]:
-    """Detect solutions that game the benchmark via __main__ fast-exit tricks.
+def _detect_benchmark_tampering(solution_path: Path, baseline_path: str) -> list[str]:
+    """Detect solutions that tamper with the benchmark via __main__ fast-exit tricks.
 
-    Returns a list of warning strings.  An empty list means no gaming detected.
+    Only flags ``__main__`` blocks that contain genuinely suspicious patterns
+    (SystemExit, hardcoded PASS, fabricated timings).  A ``__main__`` block
+    that simply runs the kernel for testing is NOT flagged.
+
+    Returns a list of warning strings.  An empty list means no tampering detected.
     """
     warnings: list[str] = []
     try:
@@ -118,10 +122,10 @@ def _detect_benchmark_gaming(solution_path: Path, baseline_path: str) -> list[st
         if body_src is None:
             continue
 
-        if "SystemExit" in body_src or "sys.exit" in body_src:
+        if "SystemExit" in body_src or "sys.exit" in body_src or "os._exit" in body_src:
             warnings.append(
                 "Solution has SystemExit/sys.exit inside __main__ guard — "
-                "likely gaming standalone benchmark measurement"
+                "likely tampering with standalone benchmark measurement"
             )
         if re.search(r'BENCHMARK_MS:\s*[\d.]+', body_src):
             warnings.append(
@@ -133,26 +137,6 @@ def _detect_benchmark_gaming(solution_path: Path, baseline_path: str) -> list[st
                 "Solution prints hardcoded PASS inside __main__ guard — "
                 "bypassing correctness check"
             )
-
-    if not Path(baseline_path).exists():
-        return warnings
-
-    try:
-        baseline_src = Path(baseline_path).read_text()
-        baseline_tree = ast.parse(baseline_src)
-    except Exception:
-        return warnings
-
-    baseline_has_main = any(
-        isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
-        and isinstance(n.test.left, ast.Name) and n.test.left.id == "__name__"
-        for n in ast.walk(baseline_tree)
-    )
-    if not baseline_has_main and warnings:
-        warnings.append(
-            "Baseline has no __main__ guard but solution added one — "
-            "structural gaming"
-        )
 
     return warnings
 
@@ -225,14 +209,58 @@ def _run_benchmark_script(script_path: str, python_bin: str, cwd: str, timeout: 
     return 0.0
 
 
-def _measure_speedup(cfg: dict, task_dir: Path, baseline_path: str, optimized_path: str) -> float:
-    """Measure speedup by running baseline and solution with --benchmark flag."""
+def _measure_speedup(
+    cfg: dict,
+    task_dir: Path,
+    baseline_path: str,
+    optimized_path: str,
+    num_runs: int = 5,
+) -> float:
+    """Measure speedup with multiple runs, outlier rejection, and variance check.
+
+    Runs each script `num_runs` times, drops top/bottom 10%, and uses
+    the median of the remaining samples.  Stores a ``_high_variance``
+    warning in cfg if std > 20% of mean.
+    """
     perf_cfg = cfg.get("performance", {})
     perf_cmd = perf_cfg.get("command", "")
     python_bin = perf_cmd.split()[0] if perf_cmd else "python3"
 
-    baseline_ms = _run_benchmark_script(baseline_path, python_bin, str(task_dir))
-    optimized_ms = _run_benchmark_script(optimized_path, python_bin, str(task_dir))
+    def _robust_median(path: str) -> tuple[float, bool]:
+        samples = []
+        for _ in range(num_runs):
+            ms = _run_benchmark_script(path, python_bin, str(task_dir))
+            if ms > 0:
+                samples.append(ms)
+        if not samples:
+            return 0.0, False
+
+        samples.sort()
+        n = len(samples)
+        trim = max(1, n // 10)
+        if n > 3:
+            trimmed = samples[trim: n - trim]
+        else:
+            trimmed = samples
+
+        median = trimmed[len(trimmed) // 2]
+        high_var = False
+        if len(trimmed) > 1:
+            mean = sum(trimmed) / len(trimmed)
+            if mean > 0:
+                variance = sum((x - mean) ** 2 for x in trimmed) / len(trimmed)
+                std = variance ** 0.5
+                if std / mean > 0.20:
+                    high_var = True
+        return median, high_var
+
+    baseline_ms, b_var = _robust_median(baseline_path)
+    optimized_ms, o_var = _robust_median(optimized_path)
+
+    if b_var or o_var:
+        cfg["_high_variance"] = True
+        print("    [grader] WARNING: high measurement variance (std > 20% of mean)",
+              file=sys.stderr)
 
     if baseline_ms > 0 and optimized_ms > 0:
         ratio = baseline_ms / optimized_ms
@@ -242,39 +270,45 @@ def _measure_speedup(cfg: dict, task_dir: Path, baseline_path: str, optimized_pa
     return 0.0
 
 
-def _apply_gaming_penalties(
+def _apply_tampering_penalties(
     raw: dict,
     solution: Path,
     baseline_path: str,
     compiled: bool,
     correct: bool,
     speedup: float,
+    speedup_cap: float = 0.0,
 ) -> tuple[bool, float]:
-    """Detect benchmark gaming and apply correctness/speedup penalties.
+    """Detect benchmark tampering and apply correctness/speedup penalties.
+
+    Args:
+        speedup_cap: If > 0 and tampering is detected, cap speedup at this value
+                     instead of the default 1.0x.  If 0, use default behaviour.
 
     Returns (adjusted_correct, adjusted_speedup).
     """
-    gaming_warnings = _detect_benchmark_gaming(solution, baseline_path) if baseline_path else []
-    if not gaming_warnings:
+    tampering_warnings = _detect_benchmark_tampering(solution, baseline_path) if baseline_path else []
+    if not tampering_warnings:
         return correct, speedup
 
-    for gw in gaming_warnings:
-        print(f"    [grader] GAMING DETECTED: {gw}", file=sys.stderr)
-    raw["_gaming_warnings"] = gaming_warnings
+    for tw in tampering_warnings:
+        print(f"    [grader] TAMPERING DETECTED: {tw}", file=sys.stderr)
+    raw["_tampering_warnings"] = tampering_warnings
 
-    has_fake_pass = any("hardcoded PASS" in w for w in gaming_warnings)
-    has_fake_benchmark = any("hardcoded BENCHMARK_MS" in w for w in gaming_warnings)
+    has_fake_pass = any("hardcoded PASS" in w for w in tampering_warnings)
+    has_fake_benchmark = any("hardcoded BENCHMARK_MS" in w for w in tampering_warnings)
 
     if has_fake_pass:
         correct = False
-        raw["_correctness_rejected_for_gaming"] = True
+        raw["_correctness_rejected_for_tampering"] = True
         print("    [grader] Marking correct=False: solution faked PASS output",
               file=sys.stderr)
     if has_fake_benchmark and speedup > 1.0:
-        print(f"    [grader] Capping speedup from {speedup:.2f}x to 1.0x: "
+        cap_val = speedup_cap if speedup_cap > 0 else 1.0
+        print(f"    [grader] Capping speedup from {speedup:.2f}x to {cap_val:.2f}x: "
               f"fabricated benchmark number", file=sys.stderr)
-        speedup = 1.0
-        raw["_speedup_capped_for_gaming"] = True
+        speedup = cap_val
+        raw["_speedup_capped_for_tampering"] = True
 
     return correct, speedup
 
@@ -288,8 +322,9 @@ def _finalize_grading_result(
     optimized_path: str,
     solution: Path,
     compare_timeout: int,
+    speedup_cap: float = 0.0,
 ) -> KernelResult:
-    """Shared post-processing: measure speedup, detect gaming, build KernelResult.
+    """Shared post-processing: measure speedup, detect tampering, build KernelResult.
 
     Used by all three correctness modes (pytorch, library_test, accordo).
     If raw already contains a pre-computed speedup (via _magpie_speedup), that
@@ -306,8 +341,9 @@ def _finalize_grading_result(
             raw["_no_perf_data"] = True
             print("    [grader] No performance data; assuming 1.0x", file=sys.stderr)
 
-    correct, speedup = _apply_gaming_penalties(
+    correct, speedup = _apply_tampering_penalties(
         raw, solution, baseline_path, compiled, correct, speedup,
+        speedup_cap=speedup_cap,
     )
 
     return KernelResult(
@@ -612,6 +648,7 @@ def grade_task(
     isolate_caches: bool = True,
     gpu_device: int = 0,
     trust_agent_config: bool = False,
+    speedup_cap: float = 0.0,
 ) -> KernelResult:
     """Grade a single task directory.
 
@@ -657,11 +694,17 @@ def grade_task(
 
     if isolate_caches:
         with isolated_grading_env(gpu_device=gpu_device):
-            return _grade_task_inner(task_dir, task_id, solution, config)
-    return _grade_task_inner(task_dir, task_id, solution, config)
+            return _grade_task_inner(task_dir, task_id, solution, config, speedup_cap)
+    return _grade_task_inner(task_dir, task_id, solution, config, speedup_cap)
 
 
-def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path) -> KernelResult:
+def _grade_task_inner(
+    task_dir: Path,
+    task_id: str,
+    solution: Path,
+    config: Path,
+    speedup_cap: float = 0.0,
+) -> KernelResult:
     """Core grading logic (runs inside or outside cache isolation).
 
     Dispatches to the appropriate correctness mode based on config.yaml:
@@ -742,6 +785,7 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
         return _finalize_grading_result(
             task_id, raw, cfg, task_dir,
             baseline_path, optimized_path, solution, compare_timeout,
+            speedup_cap=speedup_cap,
         )
 
     # ── Mode 3: Accordo HSA-level ────────────────────────────────────────
@@ -765,6 +809,7 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
         return _finalize_grading_result(
             task_id, raw, cfg, task_dir,
             baseline_path, optimized_path, solution, compare_timeout,
+            speedup_cap=speedup_cap,
         )
 
     # ── Mode 1: PyTorch / Magpie compare (default) ───────────────────────
@@ -833,6 +878,7 @@ def _grade_task_inner(task_dir: Path, task_id: str, solution: Path, config: Path
     return _finalize_grading_result(
         task_id, raw, cfg, task_dir,
         baseline_path, optimized_path, solution, compare_timeout,
+        speedup_cap=speedup_cap,
     )
 
 

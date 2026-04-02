@@ -352,3 +352,39 @@ class TestModelPromptGeneration:
     def test_model_prompt_mentions_identify_kernel_origin(self, prompts):
         for p in prompts[:5]:
             assert "identify_kernel_origin" in p["prompt"]
+
+
+class TestBuildKernelPrompt:
+    def test_basic_output(self):
+        model = MODELS[0]
+        kernel = applicable_kernels(model)[0]
+        result = build_kernel_prompt(model, kernel)
+        assert isinstance(result, dict)
+        assert "prompt" in result
+        assert "task_id" in result
+        assert len(result["prompt"]) > 100
+        assert kernel.kernel_type in result["prompt"]
+
+    def test_contains_anti_tampering(self):
+        model = MODELS[0]
+        kernel = applicable_kernels(model)[0]
+        result = build_kernel_prompt(model, kernel)
+        assert "Anti-Tampering" in result["prompt"] or "tampering" in result["prompt"].lower()
+
+
+class TestBuildModelPrompt:
+    def test_basic_output(self):
+        model = MODELS[0]
+        cfg = CONFIGS[0]
+        result = build_model_prompt(model, cfg, framework="sglang")
+        assert isinstance(result, dict)
+        assert "prompt" in result
+        assert "task_id" in result
+        assert len(result["prompt"]) > 100
+
+    def test_mentions_throughput(self):
+        model = MODELS[0]
+        cfg = CONFIGS[0]
+        result = build_model_prompt(model, cfg, framework="sglang")
+        text = result["prompt"].lower()
+        assert "throughput" in text or "tok/s" in text or "performance" in text

@@ -38,23 +38,43 @@ prompt constructor  →  LLM agent  →  output/  →  grader  →  score
 ## Repository Structure
 
 ```
-rl-env-kernel-optimization/
+Apex/
+├── workload_optimizer.py    # Main pipeline CLI (benchmark → identify → optimize → grade → integrate → score → report)
 ├── eval.py                  # End-to-end mini eval (CPU, no GPU required)
 ├── setup.sh                 # One-shot environment setup
+├── knowledge_base.json      # Persistent cross-run optimization knowledge
+├── mcp_config.json          # MCP server configuration (5 bundled servers)
+│
+├── agents/
+│   └── backends.py          # Claude Code SDK + Codex CLI agent runner
+│
+├── pipeline/
+│   ├── knowledge_base.py    # Cross-kernel/cross-run learning store
+│   ├── reflector.py         # Agent self-reflection between iterations
+│   ├── trajectory.py        # Trajectory recording (file / CouchDB / S3)
+│   ├── leaderboard.py       # Leaderboard tracking (file / CouchDB)
+│   ├── kernel_bottleneck.py # Profiling data parser, kernel classification
+│   └── export_rl_dataset.py # RL/SFT dataset export from trajectories
 │
 ├── prompts/
-│   ├── models.py            # Registry of 19 open-source LLMs (Llama, DeepSeek, Qwen, …)
-│   ├── configs.py           # Inference configurations (batch size, dtype, …)
+│   ├── models.py            # Registry of 20 open-source LLMs (Llama, DeepSeek, Qwen, GPT OSS 120B, …)
+│   ├── configs.py           # 17 inference configurations (MLPerf, InferenceMAX, custom)
 │   ├── kernel_prompt.py     # Kernel-level prompt constructor (model × kernel pairs)
 │   └── model_prompt.py      # Model-level prompt constructor (end-to-end eval)
 │
 ├── graders/
 │   ├── score.py             # Scoring formula + Magpie helpers
 │   ├── kernel_grader.py     # Grades kernel-level output/ tasks via Magpie
-│   └── model_grader.py      # Grades end-to-end model throughput via Magpie
+│   ├── model_grader.py      # Grades end-to-end model throughput via Magpie
+│   ├── ground_truth.py      # ROCm kernel discovery + ground truth specs
+│   ├── config_generator.py  # Magpie config.yaml generation + validation
+│   └── cache_manager.py     # Cache isolation for reproducible grading
 │
 ├── tools/
-│   └── setup_tools.sh       # Installs Magpie and RAG tool
+│   ├── setup_tools.sh       # Installs Magpie, MCP servers, skills
+│   ├── skills/              # 13 domain skills (SKILL.md files)
+│   ├── mcps/                # MCP server source (source-finder, rag, fusion-advisor, gpu-info)
+│   └── jsons/               # ROCm metadata indexes
 │
 ├── files/
 │   ├── setup_files.sh       # Clones ROCm repos and downloads documentation
@@ -62,10 +82,6 @@ rl-env-kernel-optimization/
 │   └── triton_best_practices.md
 │
 ├── tests/                   # pytest suite for all components
-│   ├── test_prompts.py
-│   ├── test_graders.py
-│   ├── test_tools.py
-│   └── test_files.py
 │
 └── output/                  # Agent writes all solutions here (git-ignored)
     └── <task_id>/
@@ -308,6 +324,59 @@ The mini eval (`eval.py`) uses a lightweight local grader that runs without Magp
 - **Documentation** — ROCm docs, MI355X architecture references, HIP/Triton tutorials
 - **Best-practice guides** — `hip_best_practices.md`, `triton_best_practices.md`
 
+## Pipeline Improvements
+
+### Benchmark caching
+
+Use `--benchmark-cache-hours N` to cache E2E baseline benchmark results. If a cached result exists and is younger than N hours for the same config YAML, the pipeline skips the ~30-minute benchmark run:
+
+```bash
+python3 workload_optimizer.py run -r $RESULTS -b $BENCH_CONFIG --benchmark-cache-hours 4
+```
+
+### Parallel kernel optimization
+
+Use `--parallel-kernels N` to optimize up to N kernels simultaneously. Agent reasoning is API-bound (no GPU), so parallelism is safe. GPU grading is serialized via a lock:
+
+```bash
+python3 workload_optimizer.py run -r $RESULTS -b $BENCH_CONFIG --parallel-kernels 2
+```
+
+### Smart iteration strategy
+
+The pipeline now detects stalled kernels (speedup delta < 5% for 2 consecutive iterations) and stops early, returning unused iteration budget to other kernels.
+
+### Agent model routing
+
+Use `--agent-model-simple` and `--agent-model-complex` to assign different models based on kernel difficulty (simple: rms_norm, silu_mul; complex: fused_moe, flash_attn):
+
+```bash
+python3 workload_optimizer.py optimize -r $RESULTS \
+  --agent-model-simple claude-sonnet-4-20250514 \
+  --agent-model-complex claude-opus-4-6
+```
+
+### Knowledge base
+
+All optimization outcomes are recorded in `knowledge_base.json` at the repo root. Past insights are automatically injected into agent prompts for cross-kernel and cross-run learning. The knowledge base tracks strategies used, speedups achieved, and key insights.
+
+### Anti-tampering rules
+
+The pipeline includes AST-based benchmark tampering detection that penalizes:
+- `SystemExit` / `sys.exit()` inside `__main__` guards
+- Hardcoded `PASS` output or fabricated `BENCHMARK_MS` values
+- Agents are explicitly warned about these rules in all prompt templates
+
+Use `--tampering-speedup-cap X` to configure the speedup cap when tampering is detected (default: 1.0x).
+
+### Scoring formula
+
+```
+score = compiled × 20  +  correct × 100  +  speedup × 100
+```
+
+Where `speedup = baseline_ms / optimized_ms`. Only correct solutions count the speedup component.
+
 ## Kernel Reintegration (Hot-Patching)
 
 When the pipeline integrates optimized kernels for the final E2E benchmark, it **hot-patches** installed Python modules in site-packages. This is a temporary operation -- all patches are restored after benchmarking.
@@ -323,6 +392,22 @@ When the pipeline integrates optimized kernels for the final E2E benchmark, it *
 - **Monolithic `_C.so`** -- vLLM, sglang, and PyTorch HIP kernels compile into a single `_C.so` binary and cannot be individually replaced.
 
 This is a known limitation. System library rebuild support is planned for future work.
+
+## Building CK Examples (Optional, for Accordo Validation)
+
+Composable Kernel (CK) examples provide compiled HIP binaries that Accordo can use for HSA-level correctness validation. Building is optional -- only needed if you want to use `--correctness-mode accordo` with real CK kernels.
+
+```bash
+bash tools/build_ck.sh --gpu-targets gfx950
+```
+
+This builds only the example binaries (~10-30 minutes depending on GPU target count). Binaries are placed in `tools/rocm/composable_kernel/build/bin/`.
+
+Options:
+- `--gpu-targets <arch>` -- GPU architecture (default: auto-detect via `rocminfo` or `gfx950`)
+- `--jobs N` / `-j N` -- Parallel build jobs (default: `nproc`)
+
+Once built, the Accordo config discovery in `graders/ground_truth.py` will automatically detect and use available CK binaries for validation.
 
 ## Development
 

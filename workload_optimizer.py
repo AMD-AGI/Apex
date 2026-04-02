@@ -45,6 +45,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import re as _re_mod
 import shutil
@@ -58,6 +59,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 import yaml
 
@@ -215,8 +218,22 @@ _HIP_SPEC_TO_SO: dict[str, dict[str, str]] = {
 
 _MONOLITHIC_SO_LIBRARIES = {"vllm", "pytorch", "sglang"}
 
-PATCH_LOCK_PATH = Path("/tmp/magpie_kernel_patch.lock")
-PATCH_MANIFEST_PATH = Path("/tmp/magpie_kernel_patch_manifest.json")
+_DEFAULT_PATCH_DIR = Path("/tmp")
+
+
+def _patch_lock_path(results_dir: Path | None = None) -> Path:
+    d = results_dir or _DEFAULT_PATCH_DIR
+    return d / "magpie_kernel_patch.lock"
+
+
+def _patch_manifest_path(results_dir: Path | None = None) -> Path:
+    d = results_dir or _DEFAULT_PATCH_DIR
+    return d / "magpie_kernel_patch_manifest.json"
+
+
+# Backwards-compat aliases (used when no results_dir is known)
+PATCH_LOCK_PATH = _patch_lock_path()
+PATCH_MANIFEST_PATH = _patch_manifest_path()
 
 MIN_SPEEDUP_FOR_REINJECTION = 1.05
 SMOKE_TEST_REGRESSION_THRESHOLD = 0.5
@@ -291,8 +308,8 @@ def _find_installed_so(kernel_spec: str, library: str = "aiter") -> Optional[Pat
         pkg_dir = Path(pkg.__file__).parent
         for so in pkg_dir.rglob(f"*{so_name}*.so"):
             return so
-    except (ImportError, Exception):
-        pass
+    except Exception as e:
+        _log.debug("SO lookup for %s failed: %s", so_name, e)
     return None
 
 
@@ -380,8 +397,8 @@ def _release_patch_lock(lock_fd) -> None:
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("patch lock release failed: %s", e)
     PATCH_LOCK_PATH.unlink(missing_ok=True)
     PATCH_MANIFEST_PATH.unlink(missing_ok=True)
 
@@ -1481,6 +1498,20 @@ IMPORTANT:
 - Use Magpie compare to verify correctness AND measure speedup every iteration
 - Do ALL work directly yourself — read files, write code, call MCP tools directly.
   Do NOT delegate to sub-agents via the Agent tool. Work hands-on.
+
+## MANDATORY WORKFLOW ORDER
+1. FIRST: Write a solution that passes correctness (mcp__magpie__compare with check_performance=false)
+2. ONLY AFTER correctness passes: Optimize for speed
+3. After each optimization attempt: Re-verify correctness before measuring speedup
+4. Never sacrifice correctness for speed — incorrect solutions score 0 on speedup
+
+## ANTI-TAMPERING RULES (violations are automatically detected and penalized)
+- Do NOT add `if __name__ == "__main__":` blocks that bypass evaluation
+- Do NOT use `sys.exit()`, `SystemExit`, or `os._exit()`
+- Do NOT print hardcoded "PASS" or fabricated BENCHMARK_MS values
+- Do NOT add timing code that bypasses the evaluation framework
+- These patterns are detected by AST analysis and result in score penalties
+- Focus on REAL kernel optimizations: memory coalescing, tiling, MFMA, fusion
 """
 
 
@@ -1509,13 +1540,19 @@ class WorkloadConfig:
     dry_run: bool = False
     num_benchmark_runs: int = 5
     benchmark_timeout: int = 5400
+    benchmark_cache_hours: int = 0
+    parallel_kernels: int = 1
+    agent_model_simple: str = ""
+    agent_model_complex: str = ""
+    tampering_speedup_cap: float = 0.0
 
     def __post_init__(self):
         if not self.agent_model:
             try:
                 from agents.backends import resolve_default_model
                 self.agent_model = resolve_default_model(self.agent_backend)
-            except Exception:
+            except Exception as e:
+                _log.debug("resolve_default_model failed, using fallback: %s", e)
                 from agents.backends import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
                 self.agent_model = (
                     DEFAULT_CODEX_MODEL if self.agent_backend == "codex"
@@ -1557,6 +1594,18 @@ class KernelOptResult:
 # Step 1: E2E Benchmark
 # ---------------------------------------------------------------------------
 
+def _benchmark_cache_path(config: WorkloadConfig) -> Path | None:
+    """Return the cache file path for the current benchmark config, or None if caching disabled."""
+    if config.benchmark_cache_hours <= 0 or not config.benchmark_config:
+        return None
+    import hashlib
+    cfg_text = Path(config.benchmark_config).read_text()
+    cfg_hash = hashlib.sha256(cfg_text.encode()).hexdigest()[:16]
+    results = config.effective_results_dir
+    results.mkdir(parents=True, exist_ok=True)
+    return results / f"baseline_cache_{cfg_hash}.json"
+
+
 def _run_initial_benchmark(config: WorkloadConfig) -> dict:
     if config.skip_benchmark:
         skip_path = Path(config.skip_benchmark)
@@ -1567,12 +1616,31 @@ def _run_initial_benchmark(config: WorkloadConfig) -> dict:
         with open(skip_path) as f:
             return json.load(f)
 
+    cache_path = _benchmark_cache_path(config)
+    if cache_path and cache_path.exists():
+        age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
+        if age_hours < config.benchmark_cache_hours:
+            print(f"  Loading cached benchmark ({age_hours:.1f}h old, max {config.benchmark_cache_hours}h): {cache_path}")
+            with open(cache_path) as f:
+                return json.load(f)
+        else:
+            print(f"  Benchmark cache expired ({age_hours:.1f}h > {config.benchmark_cache_hours}h)")
+
     if config.dry_run:
         return _dry_run_benchmark_result()
 
     print(f"  Running Magpie benchmark with config: {config.benchmark_config}")
     print(f"  This may take 10-90 minutes for large models...")
     result = _run_benchmark_multi(config, label="baseline")
+
+    if cache_path and result.get("success"):
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(result, f)
+            print(f"  Benchmark result cached: {cache_path}")
+        except OSError:
+            pass
+
     return result
 
 
@@ -1705,7 +1773,8 @@ def _load_gap_analysis_cache(
         return []
     try:
         entries = json.loads(cache_path.read_text())
-    except Exception:
+    except Exception as e:
+        _log.warning("corrupt gap analysis cache %s: %s", cache_path, e)
         return []
     kernels = []
     for e in entries:
@@ -2081,7 +2150,9 @@ def _create_task_config(
             ref_path.write_text(gt_spec.pytorch_reference_code)
             if gt_spec.test_shapes_code:
                 shapes_path = task_dir / "test_shapes.py"
-                shapes_path.write_text(gt_spec.test_shapes_code)
+                shapes_path.write_text(
+                    _wrap_shapes_code(gt_spec.test_shapes_code, gt_spec.input_func_name)
+                )
             print(f"    Correctness mode: pytorch (real reference from {gt_spec.source_library}/{gt_spec.source_file})")
         else:
             print(f"    Correctness mode: pytorch (baseline-vs-solution, no library reference found)")
@@ -2203,7 +2274,8 @@ def _profile_baseline_kernel(
         section += "\nUse this data to identify whether the kernel is compute-bound or memory-bound.\n"
         return section
 
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+    except Exception as e:
+        _log.warning("baseline profiling failed: %s", e)
         return ""
 
 
@@ -2267,6 +2339,60 @@ def _build_reference_section(kernel_spec: str, baseline_sources: list[str]) -> s
     return "\n".join(lines)
 
 
+def _build_correctness_ref_section(task_dir: Path, kernel_spec: str) -> str:
+    """Build a correctness reference section for the prompt.
+
+    For pytorch mode: injects the reference.py code inline.
+    For library_test mode: extracts test function signatures from the test command.
+    """
+    lines = []
+    ref_file = task_dir / "reference.py"
+    if ref_file.exists():
+        ref_code = ref_file.read_text()
+        lines.append("## Correctness Reference (PyTorch)")
+        lines.append("Your solution will be validated against this reference. "
+                      "Study it to understand expected behavior.\n")
+        lines.append(f"```python\n{ref_code[:3000]}\n```")
+        return "\n".join(lines)
+
+    config_path = task_dir / "config.yaml"
+    if config_path.exists():
+        try:
+            cfg = yaml.safe_load(config_path.read_text()) or {}
+            corr = cfg.get("correctness", {})
+            if corr.get("mode") == "library_test":
+                test_cmd = corr.get("unit_test_command", "")
+                if test_cmd:
+                    lines.append("## Correctness Reference (Library Test)")
+                    lines.append(f"Your solution will be validated by running: `{test_cmd}`")
+                    # Try to extract test file and show function signatures
+                    parts = test_cmd.split()
+                    for part in parts:
+                        if part.endswith(".py") and Path(part).exists():
+                            try:
+                                test_src = Path(part).read_text()
+                                import ast as _ast
+                                tree = _ast.parse(test_src)
+                                sigs = [
+                                    f"def {n.name}({_ast.unparse(n.args)})"
+                                    for n in _ast.walk(tree)
+                                    if isinstance(n, _ast.FunctionDef)
+                                    and n.name.startswith("test_")
+                                ]
+                                if sigs:
+                                    lines.append("\nTest function signatures:")
+                                    for s in sigs[:10]:
+                                        lines.append(f"  - `{s}`")
+                            except Exception as e:
+                                _log.debug("test signature extraction failed: %s", e)
+                            break
+                    return "\n".join(lines)
+        except Exception as e:
+            _log.debug("correctness ref section build failed: %s", e)
+
+    return ""
+
+
 def _build_kernel_prompt(
     kernel: BottleneckKernel,
     config: WorkloadConfig,
@@ -2307,6 +2433,8 @@ def _build_kernel_prompt(
     multi_strategy = _build_multi_strategy_block(spec)
     reference_section = _build_reference_section(spec, baseline_sources)
 
+    correctness_ref_section = _build_correctness_ref_section(task_dir, spec)
+
     profiling_context = textwrap.dedent(f"""\
 ## Profiling Context
 
@@ -2338,10 +2466,26 @@ def _build_kernel_prompt(
 8. The config.yaml at `{task_dir}/config.yaml` already has the baseline path set.
 
 ## IMPORTANT Constraints
-- Your solution must be functionally equivalent to the baseline (same inputs → same outputs).
+- Your solution MUST produce identical outputs to the baseline. Verify correctness BEFORE attempting any performance optimization.
 - Do NOT modify files outside `{task_dir}/`.
 - Focus on real performance improvements, not just code style changes.
 - Include the kernel function with the same signature as the baseline.
+
+## MANDATORY WORKFLOW ORDER
+1. FIRST: Write a solution that passes correctness (mcp__magpie__compare with check_performance=false)
+2. ONLY AFTER correctness passes: Optimize for speed
+3. After each optimization attempt: Re-verify correctness before measuring speedup
+4. Never sacrifice correctness for speed — incorrect solutions score 0 on speedup
+
+## ANTI-TAMPERING RULES (violations are automatically detected and penalized)
+- Do NOT add `if __name__ == "__main__":` blocks that bypass evaluation
+- Do NOT use `sys.exit()`, `SystemExit`, or `os._exit()`
+- Do NOT print hardcoded "PASS" or fabricated BENCHMARK_MS values
+- Do NOT add timing code that bypasses the evaluation framework
+- These patterns are detected by AST analysis and result in score penalties
+- Focus on REAL kernel optimizations: memory coalescing, tiling, MFMA, fusion
+
+{correctness_ref_section}
 """)
 
     if rich_prompt:
@@ -2439,6 +2583,7 @@ def _run_agent_iteration(
     config: WorkloadConfig,
     iteration: int,
     previous_reflection: str = "",
+    model_override: str = "",
 ) -> tuple[list[dict], bool]:
     full_prompt = prompt
     if previous_reflection:
@@ -2460,7 +2605,7 @@ def _run_agent_iteration(
         messages, solution_written = run_agent_task(
             prompt=full_prompt,
             cwd=task_dir,
-            model=config.agent_model,
+            model=model_override or config.agent_model,
             max_turns=config.max_turns_per_iter,
             agent=config.agent_backend,
             system_prompt=SYSTEM_PROMPT,
@@ -2474,10 +2619,33 @@ def _run_agent_iteration(
         return [{"type": "error", "error": str(e)[:500]}], False
 
 
+_SIMPLE_KERNELS = {"rms_norm", "silu_mul", "act_quant_fp8", "rope_embedding", "kv_cache_ops", "softmax"}
+_COMPLEX_KERNELS = {"fused_moe", "mla_attn", "flash_attn_prefill"}
+
+
+def _estimate_kernel_difficulty(kernel: BottleneckKernel) -> str:
+    """Classify kernel difficulty as simple/moderate/complex for model routing."""
+    spec = kernel.matched_kernel_spec or ""
+    if spec in _SIMPLE_KERNELS:
+        return "simple"
+    if spec in _COMPLEX_KERNELS:
+        return "complex"
+    if kernel.percent_total > 20:
+        return "complex"
+    return "moderate"
+
+
+import threading
+_GPU_GRADE_LOCK = threading.Lock()
+_BUDGET_LOCK = threading.Lock()
+
+
 def _optimize_kernel(
     kernel: BottleneckKernel,
     config: WorkloadConfig,
     benchmark_config: dict,
+    remaining_budget: list[int] | None = None,
+    completed_results: list[dict] | None = None,
 ) -> KernelOptResult:
     task_id = _make_kernel_task_id(kernel, config)
     task_dir = config.output_dir / task_id
@@ -2489,7 +2657,18 @@ def _optimize_kernel(
     print(f"    Task dir:   {task_dir}")
     print(f"    Profiler:   {kernel.name[:70]}")
     print(f"    GPU time:   {kernel.percent_total:.1f}%")
+    difficulty = _estimate_kernel_difficulty(kernel)
+    print(f"    Difficulty: {difficulty}")
     print(f"    {'='*55}")
+
+    # Model routing based on difficulty
+    effective_model = config.agent_model
+    if difficulty == "simple" and config.agent_model_simple:
+        effective_model = config.agent_model_simple
+        print(f"    Using simple model: {effective_model}")
+    elif difficulty == "complex" and config.agent_model_complex:
+        effective_model = config.agent_model_complex
+        print(f"    Using complex model: {effective_model}")
 
     origin_lib = kernel.origin_library if kernel.origin_library != "unknown" else "aiter"
     opt_result = KernelOptResult(
@@ -2506,19 +2685,46 @@ def _optimize_kernel(
         print(f"    [warn] No baseline sources found for {spec}")
 
     _create_task_config(task_dir, kernel, config, baseline_sources, benchmark_config)
+
+    # Knowledge base: inject past insights into prompt
+    kb_section = ""
+    try:
+        from pipeline.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase()
+        kb_section = kb.summarize_for_prompt(spec, kernel.category or "triton")
+        if completed_results:
+            cross = kb.cross_kernel_insights(spec, completed_results)
+            kb_section += cross
+    except Exception as e:
+        _log.debug("knowledge base prompt injection failed: %s", e)
+
     prompt = _build_kernel_prompt(kernel, config, benchmark_config, task_dir)
+    if kb_section:
+        prompt = prompt + "\n" + kb_section
 
     best_kr: Optional[KernelResult] = None
     reflection_prompt = ""
     total_agent_turns = 0
+    previous_speedup = 0.0
+    stall_count = 0
+
+    # Budget: base iterations + bonus from early-finish kernels
+    effective_max_iter = config.max_iterations
+    if remaining_budget is not None:
+        with _BUDGET_LOCK:
+            if remaining_budget:
+                bonus = remaining_budget.pop(0)
+                effective_max_iter += bonus
+                if bonus > 0:
+                    print(f"    Budget bonus: +{bonus} iterations (total: {effective_max_iter})")
 
     pre_existing_solution = find_solution(task_dir)
     if pre_existing_solution:
         print(f"    Pre-existing solution found: {pre_existing_solution.name}")
         print(f"    Skipping agent, going straight to grading.")
 
-    for iteration in range(1, config.max_iterations + 1):
-        print(f"\n    --- Iteration {iteration}/{config.max_iterations} ---")
+    for iteration in range(1, effective_max_iter + 1):
+        print(f"\n    --- Iteration {iteration}/{effective_max_iter} ---")
 
         if pre_existing_solution and iteration == 1:
             solution_written = True
@@ -2527,16 +2733,15 @@ def _optimize_kernel(
             t0 = time.monotonic()
             messages, solution_written = _run_agent_iteration(
                 task_dir, prompt, config, iteration, reflection_prompt,
+                model_override=effective_model,
             )
             agent_time = time.monotonic() - t0
             for msg in messages:
                 if hasattr(msg, "num_turns"):
                     total_agent_turns += getattr(msg, "num_turns", 0)
-            # Capture agent trace
             opt_result.agent_trace.extend(_serialize_agent_messages(messages))
             print(f"    Agent completed in {agent_time:.1f}s")
 
-            # Agent may have written a solution before crashing
             if not solution_written and find_solution(task_dir):
                 print("    Agent crashed but solution file exists — grading it.")
                 solution_written = True
@@ -2544,14 +2749,16 @@ def _optimize_kernel(
         if not solution_written:
             print("    Agent did not write a solution.")
             opt_result.error = "Agent did not produce solution.py"
-            if iteration < config.max_iterations:
+            if iteration < effective_max_iter:
                 delay = min(5 * iteration, 15)
                 print(f"    Retrying in {delay}s...")
                 time.sleep(delay)
             continue
 
         print("    Grading with Magpie...")
-        kr = grade_task(task_dir, isolate_caches=True, gpu_device=0)
+        with _GPU_GRADE_LOCK:
+            kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
+                            speedup_cap=config.tampering_speedup_cap)
         print(f"      compiled={kr.compiled} correct={kr.correct} "
               f"speedup={kr.speedup:.2f}x score={kr.score:.0f}")
         if kr.error:
@@ -2570,7 +2777,19 @@ def _optimize_kernel(
             print(f"    Target reached: score={kr.score:.0f} >= {config.score_threshold}")
             break
 
-        # Iterative profiling: profile solution if compiled and correct
+        # No-progress detection: stall if speedup delta < 5% for 2 consecutive iterations
+        if kr.compiled and kr.correct and previous_speedup > 0:
+            delta = abs(kr.speedup - previous_speedup) / max(previous_speedup, 1e-6)
+            if delta < 0.05:
+                stall_count += 1
+                print(f"    Stall detected: delta={delta:.1%} (count={stall_count})")
+            else:
+                stall_count = 0
+
+        if kr.compiled and kr.correct:
+            previous_speedup = kr.speedup
+
+        # Iterative profiling
         solution_profile = ""
         if kr.compiled and kr.correct:
             sol = find_solution(task_dir)
@@ -2585,11 +2804,22 @@ def _optimize_kernel(
             target_speedup=config.score_threshold / 100.0,
             min_speedup=MIN_SPEEDUP_FOR_REINJECTION,
             profile_data=solution_profile,
+            previous_speedup=previous_speedup,
         )
 
-        if not should_continue(kr, iteration, config.max_iterations, config.score_threshold):
-            print(f"    Stopping: score={kr.score:.0f}")
+        if not should_continue(kr, iteration, effective_max_iter,
+                               config.score_threshold,
+                               previous_speedup=previous_speedup,
+                               stall_count=stall_count):
+            reason = "stalled (no progress)" if stall_count >= 2 else f"score={kr.score:.0f}"
+            print(f"    Stopping: {reason}")
             break
+
+    # Return unused iterations to the budget pool
+    unused = effective_max_iter - (opt_result.iterations_used or effective_max_iter)
+    if unused > 0 and remaining_budget is not None:
+        with _BUDGET_LOCK:
+            remaining_budget.append(unused)
 
     # Restore best solution if a later iteration overwrote it
     best_snapshot = task_dir / "solution_best.py"
@@ -2630,6 +2860,24 @@ def _optimize_kernel(
         opt_result.baseline_ms = 10.0
         opt_result.optimized_ms = 6.67
         opt_result.iterations_used = 1
+
+    # Record to knowledge base
+    try:
+        from pipeline.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase()
+        sol_code = ""
+        sol_path = find_solution(task_dir)
+        if sol_path:
+            sol_code = sol_path.read_text()
+        kb.record_from_opt_result(
+            opt_result.__dict__,
+            kernel_type=kernel.category or "triton",
+            gpu_arch=config.gpu_arch,
+            agent_model=effective_model,
+            solution_code=sol_code,
+        )
+    except Exception as e:
+        _log.debug("knowledge base record failed: %s", e)
 
     return opt_result
 
@@ -2814,8 +3062,8 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
             state_path = config.effective_results_dir / "pipeline_state.json"
             try:
                 baseline_result = json.loads(state_path.read_text()).get("baseline_result", {})
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("baseline result load from state failed: %s", e)
         result = dict(baseline_result) if baseline_result else {
             "success": True,
             "throughput": {"output_throughput": baseline_tps, "total_token_throughput": baseline_tps * 2},
@@ -3323,9 +3571,13 @@ def _generate_replication_guide(
 # ---------------------------------------------------------------------------
 
 def run_workload_optimization(config: WorkloadConfig) -> WorkloadTrajectoryRecord:
+    global PATCH_LOCK_PATH, PATCH_MANIFEST_PATH
     t_start = time.monotonic()
     results_dir = config.effective_results_dir
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    PATCH_LOCK_PATH = _patch_lock_path(results_dir)
+    PATCH_MANIFEST_PATH = _patch_manifest_path(results_dir)
 
     log_path = results_dir / "run.log"
     log_file = open(log_path, "w")
@@ -3545,21 +3797,65 @@ def _run_workload_optimization_inner(
     print(f"  Duration: {step_timings['identify']:.1f}s")
 
     # Step 5: Per-kernel optimization loop
+    parallel_n = getattr(config, "parallel_kernels", 1) or 1
     print(f"\n{'─'*65}")
-    print(f"  Step 5: Kernel Optimization Loop ({len(selected)} kernels)")
+    print(f"  Step 5: Kernel Optimization Loop ({len(selected)} kernels, parallel={parallel_n})")
     print(f"{'─'*65}")
 
     t_step = time.monotonic()
     kernel_opt_results: list[KernelOptResult] = []
+    remaining_budget: list[int] = []
+    completed_results: list[dict] = []
 
-    for i, kernel in enumerate(selected, 1):
-        print(f"\n  [{i}/{len(selected)}] Optimizing: "
-              f"{kernel.matched_kernel_spec or kernel.name[:50]}")
-        opt_result = _optimize_kernel(kernel, config, benchmark_cfg)
-        kernel_opt_results.append(opt_result)
-        trajectory.kernel_optimizations.append(opt_result.to_dict())
-        print(f"    Result: compiled={opt_result.compiled} correct={opt_result.correct} "
-              f"speedup={opt_result.speedup:.2f}x score={opt_result.score:.0f}")
+    if parallel_n > 1 and len(selected) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        future_to_idx = {}
+        with ThreadPoolExecutor(max_workers=parallel_n) as executor:
+            for i, kernel in enumerate(selected):
+                future = executor.submit(
+                    _optimize_kernel, kernel, config, benchmark_cfg,
+                    remaining_budget, completed_results,
+                )
+                future_to_idx[future] = i
+
+            results_by_idx: dict[int, KernelOptResult] = {}
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    opt_result = future.result()
+                except Exception as exc:
+                    k = selected[idx]
+                    print(f"    [error] Kernel {k.matched_kernel_spec} failed: {exc}")
+                    opt_result = KernelOptResult(
+                        kernel_name=k.name,
+                        kernel_spec=k.matched_kernel_spec or "",
+                        error=str(exc)[:500],
+                    )
+                results_by_idx[idx] = opt_result
+                completed_results.append(opt_result.__dict__)
+                print(f"    Result [{idx+1}/{len(selected)}]: "
+                      f"{opt_result.kernel_spec} compiled={opt_result.compiled} "
+                      f"correct={opt_result.correct} speedup={opt_result.speedup:.2f}x "
+                      f"score={opt_result.score:.0f}")
+
+        for i in range(len(selected)):
+            r = results_by_idx[i]
+            kernel_opt_results.append(r)
+            trajectory.kernel_optimizations.append(r.to_dict())
+    else:
+        for i, kernel in enumerate(selected, 1):
+            print(f"\n  [{i}/{len(selected)}] Optimizing: "
+                  f"{kernel.matched_kernel_spec or kernel.name[:50]}")
+            opt_result = _optimize_kernel(
+                kernel, config, benchmark_cfg,
+                remaining_budget, completed_results,
+            )
+            kernel_opt_results.append(opt_result)
+            completed_results.append(opt_result.__dict__)
+            trajectory.kernel_optimizations.append(opt_result.to_dict())
+            print(f"    Result: compiled={opt_result.compiled} correct={opt_result.correct} "
+                  f"speedup={opt_result.speedup:.2f}x score={opt_result.score:.0f}")
     step_timings["optimize"] = time.monotonic() - t_step
     print(f"\n  Optimization duration: {step_timings['optimize']:.1f}s")
 
@@ -3791,6 +4087,11 @@ def _init_config_from_args(args) -> WorkloadConfig:
         dry_run=getattr(args, "dry_run", False),
         num_benchmark_runs=getattr(args, "num_benchmark_runs", 5),
         benchmark_timeout=getattr(args, "benchmark_timeout", 5400),
+        benchmark_cache_hours=getattr(args, "benchmark_cache_hours", 0),
+        parallel_kernels=getattr(args, "parallel_kernels", 1),
+        agent_model_simple=getattr(args, "agent_model_simple", ""),
+        agent_model_complex=getattr(args, "agent_model_complex", ""),
+        tampering_speedup_cap=getattr(args, "tampering_speedup_cap", 0.0),
     )
 
 
@@ -3935,16 +4236,21 @@ def cmd_optimize(args):
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     config.agent_version = f"v1.0-{run_ts}"
 
-    print(f"\n  Step 5: Kernel Optimization Loop ({len(selected)} kernels)")
+    parallel_n = getattr(config, "parallel_kernels", 1) or 1
+    print(f"\n  Step 5: Kernel Optimization Loop ({len(selected)} kernels, parallel={parallel_n})")
     print(f"  {'─'*55}")
 
     existing_results = state.get("optimization_results", {})
+    remaining_budget: list[int] = []
+    completed_results: list[dict] = []
 
     for i, kernel in enumerate(selected, 1):
         spec = kernel.matched_kernel_spec or kernel.name[:50]
         print(f"\n  [{i}/{len(selected)}] Optimizing: {spec}")
-        opt_result = _optimize_kernel(kernel, config, benchmark_cfg)
+        opt_result = _optimize_kernel(kernel, config, benchmark_cfg,
+                                      remaining_budget, completed_results)
         existing_results[spec] = opt_result.to_dict()
+        completed_results.append(opt_result.__dict__)
         print(f"    Result: compiled={opt_result.compiled} correct={opt_result.correct} "
               f"speedup={opt_result.speedup:.2f}x score={opt_result.score:.0f}")
 
@@ -3997,7 +4303,7 @@ def cmd_grade(args):
         _create_task_config(task_dir, kernel, config, baseline_sources)
 
         print(f"  Grading {spec}...")
-        kr = grade_task(task_dir)
+        kr = grade_task(task_dir, speedup_cap=config.tampering_speedup_cap)
 
         baseline_ms, optimized_ms = _extract_timing_from_raw(kr.raw)
         print(f"    compiled={kr.compiled} correct={kr.correct} "
@@ -4356,6 +4662,34 @@ class KernelStandaloneDefinition:
         return self.ground_truth.get("mode", "pytorch")
 
 
+def _wrap_shapes_code(shapes_code: str, input_func_name: str) -> str:
+    """Wrap extracted shapes code with proper imports and a get_test_inputs() wrapper.
+
+    The testcase template calls shapes_mod.get_test_inputs() (no args).
+    Registry-extracted code has functions like generate_rmsnorm_inputs(M, N, dtype)
+    that need to be wrapped with default arguments.
+    """
+    parts = ["import torch\n"]
+    if "import torch" not in shapes_code:
+        pass  # already prepending torch import
+    else:
+        parts = []  # shapes_code already has import torch
+    parts.append(shapes_code.rstrip())
+
+    if input_func_name and input_func_name in shapes_code:
+        parts.append(
+            f"\n\ndef get_test_inputs():\n"
+            f"    return [{input_func_name}(256, 4096, torch.float16)]\n"
+        )
+    elif "def get_test_inputs" not in shapes_code:
+        parts.append(
+            "\n\ndef get_test_inputs():\n"
+            "    return [(torch.randn(256, 4096, dtype=torch.float16, device='cuda'),)]\n"
+        )
+
+    return "\n".join(parts)
+
+
 _STANDALONE_TESTCASE_TEMPLATE = '''\
 #!/usr/bin/env python3
 """Correctness testcase: compare solution vs real library PyTorch reference."""
@@ -4370,7 +4704,11 @@ def _load(path, name):
     spec.loader.exec_module(mod)
     return mod
 
-def _find_fn(mod):
+def _find_fn(mod, hint=""):
+    if hint:
+        fn = getattr(mod, hint, None)
+        if callable(fn):
+            return fn
     for n in ("forward", "baseline_fn", "kernel_fn"):
         fn = getattr(mod, n, None)
         if callable(fn):
@@ -4385,8 +4723,38 @@ def _find_fn(mod):
 ref_mod = _load(os.path.join(_DIR, "reference.py"), "ref")
 sol_mod = _load(os.path.join(_DIR, "{sol_filename}"), "sol")
 
-ref_fn = _find_fn(ref_mod)
-sol_fn = _find_fn(sol_mod)
+ref_fn = _find_fn(ref_mod, "{ref_func_name}")
+sol_fn = _find_fn(sol_mod, "{sol_func_name}")
+
+if ref_fn is None:
+    print("FAIL: Could not find a callable function in reference.py")
+    sys.exit(1)
+if sol_fn is None:
+    print("FAIL: Could not find a callable function in solution")
+    sys.exit(1)
+
+import inspect
+_COMMON_DEFAULTS = {{
+    "epsilon": 1e-6, "eps": 1e-6, "atol": 1e-3, "rtol": 1e-3,
+    "out_dtype": torch.float16, "dtype": torch.float16,
+}}
+
+def _safe_call(fn, inputs):
+    """Call fn with inputs, padding missing required args from known defaults."""
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+    n_required = len([p for p in params if p.default is inspect.Parameter.empty])
+    if len(inputs) >= n_required:
+        return fn(*inputs[:n_required])
+    args = list(inputs)
+    for p in params[len(args):]:
+        if p.default is not inspect.Parameter.empty:
+            args.append(p.default)
+        elif p.name in _COMMON_DEFAULTS:
+            args.append(_COMMON_DEFAULTS[p.name])
+        else:
+            break
+    return fn(*args)
 
 try:
     shapes_mod = _load(os.path.join(_DIR, "test_shapes.py"), "shapes")
@@ -4395,7 +4763,6 @@ except Exception:
     test_inputs = None
 
 if test_inputs is None:
-    import inspect
     sig = inspect.signature(ref_fn)
     nparams = len([p for p in sig.parameters.values()
                    if p.default is inspect.Parameter.empty])
@@ -4412,8 +4779,8 @@ for i, inputs in enumerate(test_inputs):
     if not isinstance(inputs, (tuple, list)):
         inputs = (inputs,)
     with torch.no_grad():
-        ref_out = ref_fn(*inputs)
-        sol_out = sol_fn(*inputs)
+        ref_out = _safe_call(ref_fn, inputs)
+        sol_out = _safe_call(sol_fn, inputs)
     if isinstance(ref_out, (tuple, list)):
         ref_out = ref_out[0]
     if isinstance(sol_out, (tuple, list)):
@@ -4477,6 +4844,13 @@ def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
                     gt["pytorch_reference_code"] = gt_spec.pytorch_reference_code
                     if gt_spec.test_shapes_code:
                         gt["test_shapes_code"] = gt_spec.test_shapes_code
+                    if gt_spec.ref_func_name:
+                        gt["ref_func_name"] = gt_spec.ref_func_name
+                    if gt_spec.sol_entry_func:
+                        gt["sol_entry_func"] = gt_spec.sol_entry_func
+                    if gt_spec.input_func_name:
+                        gt["input_func_name"] = gt_spec.input_func_name
+                    gt["source_library"] = gt_spec.source_library
                     print(f"    Auto-discovered PyTorch reference for '{kname}' from {gt_spec.source_library}")
     elif corr_mode == "library_test":
         gt["unit_test_command"] = getattr(args, "test_cmd", "")
@@ -4540,11 +4914,20 @@ def _create_standalone_task_config(
             ref_path.write_text(ref_preamble + ref_code)
             if shapes_code:
                 shapes_path = task_dir / "test_shapes.py"
-                shapes_path.write_text(shapes_code)
+                input_func_name = gt.get("input_func_name", "")
+                shapes_path.write_text(
+                    _wrap_shapes_code(shapes_code, input_func_name)
+                )
             tc_path = task_dir / "testcase.py"
             sol_filename = f"solution{ext}"
+            ref_func_name = gt.get("ref_func_name", "")
+            sol_func_name = gt.get("sol_entry_func", "")
             tc_path.write_text(
-                _STANDALONE_TESTCASE_TEMPLATE.format(sol_filename=sol_filename)
+                _STANDALONE_TESTCASE_TEMPLATE.format(
+                    sol_filename=sol_filename,
+                    ref_func_name=ref_func_name,
+                    sol_func_name=sol_func_name,
+                )
             )
             correctness_cmd = f"{kernel_python} testcase.py"
             print(f"    Generated testcase from real library reference: {tc_path.name}")
@@ -4823,6 +5206,8 @@ def cmd_optimize_kernel(args):
 
     best_kr: Optional[KernelResult] = None
     reflection_prompt = ""
+    previous_speedup = 0.0
+    stall_count = 0
 
     for iteration in range(1, config.max_iterations + 1):
         print(f"\n  --- Iteration {iteration}/{config.max_iterations} ---")
@@ -4844,7 +5229,8 @@ def cmd_optimize_kernel(args):
             continue
 
         print("  Grading...")
-        kr = grade_task(task_dir, isolate_caches=True, gpu_device=0)
+        kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
+                        speedup_cap=config.tampering_speedup_cap)
         print(f"    compiled={kr.compiled} correct={kr.correct} "
               f"speedup={kr.speedup:.2f}x score={kr.score:.0f}")
         if kr.error:
@@ -4860,14 +5246,31 @@ def cmd_optimize_kernel(args):
             print(f"  Target reached: score={kr.score:.0f}")
             break
 
+        if kr.compiled and kr.correct and previous_speedup > 0:
+            delta = abs(kr.speedup - previous_speedup) / max(previous_speedup, 1e-6)
+            if delta < 0.05:
+                stall_count += 1
+                print(f"  Stall detected: delta={delta:.1%} (count={stall_count})")
+            else:
+                stall_count = 0
+
+        if kr.compiled and kr.correct:
+            previous_speedup = kr.speedup
+
         reflection_prompt = reflect(
             kr, task_dir, iteration,
             kernel_type=kdef.kernel_name or "kernel",
             target_speedup=config.score_threshold / 100.0,
             min_speedup=1.05,
+            previous_speedup=previous_speedup,
         )
 
-        if not should_continue(kr, iteration, config.max_iterations, config.score_threshold):
+        if not should_continue(kr, iteration, config.max_iterations,
+                               config.score_threshold,
+                               previous_speedup=previous_speedup,
+                               stall_count=stall_count):
+            reason = "stalled (no progress)" if stall_count >= 2 else f"score={kr.score:.0f}"
+            print(f"  Stopping: {reason}")
             break
 
     # Restore best
@@ -4905,6 +5308,31 @@ def cmd_optimize_kernel(args):
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"  Result saved: {summary_path}")
+
+    # Record to knowledge base
+    if best_kr and best_kr.correct and best_kr.speedup > 0:
+        try:
+            from pipeline.knowledge_base import KnowledgeBase
+            kb = KnowledgeBase()
+            sol_code = ""
+            sol_path = task_dir / "solution.py"
+            if sol_path.exists():
+                sol_code = sol_path.read_text()
+            kb.record_from_opt_result(
+                {
+                    "kernel_spec": kdef.kernel_name or kdef.task_id,
+                    "correct": best_kr.correct,
+                    "speedup": best_kr.speedup,
+                    "score": best_kr.score,
+                },
+                kernel_type=kdef.kernel_type or "triton",
+                gpu_arch=getattr(config, "gpu_arch", "gfx950"),
+                agent_model=config.agent_model,
+                solution_code=sol_code,
+            )
+            print(f"  Knowledge base updated.")
+        except Exception as e:
+            print(f"  Knowledge base recording skipped: {e}")
 
 
 def cmd_grade_kernel(args):
@@ -4954,7 +5382,9 @@ def cmd_grade_kernel(args):
     _create_standalone_task_config(task_dir, kdef)
 
     print("  Grading...")
-    kr = grade_task(task_dir, isolate_caches=True, gpu_device=0)
+    _cap = getattr(args, "tampering_speedup_cap", 0.0)
+    kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
+                    speedup_cap=_cap)
 
     elapsed = time.monotonic() - t0
     print(f"\n{'='*60}")
@@ -5050,6 +5480,8 @@ def _add_benchmark_args(parser):
     parser.add_argument("--num-benchmark-runs", type=int, default=5,
                         help="Number of benchmark runs for statistical averaging (default: 5)")
     parser.add_argument("--benchmark-timeout", type=int, default=5400)
+    parser.add_argument("--benchmark-cache-hours", type=int, default=0,
+                        help="Cache baseline benchmark results for N hours (0=disabled)")
 
 
 def _add_kernel_filter_args(parser):
@@ -5076,6 +5508,14 @@ def _add_agent_args(parser):
                         help="Override the backend-specific default agent model")
     parser.add_argument("--agent-version", default="v1.0")
     parser.add_argument("--agent-backend", default="claude", choices=["claude", "codex"])
+    parser.add_argument("--parallel-kernels", type=int, default=1,
+                        help="Number of kernels to optimize in parallel (default: 1)")
+    parser.add_argument("--agent-model-simple", default="",
+                        help="Agent model for simple kernels (model routing)")
+    parser.add_argument("--agent-model-complex", default="",
+                        help="Agent model for complex kernels (model routing)")
+    parser.add_argument("--tampering-speedup-cap", type=float, default=0.0,
+                        help="Configurable speedup cap when benchmark tampering detected (0=default 1.0x)")
 
 
 def main():
@@ -5216,6 +5656,8 @@ def main():
                    help="Path to the solution file to grade (required unless provided in --kernel-spec)")
     p.add_argument("--json", dest="json_output", action="store_true",
                    help="Print result as JSON to stdout")
+    p.add_argument("--tampering-speedup-cap", type=float, default=0.0,
+                   help="Configurable speedup cap when benchmark tampering detected (0=default 1.0x)")
 
     args = parser.parse_args()
 

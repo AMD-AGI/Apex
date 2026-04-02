@@ -16,12 +16,15 @@ Output files:
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import textwrap
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -161,8 +164,8 @@ def _read_baseline_code(kernel_type: str, framework: str = "vllm") -> str:
         if candidate.exists():
             try:
                 return candidate.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("source read failed for %s: %s", candidate, e)
     return ""
 
 
@@ -386,8 +389,8 @@ def export(
                 ))
                 if include_sft:
                     all_sft.extend(_trajectory_to_sft_pairs(record))
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("trajectory parse failed for %s: %s", tfile, e)
 
     # Load extra trajectory files
     for extra in (extra_files or []):
@@ -402,8 +405,8 @@ def export(
                 ))
                 if include_sft:
                     all_sft.extend(_trajectory_to_sft_pairs(record))
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("trajectory parse failed for %s: %s", extra, e)
 
     # Standalone mode: supplement with auto-discovered tasks
     if standalone or not all_tasks:
