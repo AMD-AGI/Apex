@@ -843,7 +843,10 @@ def compute_reward_gated(
         spd = (baseline_ms / optimized_ms) if optimized_ms > 0 else 0.0
         return total_score(compiled, correct, spd)
 
-    from reward_fn import compute_gated_reward  # lazy import to avoid circular deps
+    try:
+        from .reward_fn import compute_gated_reward  # lazy import to avoid circular deps
+    except ImportError:
+        from reward_fn import compute_gated_reward  # type: ignore[no-redef]
     return compute_gated_reward(
         solution_str=solution_str,
         ground_truth=ground_truth,

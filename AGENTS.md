@@ -16,11 +16,11 @@ Default target: **MI355X / gfx950 (CDNA4)**. Also supports gfx942 (MI300X), gfx9
 
 ## Environment (always set first)
 
-Ensure you are in the Apex repo root (the directory containing this AGENTS.md),
+Ensure you are in the Apex repo root (the directory containing this CLAUDE.md),
 then activate the venv and set MAGPIE_ROOT:
 ```bash
-cd "$(dirname "$(readlink -f AGENTS.md)" 2>/dev/null || pwd)"
-source .venv/bin/activate
+cd "$(dirname "$(readlink -f CLAUDE.md)" 2>/dev/null || pwd)"
+source ../../Kernel/.venv/bin/activate
 export MAGPIE_ROOT=$(cd ../Magpie && pwd)
 ```
 
@@ -176,7 +176,7 @@ Shows a table like:
 
 Spawns a Claude Code sub-agent per kernel. Each gets the rich prompt from
 `prompts/kernel_prompt.py` (MCP tables, skills, source locations, arch hints)
-plus actual baseline source code. The sub-agent has 5 bundled MCPs via `mcp_config.json` (plus 2 optional external servers: kernel-perf, asm-tools).
+plus actual baseline source code. The sub-agent has 7 MCPs via `mcp_config.json`.
 
 ```bash
 # Optimize ALL identified triton kernels (dynamic, no hardcoding)
@@ -477,6 +477,7 @@ types (e.g. `fused_moe` → pytorch, `kv_cache_ops` → library_test).
   - `score.py`: Scoring formula, Magpie result parsing, helper functions
   - `kernel_grader.py`: Grades individual kernel solutions
   - `model_grader.py`: Grades end-to-end model throughput
+  - `ground_truth_templates.py`: Per-kernel-type CPU baseline and test-shape generators for RL training export (12 kernel types)
 
 - **`agents/backends.py`** — Dual agent backend (Claude Code via `claude-agent-sdk`, Codex via `codex exec` CLI)
 
@@ -627,17 +628,6 @@ Each pipeline run starts with a guaranteed clean baseline:
 - **Environment snapshot**: All `VLLM_ROCM_USE_AITER_*` env vars and package versions captured in trajectory.
 - **Library test verification**: After hot-patching, the library's own test suite (from `MANUAL_REGISTRY`) is run to catch subtle correctness issues beyond import checks.
 - **Multi-file patching**: Solutions can be a directory with `manifest.json` mapping multiple files to their install targets, supporting kernel + dispatch table changes.
-- **Benchmark caching**: `--benchmark-cache-hours N` caches baseline benchmark results to skip re-running.
-- **Parallel kernel optimization**: `--parallel-kernels N` runs up to N agent sessions concurrently. GPU grading is serialized.
-- **Smart iteration**: No-progress early termination (stall detection: delta <5% for 2 consecutive iterations) with budget reallocation.
-- **Agent model routing**: `--agent-model-simple` / `--agent-model-complex` for per-kernel model override based on difficulty.
-- **Knowledge base**: `knowledge_base.json` records optimization outcomes; past insights injected into agent prompts automatically.
-- **Anti-tampering prompts**: Explicit anti-tampering rules in all prompt templates with AST-based detection.
-- **Correctness-first workflow**: Mandatory correctness → speed optimization order enforced in prompts.
-- **Speedup measurement reliability**: Multiple profiling runs with outlier rejection and high-variance warnings.
-- **Structured profiling feedback**: rocprof metrics parsed into Performance Scorecard in reflection prompts.
-- **Reference injection**: PyTorch reference code and library test function signatures injected inline in agent prompts.
-- **Configurable tampering cap**: `--tampering-speedup-cap X` overrides default speedup cap when benchmark tampering detected.
 
 ## Kernel reintegration scope
 
@@ -801,7 +791,7 @@ python3 workload_optimizer.py grade-kernel \
 
 ### MCP tools to use during kernel optimization
 
-The agent has 5 bundled MCP servers (plus 2 optional external: kernel-perf, asm-tools). Use them actively for kernel-level work:
+The agent has 7 MCP servers available. Use them actively for kernel-level work:
 
 | MCP | Tool | When to call |
 |-----|------|-------------|

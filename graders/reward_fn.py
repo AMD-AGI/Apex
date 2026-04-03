@@ -40,33 +40,62 @@ import re
 import socket
 from datetime import datetime
 
-from reward_backends import (
-    KERNEL_BACKEND_HIP,
-    KERNEL_BACKEND_TRITON,
-    normalize_answer_for_backend,
-    run_backend_static_check,
-    run_triton_static_check,
-)
-from reward_trace import (
-    ROUTE_AST_BLOCKED,
-    ROUTE_AST_NO_TRITON_JIT,
-    ROUTE_AST_SYNTAX_ERROR,
-    ROUTE_COMPILED_LOW_CORRECTNESS,
-    ROUTE_CORRECT_BUT_NO_PERF,
-    ROUTE_EVAL_COMPILE_FAIL,
-    ROUTE_EVAL_HACKING,
-    ROUTE_EVAL_TIMEOUT,
-    ROUTE_HIP_NO_BINDING,
-    ROUTE_HIP_NO_KERNEL,
-    ROUTE_HIP_STATIC_BLOCKED,
-    ROUTE_NO_ANSWER,
-    ROUTE_PERF_REWARDED,
-    _current_pst_datetime,
-    emit_reward_trace,
-    extract_syntax_error_location,
-    hash_text,
-    preview_text,
-)
+try:
+    from .reward_backends import (
+        KERNEL_BACKEND_HIP,
+        KERNEL_BACKEND_TRITON,
+        normalize_answer_for_backend,
+        run_backend_static_check,
+        run_triton_static_check,
+    )
+    from .reward_trace import (
+        ROUTE_AST_BLOCKED,
+        ROUTE_AST_NO_TRITON_JIT,
+        ROUTE_AST_SYNTAX_ERROR,
+        ROUTE_COMPILED_LOW_CORRECTNESS,
+        ROUTE_CORRECT_BUT_NO_PERF,
+        ROUTE_EVAL_COMPILE_FAIL,
+        ROUTE_EVAL_HACKING,
+        ROUTE_EVAL_TIMEOUT,
+        ROUTE_HIP_NO_BINDING,
+        ROUTE_HIP_NO_KERNEL,
+        ROUTE_HIP_STATIC_BLOCKED,
+        ROUTE_NO_ANSWER,
+        ROUTE_PERF_REWARDED,
+        _current_pst_datetime,
+        emit_reward_trace,
+        extract_syntax_error_location,
+        hash_text,
+        preview_text,
+    )
+except ImportError:
+    from reward_backends import (
+        KERNEL_BACKEND_HIP,
+        KERNEL_BACKEND_TRITON,
+        normalize_answer_for_backend,
+        run_backend_static_check,
+        run_triton_static_check,
+    )
+    from reward_trace import (
+        ROUTE_AST_BLOCKED,
+        ROUTE_AST_NO_TRITON_JIT,
+        ROUTE_AST_SYNTAX_ERROR,
+        ROUTE_COMPILED_LOW_CORRECTNESS,
+        ROUTE_CORRECT_BUT_NO_PERF,
+        ROUTE_EVAL_COMPILE_FAIL,
+        ROUTE_EVAL_HACKING,
+        ROUTE_EVAL_TIMEOUT,
+        ROUTE_HIP_NO_BINDING,
+        ROUTE_HIP_NO_KERNEL,
+        ROUTE_HIP_STATIC_BLOCKED,
+        ROUTE_NO_ANSWER,
+        ROUTE_PERF_REWARDED,
+        _current_pst_datetime,
+        emit_reward_trace,
+        extract_syntax_error_location,
+        hash_text,
+        preview_text,
+    )
 
 
 # ── Reward constants ──────────────────────────────────────────────────────────

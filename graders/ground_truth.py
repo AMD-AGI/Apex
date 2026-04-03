@@ -405,7 +405,6 @@ class _RegistryEntry(NamedTuple):
 
 
 _REGISTRY_ENTRIES: list[_RegistryEntry] = [
-    #                                                                                                                                              ref_func               input_func                 sol_entry_func         test_cmd                                                                        diff  op_type
     _RegistryEntry("rms_norm",         "pytorch",      "aiter/op_tests/triton_tests/normalization/test_rmsnorm.py",                      "aiter", "torch_rmsnorm",       "generate_rmsnorm_inputs", "rms_norm",            "",                                                                                 1, "memory_bound"),
     _RegistryEntry("silu_mul",         "library_test", "aiter/op_tests/triton_tests/test_activation.py",                                 "aiter", "",                    "",                        "",                    "python -m pytest aiter/op_tests/triton_tests/test_activation.py",               1, "memory_bound"),
     _RegistryEntry("fused_moe",        "pytorch",      "aiter/op_tests/triton_tests/moe/test_moe.py",                                   "aiter", "torch_moe_ref",       "",                        "",                    "",                                                                              3, "compute_bound"),
@@ -495,7 +494,6 @@ def scan_hip_kernels_for_accordo(
 
     # CK examples: each numbered directory is a distinct kernel operation
     ck_examples = rocm_dir / "composable_kernel" / "example"
-    ck_build_bin = rocm_dir / "composable_kernel" / "build" / "bin"
     if ck_examples.exists():
         for example_dir in sorted(ck_examples.iterdir()):
             if not example_dir.is_dir():
@@ -507,24 +505,20 @@ def scan_hip_kernels_for_accordo(
                 continue
             kernel_name = parts[1]  # e.g. "gemm", "grouped_gemm"
 
+            # Find any binary targets (from CMakeLists.txt)
+            cmake = example_dir / "CMakeLists.txt"
             binary_name = f"example_{name}"
-
-            # Prefer absolute path to built binary if it exists
-            built_binary = ck_build_bin / binary_name
-            is_built = built_binary.exists() and built_binary.stat().st_mode & 0o111
-            ref_binary_path = str(built_binary) if is_built else f"build/bin/{binary_name}"
 
             accordo_config = {
                 "correctness": {
                     "backend": "accordo",
                     "accordo": {
                         "kernel_name": kernel_name,
-                        "reference_binary": ref_binary_path,
+                        "reference_binary": f"build/bin/{binary_name}",
                         "optimized_binary": f"build/bin/{binary_name}_opt",
                         "tolerance": 0.001,
                         "timeout_seconds": 60,
-                        "working_directory": str(rocm_dir / "composable_kernel") if is_built else "${CK_HOME}",
-                        "built": is_built,
+                        "working_directory": "${CK_HOME}",
                     },
                 }
             }

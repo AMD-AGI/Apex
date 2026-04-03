@@ -25,11 +25,13 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 DEFAULT_AGENT = "claude"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
+DEFAULT_CURSOR_MODEL = "auto"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MCP_CONFIG_PATH = REPO_ROOT / "mcp_config.json"
@@ -41,6 +43,8 @@ def resolve_default_model(agent: str) -> str | None:
         return DEFAULT_CLAUDE_MODEL
     if agent == "codex":
         return _read_codex_config_model() or DEFAULT_CODEX_MODEL
+    if agent == "cursor":
+        return DEFAULT_CURSOR_MODEL
     raise ValueError(f"Unsupported agent backend: {agent}")
 
 
@@ -95,6 +99,15 @@ def run_agent_task(
         )
     if agent == "codex":
         return _run_codex_task(
+            prompt=prompt,
+            cwd=cwd,
+            model=model,
+            max_turns=max_turns,
+            system_prompt=system_prompt,
+            solution_path=solution_path,
+        )
+    if agent == "cursor":
+        return _run_cursor_task(
             prompt=prompt,
             cwd=cwd,
             model=model,
@@ -311,6 +324,182 @@ def _build_codex_prompt(prompt: str, system_prompt: str | None, max_turns: int) 
     parts.append("")
     parts.append(prompt.rstrip())
     return "\n".join(parts)
+
+
+_CURSOR_TIMEOUT_SECONDS = 600
+_CURSOR_INITIAL_OUTPUT_TIMEOUT = 30
+
+
+def _find_cursor_agent_binary() -> str | None:
+    """Locate the cursor-agent standalone binary (preferred over VS Code wrapper)."""
+    if _command_exists("cursor-agent"):
+        return "cursor-agent"
+    local_bin = Path.home() / ".local" / "bin" / "cursor-agent"
+    if local_bin.exists():
+        return str(local_bin)
+    if _command_exists("cursor"):
+        return "cursor"
+    return None
+
+
+def _run_cursor_task(
+    *,
+    prompt: str,
+    cwd: Path,
+    model: str | None,
+    max_turns: int,
+    system_prompt: str | None,
+    solution_path: Path,
+) -> tuple[list, bool]:
+    import select
+    import time
+
+    cursor_bin = _find_cursor_agent_binary()
+    if not cursor_bin:
+        raise RuntimeError(
+            "cursor-agent CLI not found. Install: "
+            "curl https://cursor.com/install -fsS | bash  OR  "
+            "npm install -g @anthropic-ai/cursor-agent"
+        )
+
+    combined_prompt = _build_codex_prompt(prompt, system_prompt, max_turns)
+    cmd = [
+        cursor_bin,
+        "-p", "--force", "--trust",
+        "--approve-mcps",
+        "--output-format", "stream-json",
+        "--workspace", str(cwd),
+    ]
+    if model:
+        cmd += ["--model", model]
+    cmd.append(combined_prompt)
+
+    env = os.environ.copy()
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True, env=env, bufsize=1,
+    )
+
+    if proc.stdin:
+        proc.stdin.close()
+
+    trajectory: list[dict] = []
+    stderr_lines: list[str] = []
+    session_id = None
+    duration_ms = None
+    final_error = None
+
+    def _read_stderr():
+        try:
+            for line in proc.stderr:
+                line = line.strip()
+                if line:
+                    stderr_lines.append(line)
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+    stderr_thread.start()
+
+    first_output_received = False
+    start_time = time.monotonic()
+
+    try:
+        while True:
+            if not first_output_received:
+                elapsed = time.monotonic() - start_time
+                if elapsed > _CURSOR_INITIAL_OUTPUT_TIMEOUT:
+                    final_error = (
+                        f"cursor-agent produced no output after {_CURSOR_INITIAL_OUTPUT_TIMEOUT}s. "
+                        "Check authentication: run 'cursor-agent login' or set CURSOR_API_KEY."
+                    )
+                    proc.kill()
+                    break
+                ready, _, _ = select.select([proc.stdout], [], [], 2.0)
+                if not ready:
+                    continue
+
+            raw_line = proc.stdout.readline()
+            if not raw_line:
+                break
+            first_output_received = True
+            line = raw_line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            trajectory.append(event)
+            etype = event.get("type")
+            subtype = event.get("subtype")
+
+            if etype == "system" and subtype == "init":
+                session_id = event.get("session_id")
+                model_name = event.get("model", "")
+                print(f"    cursor session: {session_id or 'n/a'}, model: {model_name}")
+
+            elif etype == "tool_call":
+                if subtype == "started":
+                    tc = event.get("tool_call", {})
+                    tool_name = _extract_cursor_tool_name(tc)
+                    print(f"    tool: {tool_name}")
+
+            elif etype == "assistant":
+                msg = event.get("message", {})
+                content = msg.get("content", [])
+                for block in content:
+                    text = block.get("text", "").strip()
+                    if text:
+                        first_line = text.splitlines()[0][:100]
+                        print(f"    text: {first_line}...")
+                        break
+
+            elif etype == "thinking":
+                pass
+
+            elif etype == "result":
+                duration_ms = event.get("duration_ms")
+                is_error = event.get("is_error", False)
+                if is_error:
+                    final_error = event.get("result", "unknown error")
+
+    finally:
+        proc.wait()
+
+    stderr_thread.join(timeout=5)
+
+    if stderr_lines:
+        for sline in stderr_lines[:10]:
+            print(f"    cursor-stderr: {sline[:200]}")
+            if "Authentication required" in sline or "CURSOR_API_KEY" in sline:
+                final_error = sline
+            if "Cannot use this model" in sline:
+                final_error = sline
+
+    if duration_ms is not None:
+        print(f"  result: duration={duration_ms}ms, events={len(trajectory)}")
+
+    if proc.returncode != 0 and final_error:
+        print(f"  cursor error: {final_error}")
+    elif final_error and not trajectory:
+        print(f"  cursor error: {final_error}")
+
+    return trajectory, solution_path.exists()
+
+
+def _extract_cursor_tool_name(tool_call: dict) -> str:
+    """Extract a human-readable tool name from a Cursor NDJSON tool_call object."""
+    if "function" in tool_call:
+        return tool_call["function"].get("name", "tool")
+    for key in tool_call:
+        if key.endswith("ToolCall"):
+            return key.replace("ToolCall", "")
+    return "tool"
 
 
 def _command_exists(name: str) -> bool:

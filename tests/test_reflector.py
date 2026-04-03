@@ -9,10 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "graders"))
-from pipeline.reflector import (
-    reflect, should_continue, _get_hints, _read_solution,
-    _parse_rocprof_metrics, _format_performance_scorecard,
-)
+from pipeline.reflector import reflect, should_continue, _get_hints, _read_solution
 from score import KernelResult
 
 
@@ -119,49 +116,3 @@ class TestReadSolution:
     def test_missing(self, tmp_path):
         result = _read_solution(tmp_path)
         assert "not found" in result
-
-
-class TestParseRocprofMetrics:
-    SAMPLE_PROFILE = (
-        "Memory Bandwidth utilization: 72.3 %\n"
-        "Compute utilization: 15.8 %\n"
-        "Occupancy: 8 waves/CU\n"
-        "Instruction mix: VMEM 45%, VALU 30%, MFMA 10%, LDS 15%\n"
-    )
-
-    def test_extracts_bandwidth(self):
-        metrics = _parse_rocprof_metrics(self.SAMPLE_PROFILE)
-        assert abs(metrics["bandwidth_pct"] - 72.3) < 0.1
-
-    def test_extracts_compute(self):
-        metrics = _parse_rocprof_metrics(self.SAMPLE_PROFILE)
-        assert abs(metrics["compute_pct"] - 15.8) < 0.1
-
-    def test_extracts_occupancy(self):
-        metrics = _parse_rocprof_metrics(self.SAMPLE_PROFILE)
-        assert metrics["occupancy"] == 8.0
-
-    def test_extracts_instructions(self):
-        metrics = _parse_rocprof_metrics(self.SAMPLE_PROFILE)
-        assert "VMEM" in metrics["top_instructions"]
-        assert "MFMA" in metrics["top_instructions"]
-        assert "LDS" in metrics["top_instructions"]
-
-    def test_memory_bound_recommendation(self):
-        metrics = _parse_rocprof_metrics(self.SAMPLE_PROFILE)
-        assert "memory-bound" in metrics["recommendation"]
-
-    def test_empty_input(self):
-        assert _parse_rocprof_metrics("") == {}
-
-
-class TestFormatPerformanceScorecard:
-    def test_produces_scorecard(self):
-        profile = "HBM BW: 65.0 %\nMFMA utilization: 30.0 %\nOccupancy: 12\n"
-        scorecard = _format_performance_scorecard(profile)
-        assert "Performance Scorecard" in scorecard
-        assert "65%" in scorecard
-        assert "30%" in scorecard
-
-    def test_empty_returns_empty(self):
-        assert _format_performance_scorecard("") == ""

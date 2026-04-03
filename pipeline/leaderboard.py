@@ -10,12 +10,9 @@ Supports CouchDB (integrates with Grafana) and file-based backends.
 from __future__ import annotations
 
 import json
-import logging
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-
-_log = logging.getLogger(__name__)
 from pathlib import Path
 from typing import Any
 
@@ -205,8 +202,8 @@ class _CouchDBLeaderboard:
                     self.db_name = self._LEGACY_DB_NAME
                     return
             requests.put(f"{self.url}/{self.db_name}", auth=self.auth, timeout=5)
-        except Exception as e:
-            _log.warning("CouchDB leaderboard _ensure_db failed: %s", e)
+        except Exception:
+            pass
 
     def push(self, entry: LeaderboardEntry) -> None:
         import requests
@@ -216,8 +213,7 @@ class _CouchDBLeaderboard:
                 f"{self.url}/{self.db_name}/{doc['_id']}",
                 json=doc, auth=self.auth, timeout=10,
             )
-        except Exception as e:
-            _log.warning("CouchDB leaderboard push failed, falling back to file: %s", e)
+        except Exception:
             _FileLeaderboard().push(entry)
 
     def all_entries(self) -> list[LeaderboardEntry]:
@@ -235,6 +231,6 @@ class _CouchDBLeaderboard:
             if resp.status_code == 200:
                 rows = resp.json().get("rows", [])
                 return [LeaderboardEntry.from_dict(r["doc"]) for r in rows if "doc" in r]
-        except Exception as e:
-            _log.warning("CouchDB leaderboard all_entries failed: %s", e)
+        except Exception:
+            pass
         return []

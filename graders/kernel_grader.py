@@ -92,10 +92,10 @@ def _detect_benchmark_tampering(solution_path: Path, baseline_path: str) -> list
     """Detect solutions that tamper with the benchmark via __main__ fast-exit tricks.
 
     Only flags ``__main__`` blocks that contain genuinely suspicious patterns
-    (SystemExit, hardcoded PASS, fabricated timings).  A ``__main__`` block
+    (SystemExit, hardcoded PASS, fabricated timings). A ``__main__`` block
     that simply runs the kernel for testing is NOT flagged.
 
-    Returns a list of warning strings.  An empty list means no tampering detected.
+    Returns a list of warning strings. An empty list means no tampering detected.
     """
     warnings: list[str] = []
     try:
@@ -219,7 +219,7 @@ def _measure_speedup(
     """Measure speedup with multiple runs, outlier rejection, and variance check.
 
     Runs each script `num_runs` times, drops top/bottom 10%, and uses
-    the median of the remaining samples.  Stores a ``_high_variance``
+    the median of the remaining samples. Stores a ``_high_variance``
     warning in cfg if std > 20% of mean.
     """
     perf_cfg = cfg.get("performance", {})
@@ -239,7 +239,7 @@ def _measure_speedup(
         n = len(samples)
         trim = max(1, n // 10)
         if n > 3:
-            trimmed = samples[trim: n - trim]
+            trimmed = samples[trim:n - trim]
         else:
             trimmed = samples
 
@@ -281,10 +281,6 @@ def _apply_tampering_penalties(
 ) -> tuple[bool, float]:
     """Detect benchmark tampering and apply correctness/speedup penalties.
 
-    Args:
-        speedup_cap: If > 0 and tampering is detected, cap speedup at this value
-                     instead of the default 1.0x.  If 0, use default behaviour.
-
     Returns (adjusted_correct, adjusted_speedup).
     """
     tampering_warnings = _detect_benchmark_tampering(solution, baseline_path) if baseline_path else []
@@ -294,6 +290,7 @@ def _apply_tampering_penalties(
     for tw in tampering_warnings:
         print(f"    [grader] TAMPERING DETECTED: {tw}", file=sys.stderr)
     raw["_tampering_warnings"] = tampering_warnings
+    raw["_gaming_warnings"] = tampering_warnings
 
     has_fake_pass = any("hardcoded PASS" in w for w in tampering_warnings)
     has_fake_benchmark = any("hardcoded BENCHMARK_MS" in w for w in tampering_warnings)
@@ -301,6 +298,7 @@ def _apply_tampering_penalties(
     if has_fake_pass:
         correct = False
         raw["_correctness_rejected_for_tampering"] = True
+        raw["_correctness_rejected_for_gaming"] = True
         print("    [grader] Marking correct=False: solution faked PASS output",
               file=sys.stderr)
     if has_fake_benchmark and speedup > 1.0:
@@ -309,6 +307,7 @@ def _apply_tampering_penalties(
               f"fabricated benchmark number", file=sys.stderr)
         speedup = cap_val
         raw["_speedup_capped_for_tampering"] = True
+        raw["_speedup_capped_for_gaming"] = True
 
     return correct, speedup
 
@@ -354,6 +353,10 @@ def _finalize_grading_result(
         raw=raw,
         error=raw.get("error", ""),
     )
+
+
+_detect_benchmark_gaming = _detect_benchmark_tampering
+_apply_gaming_penalties = _apply_tampering_penalties
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +763,7 @@ def _attach_gated_reward(
         baseline_ms = result.speedup * optimized_ms
 
     correctness_score = 1.0 if result.correct else 0.0
-    hacking_detected = bool(raw.get("_gaming_warnings"))
+    hacking_detected = bool(raw.get("_tampering_warnings") or raw.get("_gaming_warnings"))
     timed_out = "timed out" in (result.error or "").lower()
 
     magpie_result = {

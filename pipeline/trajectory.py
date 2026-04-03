@@ -15,7 +15,6 @@ Storage backends:
 from __future__ import annotations
 
 import json
-import logging
 import os
 import uuid
 from abc import ABC, abstractmethod
@@ -23,8 +22,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-_log = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -328,8 +325,8 @@ class CouchDBStore(TrajectoryStore):
                     self.db_name = self._LEGACY_DB_NAME
                     return
             requests.put(f"{self.url}/{self.db_name}", auth=self.auth, timeout=5)
-        except Exception as e:
-            _log.warning("CouchDB _ensure_db failed: %s", e)
+        except Exception:
+            pass
 
     def save(self, record: TrajectoryRecord) -> str:
         import requests
@@ -342,8 +339,7 @@ class CouchDBStore(TrajectoryStore):
                 json=doc, auth=self.auth, timeout=10,
             )
             resp.raise_for_status()
-        except Exception as e:
-            _log.warning("CouchDB save failed, falling back to file: %s", e)
+        except Exception:
             FileStore().save(record)
         return record.trajectory_id
 
@@ -357,8 +353,8 @@ class CouchDBStore(TrajectoryStore):
             )
             if resp.status_code == 200:
                 return TrajectoryRecord.from_dict(resp.json())
-        except Exception as e:
-            _log.warning("CouchDB load failed: %s", e)
+        except Exception:
+            pass
         return None
 
     def list_ids(self, filters: dict | None = None) -> list[str]:
@@ -372,8 +368,8 @@ class CouchDBStore(TrajectoryStore):
             if resp.status_code == 200:
                 rows = resp.json().get("rows", [])
                 return [r["id"].replace("trajectory:", "") for r in rows]
-        except Exception as e:
-            _log.warning("CouchDB list_ids failed: %s", e)
+        except Exception:
+            pass
         return []
 
 
@@ -406,8 +402,7 @@ class S3Store(TrajectoryStore):
             s3 = self._client()
             body = json.dumps(record.to_dict(), default=str)
             s3.put_object(Bucket=self.bucket, Key=self._key(record.trajectory_id), Body=body)
-        except Exception as e:
-            _log.warning("S3 save failed, falling back to file: %s", e)
+        except Exception:
             self._file_fallback.save(record)
         return record.trajectory_id
 
@@ -417,8 +412,7 @@ class S3Store(TrajectoryStore):
             obj = s3.get_object(Bucket=self.bucket, Key=self._key(trajectory_id))
             data = json.loads(obj["Body"].read().decode())
             return TrajectoryRecord.from_dict(data)
-        except Exception as e:
-            _log.warning("S3 load failed for %s: %s", trajectory_id, e)
+        except Exception:
             return None
 
     def list_ids(self, filters: dict | None = None) -> list[str]:
@@ -432,8 +426,7 @@ class S3Store(TrajectoryStore):
                     tid = key[len(self.prefix):].replace(".json", "")
                     ids.append(tid)
             return ids
-        except Exception as e:
-            _log.warning("S3 list_ids failed: %s", e)
+        except Exception:
             return []
 
 
