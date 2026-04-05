@@ -12,6 +12,7 @@ env/
 
 # ── Output directory (setup.sh step 3) ───────────────────────────────────────
 output/
+outputs/
 
 # ── Downloaded code repos (files/setup_files.sh) ─────────────────────────────
 files/code/
@@ -39,6 +40,7 @@ tools/mcps/rag_tool/chroma_db/
 datasets/
 
 # ── Pipeline runtime data ────────────────────────────────────────────────────
+knowledge_base.json
 trajectories/
 leaderboard.jsonl
 leaderboard.json

@@ -788,15 +788,31 @@ def _attach_gated_reward(
 
     trace_context = {"task_id": result.task_id}
 
+    # Compute gated reward using individual components directly.
+    # The full compute_gated_reward() AST gate is designed for RL training
+    # with self-contained kernels. Apex pipeline kernels are real library code
+    # (wrappers importing from sub-modules), so we skip the AST gate and use
+    # the existing _detect_benchmark_tampering for cheat detection instead.
     try:
-        reward = compute_reward_gated(
-            solution_str=solution_str,
-            ground_truth=ground_truth,
-            magpie_result=magpie_result,
-            kernel_backend=kernel_backend,
-            require_tags=require_tags,
+        from reward_fn import (
+            R_FORMAT_PASS, R_COMPILE_PASS, R_CORRECT_WEIGHT,
+            compute_performance_reward,
         )
-        result.raw["rl_reward"] = reward
+        r_format = R_FORMAT_PASS  # bare .py files always get format pass
+        r_compile = R_COMPILE_PASS if result.compiled else 0.0
+        r_correct = R_CORRECT_WEIGHT * correctness_score
+        r_perf = compute_performance_reward(
+            baseline_ms, optimized_ms, correctness_score,
+        )
+        # Apply tampering penalty from existing anti-cheat system
+        r_ast = -2.0 if hacking_detected else 0.0
+        reward = r_format + r_ast + r_compile + r_correct + r_perf
+        result.raw["rl_reward"] = round(reward, 4)
+        result.raw["rl_reward_breakdown"] = {
+            "r_format": r_format, "r_ast": r_ast,
+            "r_compile": r_compile, "r_correct": round(r_correct, 4),
+            "r_perf": round(r_perf, 4),
+        }
     except Exception as exc:
         print(f"    [grader] gated reward failed: {exc}", file=sys.stderr)
         result.raw["rl_reward"] = None
