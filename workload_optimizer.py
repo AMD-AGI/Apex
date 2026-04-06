@@ -1576,6 +1576,7 @@ class KernelOptResult:
     optimized_ms: float = 0.0
     speedup: float = 0.0
     score: float = 0.0
+    rl_reward: Optional[float] = None
     iterations_used: int = 0
     reinjected: bool = False
     agent_turns: int = 0
@@ -2756,11 +2757,16 @@ def _optimize_kernel(
             continue
 
         print("    Grading with Magpie...")
+        _kb = getattr(kernel, "kernel_type", "triton") or "triton"
         with _GPU_GRADE_LOCK:
             kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
-                            speedup_cap=config.tampering_speedup_cap)
+                            speedup_cap=config.tampering_speedup_cap,
+                            compute_rl_reward=True, require_tags=False,
+                            kernel_backend=_kb)
+        _rl = kr.raw.get("rl_reward")
+        _rls = f" rl_reward={_rl:.3f}" if _rl is not None else ""
         print(f"      compiled={kr.compiled} correct={kr.correct} "
-              f"speedup={kr.speedup:.2f}x score={kr.score:.0f}")
+              f"speedup={kr.speedup:.2f}x score={kr.score:.0f}{_rls}")
         if kr.error:
             print(f"      error: {kr.error[:200]}")
 
@@ -2834,6 +2840,7 @@ def _optimize_kernel(
         opt_result.correct = best_kr.correct
         opt_result.speedup = best_kr.speedup
         opt_result.score = best_kr.score
+        opt_result.rl_reward = getattr(best_kr, "rl_reward", None)
         b_ms, o_ms = _extract_timing_from_raw(raw)
         if b_ms == 0 and o_ms == 0 and best_kr.speedup > 0:
             o_ms = 1.0
@@ -4303,11 +4310,16 @@ def cmd_grade(args):
         _create_task_config(task_dir, kernel, config, baseline_sources)
 
         print(f"  Grading {spec}...")
-        kr = grade_task(task_dir, speedup_cap=config.tampering_speedup_cap)
+        _kb = getattr(kernel, "kernel_type", "triton") or "triton"
+        kr = grade_task(task_dir, speedup_cap=config.tampering_speedup_cap,
+                        compute_rl_reward=True, require_tags=False,
+                        kernel_backend=_kb)
 
         baseline_ms, optimized_ms = _extract_timing_from_raw(kr.raw)
+        _rl = kr.raw.get("rl_reward")
+        _rls = f" rl_reward={_rl:.3f}" if _rl is not None else ""
         print(f"    compiled={kr.compiled} correct={kr.correct} "
-              f"speedup={kr.speedup:.2f}x score={kr.score:.0f}"
+              f"speedup={kr.speedup:.2f}x score={kr.score:.0f}{_rls}"
               f" baseline={baseline_ms:.3f}ms optimized={optimized_ms:.3f}ms")
 
         prev = existing_results.get(spec, {})
@@ -5230,9 +5242,12 @@ def cmd_optimize_kernel(args):
 
         print("  Grading...")
         kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
-                        speedup_cap=config.tampering_speedup_cap)
+                        speedup_cap=config.tampering_speedup_cap,
+                        compute_rl_reward=True, require_tags=False,
+                        kernel_backend=kdef.kernel_type)
+        rl_str = f" rl_reward={kr.raw.get('rl_reward', 0):.3f}" if kr.raw.get("rl_reward") is not None else ""
         print(f"    compiled={kr.compiled} correct={kr.correct} "
-              f"speedup={kr.speedup:.2f}x score={kr.score:.0f}")
+              f"speedup={kr.speedup:.2f}x score={kr.score:.0f}{rl_str}")
         if kr.error:
             print(f"    error: {kr.error[:200]}")
 
@@ -5383,14 +5398,18 @@ def cmd_grade_kernel(args):
 
     print("  Grading...")
     _cap = getattr(args, "tampering_speedup_cap", 0.0)
+    _rl = getattr(args, "compute_rl_reward", True)
     kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
-                    speedup_cap=_cap)
+                    speedup_cap=_cap, compute_rl_reward=_rl,
+                    require_tags=False, kernel_backend=kdef.kernel_type)
 
     elapsed = time.monotonic() - t0
+    rl_reward = kr.raw.get("rl_reward")
+    rl_str = f"  rl_reward={rl_reward:.4f}" if rl_reward is not None else ""
     print(f"\n{'='*60}")
     print(f"  Grading Complete ({elapsed:.1f}s)")
     print(f"  compiled={kr.compiled}  correct={kr.correct}  "
-          f"speedup={kr.speedup:.2f}x  score={kr.score:.0f}")
+          f"speedup={kr.speedup:.2f}x  score={kr.score:.0f}{rl_str}")
     if kr.error:
         print(f"  error: {kr.error[:300]}")
     print(f"{'='*60}")
@@ -5405,6 +5424,7 @@ def cmd_grade_kernel(args):
         "correct": kr.correct,
         "speedup": kr.speedup,
         "score": kr.score,
+        "rl_reward": rl_reward,
         "error": kr.error or "",
         "elapsed_seconds": round(elapsed, 1),
     }
