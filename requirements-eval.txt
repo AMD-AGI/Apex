@@ -1,7 +1,31 @@
-# End-to-end mini eval (eval.py): local grading + optional Claude Agent SDK.
-# Install into your venv, e.g.:
-#   source /path/to/.venv/bin/activate && pip install -r requirements-eval.txt
+
+# Setup:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+#   pip install -r requirements-eval.txt
 #
-claude-agent-sdk>=0.1.50
+# ── Core (eval.py, workload_optimizer.py, graders/, pipeline/) ────────────
 numpy>=1.24
 PyYAML>=6.0
+requests>=2.28
+
+# ── Agent backends ────────────────────────────────────────────────────────
+claude-agent-sdk>=0.1.50
+claude-code-sdk>=0.1.0
+
+# ── GPU / Kernel (graders, tests, kernel optimization) ────────────────────
+# NOTE: torch and torchvision must be installed separately for ROCm:
+#   pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+triton>=3.0
+
+# ── MCP servers (tools/mcps/) ─────────────────────────────────────────────
+mcp>=1.0.0
+chromadb
+sentence-transformers
+tiktoken
+rich
+pymupdf>=1.24.0
+pdfplumber>=0.10.0
+
+# ── Testing ───────────────────────────────────────────────────────────────
+pytest>=7.0

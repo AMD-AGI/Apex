@@ -58,3 +58,4 @@ build/
 .cache/
 tmp/
 all_kernel_prompts.jsonl
+knowledge_base.*
