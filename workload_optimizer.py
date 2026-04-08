@@ -5527,7 +5527,7 @@ def _add_agent_args(parser):
     parser.add_argument("--agent-model", default=None,
                         help="Override the backend-specific default agent model")
     parser.add_argument("--agent-version", default="v1.0")
-    parser.add_argument("--agent-backend", default="claude", choices=["claude", "codex"])
+    parser.add_argument("--agent-backend", default="claude", choices=["claude", "codex", "cursor"])
     parser.add_argument("--parallel-kernels", type=int, default=1,
                         help="Number of kernels to optimize in parallel (default: 1)")
     parser.add_argument("--agent-model-simple", default="",
@@ -5595,7 +5595,7 @@ def main():
                     help="Push result to leaderboard")
     p.add_argument("--agent-model", default=None)
     p.add_argument("--agent-version", default="v1.0")
-    p.add_argument("--agent-backend", default="claude", choices=["claude", "codex"])
+    p.add_argument("--agent-backend", default="claude", choices=["claude", "codex", "cursor"])
     p.add_argument("--trajectory-store", default="file")
 
     # -- report --
@@ -5605,7 +5605,7 @@ def main():
     p.add_argument("-b", "--benchmark-config", default="")
     p.add_argument("--agent-model", default=None)
     p.add_argument("--agent-version", default="v1.0")
-    p.add_argument("--agent-backend", default="claude", choices=["claude", "codex"])
+    p.add_argument("--agent-backend", default="claude", choices=["claude", "codex", "cursor"])
 
     # -- run --
     p = subparsers.add_parser("run",
