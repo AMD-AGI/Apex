@@ -146,6 +146,7 @@ class WorkloadTrajectoryRecord:
     skip_benchmark_used: bool = False
     total_duration_s: float = 0.0
     errors: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
     def apply_reward(self, reward_dict: dict) -> None:
         """Apply reward results from trajectory_reward()."""

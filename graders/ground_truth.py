@@ -728,7 +728,9 @@ def build_correctness_config(
         )
 
     if mode == "library_test" and gt_spec.unit_test_command:
-        lib_dir = str(rocm_root / gt_spec.source_library) if gt_spec.source_library else ""
+        # Test commands in the registry use paths relative to the ROCm root
+        # (e.g. "aiter/op_tests/..."), so working_directory must be rocm_root.
+        lib_dir = str(rocm_root) if gt_spec.source_library else ""
         return {
             "mode": "library_test",
             "unit_test_command": gt_spec.unit_test_command,
@@ -754,7 +756,7 @@ def build_correctness_config(
         )
 
     if gt_spec.unit_test_command or gt_spec.source_file:
-        lib_dir = str(rocm_root / gt_spec.source_library) if gt_spec.source_library else ""
+        lib_dir = str(rocm_root) if gt_spec.source_library else ""
         test_cmd = gt_spec.unit_test_command or f"python -m pytest {gt_spec.source_file}"
         return {
             "mode": "library_test",
@@ -769,7 +771,8 @@ def build_correctness_config(
 def get_spec(kernel_type: str, rocm_dir: Path | None = None) -> Optional[GroundTruthSpec]:
     """Look up ground truth for a specific kernel type.
 
-    Checks manual registry first, then scans if not found.
+    Checks manual registry first, then scans Triton/Python tests,
+    then scans HIP/C++ kernels for accordo specs.
     """
     if kernel_type in MANUAL_REGISTRY:
         return MANUAL_REGISTRY[kernel_type]
@@ -777,6 +780,11 @@ def get_spec(kernel_type: str, rocm_dir: Path | None = None) -> Optional[GroundT
     for spec in scan_rocm_ground_truth(rocm_dir=rocm_dir, max_files=2000):
         if spec.kernel_type == kernel_type:
             return spec
+
+    for spec in scan_hip_kernels_for_accordo(rocm_dir=rocm_dir):
+        if spec.kernel_type == kernel_type:
+            return spec
+
     return None
 
 

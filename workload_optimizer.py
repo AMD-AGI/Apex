@@ -130,10 +130,6 @@ def _gap_cache_key(benchmark_config: str) -> str:
     return hashlib.sha256(content).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# Kernel patching infrastructure (Fixes 1, 9, 10, 11)
-# ---------------------------------------------------------------------------
-
 _KERNEL_SPEC_TO_MODULE: dict[str, dict[str, str]] = {
     "paged_attn_decode": {
         "aiter": "aiter.ops.triton.pa_decode",
@@ -3912,7 +3908,6 @@ def _run_workload_optimization_inner(
     })
 
     env_snap = _snapshot_environment()
-    trajectory.metadata = getattr(trajectory, "metadata", {})
     trajectory.metadata["environment_snapshot"] = env_snap
     print(f"  Environment: {len(env_snap.get('env_vars', {}))} AITER/TRITON vars, "
           f"{', '.join(f'{k}={v}' for k, v in env_snap.get('package_versions', {}).items())}")
@@ -5110,11 +5105,33 @@ def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
         gt["unit_test_command"] = getattr(args, "test_cmd", "")
         gt["repo_url"] = getattr(args, "repo_url", "")
         gt["working_directory"] = getattr(args, "working_directory", "")
+        kname = getattr(args, "kernel_name", "")
+        if kname and get_ground_truth_spec is not None:
+            gt_spec = get_ground_truth_spec(kname)
+            if gt_spec and gt_spec.mode == "library_test":
+                if not gt["unit_test_command"] and gt_spec.unit_test_command:
+                    gt["unit_test_command"] = gt_spec.unit_test_command
+                if not gt["repo_url"] and gt_spec.repo_url:
+                    gt["repo_url"] = gt_spec.repo_url
+                gt["source_library"] = gt_spec.source_library
+                if not gt["working_directory"] and gt_spec.source_library:
+                    rocm_dir = REPO_ROOT / "tools" / "rocm"
+                    if rocm_dir.is_dir():
+                        gt["working_directory"] = str(rocm_dir)
+                print(f"    Auto-enriched library_test for '{kname}' from {gt_spec.source_library}")
     elif corr_mode == "accordo":
         acc_path = getattr(args, "accordo_config", "")
         if acc_path and Path(acc_path).exists():
             with open(acc_path) as f:
                 gt["accordo_config"] = yaml.safe_load(f)
+        if not gt.get("accordo_config"):
+            kname = getattr(args, "kernel_name", "")
+            if kname and get_ground_truth_spec is not None:
+                gt_spec = get_ground_truth_spec(kname)
+                if gt_spec and gt_spec.mode == "accordo" and gt_spec.accordo_config:
+                    gt["accordo_config"] = gt_spec.accordo_config
+                    gt["source_library"] = gt_spec.source_library
+                    print(f"    Auto-discovered Accordo config for '{kname}' from {gt_spec.source_library}")
 
     return KernelStandaloneDefinition(
         kernel_path=kernel_path,
@@ -5153,10 +5170,12 @@ def _create_standalone_task_config(
         source_library=gt.get("source_library", ""),
         source_file=gt.get("source_file", ""),
     )
-    # For standalone, working_directory may come from CLI args directly
     correctness_cfg, gt_mode = build_correctness_config(tmp_spec)
     if gt_mode == "library_test" and gt.get("working_directory"):
         correctness_cfg["working_directory"] = gt["working_directory"]
+    # Remove empty working_directory so grader falls back to task_dir
+    if not correctness_cfg.get("working_directory"):
+        correctness_cfg.pop("working_directory", None)
 
     if gt_mode == "pytorch":
         correctness_cmd = f"{kernel_python} solution{ext}"
