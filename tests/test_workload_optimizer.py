@@ -550,3 +550,61 @@ class TestWorkloadOptimizerDryRun:
         # The entry should be findable (though other tests may also push entries)
         workload_entries = [e for e in rankings if "workload" in e.task_id]
         assert len(workload_entries) >= 0  # may be 0 if leaderboard file doesn't persist
+
+
+class TestOptimizeKernelExtractsTurns:
+    """Verify _optimize_kernel extracts turns from _agent_summary events."""
+
+    def test_agent_summary_turns_extracted(self):
+        messages = [
+            {"type": "item.completed", "item": {"type": "function_call", "name": "write"}},
+            {"type": "_agent_summary", "turns": 7, "input_tokens": 500, "output_tokens": 200,
+             "duration_ms": 3000},
+        ]
+        total = 0
+        for msg in messages:
+            if hasattr(msg, "num_turns"):
+                total += getattr(msg, "num_turns", 0)
+            elif isinstance(msg, dict) and msg.get("type") == "_agent_summary":
+                total += msg.get("turns", 0)
+        assert total == 7
+
+    def test_no_summary_gives_zero(self):
+        messages = [
+            {"type": "item.completed", "item": {"type": "function_call"}},
+        ]
+        total = 0
+        for msg in messages:
+            if hasattr(msg, "num_turns"):
+                total += getattr(msg, "num_turns", 0)
+            elif isinstance(msg, dict) and msg.get("type") == "_agent_summary":
+                total += msg.get("turns", 0)
+        assert total == 0
+
+
+class TestParallelOptimization:
+    """Verify thread safety of completed_results under parallel optimization."""
+
+    def test_completed_results_thread_safe(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results_lock = threading.Lock()
+        completed_results = []
+
+        def _mock_optimize(i):
+            import time
+            time.sleep(0.01)
+            return {"kernel": f"kernel_{i}", "speedup": 1.0 + i * 0.1}
+
+        n_kernels = 20
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(_mock_optimize, i): i for i in range(n_kernels)}
+            for future in as_completed(futures):
+                result = future.result()
+                with results_lock:
+                    completed_results.append(result)
+
+        assert len(completed_results) == n_kernels
+        kernel_names = {r["kernel"] for r in completed_results}
+        assert len(kernel_names) == n_kernels

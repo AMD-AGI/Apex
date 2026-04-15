@@ -265,8 +265,22 @@ def _parse_rocprof_metrics(profile_data: str) -> dict:
 
 
 def _format_performance_scorecard(profile_data: str) -> str:
-    """Format rocprof metrics into a structured Performance Scorecard."""
+    """Format rocprof metrics into a structured Performance Scorecard.
+
+    Parses both ``rocprof-compute`` style output and plain ``rocprof --stats``
+    output (duration, kernel name, VGPR/SGPR/LDS).
+    """
     metrics = _parse_rocprof_metrics(profile_data)
+
+    stats_metrics = _parse_rocprof_stats(profile_data)
+    if stats_metrics:
+        if not metrics:
+            metrics = stats_metrics
+        else:
+            for k, v in stats_metrics.items():
+                if k not in metrics:
+                    metrics[k] = v
+
     if not metrics:
         return ""
 
@@ -286,15 +300,81 @@ def _format_performance_scorecard(profile_data: str) -> str:
     if occ is not None:
         lines.append(f"- Occupancy: {occ:.0f} waves/CU (max ~16)")
 
+    vgpr = metrics.get("vgpr")
+    if vgpr is not None:
+        pressure = "HIGH" if vgpr > 128 else "moderate" if vgpr > 64 else "low"
+        lines.append(f"- VGPR usage: {vgpr} ({pressure} register pressure)")
+
+    lds = metrics.get("lds_kb")
+    if lds is not None:
+        lines.append(f"- LDS usage: {lds:.1f} KB / 64 KB per CU")
+
     instrs = metrics.get("top_instructions")
     if instrs:
         lines.append(f"- Key instruction categories: {', '.join(instrs)}")
+
+    dur = metrics.get("duration_us")
+    if dur is not None:
+        lines.append(f"- Kernel duration: {dur:.1f} us")
 
     rec = metrics.get("recommendation")
     if rec:
         lines.append(f"- **Recommendation:** {rec}")
 
     return "\n".join(lines) + "\n"
+
+
+def _parse_rocprof_stats(profile_data: str) -> dict:
+    """Extract metrics from plain ``rocprof --stats`` output.
+
+    Handles CSV-style kernel summaries and keyword lines that the
+    ``_parse_rocprof_metrics`` regex set does not cover.
+    """
+    if not profile_data:
+        return {}
+
+    metrics: dict = {}
+
+    dur_match = re.search(
+        r"(?:Duration|duration|DurationNs|AverageNs)[,:\s]+([\d.]+)",
+        profile_data, re.IGNORECASE,
+    )
+    if dur_match:
+        val = float(dur_match.group(1))
+        metrics["duration_us"] = val / 1000.0 if val > 10000 else val
+
+    vgpr_match = re.search(r"(?:vgpr|VGPRs?)[,:\s]+([\d]+)", profile_data, re.IGNORECASE)
+    if vgpr_match:
+        metrics["vgpr"] = int(vgpr_match.group(1))
+
+    sgpr_match = re.search(r"(?:sgpr|SGPRs?)[,:\s]+([\d]+)", profile_data, re.IGNORECASE)
+    if sgpr_match:
+        metrics["sgpr"] = int(sgpr_match.group(1))
+
+    lds_match = re.search(r"(?:lds|LDS)[,:\s]+([\d]+)", profile_data, re.IGNORECASE)
+    if lds_match:
+        val = int(lds_match.group(1))
+        metrics["lds_kb"] = val / 1024.0 if val > 1024 else float(val)
+
+    occ_match = re.search(
+        r"(?:Occupancy|Waves?[/\s]*CU)[,:\s]+([\d.]+)", profile_data, re.IGNORECASE
+    )
+    if occ_match:
+        metrics["occupancy"] = float(occ_match.group(1))
+
+    vgpr = metrics.get("vgpr", 0)
+    if vgpr > 128:
+        metrics["recommendation"] = (
+            f"High register pressure ({vgpr} VGPRs) limits occupancy. "
+            "Reduce live variables, use shared memory, or split the kernel."
+        )
+    elif vgpr > 0:
+        metrics["recommendation"] = (
+            f"Register usage ({vgpr} VGPRs) is moderate. "
+            "Check memory access patterns and instruction mix for bottlenecks."
+        )
+
+    return metrics
 
 
 def _get_hints(kernel_type: str) -> str:
@@ -389,6 +469,83 @@ def _extract_compare_details(raw: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_progress_delta(previous_speedup: float, current_speedup: float) -> str:
+    """Format a progress delta section showing improvement between iterations."""
+    if previous_speedup <= 0:
+        return ""
+    if current_speedup <= 0:
+        return ""
+
+    delta_pct = ((current_speedup - previous_speedup) / max(previous_speedup, 0.01)) * 100
+    direction = "improved" if delta_pct > 0 else "regressed"
+
+    return (
+        f"\n### Progress Since Last Iteration\n"
+        f"- Previous speedup: {previous_speedup:.2f}x\n"
+        f"- Current speedup: {current_speedup:.2f}x\n"
+        f"- Delta: {delta_pct:+.1f}% ({direction})\n"
+    )
+
+
+def _format_reward_breakdown(raw: dict) -> str:
+    """Format the rl_reward breakdown for agent feedback."""
+    breakdown = raw.get("rl_reward_breakdown")
+    if not breakdown or not isinstance(breakdown, dict):
+        return ""
+
+    rl_reward = raw.get("rl_reward")
+    if rl_reward is None:
+        return ""
+
+    lines = [f"\n### Reward Breakdown (rl_reward = {rl_reward:.4f})"]
+    component_names = {
+        "r_format": "Format",
+        "r_ast": "AST safety",
+        "r_compile": "Compilation",
+        "r_correct": "Correctness",
+        "r_perf": "Performance",
+    }
+    for key, label in component_names.items():
+        val = breakdown.get(key)
+        if val is not None:
+            status = "OK" if val >= 0 else "PENALTY"
+            lines.append(f"- {label}: {val:.4f} ({status})")
+
+    return "\n".join(lines) + "\n"
+
+
+def _escalation_hints(iteration: int, previous_speedup: float, kernel_type: str) -> str:
+    """Provide progressively more aggressive optimization suggestions per iteration."""
+    if iteration <= 1:
+        return (
+            "\n### Strategy Level: Standard\n"
+            "Start with well-known optimizations:\n"
+            "- Improve memory coalescing and vectorized loads\n"
+            "- Tune block/tile sizes for the target GPU\n"
+            "- Use `mcp__rag-server__get_optimization_playbook` for proven patterns\n"
+        )
+
+    if iteration == 2:
+        return (
+            "\n### Strategy Level: Aggressive\n"
+            f"Standard optimizations yielded {previous_speedup:.2f}x — try bolder approaches:\n"
+            "- Try a completely different algorithm or library dispatch\n"
+            "- Use `mcp__fusion-advisor__detect_fusion_opportunities` for kernel fusion\n"
+            "- Use `mcp__source-finder__find_ck_template` for CK tile-based alternatives\n"
+            "- Consider torch.compile or library calls (hipBLASLt, rocBLAS)\n"
+        )
+
+    return (
+        "\n### Strategy Level: Expert\n"
+        f"Previous attempts achieved {previous_speedup:.2f}x — use advanced techniques:\n"
+        "- Use `mcp__asm-tools__analyze_isa` for ISA-level instruction analysis\n"
+        "- Use `mcp__kernel-perf__roofline_analysis` to find the exact bottleneck\n"
+        "- Consider hand-tuned vectorization, register blocking, or LDS prefetching\n"
+        "- Try asymmetric tiling or persistent kernel strategies\n"
+        "- Profile with `mcp__kernel-perf__profile_kernel` to measure each change\n"
+    )
+
+
 def reflect(
     kernel_result: KernelResult,
     task_dir: Path,
@@ -424,6 +581,10 @@ def reflect(
             f"{profile_data}\n{scorecard}"
         )
 
+    progress_delta = _format_progress_delta(previous_speedup, kernel_result.speedup)
+    reward_breakdown = _format_reward_breakdown(kernel_result.raw or {})
+    escalation = _escalation_hints(iteration, previous_speedup, kernel_type)
+
     baseline_ref = _read_baseline_head(task_dir)
     baseline_section = ""
     if baseline_ref:
@@ -431,13 +592,15 @@ def reflect(
             f"\n### Baseline for Reference\n```python\n{baseline_ref}\n```\n"
         )
 
+    extra_sections = progress_delta + reward_breakdown + escalation
+
     if not kernel_result.compiled:
         return COMPILE_REFLECTION.format(
             iteration=iteration,
             error=error,
             solution=solution_code,
             hints=hints,
-        ) + baseline_section
+        ) + extra_sections + baseline_section
 
     if not kernel_result.correct:
         return CORRECTNESS_REFLECTION.format(
@@ -445,7 +608,7 @@ def reflect(
             error=error,
             solution=solution_code,
             hints=hints,
-        ) + baseline_section
+        ) + extra_sections + baseline_section
 
     raw = kernel_result.raw or {}
     baseline_ms = float(raw.get("baseline_ms", 0) or 0)
@@ -463,7 +626,7 @@ def reflect(
             compare_details=compare_details,
             profile_section=profile_section,
             hints=hints,
-        ) + baseline_section
+        ) + extra_sections + baseline_section
 
     if kernel_result.speedup < min_speedup:
         return BELOW_THRESHOLD_REFLECTION.format(
@@ -476,7 +639,7 @@ def reflect(
             compare_details=compare_details,
             profile_section=profile_section,
             hints=hints,
-        ) + baseline_section
+        ) + extra_sections + baseline_section
 
     return IMPROVEMENT_REFLECTION.format(
         iteration=iteration,
@@ -490,7 +653,7 @@ def reflect(
         compare_details=compare_details,
         profile_section=profile_section,
         hints=hints,
-    ) + baseline_section
+    ) + extra_sections + baseline_section
 
 
 def should_continue(
@@ -500,16 +663,20 @@ def should_continue(
     score_threshold: float = 300.0,
     previous_speedup: float = 0.0,
     stall_count: int = 0,
+    consecutive_fail_count: int = 0,
 ) -> bool:
     """Decide whether to run another optimisation iteration.
 
     Returns False early if the kernel has stalled (delta < 5% for 2+
-    consecutive iterations) to save agent budget.
+    consecutive iterations) or if 2+ consecutive compile/correctness
+    failures of the same type have occurred.
     """
     if iteration >= max_iterations:
         return False
     if kernel_result.score >= score_threshold:
         return False
     if stall_count >= 2:
+        return False
+    if consecutive_fail_count >= 2:
         return False
     return True

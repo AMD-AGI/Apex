@@ -909,3 +909,67 @@ class TestAccordoMagpieIntegration:
                 "/tmp",
             )
         assert "accordo" in result.get("error", "") or result.get("compiled") is False
+
+
+class TestTimingSanityCheck:
+    """Tests for Magpie speedup plausibility validation in _finalize_grading_result."""
+
+    def _make_solution(self, tmp_path):
+        sol = tmp_path / "solution.py"
+        sol.write_text("def kernel(x): return x * 2\n")
+        baseline = tmp_path / "baseline.py"
+        baseline.write_text("def kernel(x): return x * 2\n")
+        cfg = {"correctness": {"mode": "pytorch"}}
+        return sol, str(baseline), cfg
+
+    def test_magpie_speedup_rejected_when_implausible(self, tmp_path):
+        sol, baseline, cfg = self._make_solution(tmp_path)
+        raw = {"compiled": True, "correct": True, "_magpie_speedup": 500.0}
+        with patch.object(kernel_grader, "_measure_speedup", return_value=0.0), \
+             patch.object(kernel_grader, "_run_benchmark_script", return_value=0.0):
+            result = kernel_grader._finalize_grading_result(
+                "test", raw, cfg, tmp_path, baseline, str(sol), sol, 60,
+            )
+        assert result.speedup <= 1.0
+        assert raw.get("_rejected_magpie_speedup") == 500.0
+
+    def test_magpie_speedup_accepted_when_plausible(self, tmp_path):
+        sol, baseline, cfg = self._make_solution(tmp_path)
+        raw = {"compiled": True, "correct": True, "_magpie_speedup": 2.5}
+        with patch.object(kernel_grader, "_apply_tampering_penalties",
+                          return_value=(True, 2.5)):
+            result = kernel_grader._finalize_grading_result(
+                "test", raw, cfg, tmp_path, baseline, str(sol), sol, 60,
+            )
+        assert abs(result.speedup - 2.5) < 0.01
+
+    def test_baseline_optimized_ms_ratio_rejected(self, tmp_path):
+        sol, baseline, cfg = self._make_solution(tmp_path)
+        raw = {
+            "compiled": True, "correct": True, "_magpie_speedup": 7800.0,
+            "baseline_ms": 2661.0, "optimized_ms": 0.34,
+        }
+        with patch.object(kernel_grader, "_measure_speedup", return_value=0.0), \
+             patch.object(kernel_grader, "_run_benchmark_script", return_value=0.0):
+            result = kernel_grader._finalize_grading_result(
+                "test", raw, cfg, tmp_path, baseline, str(sol), sol, 60,
+            )
+        assert result.speedup <= 1.0
+
+    def test_speedup_exactly_at_boundary(self, tmp_path):
+        sol, baseline, cfg = self._make_solution(tmp_path)
+        raw_ok = {"compiled": True, "correct": True, "_magpie_speedup": 100.0}
+        with patch.object(kernel_grader, "_apply_tampering_penalties",
+                          return_value=(True, 100.0)):
+            result = kernel_grader._finalize_grading_result(
+                "test", raw_ok, cfg, tmp_path, baseline, str(sol), sol, 60,
+            )
+        assert abs(result.speedup - 100.0) < 0.01
+
+        raw_over = {"compiled": True, "correct": True, "_magpie_speedup": 100.01}
+        with patch.object(kernel_grader, "_measure_speedup", return_value=0.0), \
+             patch.object(kernel_grader, "_run_benchmark_script", return_value=0.0):
+            result2 = kernel_grader._finalize_grading_result(
+                "test", raw_over, cfg, tmp_path, baseline, str(sol), sol, 60,
+            )
+        assert result2.speedup <= 1.0

@@ -433,8 +433,8 @@ For HIP kernels: read `hip-kernel-optimization` and `mi300-cdna3-architecture` f
 
 ## Mandatory Workflow Order
 1. FIRST: Write a solution that passes correctness (mcp__magpie__compare with check_performance=false)
-2. ONLY AFTER correctness passes: Optimize for speed
-3. After each optimization attempt: Re-verify correctness before measuring speedup
+2. ONLY AFTER correctness passes: Re-run mcp__magpie__compare with check_performance=true to measure speedup. The speedup number from this call is what determines your score.
+3. Optimize for speed, then re-verify correctness (check_performance=false) before measuring speedup again (check_performance=true)
 4. Never sacrifice correctness for speed — incorrect solutions score 0 on speedup
 
 ## Anti-Tampering Rules (violations are automatically detected and penalized)

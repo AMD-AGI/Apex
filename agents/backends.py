@@ -33,10 +33,16 @@ import sys
 import threading
 from pathlib import Path
 
+import time as _time
+
 DEFAULT_AGENT = "claude"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
 DEFAULT_CURSOR_MODEL = "auto"
+
+_AGENT_MAX_RETRIES = 2
+_AGENT_RETRY_BACKOFFS = [10, 30]
+_AUTH_ERROR_KEYWORDS = ("authentication", "auth", "unauthorized", "api_key", "api key")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MCP_CONFIG_PATH = REPO_ROOT / "mcp_config.json"
@@ -169,6 +175,10 @@ def _run_claude_task(
                 "mcp__fusion-advisor__detect_fusion_opportunities",
                 "mcp__fusion-advisor__generate_fused_kernel", "mcp__fusion-advisor__estimate_fusion_benefit",
                 "mcp__fusion-advisor__check_library_fusion",
+                "mcp__kernel-perf__profile_kernel", "mcp__kernel-perf__roofline_analysis",
+                "mcp__kernel-perf__statistical_test", "mcp__kernel-perf__parse_rocprof_output",
+                "mcp__asm-tools__disassemble_kernel", "mcp__asm-tools__analyze_isa",
+                "mcp__asm-tools__count_instructions",
             ],
             system_prompt=system_prompt,
         )
@@ -250,71 +260,93 @@ def _run_codex_task(
     ):
         env.pop(key, None)
 
-    # Stream output line-by-line for long-running tasks
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, bufsize=1,
-    )
+    for attempt in range(_AGENT_MAX_RETRIES + 1):
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, bufsize=1,
+        )
 
-    trajectory: list[dict] = []
-    usage = None
-    final_error = None
-    total_in_tokens = 0
-    total_out_tokens = 0
-    turn_count = 0
+        trajectory: list[dict] = []
+        usage = None
+        final_error = None
+        total_in_tokens = 0
+        total_out_tokens = 0
+        turn_count = 0
 
-    try:
-        for raw_line in proc.stdout:
-            line = raw_line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            trajectory.append(event)
-            etype = event.get("type")
-            if etype == "item.completed":
-                item = event.get("item") or {}
-                item_type = item.get("type")
-                if item_type in {"function_call", "tool_call"}:
-                    name = item.get("name") or item.get("tool_name") or "tool"
-                    print(f"    tool: {name}")
-                elif item_type == "agent_message":
-                    text = (item.get("text") or "").strip()
-                    if text:
-                        print(f"    text: {text.splitlines()[0][:100]}...")
-                elif item_type == "error":
-                    msg = item.get("message") or ""
-                    if msg:
-                        print(f"    error: {str(msg)[:200]}")
-                elif item_type == "mcp_call":
-                    name = item.get("server_label", "") + "::" + (item.get("name") or "")
-                    print(f"    mcp: {name}")
-            elif etype == "turn.completed":
-                usage = event.get("usage")
-                turn_count += 1
-                if usage:
-                    total_in_tokens += usage.get("input_tokens", 0)
-                    total_out_tokens += usage.get("output_tokens", 0)
-            elif etype in {"turn.failed", "error"}:
-                err = event.get("error") or {}
-                final_error = err.get("message") if isinstance(err, dict) else event.get("message")
-    finally:
-        proc.wait()
+        try:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                trajectory.append(event)
+                etype = event.get("type")
+                if etype == "item.completed":
+                    item = event.get("item") or {}
+                    item_type = item.get("type")
+                    if item_type in {"function_call", "tool_call"}:
+                        name = item.get("name") or item.get("tool_name") or "tool"
+                        print(f"    tool: {name}")
+                    elif item_type == "agent_message":
+                        text = (item.get("text") or "").strip()
+                        if text:
+                            print(f"    text: {text.splitlines()[0][:100]}...")
+                    elif item_type == "error":
+                        msg = item.get("message") or ""
+                        if msg:
+                            print(f"    error: {str(msg)[:200]}")
+                    elif item_type == "mcp_call":
+                        name = item.get("server_label", "") + "::" + (item.get("name") or "")
+                        print(f"    mcp: {name}")
+                elif etype == "turn.completed":
+                    usage = event.get("usage")
+                    turn_count += 1
+                    if usage:
+                        total_in_tokens += usage.get("input_tokens", 0)
+                        total_out_tokens += usage.get("output_tokens", 0)
+                elif etype in {"turn.failed", "error"}:
+                    err = event.get("error") or {}
+                    final_error = err.get("message") if isinstance(err, dict) else event.get("message")
+        finally:
+            proc.wait()
 
-    stderr = (proc.stderr.read() or "").strip()
-    if stderr:
-        for sline in stderr.splitlines()[:10]:
-            sline = sline.strip()
-            if sline:
-                print(f"    codex-stderr: {sline[:200]}")
+        stderr_text = (proc.stderr.read() or "").strip()
+        if stderr_text:
+            for sline in stderr_text.splitlines()[:10]:
+                sline = sline.strip()
+                if sline:
+                    print(f"    codex-stderr: {sline[:200]}")
 
-    if turn_count > 0:
-        print(f"  result: turns={turn_count}, tokens(in={total_in_tokens}, out={total_out_tokens})")
+        if turn_count > 0:
+            print(f"  result: turns={turn_count}, tokens(in={total_in_tokens}, out={total_out_tokens})")
 
-    if proc.returncode != 0 and final_error:
-        print(f"  codex error: {final_error}")
+        if proc.returncode != 0 and final_error:
+            print(f"  codex error: {final_error}")
+
+        if proc.returncode == 0 or solution_path.exists():
+            break
+
+        all_output = (final_error or "") + " " + stderr_text
+        if any(kw in all_output.lower() for kw in _AUTH_ERROR_KEYWORDS):
+            print("  codex: auth error — not retrying")
+            break
+
+        if attempt < _AGENT_MAX_RETRIES:
+            backoff = _AGENT_RETRY_BACKOFFS[min(attempt, len(_AGENT_RETRY_BACKOFFS) - 1)]
+            print(f"  codex: transient failure, retrying in {backoff}s "
+                  f"(attempt {attempt + 2}/{_AGENT_MAX_RETRIES + 1})")
+            _time.sleep(backoff)
+
+    trajectory.append({
+        "type": "_agent_summary",
+        "turns": turn_count,
+        "input_tokens": total_in_tokens,
+        "output_tokens": total_out_tokens,
+        "duration_ms": 0,
+    })
 
     return trajectory, solution_path.exists()
 
@@ -332,7 +364,7 @@ def _build_codex_prompt(prompt: str, system_prompt: str | None, max_turns: int) 
 
 
 _CURSOR_TIMEOUT_SECONDS = 600
-_CURSOR_INITIAL_OUTPUT_TIMEOUT = 30
+_CURSOR_INITIAL_OUTPUT_TIMEOUT = int(os.environ.get("APEX_CURSOR_INIT_TIMEOUT", "60"))
 
 
 def _find_cursor_agent_binary() -> str | None:
@@ -381,118 +413,148 @@ def _run_cursor_task(
 
     env = os.environ.copy()
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True, env=env, bufsize=1,
-    )
+    for attempt in range(_AGENT_MAX_RETRIES + 1):
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True, env=env, bufsize=1,
+        )
 
-    if proc.stdin:
-        proc.stdin.close()
+        if proc.stdin:
+            proc.stdin.close()
 
-    trajectory: list[dict] = []
-    stderr_lines: list[str] = []
-    session_id = None
-    duration_ms = None
-    final_error = None
+        trajectory: list[dict] = []
+        stderr_lines: list[str] = []
+        session_id = None
+        duration_ms = None
+        final_error = None
+        is_auth_error = False
 
-    def _read_stderr():
-        try:
-            for line in proc.stderr:
-                line = line.strip()
-                if line:
-                    stderr_lines.append(line)
-        except Exception:
-            pass
-
-    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-    stderr_thread.start()
-
-    first_output_received = False
-    start_time = time.monotonic()
-
-    try:
-        while True:
-            if not first_output_received:
-                elapsed = time.monotonic() - start_time
-                if elapsed > _CURSOR_INITIAL_OUTPUT_TIMEOUT:
-                    final_error = (
-                        f"cursor-agent produced no output after {_CURSOR_INITIAL_OUTPUT_TIMEOUT}s. "
-                        "Check authentication: run 'cursor-agent login' or set CURSOR_API_KEY."
-                    )
-                    proc.kill()
-                    break
-                ready, _, _ = select.select([proc.stdout], [], [], 2.0)
-                if not ready:
-                    continue
-
-            raw_line = proc.stdout.readline()
-            if not raw_line:
-                break
-            first_output_received = True
-            line = raw_line.strip()
-            if not line or not line.startswith("{"):
-                continue
+        def _read_stderr():
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            trajectory.append(event)
-            etype = event.get("type")
-            subtype = event.get("subtype")
-
-            if etype == "system" and subtype == "init":
-                session_id = event.get("session_id")
-                model_name = event.get("model", "")
-                print(f"    cursor session: {session_id or 'n/a'}, model: {model_name}")
-
-            elif etype == "tool_call":
-                if subtype == "started":
-                    tc = event.get("tool_call", {})
-                    tool_name = _extract_cursor_tool_name(tc)
-                    print(f"    tool: {tool_name}")
-
-            elif etype == "assistant":
-                msg = event.get("message", {})
-                content = msg.get("content", [])
-                for block in content:
-                    text = block.get("text", "").strip()
-                    if text:
-                        first_line = text.splitlines()[0][:100]
-                        print(f"    text: {first_line}...")
-                        break
-
-            elif etype == "thinking":
+                for line in proc.stderr:
+                    line = line.strip()
+                    if line:
+                        stderr_lines.append(line)
+            except Exception:
                 pass
 
-            elif etype == "result":
-                duration_ms = event.get("duration_ms")
-                is_error = event.get("is_error", False)
-                if is_error:
-                    final_error = event.get("result", "unknown error")
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
 
-    finally:
-        proc.wait()
+        first_output_received = False
+        start_time = time.monotonic()
 
-    stderr_thread.join(timeout=5)
+        try:
+            while True:
+                if not first_output_received:
+                    elapsed = time.monotonic() - start_time
+                    if elapsed > _CURSOR_INITIAL_OUTPUT_TIMEOUT:
+                        final_error = (
+                            f"cursor-agent produced no output after {_CURSOR_INITIAL_OUTPUT_TIMEOUT}s. "
+                            "Check authentication: run 'cursor-agent login' or set CURSOR_API_KEY."
+                        )
+                        proc.kill()
+                        break
+                    ready, _, _ = select.select([proc.stdout], [], [], 2.0)
+                    if not ready:
+                        continue
 
-    if stderr_lines:
-        for sline in stderr_lines[:10]:
-            print(f"    cursor-stderr: {sline[:200]}")
-            if "Authentication required" in sline or "CURSOR_API_KEY" in sline:
-                final_error = sline
-            if "Cannot use this model" in sline:
-                final_error = sline
+                raw_line = proc.stdout.readline()
+                if not raw_line:
+                    break
+                first_output_received = True
+                line = raw_line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                trajectory.append(event)
+                etype = event.get("type")
+                subtype = event.get("subtype")
 
-    if duration_ms is not None:
-        print(f"  result: duration={duration_ms}ms, events={len(trajectory)}")
+                if etype == "system" and subtype == "init":
+                    session_id = event.get("session_id")
+                    model_name = event.get("model", "")
+                    print(f"    cursor session: {session_id or 'n/a'}, model: {model_name}")
 
-    if proc.returncode != 0 and final_error:
-        print(f"  cursor error: {final_error}")
-    elif final_error and not trajectory:
-        print(f"  cursor error: {final_error}")
+                elif etype == "tool_call":
+                    if subtype == "started":
+                        tc = event.get("tool_call", {})
+                        tool_name = _extract_cursor_tool_name(tc)
+                        print(f"    tool: {tool_name}")
+
+                elif etype == "assistant":
+                    msg = event.get("message", {})
+                    content = msg.get("content", [])
+                    for block in content:
+                        text = block.get("text", "").strip()
+                        if text:
+                            first_line = text.splitlines()[0][:100]
+                            print(f"    text: {first_line}...")
+                            break
+
+                elif etype == "thinking":
+                    pass
+
+                elif etype == "result":
+                    duration_ms = event.get("duration_ms")
+                    is_error = event.get("is_error", False)
+                    if is_error:
+                        final_error = event.get("result", "unknown error")
+
+        finally:
+            proc.wait()
+
+        stderr_thread.join(timeout=5)
+
+        if stderr_lines:
+            for sline in stderr_lines[:10]:
+                print(f"    cursor-stderr: {sline[:200]}")
+                if "Authentication required" in sline or "CURSOR_API_KEY" in sline:
+                    final_error = sline
+                    is_auth_error = True
+                if "Cannot use this model" in sline:
+                    final_error = sline
+
+        if duration_ms is not None:
+            print(f"  result: duration={duration_ms}ms, events={len(trajectory)}")
+
+        if proc.returncode != 0 and final_error:
+            print(f"  cursor error: {final_error}")
+        elif final_error and not trajectory:
+            print(f"  cursor error: {final_error}")
+
+        if proc.returncode == 0 or solution_path.exists():
+            break
+
+        if is_auth_error:
+            print("  cursor: auth error — not retrying")
+            break
+
+        all_output = (final_error or "") + " " + " ".join(stderr_lines)
+        if any(kw in all_output.lower() for kw in _AUTH_ERROR_KEYWORDS):
+            print("  cursor: auth error — not retrying")
+            break
+
+        if attempt < _AGENT_MAX_RETRIES:
+            backoff = _AGENT_RETRY_BACKOFFS[min(attempt, len(_AGENT_RETRY_BACKOFFS) - 1)]
+            print(f"  cursor: transient failure, retrying in {backoff}s "
+                  f"(attempt {attempt + 2}/{_AGENT_MAX_RETRIES + 1})")
+            _time.sleep(backoff)
+
+    elapsed_ms = int((time.monotonic() - start_time) * 1000) if duration_ms is None else duration_ms
+    trajectory.append({
+        "type": "_agent_summary",
+        "turns": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "duration_ms": elapsed_ms or 0,
+    })
 
     return trajectory, solution_path.exists()
 

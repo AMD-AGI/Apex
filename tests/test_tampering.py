@@ -99,3 +99,59 @@ class TestApplyTamperingPenalties:
         assert speedup == 2.0
         assert raw.get("_speedup_capped_for_tampering") is True
         path.unlink()
+
+
+class TestBroadenedTampering:
+    """Tests for whole-AST tampering detection outside __main__ guards."""
+
+    def test_sys_exit_at_module_level(self):
+        path = _write_solution("import sys\nsys.exit(0)\ndef kernel(x): return x\n")
+        warnings = _detect_benchmark_tampering(path, str(path))
+        assert any("sys.exit" in w and "outside __main__" in w for w in warnings)
+        path.unlink()
+
+    def test_quit_at_module_level(self):
+        path = _write_solution("quit()\ndef kernel(x): return x\n")
+        warnings = _detect_benchmark_tampering(path, str(path))
+        assert any("quit" in w and "outside __main__" in w for w in warnings)
+        path.unlink()
+
+    def test_exec_with_benchmark_ms(self):
+        path = _write_solution(
+            "exec(\"print('BENCHMARK_MS: 0.1')\")\ndef kernel(x): return x\n"
+        )
+        warnings = _detect_benchmark_tampering(path, str(path))
+        assert any("exec" in w and "suspicious" in w.lower() for w in warnings)
+        path.unlink()
+
+    def test_print_pass_outside_main(self):
+        path = _write_solution("print(\"PASS\")\ndef kernel(x): return x\n")
+        warnings = _detect_benchmark_tampering(path, str(path))
+        assert any("PASS" in w and "outside" in w for w in warnings)
+        path.unlink()
+
+    def test_os_exit_outside_main(self):
+        path = _write_solution(
+            "import os\ndef helper():\n    os._exit(0)\ndef kernel(x): return x\n"
+        )
+        warnings = _detect_benchmark_tampering(path, str(path))
+        assert any("os._exit" in w and "outside __main__" in w for w in warnings)
+        path.unlink()
+
+    def test_clean_solution_no_warnings(self):
+        path = _write_solution(
+            "import torch\ndef kernel(x):\n    return x * 2\n"
+        )
+        warnings = _detect_benchmark_tampering(path, str(path))
+        assert warnings == []
+        path.unlink()
+
+    def test_penalties_sys_exit_marks_incorrect(self):
+        path = _write_solution("import sys\nsys.exit(0)\ndef kernel(x): return x\n")
+        raw = {}
+        correct, speedup = _apply_tampering_penalties(
+            raw, path, str(path), compiled=True, correct=True, speedup=2.0,
+        )
+        assert correct is False
+        assert raw.get("_correctness_rejected_for_tampering") is True
+        path.unlink()

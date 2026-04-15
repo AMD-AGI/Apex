@@ -121,9 +121,12 @@ class BottleneckKernel:
     avg_time_us: float = 0.0
     percent_total: float = 0.0
     matched_kernel_spec: Optional[str] = None
+    bound_type: str = ""
+    bandwidth_pct: float = 0.0
+    compute_pct: float = 0.0
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "name": self.name,
             "category": self.category,
             "origin_library": self.origin_library,
@@ -133,6 +136,11 @@ class BottleneckKernel:
             "percent_total": round(self.percent_total, 4),
             "matched_kernel_spec": self.matched_kernel_spec,
         }
+        if self.bound_type:
+            d["bound_type"] = self.bound_type
+            d["bandwidth_pct"] = round(self.bandwidth_pct, 1)
+            d["compute_pct"] = round(self.compute_pct, 1)
+        return d
 
 
 def classify_kernel(name: str) -> str:

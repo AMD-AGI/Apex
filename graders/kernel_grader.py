@@ -81,19 +81,28 @@ def find_tasks(output_dir: Path) -> list[Path]:
 
 
 def find_solution(task_dir: Path) -> Path | None:
+    import re as _re
+    fallback = None
     for name in SOLUTION_NAMES:
         p = task_dir / name
-        if p.exists():
-            return p
-    return None
+        if not p.exists():
+            continue
+        content = p.read_text().strip()
+        if _re.match(r'^from\s+\w+\s+import\s+\*', content) and len(content) < 200:
+            if fallback is None:
+                fallback = p
+            continue
+        return p
+    return fallback
 
 
 def _detect_benchmark_tampering(solution_path: Path, baseline_path: str) -> list[str]:
-    """Detect solutions that tamper with the benchmark via __main__ fast-exit tricks.
+    """Detect solutions that tamper with the benchmark.
 
-    Only flags ``__main__`` blocks that contain genuinely suspicious patterns
-    (SystemExit, hardcoded PASS, fabricated timings).  A ``__main__`` block
-    that simply runs the kernel for testing is NOT flagged.
+    Scans both ``__main__`` blocks AND top-level / non-test code for:
+    - sys.exit / os._exit / quit / exit calls
+    - exec / eval with suspicious strings (BENCHMARK_MS, PASS)
+    - Hardcoded print("PASS") outside test helpers
 
     Returns a list of warning strings.  An empty list means no tampering detected.
     """
@@ -104,6 +113,7 @@ def _detect_benchmark_tampering(solution_path: Path, baseline_path: str) -> list
     except Exception:
         return warnings
 
+    # --- Phase 1: __main__ guard scanning (original) ---
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
@@ -137,6 +147,80 @@ def _detect_benchmark_tampering(solution_path: Path, baseline_path: str) -> list
                 "Solution prints hardcoded PASS inside __main__ guard — "
                 "bypassing correctness check"
             )
+
+    # --- Phase 2: whole-AST scanning for dangerous calls outside __main__ ---
+    _EXIT_FUNCS = {"sys.exit", "os._exit", "quit", "exit"}
+
+    def _is_inside_main_guard(node: ast.AST) -> bool:
+        """Check if a node is nested inside an if __name__ == '__main__' block."""
+        parent = getattr(node, "_parent", None)
+        while parent is not None:
+            if isinstance(parent, ast.If):
+                t = parent.test
+                if isinstance(t, ast.Compare):
+                    left = t.left
+                    if (isinstance(left, ast.Name) and left.id == "__name__") or \
+                       (isinstance(left, ast.Constant) and left.value == "__main__"):
+                        return True
+            parent = getattr(parent, "_parent", None)
+        return False
+
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            child._parent = node  # type: ignore[attr-defined]
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _is_inside_main_guard(node):
+            continue
+
+        call_name = ""
+        func = node.func
+        if isinstance(func, ast.Name):
+            call_name = func.id
+        elif isinstance(func, ast.Attribute):
+            parts = []
+            obj = func
+            while isinstance(obj, ast.Attribute):
+                parts.append(obj.attr)
+                obj = obj.value
+            if isinstance(obj, ast.Name):
+                parts.append(obj.id)
+            call_name = ".".join(reversed(parts))
+
+        if call_name in _EXIT_FUNCS:
+            warnings.append(
+                f"Solution calls {call_name}() outside __main__ guard — "
+                "likely tampering with benchmark execution"
+            )
+
+        if call_name in ("exec", "eval") and node.args:
+            arg = node.args[0]
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                if "BENCHMARK_MS" in arg.value or "PASS" in arg.value:
+                    warnings.append(
+                        f"Solution uses {call_name}() with suspicious string "
+                        f"containing benchmark keywords — likely tampering"
+                    )
+
+        if call_name == "print" and not _is_inside_main_guard(node):
+            if node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and arg.value == "PASS":
+                    parent = getattr(node, "_parent", None)
+                    in_func = False
+                    while parent is not None:
+                        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            if parent.name.startswith("test"):
+                                in_func = True
+                            break
+                        parent = getattr(parent, "_parent", None)
+                    if not in_func:
+                        warnings.append(
+                            "Solution prints hardcoded PASS outside test function — "
+                            "bypassing correctness check"
+                        )
 
     return warnings
 
@@ -297,11 +381,17 @@ def _apply_tampering_penalties(
 
     has_fake_pass = any("hardcoded PASS" in w for w in tampering_warnings)
     has_fake_benchmark = any("hardcoded BENCHMARK_MS" in w for w in tampering_warnings)
+    has_exit_call = any(
+        ("sys.exit" in w or "os._exit" in w or "quit()" in w or "exit()" in w)
+        and "outside __main__" in w
+        for w in tampering_warnings
+    )
 
-    if has_fake_pass:
+    if has_fake_pass or has_exit_call:
         correct = False
         raw["_correctness_rejected_for_tampering"] = True
-        print("    [grader] Marking correct=False: solution faked PASS output",
+        reason = "faked PASS output" if has_fake_pass else "exit call outside __main__"
+        print(f"    [grader] Marking correct=False: solution has {reason}",
               file=sys.stderr)
     if has_fake_benchmark and speedup > 1.0:
         cap_val = speedup_cap if speedup_cap > 0 else 1.0
@@ -334,12 +424,50 @@ def _finalize_grading_result(
     correct = raw.get("correct", False)
     speedup = raw.pop("_magpie_speedup", 0.0)
 
+    if compiled and correct and speedup > 0:
+        if speedup < 0.01 or speedup > 100:
+            print(f"    [grader] Magpie speedup {speedup:.2f}x outside plausible range "
+                  f"[0.01, 100]; rejecting and re-measuring", file=sys.stderr)
+            raw["_rejected_magpie_speedup"] = round(speedup, 4)
+            speedup = 0.0
+        b_ms = raw.get("baseline_ms", 0)
+        o_ms = raw.get("optimized_ms", 0)
+        if b_ms > 0 and o_ms > 0 and max(b_ms, o_ms) / max(min(b_ms, o_ms), 1e-9) > 1000:
+            print(f"    [grader] baseline_ms={b_ms:.2f} vs optimized_ms={o_ms:.2f} "
+                  f"differ by >1000x; rejecting Magpie speedup", file=sys.stderr)
+            raw["_rejected_magpie_speedup"] = round(speedup, 4)
+            speedup = 0.0
+
     if compiled and correct and speedup <= 0:
         speedup = _measure_speedup(cfg, task_dir, baseline_path, optimized_path)
         if speedup <= 0:
-            speedup = 1.0
-            raw["_no_perf_data"] = True
-            print("    [grader] No performance data; assuming 1.0x", file=sys.stderr)
+            perf_cfg = cfg.get("performance", {})
+            perf_cmd = perf_cfg.get("command", "")
+            python_bin = perf_cmd.split()[0] if perf_cmd else "python3"
+            b_ms = _run_benchmark_script(baseline_path, python_bin, str(task_dir))
+            o_ms = _run_benchmark_script(str(solution), python_bin, str(task_dir))
+            if b_ms > 0 and o_ms > 0:
+                candidate = b_ms / o_ms
+                if 0.01 < candidate < 100:
+                    speedup = candidate
+                    raw["baseline_ms"] = round(b_ms, 4)
+                    raw["optimized_ms"] = round(o_ms, 4)
+                    raw["_benchmark_speedup"] = round(speedup, 4)
+                    raw["_perf_source"] = "script_benchmark_fallback"
+                    print(f"    [grader] Script benchmark fallback: {speedup:.3f}x "
+                          f"(baseline={b_ms:.2f}ms, optimized={o_ms:.2f}ms)", file=sys.stderr)
+                else:
+                    speedup = 1.0
+                    raw["_no_perf_data"] = True
+                    raw["_rejected_speedup"] = round(candidate, 4)
+                    print(f"    [grader] Script benchmark gave implausible {candidate:.2f}x; "
+                          f"assuming 1.0x", file=sys.stderr)
+            else:
+                speedup = 1.0
+                raw["_no_perf_data"] = True
+                print(f"    [grader] No performance data from any source "
+                      f"(baseline_ms={b_ms:.1f}, optimized_ms={o_ms:.1f}); "
+                      f"assuming 1.0x", file=sys.stderr)
 
     correct, speedup = _apply_tampering_penalties(
         raw, solution, baseline_path, compiled, correct, speedup,

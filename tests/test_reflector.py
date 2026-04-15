@@ -165,3 +165,27 @@ class TestFormatPerformanceScorecard:
 
     def test_empty_returns_empty(self):
         assert _format_performance_scorecard("") == ""
+
+
+class TestShouldContinueFailDetection:
+    """Tests for consecutive failure early-stop in should_continue."""
+
+    def test_should_stop_after_two_consecutive_compile_failures(self):
+        kr = KernelResult(task_id="t", compiled=False)
+        assert not should_continue(kr, iteration=2, max_iterations=5,
+                                   consecutive_fail_count=2)
+
+    def test_should_continue_after_one_failure(self):
+        kr = KernelResult(task_id="t", compiled=False)
+        assert should_continue(kr, iteration=1, max_iterations=5,
+                               consecutive_fail_count=1)
+
+    def test_should_stop_after_two_correctness_failures(self):
+        kr = KernelResult(task_id="t", compiled=True, correct=False)
+        assert not should_continue(kr, iteration=2, max_iterations=5,
+                                   consecutive_fail_count=2)
+
+    def test_fail_count_resets_on_success(self):
+        kr = KernelResult(task_id="t", compiled=True, correct=True, speedup=1.2)
+        assert should_continue(kr, iteration=2, max_iterations=5,
+                               consecutive_fail_count=0)
