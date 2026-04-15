@@ -34,7 +34,7 @@ class ModelConfig:
 
 
 # ── Model registry ─────────────────────────────────────────────────────────────
-# 19 models; ~15 distinct kernel shapes for good RL diversity.
+# 21 models; ~15 distinct kernel shapes for good RL diversity.
 
 MODELS: list[ModelConfig] = [
 

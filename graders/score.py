@@ -3,12 +3,12 @@
 """
 score.py — Shared scoring logic and Magpie helpers for the RL graders.
 
-AgentKernelArena scoring formula (kernel-level):
+Scoring formula (kernel-level):
   compiled    → +20 pts
   correct     → +100 pts
-  speedup S   → +S × 100 pts  (S = baseline_time / optimized_time ≥ 1.0)
+  speedup S   → 100 + (S-1)×200 for S≥1, max(0, 100S-50) for S<1
 
-  Total max (uncapped): 220+ pts per task
+  Reference score (compile+correct+2× speedup): 420 pts
 
 Magpie integration:
   - Primary: Python API via `Magpie` package (pip-installed)
