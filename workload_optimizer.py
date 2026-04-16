@@ -563,8 +563,27 @@ def _resolve_module_to_path(module_name: str) -> Optional[Path]:
     return None
 
 
+def _get_container_site_packages(docker_image: str) -> str:
+    """Probe a Docker image for its Python site-packages path."""
+    if docker_image:
+        try:
+            result = subprocess.run(
+                ["docker", "run", "--rm", docker_image,
+                 "python3", "-c",
+                 "import site; print(site.getsitepackages()[0])"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return f"/usr/local/lib/python{py_ver}/dist-packages"
+
+
 def _hook_docker_volumes(
     backups: dict[Path, Path],
+    docker_image: str = "",
 ) -> callable:
     """Monkey-patch subprocess.Popen to inject -v mounts for patched files.
 
@@ -574,12 +593,13 @@ def _hook_docker_volumes(
     """
     import subprocess as _sp
 
+    container_site_packages = _get_container_site_packages(docker_image)
     volume_flags: list[str] = []
     for patched_path in backups:
         host = str(patched_path.resolve())
         if "site-packages" in host:
             rel = host.split("site-packages/", 1)[1]
-            container = f"/usr/local/lib/python3.12/dist-packages/{rel}"
+            container = f"{container_site_packages}/{rel}"
         else:
             container = host
         volume_flags.extend(["-v", f"{host}:{container}"])
@@ -2208,7 +2228,7 @@ def _create_task_config(
         correctness_cmd = f"{kernel_python} solution{ext}"
         if gt_spec and gt_spec.pytorch_reference_code:
             ref_path = task_dir / "reference.py"
-            ref_path.write_text(gt_spec.pytorch_reference_code)
+            ref_path.write_text(_fix_reference_imports(gt_spec.pytorch_reference_code))
             if gt_spec.test_shapes_code:
                 shapes_path = task_dir / "test_shapes.py"
                 shapes_path.write_text(
@@ -2900,13 +2920,20 @@ def _optimize_kernel(
                 time.sleep(delay)
             continue
 
-        print("    Grading with Magpie...")
-        _kb = getattr(kernel, "kernel_type", "triton") or "triton"
-        with _GPU_GRADE_LOCK:
-            kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
-                            speedup_cap=config.tampering_speedup_cap,
-                            compute_rl_reward=True, require_tags=False,
-                            kernel_backend=_kb)
+        if config.dry_run:
+            kr = KernelResult(
+                task_id=task_id, compiled=True, correct=True,
+                speedup=1.5, raw={"rl_reward": 1.0,
+                                  "baseline_ms": 10.0, "optimized_ms": 6.67},
+            )
+        else:
+            print("    Grading with Magpie...")
+            _kb = getattr(kernel, "kernel_type", "triton") or "triton"
+            with _GPU_GRADE_LOCK:
+                kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
+                                speedup_cap=config.tampering_speedup_cap,
+                                compute_rl_reward=True, require_tags=False,
+                                kernel_backend=_kb)
         _rl = kr.raw.get("rl_reward")
         _rls = f" rl_reward={_rl:.3f}" if _rl is not None else ""
         print(f"      compiled={kr.compiled} correct={kr.correct} "
@@ -3325,7 +3352,7 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
         # Magpie runs benchmarks in Docker so the host's patched site-packages
         # are invisible. We monkey-patch subprocess.Popen to append -v flags
         # that mount each patched file into the container's dist-packages.
-        _popen_unhook = _hook_docker_volumes(backups) if backups else None
+        _popen_unhook = _hook_docker_volumes(backups, config.docker_image) if backups else None
         try:
             # Post-reinjection correctness gate
             failed = _verify_patched_kernels(backups, config)
@@ -4911,6 +4938,15 @@ class KernelStandaloneDefinition:
         return self.ground_truth.get("mode", "pytorch")
 
 
+def _fix_reference_imports(code: str) -> str:
+    """Ensure typing imports are present if type aliases are used."""
+    _TYPING_NAMES = {"Optional", "Tuple", "List", "Dict", "Union", "Any", "Sequence"}
+    used = sorted(n for n in _TYPING_NAMES if n in code)
+    if used and "from typing import" not in code:
+        return f"from typing import {', '.join(used)}\n" + code
+    return code
+
+
 def _wrap_shapes_code(shapes_code: str, input_func_name: str) -> str:
     """Wrap extracted shapes code with proper imports and a get_test_inputs() wrapper.
 
@@ -5184,7 +5220,7 @@ def _create_standalone_task_config(
         if ref_code:
             ref_path = task_dir / "reference.py"
             ref_preamble = "import torch\nimport math\n\n" if "torch" in ref_code and "import torch" not in ref_code else ""
-            ref_path.write_text(ref_preamble + ref_code)
+            ref_path.write_text(_fix_reference_imports(ref_preamble + ref_code))
             if shapes_code:
                 shapes_path = task_dir / "test_shapes.py"
                 input_func_name = gt.get("input_func_name", "")
@@ -5415,6 +5451,8 @@ Based on the research above, implement MULTIPLE optimization strategies. Common 
 ## IMPORTANT Constraints
 - Your solution must be functionally equivalent to the baseline (same inputs -> same outputs).
 - Do NOT modify files outside `{task_dir}/`.
+- Do NOT modify reference.py, testcase.py, or config.yaml -- these are integrity-checked and tampering results in score 0.
+- Only edit solution.{sol_ext} (your optimized kernel).
 - Do NOT add `if __name__ == "__main__":` blocks with fake benchmarks or `sys.exit(0)`.
 - Focus on real performance improvements, not just code style changes.
 - Include the kernel function with the same signature as the baseline.

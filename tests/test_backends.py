@@ -89,7 +89,7 @@ class TestCodexRetry:
         assert call_count["n"] == 3  # 1 initial + 2 retries
         assert found is False
 
-    def test_codex_no_retry_when_solution_exists(self, tmp_path):
+    def test_codex_clears_stale_solution_before_retry(self, tmp_path):
         solution = tmp_path / "solution.py"
         solution.write_text("# pre-existing")
         call_count = {"n": 0}
@@ -99,13 +99,15 @@ class TestCodexRetry:
             return _make_mock_proc(returncode=1, stderr_text="crash")
 
         with patch.object(backends, "_command_exists", return_value=True), \
-             patch("subprocess.Popen", side_effect=_mock_popen):
+             patch("subprocess.Popen", side_effect=_mock_popen), \
+             patch.object(backends, "_time") as mock_time:
+            mock_time.sleep = MagicMock()
             trajectory, found = backends._run_codex_task(
                 prompt="optimize", cwd=tmp_path, model=None,
                 max_turns=5, system_prompt=None, solution_path=solution,
             )
-        assert call_count["n"] == 1
-        assert found is True
+        assert call_count["n"] == 3  # stale file cleared, all retries attempted
+        assert found is False
 
 
 def _make_cursor_mock_proc(returncode=0, stdout_lines=None, stderr_lines_iter=None):

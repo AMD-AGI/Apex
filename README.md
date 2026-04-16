@@ -145,7 +145,7 @@ Apex/
 │   └── export_rl_dataset.py # RL/SFT dataset export from trajectories
 │
 ├── prompts/
-│   ├── models.py            # Registry of 21 open-source LLMs
+│   ├── models.py            # Model registry (Qwen3.5, GPT-OSS, etc.)
 │   ├── configs.py           # 17 inference configurations
 │   ├── kernel_prompt.py     # Kernel-level prompt constructor
 │   └── model_prompt.py      # Model-level prompt constructor
@@ -276,18 +276,26 @@ cursor .
 
 ### Agent-Driven Kernel Optimization Examples
 
-These prompts are tested and work end-to-end. Open an agent CLI (`cursor-agent`, `claude`, or `codex`) from the Apex directory and paste a prompt:
+These prompts are tested and work end-to-end. Open the Claude Code CLI from the Apex directory and paste a prompt:
 
 ```
-Optimize the rms_norm Triton kernel for Llama 3.1 8B on MI355X.
+Run the full optimization pipeline for Qwen3.5 27B with these settings:
+triton kernels only, top 3 bottleneck kernels, 3 optimization iterations,
+max 25 agent turns per iteration, claude agent backend, and leaderboard enabled.
+Set HF_HOME=/mnt/dcgpuval/sirafati/hf before running.
+Show the final score comparison and generate a report when done.
+```
+
+```
+Run the full optimization pipeline for GPT OSS 20B with these settings:
+triton kernels only, top 3 bottleneck kernels, 3 optimization iterations,
+max 25 agent turns per iteration, claude agent backend, and leaderboard enabled.
+Show the final score comparison and generate a report when done.
+```
+
+```
+Optimize the rms_norm Triton kernel on MI355X.
 Write the solution to output/ and grade it when done. Show the score breakdown.
-```
-
-```
-Run the full optimization pipeline for GPT OSS 120B with these settings:
-triton kernels only, top 2 bottleneck kernels, 2 optimization iterations,
-max 15 agent turns per iteration, and leaderboard enabled.
-Show the final score comparison when done.
 ```
 
 The agent reads `CLAUDE.md` / `AGENTS.md`, discovers MCP tools, and translates the prompt into the correct `workload_optimizer.py` commands.
@@ -295,42 +303,36 @@ The agent reads `CLAUDE.md` / `AGENTS.md`, discovers MCP tools, and translates t
 **How to use:**
 
 ```bash
-# Open an agent CLI from the Apex directory, then paste any prompt above:
-cd Apex && claude          # Claude Code (interactive)
-cd Apex && codex           # OpenAI Codex (interactive)
-cd Apex && cursor-agent    # Cursor Agent CLI
-
-# Or use Cursor IDE — open the Apex folder, then use agent mode:
-cursor .
+# Open Claude Code from the Apex directory, then paste any prompt above:
+cd Apex && claude
 ```
 
 **Equivalent direct commands** (what the agent executes under the hood):
 
 ```bash
-# Prompt 1: standalone kernel optimization (tested: compiled, correct, 3.08x, score=637)
+# Full pipeline for Qwen3.5 27B
+python3 workload_optimizer.py run \
+  -r ./results_qwen35_27b \
+  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_qwen35_27b.yaml \
+  --kernel-types triton --top-k 3 \
+  --max-iterations 3 --max-turns 25 \
+  --agent-backend claude --leaderboard
+
+# Full pipeline for GPT-OSS-20B
+python3 workload_optimizer.py run \
+  -r ./results_gptoss_20b \
+  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_20b.yaml \
+  --kernel-types triton --top-k 3 \
+  --max-iterations 3 --max-turns 25 \
+  --agent-backend claude --leaderboard
+
+# Standalone kernel optimization
 python3 workload_optimizer.py optimize-kernel \
   -r ./results \
   --kernel tools/rocm/aiter/aiter/ops/triton/normalization/rmsnorm.py \
   --kernel-name rms_norm --kernel-type triton \
   --correctness-mode pytorch \
-  --agent-backend cursor \
-  --max-iterations 1 --max-turns 10
-
-# Prompt 2: full pipeline (tested: identifies kernels, optimizes, scores, generates report)
-python3 workload_optimizer.py run \
-  -r ./results \
-  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml \
-  --kernel-types triton --top-k 2 \
-  --max-iterations 2 --max-turns 15 \
-  --agent-backend cursor --leaderboard
-
-# Optimize with library_test validation (aiter's own pytest suite)
-python3 workload_optimizer.py optimize-kernel \
-  -r ./results \
-  --kernel tools/rocm/aiter/aiter/ops/triton/activation.py \
-  --kernel-name silu_mul --kernel-type triton \
-  --correctness-mode library_test \
-  --agent-backend cursor \
+  --agent-backend claude \
   --max-iterations 1 --max-turns 10
 ```
 
@@ -414,11 +416,14 @@ Cache E2E baseline results to skip the ~30-minute benchmark on repeat runs:
 
 ### Parallel Kernel Optimization
 
-Optimize up to N kernels simultaneously (agent reasoning is API-bound; GPU grading is serialized):
+When using the `run` subcommand (full pipeline), optimize up to N kernels simultaneously
+(agent reasoning is API-bound; GPU grading is serialized):
 
 ```bash
---parallel-kernels 2
+python3 workload_optimizer.py run ... --parallel-kernels 2
 ```
+
+Note: the standalone `optimize` subcommand processes kernels sequentially regardless of this flag.
 
 ### Agent Model Routing
 
@@ -585,6 +590,20 @@ These kernels have explicit library test commands in the ground truth registry, 
 | `all_reduce` | HIP | Tensor-parallel all-reduce (RCCL + fused kernels) |
 | `act_quant_fp8` | Triton | Dynamic per-token FP8 activation quantization |
 | `silu_mul` | Triton | Fused SiLU × gate (SwiGLU) for MLP |
+
+### Validated Results (agent-driven, cursor backend)
+
+| Kernel | Speedup | Score | Settings | Notes |
+|--------|---------|-------|----------|-------|
+| `all_reduce` | 36.35x | 7290 | 3 iter / 25 turns | HIP, library_test; multi-GPU |
+| `rms_norm` | 1.05x | 674 | 1 iter / 10 turns | Triton, pytorch mode |
+| `fused_moe` | 1.14x | 248 | 1 iter / 10 turns | Triton, pytorch mode |
+| `gemm_bf16` | 1.00x | 220 | 3 iter / 25 turns | Triton, library_test |
+| `silu_mul` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
+| `act_quant_fp8` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
+| `kv_cache_ops` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
+
+**7 kernels validated** with correct optimizations. Top performers: `all_reduce` (36.35x), `fused_moe` (1.14x), `rms_norm` (1.05x).
 
 ## Troubleshooting
 

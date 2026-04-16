@@ -250,17 +250,34 @@ if [[ "$SKIP_DOWNLOADS" == "false" ]]; then
 
     source "$MCPS_DIR/_shared.sh"
 
-    if [[ -d "$ROCM_DIR" ]] && [[ -n "$(ls -A "$ROCM_DIR" 2>/dev/null)" ]]; then
+    # Determine which repos (from rocm.json) are still missing under $ROCM_DIR.
+    # clone_rocm_repos is idempotent (skips repos whose .git already exists),
+    # so we always run it when anything is missing — this ensures newly added
+    # entries in rocm.json (e.g. the rocm-libraries monorepo) get cloned even
+    # on repeat runs where tools/rocm/ is already partially populated.
+    missing_repos=()
+    if [[ -f "$JSONS_DIR/rocm.json" ]] && command -v jq >/dev/null 2>&1; then
+        while IFS= read -r repo_url; do
+            [[ -z "$repo_url" ]] && continue
+            repo_name="$(basename "$repo_url" .git)"
+            [[ ! -d "$ROCM_DIR/$repo_name/.git" ]] && missing_repos+=("$repo_name")
+        done < <(jq -r '.rocm_libraries[].github' "$JSONS_DIR/rocm.json" | sort -u)
+    fi
+
+    if [[ -d "$ROCM_DIR" ]] && [[ ${#missing_repos[@]} -eq 0 ]]; then
         repo_count=$(find "$ROCM_DIR" -maxdepth 1 -mindepth 1 -type d | wc -l)
-        ok "ROCm repos: $ROCM_DIR ($repo_count repos)"
+        ok "ROCm repos: $ROCM_DIR ($repo_count repos, all entries present)"
     else
+        if [[ ${#missing_repos[@]} -gt 0 ]]; then
+            info "Missing ROCm repos (${#missing_repos[@]}): ${missing_repos[*]}"
+        fi
         if [[ "$NON_INTERACTIVE" == "true" ]]; then
             info "Cloning ROCm repos..."
             clone_rocm_repos
         else
             echo ""
             echo -e "  ${YELLOW}ROCm repos are required for source-finder and RAG indexing.${NC}"
-            read -rp "  Clone ROCm repos into tools/rocm/? [y/N]: " clone_choice
+            read -rp "  Clone missing ROCm repos into tools/rocm/? [y/N]: " clone_choice
             if [[ "$clone_choice" =~ ^[Yy]$ ]]; then
                 clone_rocm_repos
             else

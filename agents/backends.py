@@ -260,7 +260,15 @@ def _run_codex_task(
     ):
         env.pop(key, None)
 
+    all_trajectory: list[dict] = []
+    cumulative_in_tokens = 0
+    cumulative_out_tokens = 0
+    cumulative_turns = 0
+
     for attempt in range(_AGENT_MAX_RETRIES + 1):
+        if solution_path.exists():
+            solution_path.unlink(missing_ok=True)
+
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env, bufsize=1,
@@ -313,6 +321,13 @@ def _run_codex_task(
         finally:
             proc.wait()
 
+        if attempt > 0:
+            all_trajectory.append({"type": "_retry_boundary", "attempt": attempt})
+        all_trajectory.extend(trajectory)
+        cumulative_in_tokens += total_in_tokens
+        cumulative_out_tokens += total_out_tokens
+        cumulative_turns += turn_count
+
         stderr_text = (proc.stderr.read() or "").strip()
         if stderr_text:
             for sline in stderr_text.splitlines()[:10]:
@@ -340,15 +355,15 @@ def _run_codex_task(
                   f"(attempt {attempt + 2}/{_AGENT_MAX_RETRIES + 1})")
             _time.sleep(backoff)
 
-    trajectory.append({
+    all_trajectory.append({
         "type": "_agent_summary",
-        "turns": turn_count,
-        "input_tokens": total_in_tokens,
-        "output_tokens": total_out_tokens,
+        "turns": cumulative_turns,
+        "input_tokens": cumulative_in_tokens,
+        "output_tokens": cumulative_out_tokens,
         "duration_ms": 0,
     })
 
-    return trajectory, solution_path.exists()
+    return all_trajectory, solution_path.exists()
 
 
 def _build_codex_prompt(prompt: str, system_prompt: str | None, max_turns: int) -> str:
@@ -413,7 +428,14 @@ def _run_cursor_task(
 
     env = os.environ.copy()
 
+    all_trajectory: list[dict] = []
+    overall_start = time.monotonic()
+    last_duration_ms = None
+
     for attempt in range(_AGENT_MAX_RETRIES + 1):
+        if solution_path.exists():
+            solution_path.unlink(missing_ok=True)
+
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -510,6 +532,12 @@ def _run_cursor_task(
         finally:
             proc.wait()
 
+        if attempt > 0:
+            all_trajectory.append({"type": "_retry_boundary", "attempt": attempt})
+        all_trajectory.extend(trajectory)
+        if duration_ms is not None:
+            last_duration_ms = duration_ms
+
         stderr_thread.join(timeout=5)
 
         if stderr_lines:
@@ -547,8 +575,11 @@ def _run_cursor_task(
                   f"(attempt {attempt + 2}/{_AGENT_MAX_RETRIES + 1})")
             _time.sleep(backoff)
 
-    elapsed_ms = int((time.monotonic() - start_time) * 1000) if duration_ms is None else duration_ms
-    trajectory.append({
+    elapsed_ms = (
+        last_duration_ms if last_duration_ms is not None
+        else int((time.monotonic() - overall_start) * 1000)
+    )
+    all_trajectory.append({
         "type": "_agent_summary",
         "turns": 0,
         "input_tokens": 0,
@@ -556,7 +587,7 @@ def _run_cursor_task(
         "duration_ms": elapsed_ms or 0,
     })
 
-    return trajectory, solution_path.exists()
+    return all_trajectory, solution_path.exists()
 
 
 def _extract_cursor_tool_name(tool_call: dict) -> str:
