@@ -72,6 +72,7 @@ sys.path.insert(0, str(REPO_ROOT / "pipeline"))
 
 from score import (
     KernelResult,
+    VLLM_ROCM_IMAGE_DEFAULT,
     cleanup_inference_server,
     run_magpie_benchmark,
     run_magpie_compare,
@@ -129,10 +130,6 @@ def _gap_cache_key(benchmark_config: str) -> str:
         content = benchmark_config.encode()
     return hashlib.sha256(content).hexdigest()[:16]
 
-
-# ---------------------------------------------------------------------------
-# Kernel patching infrastructure (Fixes 1, 9, 10, 11)
-# ---------------------------------------------------------------------------
 
 _KERNEL_SPEC_TO_MODULE: dict[str, dict[str, str]] = {
     "paged_attn_decode": {
@@ -567,6 +564,112 @@ def _resolve_module_to_path(module_name: str) -> Optional[Path]:
     return None
 
 
+def _resolve_benchmark_docker_image(
+    benchmark_config_path: str = "",
+    docker_image: str = "",
+) -> str:
+    """Resolve the Docker image the benchmark will actually use."""
+    if docker_image:
+        return docker_image
+
+    if benchmark_config_path:
+        try:
+            cfg = yaml.safe_load(Path(benchmark_config_path).read_text()) or {}
+            bench = cfg.get("benchmark", {})
+            if bench.get("docker_image"):
+                return str(bench["docker_image"])
+            if str(bench.get("framework", "")).lower() == "vllm":
+                return os.environ.get("APEX_VLLM_ROCM_IMAGE", "") or VLLM_ROCM_IMAGE_DEFAULT
+        except Exception:
+            pass
+
+    return os.environ.get("APEX_VLLM_ROCM_IMAGE", "") or VLLM_ROCM_IMAGE_DEFAULT
+
+
+def _get_container_site_packages(
+    docker_image: str = "",
+    benchmark_config_path: str = "",
+) -> str:
+    """Probe the benchmark Docker image for its Python site-packages path."""
+    resolved_image = _resolve_benchmark_docker_image(
+        benchmark_config_path=benchmark_config_path,
+        docker_image=docker_image,
+    )
+    if resolved_image:
+        try:
+            result = subprocess.run(
+                ["docker", "run", "--rm", resolved_image,
+                 "python3", "-c",
+                 "import site; print(site.getsitepackages()[0])"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return f"/usr/local/lib/python{py_ver}/dist-packages"
+
+
+def _site_packages_relative(path: str) -> Optional[str]:
+    """Return the portion of a path after site/dist-packages, if present."""
+    for marker in ("site-packages/", "dist-packages/"):
+        if marker in path:
+            return path.split(marker, 1)[1]
+    return None
+
+
+def _hook_docker_volumes(
+    backups: dict[Path, Path],
+    docker_image: str = "",
+    benchmark_config_path: str = "",
+) -> callable:
+    """Monkey-patch subprocess.Popen to inject -v mounts for patched files.
+
+    Returns an unhook callable that restores the original Popen.
+    This lets Apex inject patched kernels into Magpie's Docker containers
+    without modifying any Magpie code.
+    """
+    import subprocess as _sp
+
+    container_site_packages = _get_container_site_packages(
+        docker_image=docker_image,
+        benchmark_config_path=benchmark_config_path,
+    )
+    volume_flags: list[str] = []
+    for patched_path in backups:
+        host = str(patched_path.resolve())
+        rel = _site_packages_relative(host)
+        if rel:
+            container = f"{container_site_packages}/{rel}"
+        else:
+            container = host
+        volume_flags.extend(["-v", f"{host}:{container}"])
+        print(f"  Docker mount: {host} -> {container}")
+
+    if not volume_flags:
+        return lambda: None
+
+    _orig_popen = _sp.Popen
+
+    class _PatchedPopen(_orig_popen):
+        def __init__(self, args, *a, **kw):
+            if isinstance(args, (list, tuple)) and len(args) > 1:
+                args = list(args)
+                if args[0] == "docker" and "run" in args[:3]:
+                    run_idx = args.index("run")
+                    for i, flag in enumerate(volume_flags):
+                        args.insert(run_idx + 1 + i, flag)
+            super().__init__(args, *a, **kw)
+
+    _sp.Popen = _PatchedPopen
+
+    def _unhook():
+        _sp.Popen = _orig_popen
+
+    return _unhook
+
+
 def _apply_kernel_patches(
     reinjected_dir: Path, gpu_arch: str = "gfx950",
 ) -> tuple[dict[Path, Path], "IO"]:
@@ -610,7 +713,16 @@ def _apply_kernel_patches(
             if lib_meta.exists():
                 library = lib_meta.read_text().strip() or "aiter"
 
-            if suffix == ".py":
+            is_python = suffix == ".py"
+            if not is_python and suffix in (".hip", ".cu"):
+                try:
+                    _ast.parse(solution_file.read_text())
+                    is_python = True
+                    print(f"    {spec}: {suffix} file contains valid Python — treating as .py patch")
+                except SyntaxError:
+                    pass
+
+            if is_python:
                 try:
                     _ast.parse(solution_file.read_text())
                 except SyntaxError as e:
@@ -1190,6 +1302,7 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
             model="",
             benchmark_config_path=config.benchmark_config,
             timeout=config.benchmark_timeout,
+            docker_image=config.docker_image,
         )
         cleanup_inference_server()
         tps = extract_tps(result)
@@ -1212,6 +1325,7 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
         model="",
         benchmark_config_path=config.benchmark_config,
         timeout=config.benchmark_timeout,
+        docker_image=config.docker_image,
     )
     cleanup_inference_server()
 
@@ -1225,6 +1339,7 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
             model="",
             benchmark_config_path=config.benchmark_config,
             timeout=config.benchmark_timeout,
+            docker_image=config.docker_image,
         )
         tps = extract_tps(result)
         run_failed = (
@@ -1487,10 +1602,17 @@ WORKFLOW:
 Focus on: memory coalescing, LDS usage, MFMA utilization, register pressure,
 bank conflicts, optimal block/tile sizes for the target architecture.
 
+REALISTIC SPEEDUP RANGES (use these to calibrate your optimization effort):
+- Normalization (rms_norm, layer_norm): 2-5x achievable via vectorized loads and fused ops
+- Softmax: 1.2-3x via online algorithm, vectorization, and torch.softmax dispatch
+- Attention (paged_attn, flash_attn): 1.05-1.5x — highly optimized baselines, focus on memory access
+- GEMM (gemm_bf16, gemm_w8a8): 1.05-1.3x — use library dispatch (hipBLASLt/rocBLAS) or CK templates
+- MoE (fused_moe): 1.1-2x via expert sorting, workspace caching, and dispatch path selection
+- Elementwise/activation: 2-10x via kernel fusion with adjacent operations
+
 IMPORTANT:
 - Write your optimized kernel to solution.py in the task directory
-- The solution must be a self-contained Python file with a __main__ block that
-  runs the kernel and prints PASS/FAIL
+- The solution must be importable — expose the same function signatures as the baseline
 - Do NOT modify files outside the task directory
 - Do NOT create new scripts — all evaluation uses Magpie MCP (analyze, compare)
 - Do NOT hardcode kernel names — they are provided dynamically by the pipeline
@@ -1501,8 +1623,8 @@ IMPORTANT:
 
 ## MANDATORY WORKFLOW ORDER
 1. FIRST: Write a solution that passes correctness (mcp__magpie__compare with check_performance=false)
-2. ONLY AFTER correctness passes: Optimize for speed
-3. After each optimization attempt: Re-verify correctness before measuring speedup
+2. ONLY AFTER correctness passes: Re-run mcp__magpie__compare with check_performance=true to measure speedup. The speedup number from this call is what determines your score.
+3. Optimize for speed, then re-verify correctness (check_performance=false) before measuring speedup again (check_performance=true)
 4. Never sacrifice correctness for speed — incorrect solutions score 0 on speedup
 
 ## ANTI-TAMPERING RULES (violations are automatically detected and penalized)
@@ -2148,7 +2270,7 @@ def _create_task_config(
         correctness_cmd = f"{kernel_python} solution{ext}"
         if gt_spec and gt_spec.pytorch_reference_code:
             ref_path = task_dir / "reference.py"
-            ref_path.write_text(gt_spec.pytorch_reference_code)
+            ref_path.write_text(_fix_reference_imports(gt_spec.pytorch_reference_code))
             if gt_spec.test_shapes_code:
                 shapes_path = task_dir / "test_shapes.py"
                 shapes_path.write_text(
@@ -2239,8 +2361,12 @@ def _profile_baseline_kernel(
     baseline_path: str,
     task_dir: Path,
     gpu_arch: str = "gfx950",
+    kernel: "BottleneckKernel | None" = None,
 ) -> str:
     """Run rocprof on the baseline kernel and return a formatted profiling summary.
+
+    If *kernel* is provided and bound_type is not yet set, infers compute/memory
+    bound classification from the profiling data and updates the kernel in-place.
 
     Returns empty string if profiling fails.
     """
@@ -2258,26 +2384,95 @@ def _profile_baseline_kernel(
 
         lines = []
         output = proc.stdout + proc.stderr
+        bandwidth_pct = 0.0
+        compute_pct = 0.0
         for line in output.splitlines():
-            if any(kw in line.lower() for kw in (
+            low = line.lower()
+            if any(kw in low for kw in (
                 "kernel", "duration", "occupancy", "lds", "vgpr", "sgpr",
-                "memory", "bandwidth", "cache", "flop",
+                "memory", "bandwidth", "cache", "flop", "mfma", "valu",
             )):
                 lines.append(line.strip())
 
+            bw_m = _re_mod.search(
+                r"(?:HBM|Memory)\s*(?:BW|Bandwidth)[^:]*:\s*([\d.]+)\s*%", line, _re_mod.IGNORECASE
+            )
+            if bw_m:
+                bandwidth_pct = max(bandwidth_pct, float(bw_m.group(1)))
+            comp_m = _re_mod.search(
+                r"(?:Compute|MFMA|VALU)[^:]*(?:utilization|util)[^:]*:\s*([\d.]+)\s*%",
+                line, _re_mod.IGNORECASE,
+            )
+            if comp_m:
+                compute_pct = max(compute_pct, float(comp_m.group(1)))
+
         if not lines:
+            if kernel and not kernel.bound_type:
+                _classify_bound_type_heuristic(kernel)
             return ""
+
+        bound_type = ""
+        if bandwidth_pct > 0 or compute_pct > 0:
+            bound_type = "memory-bound" if bandwidth_pct > compute_pct else "compute-bound"
+        elif kernel and kernel.matched_kernel_spec:
+            bound_type = _KERNEL_BOUND_TYPE_DEFAULTS.get(
+                kernel.matched_kernel_spec, ""
+            )
+
+        if kernel and not kernel.bound_type and bound_type:
+            kernel.bound_type = bound_type
+            kernel.bandwidth_pct = bandwidth_pct
+            kernel.compute_pct = compute_pct
 
         section = "## Baseline Profiling Results (rocprof)\n\n"
         section += "```\n"
         section += "\n".join(lines[:20])
         section += "\n```\n"
-        section += "\nUse this data to identify whether the kernel is compute-bound or memory-bound.\n"
+        if bound_type:
+            section += (
+                f"\n**Classification: {bound_type.upper()}** "
+                f"(memory BW: {bandwidth_pct:.0f}%, compute: {compute_pct:.0f}%)\n"
+            )
+            if bound_type == "memory-bound":
+                section += (
+                    "Focus on: vectorized loads (float4), coalesced access patterns, "
+                    "reducing global memory traffic, LDS tiling for data reuse.\n"
+                )
+            else:
+                section += (
+                    "Focus on: MFMA instruction utilization, loop unrolling, "
+                    "reducing register pressure, improving occupancy.\n"
+                )
+        else:
+            section += "\nUse this data to identify whether the kernel is compute-bound or memory-bound.\n"
         return section
 
     except Exception as e:
         _log.warning("baseline profiling failed: %s", e)
+        if kernel and not kernel.bound_type:
+            _classify_bound_type_heuristic(kernel)
         return ""
+
+
+_KERNEL_BOUND_TYPE_DEFAULTS: dict[str, str] = {
+    "rms_norm": "memory-bound",
+    "layer_norm": "memory-bound",
+    "softmax": "memory-bound",
+    "paged_attn_decode": "memory-bound",
+    "flash_attn_prefill": "compute-bound",
+    "gemm_bf16": "compute-bound",
+    "gemm_w8a8": "compute-bound",
+    "fused_moe": "compute-bound",
+    "all_reduce": "memory-bound",
+}
+
+
+def _classify_bound_type_heuristic(kernel: "BottleneckKernel") -> None:
+    """Set bound_type from kernel_spec defaults when profiling data unavailable."""
+    spec = kernel.matched_kernel_spec or ""
+    bt = _KERNEL_BOUND_TYPE_DEFAULTS.get(spec, "")
+    if bt:
+        kernel.bound_type = bt
 
 
 def _build_multi_strategy_block(kernel_spec: str) -> str:
@@ -2428,7 +2623,7 @@ def _build_kernel_prompt(
     local_baseline = task_dir / "baseline.py"
     if local_baseline.exists():
         profiling_section = _profile_baseline_kernel(
-            str(local_baseline), task_dir, gpu_arch,
+            str(local_baseline), task_dir, gpu_arch, kernel=kernel,
         )
 
     multi_strategy = _build_multi_strategy_block(spec)
@@ -2436,13 +2631,19 @@ def _build_kernel_prompt(
 
     correctness_ref_section = _build_correctness_ref_section(task_dir, spec)
 
+    bound_info = ""
+    if kernel.bound_type:
+        bound_info = f"\n**Performance bottleneck:** {kernel.bound_type.upper()}"
+        if kernel.bandwidth_pct > 0 or kernel.compute_pct > 0:
+            bound_info += f" (memory BW: {kernel.bandwidth_pct:.0f}%, compute: {kernel.compute_pct:.0f}%)"
+
     profiling_context = textwrap.dedent(f"""\
 ## Profiling Context
 
 **Profiler kernel name:** `{kernel.name}`
 **Category:** {kernel.category}
 **Current GPU time:** {kernel.percent_total:.1f}% of total ({kernel.total_time_us/1000:.1f} ms over {kernel.calls} calls)
-**Task directory:** `{task_dir}`
+**Task directory:** `{task_dir}`{bound_info}
 
 {profiling_section}
 
@@ -2474,8 +2675,8 @@ def _build_kernel_prompt(
 
 ## MANDATORY WORKFLOW ORDER
 1. FIRST: Write a solution that passes correctness (mcp__magpie__compare with check_performance=false)
-2. ONLY AFTER correctness passes: Optimize for speed
-3. After each optimization attempt: Re-verify correctness before measuring speedup
+2. ONLY AFTER correctness passes: Re-run mcp__magpie__compare with check_performance=true to measure speedup. The speedup number from this call is what determines your score.
+3. Optimize for speed, then re-verify correctness (check_performance=false) before measuring speedup again (check_performance=true)
 4. Never sacrifice correctness for speed — incorrect solutions score 0 on speedup
 
 ## ANTI-TAMPERING RULES (violations are automatically detected and penalized)
@@ -2639,6 +2840,7 @@ def _estimate_kernel_difficulty(kernel: BottleneckKernel) -> str:
 import threading
 _GPU_GRADE_LOCK = threading.Lock()
 _BUDGET_LOCK = threading.Lock()
+_RESULTS_LOCK = threading.Lock()
 
 
 def _optimize_kernel(
@@ -2708,6 +2910,8 @@ def _optimize_kernel(
     total_agent_turns = 0
     previous_speedup = 0.0
     stall_count = 0
+    consecutive_fail_count = 0
+    last_fail_type: Optional[str] = None
 
     # Budget: base iterations + bonus from early-finish kernels
     effective_max_iter = config.max_iterations
@@ -2740,6 +2944,8 @@ def _optimize_kernel(
             for msg in messages:
                 if hasattr(msg, "num_turns"):
                     total_agent_turns += getattr(msg, "num_turns", 0)
+                elif isinstance(msg, dict) and msg.get("type") == "_agent_summary":
+                    total_agent_turns += msg.get("turns", 0)
             opt_result.agent_trace.extend(_serialize_agent_messages(messages))
             print(f"    Agent completed in {agent_time:.1f}s")
 
@@ -2756,13 +2962,20 @@ def _optimize_kernel(
                 time.sleep(delay)
             continue
 
-        print("    Grading with Magpie...")
-        _kb = getattr(kernel, "kernel_type", "triton") or "triton"
-        with _GPU_GRADE_LOCK:
-            kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
-                            speedup_cap=config.tampering_speedup_cap,
-                            compute_rl_reward=True, require_tags=False,
-                            kernel_backend=_kb)
+        if config.dry_run:
+            kr = KernelResult(
+                task_id=task_id, compiled=True, correct=True,
+                speedup=1.5, raw={"rl_reward": 1.0,
+                                  "baseline_ms": 10.0, "optimized_ms": 6.67},
+            )
+        else:
+            print("    Grading with Magpie...")
+            _kb = getattr(kernel, "kernel_type", "triton") or "triton"
+            with _GPU_GRADE_LOCK:
+                kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
+                                speedup_cap=config.tampering_speedup_cap,
+                                compute_rl_reward=True, require_tags=False,
+                                kernel_backend=_kb)
         _rl = kr.raw.get("rl_reward")
         _rls = f" rl_reward={_rl:.3f}" if _rl is not None else ""
         print(f"      compiled={kr.compiled} correct={kr.correct} "
@@ -2782,6 +2995,24 @@ def _optimize_kernel(
         if kr.score >= config.score_threshold:
             print(f"    Target reached: score={kr.score:.0f} >= {config.score_threshold}")
             break
+
+        # Consecutive failure detection
+        if not kr.compiled:
+            cur_fail = "compile"
+        elif not kr.correct:
+            cur_fail = "correctness"
+        else:
+            cur_fail = None
+
+        if cur_fail:
+            if cur_fail == last_fail_type:
+                consecutive_fail_count += 1
+            else:
+                consecutive_fail_count = 1
+                last_fail_type = cur_fail
+        else:
+            consecutive_fail_count = 0
+            last_fail_type = None
 
         # No-progress detection: stall if speedup delta < 5% for 2 consecutive iterations
         if kr.compiled and kr.correct and previous_speedup > 0:
@@ -2816,8 +3047,14 @@ def _optimize_kernel(
         if not should_continue(kr, iteration, effective_max_iter,
                                config.score_threshold,
                                previous_speedup=previous_speedup,
-                               stall_count=stall_count):
-            reason = "stalled (no progress)" if stall_count >= 2 else f"score={kr.score:.0f}"
+                               stall_count=stall_count,
+                               consecutive_fail_count=consecutive_fail_count):
+            if consecutive_fail_count >= 2:
+                reason = f"consecutive {last_fail_type} failures ({consecutive_fail_count})"
+            elif stall_count >= 2:
+                reason = "stalled (no progress)"
+            else:
+                reason = f"score={kr.score:.0f}"
             print(f"    Stopping: {reason}")
             break
 
@@ -2840,7 +3077,7 @@ def _optimize_kernel(
         opt_result.correct = best_kr.correct
         opt_result.speedup = best_kr.speedup
         opt_result.score = best_kr.score
-        opt_result.rl_reward = getattr(best_kr, "rl_reward", None)
+        opt_result.rl_reward = (best_kr.raw or {}).get("rl_reward")
         b_ms, o_ms = _extract_timing_from_raw(raw)
         if b_ms == 0 and o_ms == 0 and best_kr.speedup > 0:
             o_ms = 1.0
@@ -2893,6 +3130,57 @@ def _optimize_kernel(
 # Step 6: Kernel re-injection
 # ---------------------------------------------------------------------------
 
+
+def _resolve_reexport_wrapper(solution: Path, task_dir: Path) -> Path | None:
+    """If solution is just 'from solution import *', find the real implementation.
+
+    Agents sometimes create wrapper files that re-export from another module.
+    This resolves through the chain to find the file with actual code.
+    """
+    import re as _re
+
+    content = solution.read_text().strip()
+    if not _re.match(r'^from\s+\w+\s+import\s+\*', content) or len(content) > 200:
+        return solution
+
+    print(f"    {solution.name} is a re-export wrapper, searching for real implementation...")
+
+    candidates = [
+        task_dir / "solution_best.py",
+        task_dir / "solution.py",
+        task_dir / "solution_iter1.py",
+        task_dir / "solution.hip",
+    ]
+    for candidate in candidates:
+        if candidate == solution or not candidate.exists():
+            continue
+        c = candidate.read_text().strip()
+        if _re.match(r'^from\s+\w+\s+import\s+\*', c) and len(c) < 200:
+            continue
+        if len(c) > 50:
+            print(f"    Found real implementation: {candidate.name} ({len(c)} chars)")
+            return candidate
+
+    # Last resort: check __pycache__ for compiled bytecode with real source
+    pycache = task_dir / "__pycache__"
+    if pycache.exists():
+        for pyc in sorted(pycache.glob("solution*.pyc")):
+            try:
+                import marshal, struct
+                with open(pyc, 'rb') as f:
+                    f.read(4)  # magic
+                    f.read(4)  # flags
+                    f.read(4)  # timestamp
+                    size = struct.unpack('I', f.read(4))[0]
+                if size > 200:
+                    print(f"    Bytecache {pyc.name} has real source ({size} bytes), "
+                          f"but no .py file found")
+            except Exception:
+                pass
+
+    return None
+
+
 def _reinject_kernel(
     opt_result: KernelOptResult,
     task_dir: Path,
@@ -2918,6 +3206,12 @@ def _reinject_kernel(
     solution = find_solution(task_dir)
     if solution is None:
         print(f"    No solution file found in {task_dir}")
+        return False
+
+    # Resolve re-export wrappers (e.g. "from solution import *") to actual implementation
+    solution = _resolve_reexport_wrapper(solution, task_dir)
+    if solution is None:
+        print(f"    No real solution implementation found in {task_dir}")
         return False
 
     inject_dir = config.output_dir / "reinjected"
@@ -2954,6 +3248,7 @@ def _smoke_test_e2e(config: WorkloadConfig, baseline_tps: float) -> bool:
         model="",
         benchmark_config_path=config.benchmark_config,
         timeout=config.benchmark_timeout,
+        docker_image=config.docker_image,
     )
     cleanup_inference_server()
     smoke_tps = extract_tps(result)
@@ -3029,6 +3324,7 @@ def _check_baseline_drift(config: WorkloadConfig, original_baseline_tps: float) 
         model="",
         benchmark_config_path=config.benchmark_config,
         timeout=config.benchmark_timeout,
+        docker_image=config.docker_image,
     )
     cleanup_inference_server()
     current_tps = extract_tps(result)
@@ -3051,17 +3347,20 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
             "_kernel_patches_applied": False,
         }
 
-    if config.skip_benchmark:
-        print(f"  WARNING: Loading cached result -- kernel patches NOT applied to this run")
-        print(f"  WARNING: E2E throughput comparison will NOT reflect kernel optimizations")
+    reinjected_dir = config.output_dir / "reinjected"
+    has_reinjected = reinjected_dir.exists() and any(reinjected_dir.glob("*_solution.*"))
+
+    if config.skip_benchmark and not has_reinjected:
+        print(f"  WARNING: Loading cached result -- no reinjected kernels to test")
         result = json.loads(Path(config.skip_benchmark).read_text())
         result["_kernel_patches_applied"] = False
         return result
 
-    reinjected_dir = config.output_dir / "reinjected"
-    has_patches = reinjected_dir.exists() and any(reinjected_dir.glob("*_solution.*"))
+    if config.skip_benchmark and has_reinjected:
+        print(f"  Reinjected kernels found — running LIVE final benchmark with patches applied")
+        print(f"  (--skip-benchmark only skips the baseline, not the final benchmark when patches exist)")
 
-    if not has_patches:
+    if not has_reinjected:
         print(f"  No reinjected kernels found — skipping final benchmark")
         print(f"  Using baseline TPS ({baseline_tps:.1f}) as final TPS (no optimizations applied)")
         baseline_result = {}
@@ -3091,6 +3390,15 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
         os.environ["TRITON_CACHE_DIR"] = triton_cache
 
         backups, lock_fd = _apply_kernel_patches(reinjected_dir, config.gpu_arch)
+        # Inject patched files into Docker containers via subprocess hook.
+        # Magpie runs benchmarks in Docker so the host's patched site-packages
+        # are invisible. We monkey-patch subprocess.Popen to append -v flags
+        # that mount each patched file into the container's dist-packages.
+        _popen_unhook = _hook_docker_volumes(
+            backups,
+            config.docker_image,
+            config.benchmark_config,
+        ) if backups else None
         try:
             # Post-reinjection correctness gate
             failed = _verify_patched_kernels(backups, config)
@@ -3155,6 +3463,8 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
                 result.update(result_meta)
         finally:
             _restore_kernel_patches(backups, lock_fd)
+            if _popen_unhook:
+                _popen_unhook()
             if old_triton_cache is not None:
                 os.environ["TRITON_CACHE_DIR"] = old_triton_cache
             else:
@@ -3671,7 +3981,6 @@ def _run_workload_optimization_inner(
     })
 
     env_snap = _snapshot_environment()
-    trajectory.metadata = getattr(trajectory, "metadata", {})
     trajectory.metadata["environment_snapshot"] = env_snap
     print(f"  Environment: {len(env_snap.get('env_vars', {}))} AITER/TRITON vars, "
           f"{', '.join(f'{k}={v}' for k, v in env_snap.get('package_versions', {}).items())}")
@@ -3840,7 +4149,8 @@ def _run_workload_optimization_inner(
                         error=str(exc)[:500],
                     )
                 results_by_idx[idx] = opt_result
-                completed_results.append(opt_result.__dict__)
+                with _RESULTS_LOCK:
+                    completed_results.append(opt_result.__dict__)
                 print(f"    Result [{idx+1}/{len(selected)}]: "
                       f"{opt_result.kernel_spec} compiled={opt_result.compiled} "
                       f"correct={opt_result.correct} speedup={opt_result.speedup:.2f}x "
@@ -4674,6 +4984,15 @@ class KernelStandaloneDefinition:
         return self.ground_truth.get("mode", "pytorch")
 
 
+def _fix_reference_imports(code: str) -> str:
+    """Ensure typing imports are present if type aliases are used."""
+    _TYPING_NAMES = {"Optional", "Tuple", "List", "Dict", "Union", "Any", "Sequence"}
+    used = sorted(n for n in _TYPING_NAMES if n in code)
+    if used and "from typing import" not in code:
+        return f"from typing import {', '.join(used)}\n" + code
+    return code
+
+
 def _wrap_shapes_code(shapes_code: str, input_func_name: str) -> str:
     """Wrap extracted shapes code with proper imports and a get_test_inputs() wrapper.
 
@@ -4868,11 +5187,33 @@ def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
         gt["unit_test_command"] = getattr(args, "test_cmd", "")
         gt["repo_url"] = getattr(args, "repo_url", "")
         gt["working_directory"] = getattr(args, "working_directory", "")
+        kname = getattr(args, "kernel_name", "")
+        if kname and get_ground_truth_spec is not None:
+            gt_spec = get_ground_truth_spec(kname)
+            if gt_spec and gt_spec.mode == "library_test":
+                if not gt["unit_test_command"] and gt_spec.unit_test_command:
+                    gt["unit_test_command"] = gt_spec.unit_test_command
+                if not gt["repo_url"] and gt_spec.repo_url:
+                    gt["repo_url"] = gt_spec.repo_url
+                gt["source_library"] = gt_spec.source_library
+                if not gt["working_directory"] and gt_spec.source_library:
+                    rocm_dir = REPO_ROOT / "tools" / "rocm"
+                    if rocm_dir.is_dir():
+                        gt["working_directory"] = str(rocm_dir)
+                print(f"    Auto-enriched library_test for '{kname}' from {gt_spec.source_library}")
     elif corr_mode == "accordo":
         acc_path = getattr(args, "accordo_config", "")
         if acc_path and Path(acc_path).exists():
             with open(acc_path) as f:
                 gt["accordo_config"] = yaml.safe_load(f)
+        if not gt.get("accordo_config"):
+            kname = getattr(args, "kernel_name", "")
+            if kname and get_ground_truth_spec is not None:
+                gt_spec = get_ground_truth_spec(kname)
+                if gt_spec and gt_spec.mode == "accordo" and gt_spec.accordo_config:
+                    gt["accordo_config"] = gt_spec.accordo_config
+                    gt["source_library"] = gt_spec.source_library
+                    print(f"    Auto-discovered Accordo config for '{kname}' from {gt_spec.source_library}")
 
     return KernelStandaloneDefinition(
         kernel_path=kernel_path,
@@ -4911,10 +5252,12 @@ def _create_standalone_task_config(
         source_library=gt.get("source_library", ""),
         source_file=gt.get("source_file", ""),
     )
-    # For standalone, working_directory may come from CLI args directly
     correctness_cfg, gt_mode = build_correctness_config(tmp_spec)
     if gt_mode == "library_test" and gt.get("working_directory"):
         correctness_cfg["working_directory"] = gt["working_directory"]
+    # Remove empty working_directory so grader falls back to task_dir
+    if not correctness_cfg.get("working_directory"):
+        correctness_cfg.pop("working_directory", None)
 
     if gt_mode == "pytorch":
         correctness_cmd = f"{kernel_python} solution{ext}"
@@ -4923,7 +5266,7 @@ def _create_standalone_task_config(
         if ref_code:
             ref_path = task_dir / "reference.py"
             ref_preamble = "import torch\nimport math\n\n" if "torch" in ref_code and "import torch" not in ref_code else ""
-            ref_path.write_text(ref_preamble + ref_code)
+            ref_path.write_text(_fix_reference_imports(ref_preamble + ref_code))
             if shapes_code:
                 shapes_path = task_dir / "test_shapes.py"
                 input_func_name = gt.get("input_func_name", "")
@@ -5154,6 +5497,8 @@ Based on the research above, implement MULTIPLE optimization strategies. Common 
 ## IMPORTANT Constraints
 - Your solution must be functionally equivalent to the baseline (same inputs -> same outputs).
 - Do NOT modify files outside `{task_dir}/`.
+- Do NOT modify reference.py, testcase.py, or config.yaml -- these are integrity-checked and tampering results in score 0.
+- Only edit solution.{sol_ext} (your optimized kernel).
 - Do NOT add `if __name__ == "__main__":` blocks with fake benchmarks or `sys.exit(0)`.
 - Focus on real performance improvements, not just code style changes.
 - Include the kernel function with the same signature as the baseline.

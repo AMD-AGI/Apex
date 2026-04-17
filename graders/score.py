@@ -3,12 +3,12 @@
 """
 score.py — Shared scoring logic and Magpie helpers for the RL graders.
 
-AgentKernelArena scoring formula (kernel-level):
+Scoring formula (kernel-level):
   compiled    → +20 pts
   correct     → +100 pts
-  speedup S   → +S × 100 pts  (S = baseline_time / optimized_time ≥ 1.0)
+  speedup S   → 100 + (S-1)×200 for S≥1, max(0, 100S-50) for S<1
 
-  Total max (uncapped): 220+ pts per task
+  Reference score (compile+correct+2× speedup): 420 pts
 
 Magpie integration:
   - Primary: Python API via `Magpie` package (pip-installed)
@@ -320,6 +320,48 @@ def _detect_run_mode() -> str:
         return "local"
 
 
+VLLM_ROCM_IMAGE_DEFAULT = "vllm/vllm-openai-rocm:v0.19.0"
+
+
+def _ensure_docker_image(
+    benchmark_config_path: str | None,
+    docker_image: str = "",
+) -> str | None:
+    """Return a benchmark config path with docker_image set if missing.
+
+    Resolution order for the image tag:
+      1. ``docker_image`` argument (from ``--docker-image`` CLI / WorkloadConfig)
+      2. ``APEX_VLLM_ROCM_IMAGE`` environment variable
+      3. ``VLLM_ROCM_IMAGE_DEFAULT`` constant
+
+    If the benchmark config already has ``docker_image`` set, it is left
+    untouched (the user's explicit config always wins).
+    """
+    if not benchmark_config_path:
+        return benchmark_config_path
+    import yaml
+    cfg_path = Path(benchmark_config_path).resolve()
+    try:
+        data = yaml.safe_load(cfg_path.read_text()) or {}
+    except Exception:
+        return benchmark_config_path
+    bench = data.get("benchmark", {})
+    if bench.get("docker_image"):
+        return benchmark_config_path
+    framework = bench.get("framework", "").lower()
+    if framework != "vllm":
+        return benchmark_config_path
+    image = (
+        docker_image
+        or os.environ.get("APEX_VLLM_ROCM_IMAGE", "")
+        or VLLM_ROCM_IMAGE_DEFAULT
+    )
+    bench["docker_image"] = image
+    tmp = Path(tempfile.mkdtemp(prefix="apex_bench_cfg_")) / cfg_path.name
+    tmp.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+    return str(tmp)
+
+
 _BENCHMARK_PGIDS: set[int] = set()
 
 
@@ -443,6 +485,7 @@ def run_magpie_benchmark(
     input_len: int = 1024,
     output_len: int = 512,
     timeout: int = 1800,
+    docker_image: str = "",
 ) -> dict:
     """
     Run Magpie benchmark mode.
@@ -458,7 +501,8 @@ def run_magpie_benchmark(
     cmd = _magpie_bin()
 
     if benchmark_config_path:
-        abs_config = str(Path(benchmark_config_path).resolve())
+        effective_config = _ensure_docker_image(benchmark_config_path, docker_image)
+        abs_config = str(Path(effective_config).resolve())
         cmd += ["benchmark", "--benchmark-config", abs_config]
     else:
         cmd += [

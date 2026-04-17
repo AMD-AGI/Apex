@@ -177,18 +177,29 @@ class KnowledgeBase:
         return results[:top_k]
 
     def summarize_for_prompt(self, kernel_spec: str, kernel_type: str) -> str:
-        """Generate a markdown section summarizing past optimization insights."""
-        exact = self.query(kernel_spec=kernel_spec, min_speedup=1.0, top_k=3)
-        similar = self.query(kernel_type=kernel_type, min_speedup=1.0, top_k=3)
+        """Generate a markdown section summarizing past optimization insights.
 
-        if not exact and not similar:
+        Includes both successful strategies and failed attempts so agents
+        avoid repeating mistakes.
+        """
+        exact = self.query(kernel_spec=kernel_spec, min_speedup=0.0, top_k=5)
+        similar = self.query(kernel_type=kernel_type, min_speedup=0.0, top_k=5)
+
+        exact_success = [o for o in exact if o.correct and o.speedup >= 1.0]
+        exact_failed = [o for o in exact if not o.correct or o.speedup < 1.0]
+        similar_success = [
+            o for o in similar
+            if o.kernel_spec != kernel_spec and o.correct and o.speedup >= 1.0
+        ]
+
+        if not exact_success and not exact_failed and not similar_success:
             return ""
 
-        lines = ["\n## What Worked Before (Knowledge Base)\n"]
+        lines = ["\n## Optimization History (Knowledge Base)\n"]
 
-        if exact:
-            lines.append(f"### Prior optimizations for `{kernel_spec}`:")
-            for o in exact:
+        if exact_success:
+            lines.append(f"### What worked for `{kernel_spec}`:")
+            for o in exact_success[:3]:
                 lines.append(
                     f"- **{o.speedup:.2f}x** using {o.strategy_used}: "
                     f"{o.strategy_description} ({o.agent_model}, {o.timestamp[:10]})"
@@ -196,17 +207,23 @@ class KnowledgeBase:
                 if o.key_insight:
                     lines.append(f"  - Insight: {o.key_insight}")
 
-        if similar:
-            type_results = [o for o in similar if o.kernel_spec != kernel_spec]
-            if type_results:
-                lines.append(f"\n### Insights from other `{kernel_type}` kernels:")
-                for o in type_results[:3]:
-                    lines.append(
-                        f"- `{o.kernel_spec}` achieved **{o.speedup:.2f}x** "
-                        f"using {o.strategy_used}: {o.strategy_description}"
-                    )
-                    if o.key_insight:
-                        lines.append(f"  - Insight: {o.key_insight}")
+        if exact_failed:
+            lines.append(f"\n### What FAILED for `{kernel_spec}` (avoid these):")
+            for o in exact_failed[:3]:
+                lines.append(
+                    f"- {o.strategy_used}: {o.strategy_description} "
+                    f"({o.agent_model}, {o.timestamp[:10]})"
+                )
+
+        if similar_success:
+            lines.append(f"\n### Insights from other `{kernel_type}` kernels:")
+            for o in similar_success[:3]:
+                lines.append(
+                    f"- `{o.kernel_spec}` achieved **{o.speedup:.2f}x** "
+                    f"using {o.strategy_used}: {o.strategy_description}"
+                )
+                if o.key_insight:
+                    lines.append(f"  - Insight: {o.key_insight}")
 
         return "\n".join(lines) + "\n"
 
@@ -249,13 +266,24 @@ class KnowledgeBase:
         agent_model: str = "",
         solution_code: str = "",
     ) -> None:
-        """Record an optimization outcome from a KernelOptResult dict."""
-        if not opt_result_dict.get("correct"):
-            return
-        if opt_result_dict.get("speedup", 0) <= 0:
+        """Record an optimization outcome from a KernelOptResult dict.
+
+        Records both successful and failed attempts so future runs can learn
+        from what didn't work.
+        """
+        correct = opt_result_dict.get("correct", False)
+        speedup = opt_result_dict.get("speedup", 0)
+
+        if not correct and not solution_code:
             return
 
-        strategy, desc, tags = _infer_strategy(solution_code)
+        strategy, desc, tags = _infer_strategy(solution_code) if solution_code else (
+            "unknown", "No solution produced", ["failed"]
+        )
+
+        if not correct:
+            desc = f"FAILED ({opt_result_dict.get('error', 'incorrect results')[:100]}): {desc}"
+            tags = ["failed"] + tags
 
         outcome = OptimizationOutcome(
             kernel_spec=opt_result_dict.get("kernel_spec", ""),
@@ -263,8 +291,8 @@ class KnowledgeBase:
             gpu_arch=gpu_arch,
             strategy_used=strategy,
             strategy_description=desc,
-            speedup=opt_result_dict.get("speedup", 0),
-            correct=True,
+            speedup=speedup if correct else 0.0,
+            correct=correct,
             score=opt_result_dict.get("score", 0),
             agent_model=agent_model,
             timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),

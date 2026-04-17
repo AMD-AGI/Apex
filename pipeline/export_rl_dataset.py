@@ -390,7 +390,7 @@ def export(
                 if include_sft:
                     all_sft.extend(_trajectory_to_sft_pairs(record))
             except Exception as e:
-                _log.debug("trajectory parse failed for %s: %s", tfile, e)
+                _log.debug("trajectory parse failed for %s: %s", traj_file, e)
 
     # Load extra trajectory files
     for extra in (extra_files or []):

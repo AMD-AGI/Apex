@@ -468,7 +468,7 @@ types (e.g. `fused_moe` → pytorch, `kv_cache_ops` → library_test).
 ### Core Modules
 
 - **`prompts/`** — Generates task prompts for (model, kernel, GPU arch) combinations
-  - `models.py`: Registry of 20 open-source LLMs (Llama 3, DeepSeek, Qwen, Mistral, etc.; includes openai/gpt-oss-120b and  openai/gpt-oss-20b)
+  - `models.py`: Registry of 21 open-source LLMs (Llama 3, DeepSeek, Qwen, Mistral, Kimi K2, GPT OSS 120B, etc.)
   - `configs.py`: Inference config presets (batch sizes, dtypes, tensor parallelism)
   - `kernel_prompt.py`: Constructs prompts for 12 kernel types (flash_attn, fused_moe, gemm_w8a8, rms_norm, etc.)
   - `model_prompt.py`: End-to-end model optimization prompts

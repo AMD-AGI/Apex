@@ -34,7 +34,7 @@ class ModelConfig:
 
 
 # ── Model registry ─────────────────────────────────────────────────────────────
-# 19 models; ~15 distinct kernel shapes for good RL diversity.
+# 21 models; ~15 distinct kernel shapes for good RL diversity.
 
 MODELS: list[ModelConfig] = [
 
@@ -265,6 +265,38 @@ MODELS: list[ModelConfig] = [
         context_len=128_000,
         frameworks=["vllm"],
         notes="GPT OSS 120B MoE; FP4 primary; fused_moe + paged_attn_decode + GEMM critical path; TP=8 MI355X",
+    ),
+    ModelConfig(
+        hf_id="openai/gpt-oss-20b",
+        family="gpt_oss", params_b=20.9,
+        attention="gqa",    num_heads=64, num_kv_heads=8,  head_dim=128,
+        hidden_dim=2880,    num_layers=24,
+        mlp_type="moe",     num_experts=32, active_experts=4,
+        context_len=128_000,
+        frameworks=["vllm"],
+        notes="GPT OSS 20B MoE (3.6B active); FP4 primary; TP=1 MI355X",
+    ),
+
+    # ── Qwen 3.5 ──────────────────────────────────────────────────────────
+    ModelConfig(
+        hf_id="Qwen/Qwen3.5-27B",
+        family="qwen", params_b=27,
+        attention="gqa",    num_heads=24, num_kv_heads=4,  head_dim=256,
+        hidden_dim=4096,    num_layers=64,
+        mlp_type="dense",   num_experts=0, active_experts=0,
+        context_len=262_144,
+        frameworks=["vllm"],
+        notes="Qwen3.5 27B dense; hybrid GatedDeltaNet+GQA; BF16; TP=1 MI355X",
+    ),
+    ModelConfig(
+        hf_id="Qwen/Qwen3.5-35B-A3B",
+        family="qwen", params_b=35,
+        attention="gqa",    num_heads=16, num_kv_heads=2,  head_dim=256,
+        hidden_dim=2048,    num_layers=40,
+        mlp_type="moe",     num_experts=256, active_experts=8,
+        context_len=262_144,
+        frameworks=["vllm"],
+        notes="Qwen3.5 35B MoE (3B active); 256 experts top-8 + 1 shared; BF16; TP=1 MI355X",
     ),
 ]
 

@@ -388,3 +388,47 @@ class TestBuildModelPrompt:
         result = build_model_prompt(model, cfg, framework="sglang")
         text = result["prompt"].lower()
         assert "throughput" in text or "tok/s" in text or "performance" in text
+
+
+class TestPromptImprovements:
+    """Tests verifying hardened prompt content."""
+
+    def test_system_prompt_has_speedup_ranges(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        import workload_optimizer
+        assert "REALISTIC SPEEDUP RANGES" in workload_optimizer.SYSTEM_PROMPT
+
+    def test_system_prompt_no_main_requirement(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        import workload_optimizer
+        assert "__main__ block that runs" not in workload_optimizer.SYSTEM_PROMPT
+
+    def test_system_prompt_importable(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        import workload_optimizer
+        assert "importable" in workload_optimizer.SYSTEM_PROMPT
+
+    def test_workflow_has_check_performance_true(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        import workload_optimizer
+        assert "check_performance=true" in workload_optimizer.SYSTEM_PROMPT
+
+    def test_kernel_prompt_has_check_performance_true(self):
+        from kernel_prompt import KERNEL_PROMPT_TEMPLATE
+        assert "check_performance=true" in KERNEL_PROMPT_TEMPLATE
+
+    def test_claude_allowed_tools_has_kernel_perf(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "agents"))
+        import importlib
+        import backends
+        importlib.reload(backends)
+        src = Path(backends.__file__).read_text()
+        assert "mcp__kernel-perf__" in src or "kernel-perf" in src
+
+    def test_claude_allowed_tools_has_asm_tools(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "agents"))
+        import importlib
+        import backends
+        importlib.reload(backends)
+        src = Path(backends.__file__).read_text()
+        assert "mcp__asm-tools__" in src or "asm-tools" in src

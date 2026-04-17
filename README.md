@@ -1,4 +1,4 @@
-# RL Environment for Kernel Optimization
+# Apex — GPU Kernel Optimization Pipeline
 
 > **License Notice**
 >
@@ -17,36 +17,124 @@
 > |---|---|---|
 > | **Claude Code** | Anthropic | An active [Anthropic account](https://console.anthropic.com/) and acceptance of [Anthropic's usage policies](https://www.anthropic.com/legal/usage-policy) |
 > | **OpenAI Codex** | OpenAI | An active [OpenAI account](https://platform.openai.com/) and acceptance of [OpenAI's terms of service](https://openai.com/policies/terms-of-use) |
+> | **Cursor Agent** | Cursor | An active [Cursor](https://cursor.com/) subscription with agent mode enabled |
 >
 > Each user must independently obtain their own credentials and comply with the respective provider's licensing and usage terms. **This project does not include, bundle, or sublicense access to any AI model or API.** Usage of these agents may incur costs billed directly by the provider.
 
 ---
 
-An RL training environment that tasks an LLM agent with optimizing GPU kernels for AMD ROCm hardware. The agent is given a baseline kernel, a sandbox with relevant source code and documentation, and is scored on compilation, correctness, and runtime speedup.
+An RL training environment that tasks an LLM agent with optimizing GPU kernels for AMD ROCm hardware. The agent receives a baseline kernel, a sandbox with relevant source code and documentation, and is scored on compilation, correctness, and runtime speedup.
 
-## Overview
+## How It Works
 
 ```
-prompt constructor  →  LLM agent  →  output/  →  grader  →  score
+baseline kernel  →  prompt constructor  →  LLM agent  →  grader (Magpie)  →  score + reinjection
 ```
 
-1. **Prompt constructor** — generates a task prompt for a specific (model, kernel) pair targeting a particular GPU architecture (default: MI355X / gfx950)
-2. **LLM agent** — reads the existing kernel, writes an optimized version to `output/<task_id>/solution.{py,hip}`, and produces a Magpie evaluation config
-3. **Grader** — calls [Magpie](https://github.com/AMD-AGI/Magpie) to check compilation, correctness (unit tests), and measure speedup
-4. **Score** — `+20 pts` compiled, `+100 pts` correct, `+speedup × 100 pts` performance
+1. **Benchmark** — profile the model end-to-end to identify bottleneck kernels
+2. **Identify** — rank kernels by GPU time and select candidates
+3. **Optimize** — an LLM agent writes an optimized kernel in `output/<task_id>/solution.{py,hip}`
+4. **Grade** — [Magpie](https://github.com/AMD-AGI/Magpie) checks compilation, correctness, and measures speedup
+5. **Integrate** — kernels exceeding the speedup threshold (>1.05×) are hot-patched into site-packages
+6. **Benchmark (final)** — re-run E2E benchmark with patches to measure real throughput improvement
+7. **Score & Report** — compute rewards, update leaderboard, generate report
+
+## Quick Start
+
+### Prerequisites
+
+- **OS:** Linux (Ubuntu 22.04+ recommended)
+- **Python:** 3.10+
+- **Node.js:** 18+ (for agent CLIs)
+- **System packages:** `git`, `curl`, `jq`
+- **GPU (optional):** AMD Instinct GPU with ROCm 6.x+ (required for real kernel grading; not needed for CPU-only eval)
+
+### 1. Clone the Repository
+
+```bash
+git clone <repo-url> Apex
+cd Apex
+```
+
+### 2. Install at Least One Agent CLI
+
+Install whichever agent(s) you plan to use:
+
+```bash
+# Claude Code
+npm install -g @anthropic-ai/claude-code
+claude login
+
+# OpenAI Codex
+npm install -g @openai/codex
+codex login
+
+# Cursor Agent (standalone CLI)
+npm install -g cursor-agent
+cursor-agent login
+
+# Cursor IDE (alternative — open Apex folder in Cursor; MCP servers auto-configure via .mcp.json)
+```
+
+### 3. Run Setup
+
+```bash
+bash setup.sh
+```
+
+This single command handles everything:
+
+1. **CLI selection** — choose Claude Code, Codex, Cursor Agent, or all
+2. **Python venv** — creates `.venv/` (or reuses an existing one)
+3. **Python dependencies** — installs numpy, PyYAML, pytest, MCP packages, SDKs, etc.
+4. **PyTorch for ROCm** — installs `torch` + `torchvision` from the ROCm 7.2 wheel index
+5. **Triton** — installs the Triton compiler
+6. **ROCm source repos** — clones AMD kernel source code into `tools/rocm/` (optional, for source-finder & RAG)
+7. **Documentation** — downloads AMD architecture PDFs for the RAG server (optional)
+8. **MCP servers** — installs and registers 5 MCP servers with the selected CLI(s)
+9. **Magpie** — clones and installs the kernel evaluation framework into `tools/magpie/`
+10. **Skills** — makes 13 domain-specific optimization skills discoverable by agents
+11. **`.mcp.json`** — generates workspace config so Cursor IDE auto-discovers MCP servers
+
+#### Setup Flags
+
+```bash
+bash setup.sh                     # Interactive (prompts for choices)
+bash setup.sh --non-interactive   # Auto-detect CLIs, accept all defaults
+bash setup.sh --skip-downloads    # Skip ROCm repo cloning + doc downloads
+bash setup.sh --skip-tools        # Skip MCP + Magpie installation
+bash setup.sh --venv=/path/.venv  # Use a specific venv path
+```
+
+### 4. Activate and Run
+
+```bash
+source .venv/bin/activate
+export MAGPIE_ROOT=$(pwd)/tools/magpie
+
+# Interactive agent session
+claude                # or: codex / cursor-agent
+
+# Automated pipeline
+python3 workload_optimizer.py run \
+  -r ./results \
+  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml \
+  --kernel-types triton --top-k 10 \
+  --max-iterations 3 --max-turns 25 --leaderboard
+```
 
 ## Repository Structure
 
 ```
 Apex/
-├── workload_optimizer.py    # Main pipeline CLI (benchmark → identify → optimize → grade → integrate → score → report)
-├── eval.py                  # End-to-end mini eval (CPU, no GPU required)
+├── workload_optimizer.py    # Main pipeline CLI
+├── eval.py                  # Mini eval (CPU-only, no GPU required)
 ├── setup.sh                 # One-shot environment setup
-├── knowledge_base.json      # Persistent cross-run optimization knowledge
-├── mcp_config.json          # MCP server configuration (5 bundled servers)
+├── mcp_config.json          # MCP server configuration
+├── .mcp.json                # Auto-generated by setup.sh (MCP config for Cursor IDE)
 │
 ├── agents/
-│   └── backends.py          # Claude Code SDK + Codex CLI agent runner
+│   └── backends.py          # Claude Code SDK + Codex + Cursor Agent runner
 │
 ├── pipeline/
 │   ├── knowledge_base.py    # Cross-kernel/cross-run learning store
@@ -57,15 +145,15 @@ Apex/
 │   └── export_rl_dataset.py # RL/SFT dataset export from trajectories
 │
 ├── prompts/
-│   ├── models.py            # Registry of 20 open-source LLMs (Llama, DeepSeek, Qwen, GPT OSS 120B, …)
-│   ├── configs.py           # 17 inference configurations (MLPerf, InferenceMAX, custom)
-│   ├── kernel_prompt.py     # Kernel-level prompt constructor (model × kernel pairs)
-│   └── model_prompt.py      # Model-level prompt constructor (end-to-end eval)
+│   ├── models.py            # Model registry (Qwen3.5, GPT-OSS, etc.)
+│   ├── configs.py           # 17 inference configurations
+│   ├── kernel_prompt.py     # Kernel-level prompt constructor
+│   └── model_prompt.py      # Model-level prompt constructor
 │
 ├── graders/
 │   ├── score.py             # Scoring formula + Magpie helpers
-│   ├── kernel_grader.py     # Grades kernel-level output/ tasks via Magpie
-│   ├── model_grader.py      # Grades end-to-end model throughput via Magpie
+│   ├── kernel_grader.py     # Grades kernel tasks via Magpie
+│   ├── model_grader.py      # Grades E2E model throughput via Magpie
 │   ├── ground_truth.py      # ROCm kernel discovery + ground truth specs
 │   ├── config_generator.py  # Magpie config.yaml generation + validation
 │   └── cache_manager.py     # Cache isolation for reproducible grading
@@ -73,164 +161,312 @@ Apex/
 ├── tools/
 │   ├── setup_tools.sh       # Installs Magpie, MCP servers, skills
 │   ├── skills/              # 13 domain skills (SKILL.md files)
-│   ├── mcps/                # MCP server source (source-finder, rag, fusion-advisor, gpu-info)
+│   ├── mcps/                # MCP server source
 │   └── jsons/               # ROCm metadata indexes
 │
 ├── files/
-│   ├── setup_files.sh       # Clones ROCm repos and downloads documentation
+│   ├── setup_files.sh       # Clones ROCm repos and downloads docs
 │   ├── hip_best_practices.md
 │   └── triton_best_practices.md
 │
-├── tests/                   # pytest suite for all components
+├── tests/                   # pytest suite
 │
-└── output/                  # Agent writes all solutions here (git-ignored)
+└── output/                  # Agent solutions (git-ignored)
     └── <task_id>/
         ├── solution.py / solution.hip
-        ├── config.yaml       # Magpie evaluation config
+        ├── config.yaml
         └── …
 ```
 
-## Setup
+## Usage
 
-**Requirements:** Python 3.10+, `git`, `curl`. AMD GPU with ROCm optional (needed only for real kernel grading).
+### Full Pipeline (Automated)
 
-```bash
-# Full setup: venv, dependencies, ROCm repos, Magpie + RAG tool
-bash setup.sh
-
-# Skip cloning repos and downloading docs (faster for development)
-bash setup.sh --skip-downloads
-
-# Skip Magpie + RAG tool install
-bash setup.sh --skip-tools
-
-# Custom venv path
-bash setup.sh --venv=/path/to/.venv
-```
-
-Activate the environment:
+Run the entire optimization loop end-to-end:
 
 ```bash
 source .venv/bin/activate
+export MAGPIE_ROOT=$(pwd)/tools/magpie
+
+RESULTS=./results
+BENCH_CONFIG=$MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml
+
+python3 workload_optimizer.py run \
+  -r $RESULTS \
+  -b $BENCH_CONFIG \
+  --kernel-types triton \
+  --top-k 10 \
+  --max-iterations 3 \
+  --max-turns 25 \
+  --leaderboard
 ```
 
-**Environment variable required for the agent:**
+### Step-by-Step Pipeline
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+# 1. Benchmark (or --skip-benchmark <path-to-existing-report.json>)
+python3 workload_optimizer.py benchmark -r $RESULTS -b $BENCH_CONFIG
+
+# 2. Identify top bottleneck kernels
+python3 workload_optimizer.py identify -r $RESULTS --kernel-types triton --top-k 10
+
+# 3. List identified kernels
+python3 workload_optimizer.py list-kernels -r $RESULTS
+
+# 4. Optimize all identified kernels
+python3 workload_optimizer.py optimize -r $RESULTS --max-iterations 3 --max-turns 25
+
+# 5. Integrate winners (auto-filters to >5% speedup)
+python3 workload_optimizer.py integrate -r $RESULTS
+
+# 6. Final E2E benchmark with optimized kernels
+python3 workload_optimizer.py benchmark-final -r $RESULTS -b $BENCH_CONFIG
+
+# 7. Score + trajectory + leaderboard
+python3 workload_optimizer.py score -r $RESULTS --leaderboard
+
+# 8. Generate report + replication guide
+python3 workload_optimizer.py report -r $RESULTS -b $BENCH_CONFIG
 ```
 
-## Agent CLI Installation
+### Standalone Kernel Optimization
 
-Apex uses an LLM agent (Claude Code or OpenAI Codex) to optimize kernels. Install at least one CLI before running `setup.sh`.
-
-### Install Claude Code CLI
+Optimize a single kernel without running the full pipeline:
 
 ```bash
-npm install -g @anthropic-ai/claude-code
-claude login
+python3 workload_optimizer.py optimize-kernel \
+  -r ./results \
+  --kernel path/to/baseline_kernel.py \
+  --kernel-name rms_norm \
+  --kernel-type triton \
+  --agent-backend cursor \
+  --max-iterations 3 --max-turns 25
 ```
 
-### Install Codex CLI
+Correctness modes for standalone optimization:
 
 ```bash
-npm install -g @openai/codex
-codex login
+# PyTorch reference (default) — validates against a PyTorch implementation
+--correctness-mode pytorch
+
+# Library test — runs the original library's unit test suite
+--correctness-mode library_test
+
+# Accordo — HSA-level validation for HIP/C++ kernels
+--correctness-mode accordo
 ```
 
-### What `setup.sh` does
+### Interactive Agent Mode
 
-Running `bash setup.sh` from the Apex project root is the single command needed to get everything configured. The script is interactive and walks you through each step:
-
-1. **CLI selection** — prompts you to choose Claude Code, Codex, or both
-2. **Prerequisite checks** — verifies the selected CLI(s) are installed, locates or creates a Python venv
-3. **ROCm repos & docs** (optional) — offers to clone AMD ROCm source repos into `tools/rocm/` and download architecture documentation PDFs into `tools/doc/`, used by the source-finder and RAG MCP servers
-4. **MCP Python dependencies** — installs each MCP server's Python packages into the venv (including cloning and setting up Magpie)
-5. **MCP server registration** — registers all 5 MCP servers (`source-finder`, `kernel-rag`, `gpu-info`, `fusion-advisor`, `magpie`) with the selected CLI(s) so the agent can call them at runtime
-6. **Skill installation** — makes 13 domain skills (Triton optimization, HIP tuning, architecture guides, etc.) discoverable by the agent. For Claude Code this relies on `CLAUDE.md`; for Codex the skills are symlinked into `$CODEX_HOME/skills/`
-7. **Results directory** — creates the output directory for pipeline state, trajectories, and leaderboard data
-8. **Verification & summary** — lists registered MCPs, prints configured paths, and shows ready-to-run commands for both interactive and automated usage
-
-After setup completes you can launch the agent interactively:
+Launch the agent directly for exploratory optimization:
 
 ```bash
 # Claude Code
 cd Apex && claude
 
-# Codex
+# OpenAI Codex
 cd Apex && codex
+
+# Cursor Agent (standalone CLI)
+cd Apex && cursor-agent
+
+# Cursor IDE (open Apex folder — MCP servers auto-configure via .mcp.json)
+cursor .
 ```
 
-Or run the automated pipeline directly (no interactive agent):
+### Agent-Driven Kernel Optimization Examples
+
+These prompts are tested and work end-to-end. Open the Claude Code CLI from the Apex directory and paste a prompt:
+
+```
+Run the full optimization pipeline for Qwen3.5 27B with these settings:
+triton kernels only, top 3 bottleneck kernels, 3 optimization iterations,
+max 25 agent turns per iteration, claude agent backend, and leaderboard enabled.
+Set HF_HOME=/mnt/dcgpuval/sirafati/hf before running.
+Show the final score comparison and generate a report when done.
+```
+
+```
+Run the full optimization pipeline for GPT OSS 20B with these settings:
+triton kernels only, top 3 bottleneck kernels, 3 optimization iterations,
+max 25 agent turns per iteration, claude agent backend, and leaderboard enabled.
+Show the final score comparison and generate a report when done.
+```
+
+```
+Optimize the rms_norm Triton kernel on MI355X.
+Write the solution to output/ and grade it when done. Show the score breakdown.
+```
+
+The agent reads `CLAUDE.md` / `AGENTS.md`, discovers MCP tools, and translates the prompt into the correct `workload_optimizer.py` commands.
+
+**How to use:**
 
 ```bash
-source .venv/bin/activate
-export MAGPIE_ROOT=tools/magpie
-python3 workload_optimizer.py run \
-  -r $RESULTS_DIR \
-  -b $MAGPIE_ROOT/examples/benchmark_vllm_gptoss_120b.yaml \
-  --kernel-types triton --top-k 10 \
-  --max-iterations 3 --max-turns 25 --leaderboard
+# Open Claude Code from the Apex directory, then paste any prompt above:
+cd Apex && claude
 ```
 
-## Quick Start
+**Equivalent direct commands** (what the agent executes under the hood):
 
-### Run the mini eval (no GPU required)
+```bash
+# Full pipeline for Qwen3.5 27B
+python3 workload_optimizer.py run \
+  -r ./results_qwen35_27b \
+  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_qwen35_27b.yaml \
+  --kernel-types triton --top-k 3 \
+  --max-iterations 3 --max-turns 25 \
+  --agent-backend claude --leaderboard
+
+# Full pipeline for GPT-OSS-20B
+python3 workload_optimizer.py run \
+  -r ./results_gptoss_20b \
+  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_20b.yaml \
+  --kernel-types triton --top-k 3 \
+  --max-iterations 3 --max-turns 25 \
+  --agent-backend claude --leaderboard
+
+# Standalone kernel optimization
+python3 workload_optimizer.py optimize-kernel \
+  -r ./results \
+  --kernel tools/rocm/aiter/aiter/ops/triton/normalization/rmsnorm.py \
+  --kernel-name rms_norm --kernel-type triton \
+  --correctness-mode pytorch \
+  --agent-backend claude \
+  --max-iterations 1 --max-turns 10
+```
+
+### Mini Eval (No GPU Required)
 
 Exercises the full pipeline on a CPU-only task (naive Python RMSNorm → NumPy):
 
 ```bash
-# One-time: Agent SDK + numpy + PyYAML (use your Apex venv)
-uv pip install -r requirements-eval.txt
+pip install -r requirements-eval.txt
 
-# Uses the Claude API to write an optimized solution
-python3 eval.py
-
-# Skip the API call; write a trivial numpy solution and grade it
-python3 eval.py --dry-run
-
-# Use a different model or increase turn budget
+python3 eval.py              # Uses Claude API
+python3 eval.py --dry-run    # Skip API call, grade a trivial solution
 python3 eval.py --model claude-opus-4-6 --max-turns 12
 ```
 
-### Run the test suite
+### Explore Prompts
+
+```bash
+python3 prompts/kernel_prompt.py --list                          # List all kernel task IDs
+python3 prompts/kernel_prompt.py --task-id llama-3-1-8b-instruct__rms_norm  # Print a single prompt
+python3 prompts/kernel_prompt.py --all > prompts.jsonl             # Dump all as JSONL
+python3 prompts/kernel_prompt.py --target gfx942 --list            # Target a specific GPU
+```
+
+### Grade Output Tasks
+
+```bash
+python3 graders/kernel_grader.py    # Grade all kernel tasks in output/
+python3 graders/model_grader.py     # Grade model-level tasks
+```
+
+### Export RL/SFT Datasets
+
+```bash
+# Export trajectory data as RL training tasks
+python3 workload_optimizer.py export-rl -r ./results --export-output-dir ./datasets
+
+# Include SFT warm-start pairs
+python3 workload_optimizer.py export-rl -r ./results --export-output-dir ./datasets --sft
+```
+
+### Run Tests
 
 ```bash
 pytest tests/ -v
+pytest tests/test_prompts.py -v     # Prompt tests only
+pytest tests/test_graders.py -v     # Grader tests only
 ```
 
-### Explore the prompt space
+## Pipeline Options
+
+### Agent Backend
 
 ```bash
-# List all kernel task IDs
-python3 prompts/kernel_prompt.py --list
-
-# Print a single kernel prompt
-python3 prompts/kernel_prompt.py --task-id llama-3-1-8b-instruct__flash_attn_prefill
-
-# Dump all kernel prompts as JSONL
-python3 prompts/kernel_prompt.py --all > all_kernel_prompts.jsonl
-
-# Target a specific GPU arch (default: gfx950 / MI355X)
-python3 prompts/kernel_prompt.py --target gfx942 --framework vllm --list
-
-# Same for model-level prompts
-python3 prompts/model_prompt.py --list
+--agent-backend claude         # Use Claude Code (default)
+--agent-backend codex          # Use OpenAI Codex
+--agent-backend cursor         # Use Cursor Agent
 ```
 
-### Grade output tasks
+### Docker Image Override
+
+The pipeline runs E2E benchmarks inside Docker containers. Override the vLLM image:
 
 ```bash
-# Grade all kernel tasks in output/
-python3 graders/kernel_grader.py
-
-# Grade model-level tasks
-python3 graders/model_grader.py
+--docker-image vllm/vllm-openai-rocm:v0.19.0
 ```
+
+Or set the environment variable:
+
+```bash
+export APEX_VLLM_ROCM_IMAGE=vllm/vllm-openai-rocm:v0.19.0
+```
+
+### Benchmark Caching
+
+Cache E2E baseline results to skip the ~30-minute benchmark on repeat runs:
+
+```bash
+--benchmark-cache-hours 4
+```
+
+### Parallel Kernel Optimization
+
+When using the `run` subcommand (full pipeline), optimize up to N kernels simultaneously
+(agent reasoning is API-bound; GPU grading is serialized):
+
+```bash
+python3 workload_optimizer.py run ... --parallel-kernels 2
+```
+
+Note: the standalone `optimize` subcommand processes kernels sequentially regardless of this flag.
+
+### Agent Model Routing
+
+Assign different models based on kernel difficulty:
+
+```bash
+--agent-model-simple claude-sonnet-4-20250514 \
+--agent-model-complex claude-opus-4-6
+```
+
+### Anti-Tampering
+
+AST-based detection penalizes solutions that fake benchmark results (`sys.exit()`, hardcoded `PASS`, fabricated timings). Configure the speedup cap:
+
+```bash
+--tampering-speedup-cap 1.0
+```
+
+## Scoring
+
+```
+score = compiled × 20  +  correct × 100  +  speedup_score(S)
+```
+
+Where `S = baseline_time / optimized_time`. Only compiled + correct solutions earn the speedup component.
+
+- **Compiled** (+20 pts): solution imports and defines the expected function
+- **Correct** (+100 pts): passes all unit tests against the baseline
+- **Speedup** (piecewise):
+  - S ≥ 1.0: `100 + (S − 1) × 200` pts (e.g. 1.2× → 140, 2× → 300, 3× → 500)
+  - S < 1.0: `max(0, 100 × S − 50)` pts (regression penalty)
+
+### Model-Level Reward
+
+```
+reward = 0.7 × normalized_kernel_score  +  0.3 × (optimized_tps / baseline_tps − 1)
+```
+
+Kernel score is normalized to [0, 1] against a reference of 420 pts (compile + correct + 2× speedup). Model-level grading requires a full AMD GPU environment.
 
 ## Target Hardware
 
-The default target is the **AMD Instinct MI355X (gfx950 / CDNA4)**. Other supported architectures:
+Default target: **AMD Instinct MI355X (gfx950 / CDNA4)**.
 
 | `--target` | Hardware |
 |---|---|
@@ -241,17 +477,98 @@ The default target is the **AMD Instinct MI355X (gfx950 / CDNA4)**. Other suppor
 
 The GPU is auto-detected via `rocm-smi` if available; otherwise falls back to gfx950.
 
+## Kernel Reintegration (Hot-Patching)
+
+When the pipeline integrates optimized kernels for the final E2E benchmark, it hot-patches installed Python modules in site-packages. All patches are restored after benchmarking.
+
+**Supported (hot-patching):**
+
+- **aiter, vllm, sglang** — Python/Triton `.py` kernels can be replaced in site-packages. Triton JIT re-compiles automatically on next invocation.
+- **aiter HIP** — Standalone `.so` files can be recompiled with `hipcc` and swapped.
+
+**Not supported (requires source rebuild):**
+
+- **System C/C++ libraries** — hipBLASLt, rocBLAS, composable_kernel (CK), MIOpen, rccl are system-level shared libraries that cannot be individually hot-patched.
+- **Monolithic `_C.so`** — vLLM, sglang, and PyTorch HIP kernels compile into a single binary and cannot be individually replaced.
+
+## MCP Servers
+
+Apex ships with 5 MCP servers that give agents access to domain-specific tools:
+
+| MCP | Key tools | Purpose |
+|-----|-----------|---------|
+| **source-finder** | `find_kernel_source`, `classify_kernel` | Search kernel implementations across ROCm repos |
+| **kernel-rag** | `search_kernel_optimization`, `get_optimization_playbook` | Optimization patterns, snippets, domain analysis |
+| **gpu-info** | `get_gpu_info`, `get_arch_optimization_hints` | MI355X / CDNA4 specs and optimization hints |
+| **fusion-advisor** | `detect_fusion_opportunities`, `generate_fused_kernel` | Kernel fusion detection and code generation |
+| **magpie** | `analyze`, `compare`, `benchmark` | Kernel correctness/performance evaluation |
+
+MCP servers are auto-configured for:
+- **Claude Code** — registered via `claude mcp add` during setup
+- **Codex** — registered via `codex mcp add` during setup
+- **Cursor IDE** — auto-discovered from `.mcp.json` in the project root (no manual registration needed)
+
+## Prompt Architecture
+
+Apex uses a two-layer prompt system when agents optimize kernels:
+
+**System prompt** (`SYSTEM_PROMPT` in `workload_optimizer.py`) defines the agent's role and constraints:
+- GPU kernel engineer persona with AMD ROCm specialization
+- MCP tool inventory and when to use each tool
+- Skill paths (13 `SKILL.md` files the agent can read for domain knowledge)
+- Mandatory compare-before-submit workflow via Magpie
+- Speedup calibration guidance and anti-tampering rules
+
+**Task prompt** (`KERNEL_PROMPT_TEMPLATE` in `prompts/kernel_prompt.py`) is built per-kernel with:
+
+| Section | Content |
+|---------|---------|
+| Target hardware | GPU arch, wavefront size, MFMA units, LDS, HBM bandwidth |
+| Task definition | Kernel type, model architecture, framework (vLLM/SGLang) |
+| Source locations | Paths to baseline implementations in `tools/rocm/` (aiter, CK, etc.) |
+| MCP tools table | Available tools for source search, RAG, GPU info, fusion, Magpie |
+| Skills table | 13 domain-specific optimization skills the agent can read |
+| Instructions | Step-by-step: locate baseline, analyze bottlenecks, write `solution.py` |
+| Optimization hints | Architecture-specific tips (e.g. MFMA usage, LDS tiling for CDNA4) |
+
+When running via the full pipeline, the prompt is further enriched with:
+- **Baseline source code** inlined as markdown
+- **Profiling data** (GPU time %, bound type, bandwidth/compute utilization)
+- **Knowledge base insights** from prior optimization runs
+- **Correctness reference** (PyTorch reference code or library test commands)
+
+Preview any task prompt:
+
+```bash
+python3 prompts/kernel_prompt.py --task-id llama-3-1-8b-instruct__rms_norm
+```
+
+## Kernels with Library Test Coverage
+
+These kernels have explicit library test commands in the ground truth registry, enabling `--correctness-mode library_test` for validation against aiter's own pytest suite:
+
+| Kernel | Test command | Type |
+|--------|-------------|------|
+| `silu_mul` | `pytest aiter/op_tests/triton_tests/test_activation.py` | memory-bound |
+| `gemm_bf16` | `pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py` | compute-bound |
+| `gemm_w8a8` | `pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py` | compute-bound |
+| `act_quant_fp8` | `pytest aiter/op_tests/triton_tests/quant/test_quant.py` | memory-bound |
+| `kv_cache_ops` | `pytest aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py` | memory-bound |
+| `all_reduce` | `pytest aiter/op_tests/multigpu_tests/test_quick_all_reduce.py` | comms |
+
 ## Model Registry
 
-19 open-source models covering a range of architectures:
+21 models covering a range of architectures:
 
 | Family | Models | Attention | MLP |
 |---|---|---|---|
 | Llama 3 | 1B, 8B, 70B (×2) | GQA | Dense |
 | Mistral / Mixtral | 7B, 8×7B, 8×22B | GQA | Dense / MoE |
 | Qwen 2.5 | 7B, 32B, 72B, Coder-32B | GQA | Dense |
-| Gemma 2 | 9B, 27B | MHA | Dense |
+| Gemma 2 | 9B, 27B | GQA | Dense |
 | DeepSeek | R1 (671B), V3 (671B), R1-Distill-70B | MLA / GQA | MoE / Dense |
+| Kimi | K2-Thinking | MLA | MoE |
+| GPT OSS | 120B | GQA | MoE |
 | Phi | 3.5-mini, phi-4 | GQA | Dense |
 | Falcon | 7B | MQA | Dense |
 
@@ -261,7 +578,7 @@ The GPU is auto-detected via `rocm-smi` if available; otherwise falls back to gf
 
 | Kernel | Framework | Notes |
 |---|---|---|
-| `flash_attn_prefill` | Triton | Flash attention for the prompt (prefill) phase |
+| `flash_attn_prefill` | Triton | Flash attention for prompt (prefill) phase |
 | `paged_attn_decode` | Triton | Paged attention for autoregressive decoding |
 | `mla_attn` | Triton | Multi-Head Latent Attention (DeepSeek MLA) |
 | `fused_moe` | Triton | Fused MoE gate + routing + expert GEMM |
@@ -274,151 +591,64 @@ The GPU is auto-detected via `rocm-smi` if available; otherwise falls back to gf
 | `act_quant_fp8` | Triton | Dynamic per-token FP8 activation quantization |
 | `silu_mul` | Triton | Fused SiLU × gate (SwiGLU) for MLP |
 
-## Scoring
+### Validated Results (agent-driven, cursor backend)
 
-### Kernel-level (AgentKernelArena formula)
+| Kernel | Speedup | Score | Settings | Notes |
+|--------|---------|-------|----------|-------|
+| `all_reduce` | 36.35x | 7290 | 3 iter / 25 turns | HIP, library_test; multi-GPU |
+| `rms_norm` | 1.05x | 674 | 1 iter / 10 turns | Triton, pytorch mode |
+| `fused_moe` | 1.14x | 248 | 1 iter / 10 turns | Triton, pytorch mode |
+| `gemm_bf16` | 1.00x | 220 | 3 iter / 25 turns | Triton, library_test |
+| `silu_mul` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
+| `act_quant_fp8` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
+| `kv_cache_ops` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
 
-```
-score = compiled × 20  +  correct × 100  +  (baseline_ms / optimized_ms) × 100
-```
+**7 kernels validated** with correct optimizations. Top performers: `all_reduce` (36.35x), `fused_moe` (1.14x), `rms_norm` (1.05x).
 
-- **Compiled** (+20 pts): solution imports and defines the expected function
-- **Correct** (+100 pts): passes all unit tests against the baseline
-- **Speedup** (+speedup × 100 pts): e.g. 3× speedup → +300 pts
+## Troubleshooting
 
-### Model-level
-
-```
-score = 0.5 × normalized_kernel_score  +  0.5 × (optimized_tps / baseline_tps − 1)
-```
-
-Kernel score is normalized to [0, 1] against a reference of 320 pts (compile + correct + 3× speedup). Model-level grading requires a full AMD GPU environment.
-
-## Grading Architecture
-
-Both graders call [Magpie](https://github.com/AMD-AGI/Magpie) with the `config.yaml` the agent writes to `output/<task_id>/`:
-
-```yaml
-gpu:
-  device: 0
-  arch: gfx950
-baseline:
-  path: <path-to-original-kernel>
-optimized:
-  path: ./solution.py
-correctness:
-  command: "pytest tests/ -k rms_norm -x"
-performance:
-  command: "python bench_rms_norm.py --arch gfx950"
-  iterations: 100
-```
-
-The mini eval (`eval.py`) uses a lightweight local grader that runs without Magpie or AMD hardware, suitable for CI and development.
-
-## Files and Documentation
-
-`files/setup_files.sh` populates the agent sandbox with:
-
-- **ROCm source repos** — rocm-libraries, hipBLASLt, hipCUB, composable_kernel, RCCL, and more
-- **Inference framework source** — SGLang, vLLM, AITER, Triton
-- **Documentation** — ROCm docs, MI355X architecture references, HIP/Triton tutorials
-- **Best-practice guides** — `hip_best_practices.md`, `triton_best_practices.md`
-
-## Pipeline Improvements
-
-### Benchmark caching
-
-Use `--benchmark-cache-hours N` to cache E2E baseline benchmark results. If a cached result exists and is younger than N hours for the same config YAML, the pipeline skips the ~30-minute benchmark run:
+### PyTorch ROCm installation fails
 
 ```bash
-python3 workload_optimizer.py run -r $RESULTS -b $BENCH_CONFIG --benchmark-cache-hours 4
+# Install manually with the correct ROCm version
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+
+# For older ROCm:
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
 ```
 
-### Parallel kernel optimization
-
-Use `--parallel-kernels N` to optimize up to N kernels simultaneously. Agent reasoning is API-bound (no GPU), so parallelism is safe. GPU grading is serialized via a lock:
+### Agent CLI not found
 
 ```bash
-python3 workload_optimizer.py run -r $RESULTS -b $BENCH_CONFIG --parallel-kernels 2
+# Verify Node.js 18+
+node --version
+
+# Claude Code
+npm install -g @anthropic-ai/claude-code && claude login
+
+# Codex
+npm install -g @openai/codex && codex login
+
+# Cursor Agent
+npm install -g cursor-agent && cursor-agent login
 ```
 
-### Smart iteration strategy
+### MCP servers not working in Cursor IDE
 
-The pipeline now detects stalled kernels (speedup delta < 5% for 2 consecutive iterations) and stops early, returning unused iteration budget to other kernels.
+Cursor auto-discovers MCP servers from `.mcp.json`. If MCPs aren't loading:
 
-### Agent model routing
+1. Verify `.mcp.json` exists in the Apex root (generated by `setup.sh`)
+2. Restart Cursor or reload the window
+3. Check that the Python path in `.mcp.json` matches your venv
 
-Use `--agent-model-simple` and `--agent-model-complex` to assign different models based on kernel difficulty (simple: rms_norm, silu_mul; complex: fused_moe, flash_attn):
+### No GPU detected
+
+The pipeline auto-detects GPUs via `rocm-smi`. For CPU-only development:
 
 ```bash
-python3 workload_optimizer.py optimize -r $RESULTS \
-  --agent-model-simple claude-sonnet-4-20250514 \
-  --agent-model-complex claude-opus-4-6
-```
+# Use the mini eval (no GPU needed)
+python3 eval.py --dry-run
 
-### Knowledge base
-
-All optimization outcomes are recorded in `knowledge_base.json` at the repo root. Past insights are automatically injected into agent prompts for cross-kernel and cross-run learning. The knowledge base tracks strategies used, speedups achieved, and key insights.
-
-### Anti-tampering rules
-
-The pipeline includes AST-based benchmark tampering detection that penalizes:
-- `SystemExit` / `sys.exit()` inside `__main__` guards
-- Hardcoded `PASS` output or fabricated `BENCHMARK_MS` values
-- Agents are explicitly warned about these rules in all prompt templates
-
-Use `--tampering-speedup-cap X` to configure the speedup cap when tampering is detected (default: 1.0x).
-
-### Scoring formula
-
-```
-score = compiled × 20  +  correct × 100  +  speedup × 100
-```
-
-Where `speedup = baseline_ms / optimized_ms`. Only correct solutions count the speedup component.
-
-## Kernel Reintegration (Hot-Patching)
-
-When the pipeline integrates optimized kernels for the final E2E benchmark, it **hot-patches** installed Python modules in site-packages. This is a temporary operation -- all patches are restored after benchmarking.
-
-**Currently supported (hot-patching):**
-
-- **aiter, vllm, sglang** -- Python/Triton `.py` kernels can be replaced in site-packages. Triton JIT re-compiles automatically on next invocation.
-- **aiter HIP** -- Standalone `.so` files (e.g., `activation_kernels.so`) can be recompiled with `hipcc` and swapped.
-
-**Not supported (requires source rebuild):**
-
-- **System C/C++ libraries** -- hipBLASLt, rocBLAS, composable_kernel (CK), MIOpen, rccl are system-level shared libraries that cannot be individually hot-patched. Optimizations for these libraries can be developed and tested standalone using `optimize-kernel` + Accordo, but cannot be reinjected into the E2E pipeline without rebuilding the library from source.
-- **Monolithic `_C.so`** -- vLLM, sglang, and PyTorch HIP kernels compile into a single `_C.so` binary and cannot be individually replaced.
-
-This is a known limitation. System library rebuild support is planned for future work.
-
-## Building CK Examples (Optional, for Accordo Validation)
-
-Composable Kernel (CK) examples provide compiled HIP binaries that Accordo can use for HSA-level correctness validation. Building is optional -- only needed if you want to use `--correctness-mode accordo` with real CK kernels.
-
-```bash
-bash tools/build_ck.sh --gpu-targets gfx950
-```
-
-This builds only the example binaries (~10-30 minutes depending on GPU target count). Binaries are placed in `tools/rocm/composable_kernel/build/bin/`.
-
-Options:
-- `--gpu-targets <arch>` -- GPU architecture (default: auto-detect via `rocminfo` or `gfx950`)
-- `--jobs N` / `-j N` -- Parallel build jobs (default: `nproc`)
-
-Once built, the Accordo config discovery in `graders/ground_truth.py` will automatically detect and use available CK binaries for validation.
-
-## Development
-
-```bash
-# Run only prompt tests
-pytest tests/test_prompts.py -v
-
-# Run only grader tests
-pytest tests/test_graders.py -v
-
-# Check prompt counts
-python3 prompts/models.py
-python3 prompts/kernel_prompt.py
+# Use --skip-benchmark with pre-recorded profiling data
+python3 workload_optimizer.py run -r ./results --skip-benchmark report.json ...
 ```

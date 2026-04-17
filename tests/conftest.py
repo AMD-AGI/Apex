@@ -11,6 +11,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "live: marks tests that require real agents and GPU (deselect with '-m \"not live\"')")
+
+
 # ── Filesystem fixtures ────────────────────────────────────────────────────────
 
 @pytest.fixture()

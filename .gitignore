@@ -59,3 +59,8 @@ build/
 tmp/
 all_kernel_prompts.jsonl
 knowledge_base.*
+
+# ── Runtime artifacts ──────────────────────────────────────────────────────
+.codex
+grade_result.json
+kernel_experiments_db.json
