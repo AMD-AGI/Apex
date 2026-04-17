@@ -72,6 +72,7 @@ sys.path.insert(0, str(REPO_ROOT / "pipeline"))
 
 from score import (
     KernelResult,
+    VLLM_ROCM_IMAGE_DEFAULT,
     cleanup_inference_server,
     run_magpie_benchmark,
     run_magpie_compare,
@@ -563,12 +564,41 @@ def _resolve_module_to_path(module_name: str) -> Optional[Path]:
     return None
 
 
-def _get_container_site_packages(docker_image: str) -> str:
-    """Probe a Docker image for its Python site-packages path."""
+def _resolve_benchmark_docker_image(
+    benchmark_config_path: str = "",
+    docker_image: str = "",
+) -> str:
+    """Resolve the Docker image the benchmark will actually use."""
     if docker_image:
+        return docker_image
+
+    if benchmark_config_path:
+        try:
+            cfg = yaml.safe_load(Path(benchmark_config_path).read_text()) or {}
+            bench = cfg.get("benchmark", {})
+            if bench.get("docker_image"):
+                return str(bench["docker_image"])
+            if str(bench.get("framework", "")).lower() == "vllm":
+                return os.environ.get("APEX_VLLM_ROCM_IMAGE", "") or VLLM_ROCM_IMAGE_DEFAULT
+        except Exception:
+            pass
+
+    return os.environ.get("APEX_VLLM_ROCM_IMAGE", "") or VLLM_ROCM_IMAGE_DEFAULT
+
+
+def _get_container_site_packages(
+    docker_image: str = "",
+    benchmark_config_path: str = "",
+) -> str:
+    """Probe the benchmark Docker image for its Python site-packages path."""
+    resolved_image = _resolve_benchmark_docker_image(
+        benchmark_config_path=benchmark_config_path,
+        docker_image=docker_image,
+    )
+    if resolved_image:
         try:
             result = subprocess.run(
-                ["docker", "run", "--rm", docker_image,
+                ["docker", "run", "--rm", resolved_image,
                  "python3", "-c",
                  "import site; print(site.getsitepackages()[0])"],
                 capture_output=True, text=True, timeout=30,
@@ -581,9 +611,18 @@ def _get_container_site_packages(docker_image: str) -> str:
     return f"/usr/local/lib/python{py_ver}/dist-packages"
 
 
+def _site_packages_relative(path: str) -> Optional[str]:
+    """Return the portion of a path after site/dist-packages, if present."""
+    for marker in ("site-packages/", "dist-packages/"):
+        if marker in path:
+            return path.split(marker, 1)[1]
+    return None
+
+
 def _hook_docker_volumes(
     backups: dict[Path, Path],
     docker_image: str = "",
+    benchmark_config_path: str = "",
 ) -> callable:
     """Monkey-patch subprocess.Popen to inject -v mounts for patched files.
 
@@ -593,12 +632,15 @@ def _hook_docker_volumes(
     """
     import subprocess as _sp
 
-    container_site_packages = _get_container_site_packages(docker_image)
+    container_site_packages = _get_container_site_packages(
+        docker_image=docker_image,
+        benchmark_config_path=benchmark_config_path,
+    )
     volume_flags: list[str] = []
     for patched_path in backups:
         host = str(patched_path.resolve())
-        if "site-packages" in host:
-            rel = host.split("site-packages/", 1)[1]
+        rel = _site_packages_relative(host)
+        if rel:
             container = f"{container_site_packages}/{rel}"
         else:
             container = host
@@ -3352,7 +3394,11 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
         # Magpie runs benchmarks in Docker so the host's patched site-packages
         # are invisible. We monkey-patch subprocess.Popen to append -v flags
         # that mount each patched file into the container's dist-packages.
-        _popen_unhook = _hook_docker_volumes(backups, config.docker_image) if backups else None
+        _popen_unhook = _hook_docker_volumes(
+            backups,
+            config.docker_image,
+            config.benchmark_config,
+        ) if backups else None
         try:
             # Post-reinjection correctness gate
             failed = _verify_patched_kernels(backups, config)

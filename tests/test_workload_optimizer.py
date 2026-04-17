@@ -19,6 +19,8 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "graders"))
 sys.path.insert(0, str(REPO_ROOT / "prompts"))
 
+import workload_optimizer as wo
+
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -215,6 +217,23 @@ class TestExtractBottlenecks:
         from pipeline.kernel_bottleneck import extract_bottlenecks
         kernels = extract_bottlenecks({})
         assert kernels == []
+
+
+class TestDockerPatchMounting:
+    def test_site_packages_relative_handles_dist_packages(self):
+        rel = wo._site_packages_relative(
+            "/usr/lib/python3/dist-packages/vllm/model_executor/layers/layernorm.py"
+        )
+        assert rel == "vllm/model_executor/layers/layernorm.py"
+
+    def test_resolve_benchmark_docker_image_prefers_yaml_image(self, tmp_path):
+        cfg = tmp_path / "bench.yaml"
+        cfg.write_text(
+            "benchmark:\n"
+            "  framework: vllm\n"
+            "  docker_image: custom/image:tag\n"
+        )
+        assert wo._resolve_benchmark_docker_image(str(cfg), "") == "custom/image:tag"
 
 
 # ── bottleneck.py — filter functions ──────────────────────────────────────────
