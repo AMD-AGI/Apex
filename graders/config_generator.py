@@ -71,6 +71,20 @@ _BASELINE_PATHS: dict[str, dict[str, str]] = {
         "vllm": "vllm/model_executor/layers/fused_moe/rocm_aiter_fused_moe.py",
         "sglang": "sglang/srt/layers/moe/fused_moe_triton.py",
     },
+    # OpenAI `triton_kernels` MoE pipeline (model-agnostic). The pipeline's
+    # baseline copier prefers the pip-installed `triton_kernels` package and
+    # falls back to aiter or vllm via the multi-library spec map in
+    # workload_optimizer.py:_KERNEL_SPEC_TO_MODULE.
+    "moe_ogs_matmul": {
+        "vllm": "triton_kernels/matmul_ogs_details/_matmul_ogs.py",
+        "sglang": "sglang/srt/layers/moe/fused_moe_triton.py",
+    },
+    "moe_ogs_routing": {
+        "vllm": "triton_kernels/routing_details/_routing_compute.py",
+    },
+    "moe_ogs_finalize": {
+        "vllm": "triton_kernels/matmul_ogs_details/_finalize_matmul.py",
+    },
     "gemm_w8a8": {
         "vllm": "vllm/model_executor/layers/quantization/utils/w8a8_utils.py",
         "sglang": "sglang/srt/layers/quantization/fp8_kernel.py",
@@ -163,7 +177,12 @@ def _resolve_baseline_path(
       1. baseline_ref.py / baseline_ref.hip in task_dir (pipeline-generated reference)
       2. baseline.py / baseline.hip in task_dir (copied from source tree by pipeline)
       3. Absolute path resolved from _BASELINE_PATHS via tools/rocm/ source tree
-      4. Raw _BASELINE_PATHS value as fallback
+      4. Installed-package fallback: resolve via importlib on whichever
+         package owns the spec (triton_kernels / aiter / vllm). This makes
+         the harness work on hosts where the local tools/rocm/* checkout
+         is incomplete but the underlying package is pip-installed (host
+         venv OR docker image).
+      5. Raw _BASELINE_PATHS value as fallback
     """
     for ext in (".py", ".hip"):
         ref = task_dir / f"baseline_ref{ext}"
@@ -183,7 +202,51 @@ def _resolve_baseline_path(
         if candidate.exists():
             return str(candidate.resolve())
 
+    pkg_path = _resolve_installed_package_file(raw_path)
+    if pkg_path:
+        return pkg_path
+
     return raw_path
+
+
+def _resolve_installed_package_file(raw_path: str) -> str:
+    """Look up `raw_path` inside an installed top-level Python package.
+
+    `raw_path` is like `triton_kernels/matmul_ogs_details/_matmul_ogs.py`,
+    `aiter/aiter/ops/triton/pa_decode.py`, or
+    `vllm/model_executor/layers/fused_moe/rocm_aiter_fused_moe.py`.
+
+    Returns an absolute filesystem path if the package is importable AND
+    the requested file exists inside its installed source tree; otherwise
+    returns "". Used as a final fallback by `_resolve_baseline_path` so
+    that hosts with a pip-installed package but no vendored checkout still
+    grade correctly.
+    """
+    import importlib.util as _ilu
+
+    p = Path(raw_path)
+    parts = p.parts
+    if not parts:
+        return ""
+
+    candidates: list[tuple[str, Path]] = []
+    candidates.append((parts[0], Path(*parts[1:]) if len(parts) > 1 else Path()))
+    if len(parts) >= 2 and parts[1] == parts[0]:
+        candidates.append((parts[0], Path(*parts[2:]) if len(parts) > 2 else Path()))
+
+    for top_pkg, sub in candidates:
+        try:
+            spec = _ilu.find_spec(top_pkg)
+        except (ValueError, ModuleNotFoundError):
+            spec = None
+        if spec is None or not spec.submodule_search_locations:
+            continue
+        for root in spec.submodule_search_locations:
+            cand = Path(root) / sub if str(sub) else Path(root)
+            if cand.is_file():
+                return str(cand.resolve())
+
+    return ""
 
 
 def generate_config(

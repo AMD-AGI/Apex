@@ -428,7 +428,7 @@ def compute_gated_reward(
         trace["syntax_error_offset"] = syntax_error_offset
         if ast_reason.startswith("SyntaxError"):
             trace["route"] = ROUTE_AST_SYNTAX_ERROR
-        elif ast_reason.startswith("no_triton_jit:"):
+        elif ast_reason.startswith("no_triton_jit:") or ast_reason.startswith("no_jit:"):
             trace["route"] = ROUTE_AST_NO_TRITON_JIT
         elif ast_reason.startswith("no_hip_binding:"):
             trace["route"] = ROUTE_HIP_NO_BINDING

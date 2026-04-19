@@ -113,8 +113,12 @@ KERNEL_SPECS: list[KernelSpec] = [
         applies_to="all",
         triton=True,
         sources=(
+            # Public aiter path — installed as `aiter.ops.triton.pa_decode`
+            # in both the `vllm-rocm` docker image and a local
+            # `pip install -e tools/rocm/aiter`. The previously-used private
+            # `attention/pa_decode.py` location does not exist in either.
             KernelSource("aiter", (
-                "aiter/aiter/ops/triton/attention/pa_decode.py",
+                "aiter/aiter/ops/triton/pa_decode.py",
                 "aiter/aiter/ops/triton/gluon/pa_decode_gluon.py",
             )),
             KernelSource("vllm", (
@@ -184,8 +188,12 @@ KERNEL_SPECS: list[KernelSpec] = [
         applies_to="all",
         triton=False,
         sources=(
+            # Public aiter paths — installed as `aiter.ops.gemm_op_a16w16`
+            # and `aiter.ops.triton.gemm.basic.gemm_a16w16` on both the
+            # vllm-rocm docker image and a local `pip install -e aiter`.
             KernelSource("aiter", (
                 "aiter/aiter/ops/gemm_op_a16w16.py",
+                "aiter/aiter/ops/triton/gemm/basic/gemm_a16w16.py",
             )),
             KernelSource("rocBLAS", (
                 "rocBLAS/library/src/blas3/",
@@ -310,6 +318,73 @@ KERNEL_SPECS: list[KernelSpec] = [
             KernelSource("vllm", (
                 "vllm/vllm/model_executor/layers/activation.py",
             ), role="wrapper"),
+        ),
+    ),
+    # ── OpenAI `triton_kernels` MoE pipeline ────────────────────────────────
+    # Three model-agnostic specs targeting the OGS (outer-grouped-scattered)
+    # MoE design used by gpt-oss today and by any future workload that adopts
+    # the same package. These are real `@triton.jit` kernels (NOT asm) and are
+    # the dominant GPU-time consumer for OGS-MoE LLMs (~50%+ of total GPU
+    # time on gpt-oss-20b).
+    KernelSpec(
+        kernel_type="moe_ogs_matmul",
+        description=(
+            "OGS (outer-grouped-scattered) MoE matmul — bf16/fp16/fp8 "
+            "activations × MXFP4/FP8/BF16 expert weights, fused SwiGLU. "
+            "Per-launch shape (M, N, K, BS) and dtype are extracted from "
+            "the trace name and supplied via the shape-hint addendum."
+        ),
+        applies_to="moe",
+        triton=True,
+        sources=(
+            KernelSource("triton_kernels", (
+                "triton_kernels/matmul_ogs.py",
+                "triton_kernels/matmul_ogs_details/_matmul_ogs.py",
+                "triton_kernels/matmul_ogs_details/_p_matmul_ogs.py",
+                "triton_kernels/matmul_ogs_details/_common.py",
+                "triton_kernels/matmul_ogs_details/opt_flags.py",
+                "triton_kernels/numerics_details/mxfp.py",
+            )),
+            KernelSource("aiter", (
+                "aiter/aiter/ops/triton/fused_moe.py",
+            ), role="reference"),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="moe_ogs_routing",
+        description=(
+            "OGS MoE routing pipeline — topk gate selection, combined "
+            "routing-compute, and bitmatrix sum. Launched per-token-block; "
+            "cost is dominated by launch overhead, not compute. Strong "
+            "candidate for kernel fusion (one persistent CTA per token-block)."
+        ),
+        applies_to="moe",
+        triton=True,
+        sources=(
+            KernelSource("triton_kernels", (
+                "triton_kernels/topk.py",
+                "triton_kernels/topk_details/_topk_forward.py",
+                "triton_kernels/routing.py",
+                "triton_kernels/routing_details/_routing_compute.py",
+                "triton_kernels/reduction_details/reduce_bitmatrix.py",
+            )),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="moe_ogs_finalize",
+        description=(
+            "OGS MoE scatter-finalize — combines per-expert outputs back "
+            "into the per-token activation buffer. Memory-bound; benefits "
+            "from vectorized stores and Gluon BlockedLayouts that match "
+            "the upstream matmul tile shape."
+        ),
+        applies_to="moe",
+        triton=True,
+        sources=(
+            KernelSource("triton_kernels", (
+                "triton_kernels/matmul_ogs_details/_finalize_matmul.py",
+                "triton_kernels/matmul_ogs.py",
+            )),
         ),
     ),
 ]
@@ -528,12 +603,117 @@ def _build_library_context(origin_library: str = "aiter") -> str:
         )
 
 
+def _build_moe_ogs_hints(
+    kernel_type: str, gpu_arch: str, shape_hint: dict | None
+) -> str:
+    """Render the model-agnostic Gluon-rewrite addendum for moe_ogs_* specs.
+
+    Shape and dtype values come from the shape_hint dict (extracted from the
+    real trace name by `pipeline.kernel_bottleneck._parse_kernel_shape_hint`).
+    Numbers are NEVER hard-coded for any specific model — gpt-oss-20b,
+    gpt-oss-120b, Mixtral, DeepSeek-V3, etc. all flow through the same
+    template.
+    """
+    sh = shape_hint or {}
+
+    def _fmt(key: str, fallback: str = "?") -> str:
+        v = sh.get(key)
+        return str(v) if v not in (None, "") else fallback
+
+    M, N, K, BS = _fmt("M"), _fmt("N"), _fmt("K"), _fmt("BS")
+    dt_a, dt_w = _fmt("dtype_a", "bf16"), _fmt("dtype_w", "bf16")
+    swiglu = bool(sh.get("swiglu_fused"))
+    n_exp = sh.get("num_experts")
+    top_k = sh.get("top_k")
+    model_id = sh.get("model_id")
+
+    mfma = "gl.amd.cdna4.mfma" if gpu_arch == "gfx950" else "gl.amd.cdna3.mfma"
+    wave = 64
+    expert_blurb = (
+        f"({n_exp} experts, top-{top_k})" if (n_exp and top_k) else
+        "(experts/top_k from model card)"
+    )
+    model_blurb = f" on `{model_id}`" if model_id else ""
+
+    if kernel_type == "moe_ogs_matmul":
+        swiglu_note = (
+            "- Keep the fused SwiGLU epilogue (the `_swiglu` suffix in the "
+            "trace name indicates SiLU(gate) * up is folded into the matmul "
+            "epilogue). Do NOT split it into a separate launch.\n"
+        ) if swiglu else ""
+        mxfp4_note = ""
+        if "fp4" in dt_w.lower() or "mxfp4" in dt_w.lower():
+            mxfp4_note = (
+                "- Weights are MXFP4 (block-scaled FP4 with one fp8 scale per "
+                "32 elements). Pre-stage the FP4 packed bytes AND their fp8 "
+                "block-scales into LDS in the same async issue group, then use "
+                f"`{mfma}_scaled(...)` for the inner K-tile.\n"
+            )
+        return (
+            f"- TARGET: rewrite `triton_kernels/matmul_ogs_details/_matmul_ogs.py` "
+            f"as `@gluon.jit` for tile (M={M}, N={N}, K={K}, BS={BS}), "
+            f"activations={dt_a}, weights={dt_w}{model_blurb}.\n"
+            f"- Workload: OGS MoE matmul {expert_blurb}; this kernel is the "
+            f"single largest GPU-time consumer.\n"
+            f"- Use explicit `gl.BlockedLayout(threads_per_warp=[{wave}, ...])` "
+            f"for the {dt_a} activation tile and "
+            f"`gl.MFMALayout(version=4, mDim=16, nDim=16, kDim=128)` for the "
+            f"fp32 accumulator on {gpu_arch} (wavefront={wave}).\n"
+            + mxfp4_note
+            + swiglu_note
+            + "- Keep the Python wrapper signature in `triton_kernels/matmul_ogs.py` "
+              "byte-identical so existing call sites continue to work.\n"
+            + "- Verify correctness via `triton_kernels.testing.assert_close` against "
+              "the original kernel on the canonical shape above. Aim for >= 1.3x.\n"
+            + "- Read `tools/skills/gluon-kernel-optimization/SKILL.md` and "
+              "`tools/skills/mi300-cdna3-architecture/SKILL.md` first; the "
+              "`tools/gluon_rag/` directory has working Gluon MFMA examples."
+        )
+
+    if kernel_type == "moe_ogs_routing":
+        return (
+            f"- TARGET: fuse `triton_kernels/topk_details/_topk_forward.py`, "
+            f"`triton_kernels/routing_details/_routing_compute.py`, and "
+            f"`triton_kernels/reduction_details/reduce_bitmatrix.py` into a "
+            f"single `@gluon.jit` 'routing-fuse' kernel{model_blurb}.\n"
+            f"- These three kernels each launch ~25k times per benchmark with "
+            f"~5us per launch — their cost is launch-overhead dominated, not "
+            f"compute. Goal: cut launch count by 3-4x.\n"
+            f"- Use ONE persistent CTA per token-block of size 128 with "
+            f"`gl.BlockedLayout(threads_per_warp=[{wave}, ...])`; loop over "
+            f"experts {expert_blurb} inside the kernel.\n"
+            f"- Validate against the three originals on the same dispatch "
+            f"tensors used by `triton_kernels.routing.routing_from_bitmatrix`. "
+            f"Aim for >= 1.5x on the bundle.\n"
+            f"- Read `tools/skills/gluon-kernel-optimization/SKILL.md` first."
+        )
+
+    if kernel_type == "moe_ogs_finalize":
+        return (
+            f"- TARGET: rewrite "
+            f"`triton_kernels/matmul_ogs_details/_finalize_matmul.py` "
+            f"(`_finalize_matmul_scatter_*`) as `@gluon.jit`{model_blurb}.\n"
+            f"- This kernel scatters per-expert outputs back into the per-token "
+            f"activation buffer; it is memory-bound. Use vectorized stores "
+            f"(`size_per_thread[innermost] >= 4`) and a `gl.BlockedLayout` "
+            f"that matches the upstream matmul tile shape "
+            f"(M={M}, N={N}, BS={BS}).\n"
+            f"- Verify against the existing kernel via "
+            f"`triton_kernels.testing.assert_close`. Aim for >= 1.2x.\n"
+            f"- Read `tools/skills/gluon-kernel-optimization/SKILL.md` first."
+        )
+
+    return ""
+
+
 def build_kernel_prompt(
     model:     ModelConfig,
     kernel:    KernelSpec,
     framework: str = "sglang",
     gpu_arch:  str = DEFAULT_TARGET,
     origin_library: str = "aiter",
+    rewrite_as: str = "",
+    shape_hint: dict | None = None,
 ) -> dict:
     gpu_name  = ARCH_MAP.get(gpu_arch, gpu_arch)
     cdna_gen  = "CDNA4" if gpu_arch == "gfx950" else "CDNA3" if gpu_arch in ("gfx942","gfx940") else "CDNA2"
@@ -556,6 +736,23 @@ def build_kernel_prompt(
     elif kernel.kernel_type == "mla_attn":
         extra_hints = "- MLA absorbs W_UK and W_UV into the projection; avoid re-expanding KV\n"
         extra_hints += "- Latent KV dim is 512 (R1/V3); full KV is 128*num_heads; keep latent in LDS"
+    elif kernel.kernel_type.startswith("moe_ogs_"):
+        extra_hints = _build_moe_ogs_hints(kernel.kernel_type, gpu_arch, shape_hint)
+
+    # Gluon rewrite addendum — appended when --rewrite-as gluon is set, or when
+    # the bottleneck classifier identifies the source kernel as Gluon.
+    if rewrite_as.lower() == "gluon":
+        extra_hints += (
+            ("\n" if extra_hints else "")
+            + "- REWRITE TARGET: Gluon. Use `from triton.experimental import gluon` "
+              "and `from triton.experimental.gluon import language as gl`. "
+              "Decorate the device kernel with `@gluon.jit`.\n"
+            + "- Choose `gl.BlockedLayout(threads_per_warp=[64, ...])` on AMD MI300X/MI355X "
+              "(wavefront size = 64). Pick `size_per_thread[innermost] >= 2` for vectorized loads.\n"
+            + "- Read `tools/skills/gluon-kernel-optimization/SKILL.md` first; consult "
+              "`tools/gluon_rag/` for working Gluon kernel patterns. For matmul on this arch "
+              "use `gl.amd.cdna3.mfma` (gfx942) or `gl.amd.cdna4.mfma` (gfx950)."
+        )
 
     library_context = _build_library_context(origin_library)
 
@@ -582,6 +779,8 @@ def build_kernel_prompt(
         "framework":   framework,
         "gpu_arch":    gpu_arch,
         "triton":      kernel.triton,
+        "rewrite_as":  rewrite_as,
+        "shape_hint":  shape_hint or {},
         "prompt":      prompt,
     }
 

@@ -100,21 +100,32 @@ class TestClassifyKernel:
         from pipeline.kernel_bottleneck import classify_kernel
         assert classify_kernel("_ZN7ck_tile6kentryI_Rmsnorm2dFwd_Pipeline") == "ck"
 
-    def test_asm_matmul_ogs(self):
+    # OpenAI `triton_kernels` MoE pipeline: real @triton.jit (NOT asm).
+    # Reclassified by the moe-and-env enabler so these are agent-rewritable.
+    def test_triton_matmul_ogs(self):
         from pipeline.kernel_bottleneck import classify_kernel
-        assert classify_kernel("_matmul_ogs_NNT_bf16xbf16xmxfp4_16x128x256x1_swiglu") == "asm"
+        assert classify_kernel("_matmul_ogs_NNT_bf16xbf16xmxfp4_16x128x256x1_swiglu") == "triton"
 
-    def test_asm_topk(self):
+    def test_triton_p_matmul_ogs(self):
         from pipeline.kernel_bottleneck import classify_kernel
-        assert classify_kernel("_topk_forward") == "asm"
+        assert classify_kernel("_p_matmul_ogs_NNT_bf16xfp16_8x256x128x1") == "triton"
 
-    def test_asm_combined_routing(self):
+    def test_triton_topk(self):
         from pipeline.kernel_bottleneck import classify_kernel
-        assert classify_kernel("_combined_routing_memset") == "asm"
+        assert classify_kernel("_topk_forward") == "triton"
 
-    def test_asm_finalize(self):
+    def test_triton_combined_routing(self):
         from pipeline.kernel_bottleneck import classify_kernel
-        assert classify_kernel("_finalize_matmul_scatter_bf16") == "asm"
+        assert classify_kernel("_combined_routing_memset") == "triton"
+
+    def test_triton_finalize(self):
+        from pipeline.kernel_bottleneck import classify_kernel
+        assert classify_kernel("_finalize_matmul_scatter_bf16") == "triton"
+
+    def test_asm_fused_moe_bf16(self):
+        # The legacy aiter ASM MoE kernel must still classify as asm.
+        from pipeline.kernel_bottleneck import classify_kernel
+        assert classify_kernel("fused_moe_bf16_asm_kernel") == "asm"
 
     def test_hip_vllm(self):
         from pipeline.kernel_bottleneck import classify_kernel
@@ -135,6 +146,240 @@ class TestClassifyKernel:
     def test_unknown_kernel(self):
         from pipeline.kernel_bottleneck import classify_kernel
         assert classify_kernel("some_random_function") == "unknown"
+
+    # ── Gluon classification ──────────────────────────────────────────────
+    def test_gluon_aiter_gemm_a8w8(self):
+        from pipeline.kernel_bottleneck import classify_kernel
+        assert classify_kernel("_gemm_a8w8_kernel") == "gluon"
+
+    def test_gluon_aiter_gemm_a8w8_with_specialization(self):
+        # Triton appends specialization suffixes after the function name.
+        from pipeline.kernel_bottleneck import classify_kernel
+        assert classify_kernel("_gemm_a8w8_kernel_d_BLOCK_M=128_BLOCK_N=128") == "gluon"
+
+    def test_gluon_aiter_pa_decode(self):
+        from pipeline.kernel_bottleneck import classify_kernel
+        assert classify_kernel("_pa_decode_gluon_kernel_BLOCK_SIZE=64") == "gluon"
+
+    def test_gluon_aiter_blockscale(self):
+        from pipeline.kernel_bottleneck import classify_kernel
+        assert classify_kernel("_gemm_a8w8_blockscale_kernel") == "gluon"
+
+    def test_gluon_token_in_name(self):
+        # Any kernel whose name contains a `_gluon_` (or `gluon_` at start)
+        # token is classified as gluon — convenient for downstream forks.
+        from pipeline.kernel_bottleneck import classify_kernel
+        assert classify_kernel("triton_my_gluon_kernel_v2") == "gluon"
+
+    def test_gluon_takes_priority_over_triton(self):
+        # `_pa_decode_gluon_kernel` would also match `^triton_` if it had a
+        # `triton_` prefix — verify Gluon wins anyway because we check it first.
+        from pipeline.kernel_bottleneck import classify_kernel
+        assert classify_kernel("triton_gluon_pa_decode_kernel") == "gluon"
+
+
+# ── bottleneck.py — match_to_kernel_spec (model-agnostic moe_ogs) ─────────────
+
+
+class TestSpecMappingMoeOgs:
+    """Verify the moe_ogs_* specs match BOTH gpt-oss kernel names AND
+    arbitrary model-agnostic name shapes (Mixtral-style synthetic, future
+    MoE models). The regex anchors on the kernel-FAMILY prefix, never on
+    a model-specific suffix.
+    """
+
+    def test_gptoss_matmul_ogs_with_swiglu(self):
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec(
+            "_matmul_ogs_NNT_bf16xbf16xmxfp4_16x128x256x1_swiglu"
+        ) == "moe_ogs_matmul"
+
+    def test_gptoss_matmul_ogs_no_swiglu(self):
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec(
+            "_matmul_ogs_NNT_bf16xbf16xmxfp4_64x512x256x1"
+        ) == "moe_ogs_matmul"
+
+    def test_mixtral_style_matmul_ogs(self):
+        # Synthetic Mixtral-shaped name — verifies the pattern is NOT
+        # gpt-oss-specific. Mixtral uses bf16 weights, no MXFP4.
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec(
+            "_matmul_ogs_NNT_bf16xfp16_8x256x128x1"
+        ) == "moe_ogs_matmul"
+
+    def test_routing_topk(self):
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec("_topk_forward") == "moe_ogs_routing"
+
+    def test_routing_combined(self):
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec(
+            "_combined_routing_compute"
+        ) == "moe_ogs_routing"
+
+    def test_routing_bitmatrix(self):
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec("_sum_bitmatrix_rows") == "moe_ogs_routing"
+
+    def test_finalize_scatter(self):
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec(
+            "_finalize_matmul_scatter_bf16"
+        ) == "moe_ogs_finalize"
+
+    def test_legacy_fused_moe_still_matches(self):
+        # The legacy `fused_moe` spec must still resolve for aiter's
+        # `fused_moe_bf16_asm` and the `moe_forward` family — only the
+        # OpenAI ogs names should be re-routed.
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec("fused_moe_bf16_asm_kernel") == "fused_moe"
+
+    def test_aiter_unified_attention_unchanged(self):
+        # Regression net: the moe_ogs additions must not steal aiter's
+        # `paged_attn_decode` mapping.
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec(
+            "kernel_unified_attention_3d"
+        ) == "paged_attn_decode"
+
+    def test_aiter_gemm_a16w16_unchanged(self):
+        from pipeline.kernel_bottleneck import match_to_kernel_spec
+        assert match_to_kernel_spec(
+            "_gemm_a16_w16_kernel_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_256"
+        ) == "gemm_bf16"
+
+
+# ── bottleneck.py — _parse_kernel_shape_hint ─────────────────────────────────
+
+
+class TestParseKernelShapeHint:
+    """Verify the trace-name shape extractor works for all shapes seen on
+    real workloads, NOT just gpt-oss. Used by the prompt template to render
+    real workload values instead of hard-coded constants.
+    """
+
+    def test_gptoss_swiglu_shape(self):
+        from pipeline.kernel_bottleneck import _parse_kernel_shape_hint
+        h = _parse_kernel_shape_hint(
+            "_matmul_ogs_NNT_bf16xmxfp4_16x128x256x1_swiglu"
+        )
+        assert h["M"] == 16 and h["N"] == 128 and h["K"] == 256 and h["BS"] == 1
+        assert h["dtype_a"] == "bf16" and h["dtype_w"] == "mxfp4"
+        assert h["swiglu_fused"] is True
+
+    def test_mixtral_style_shape(self):
+        from pipeline.kernel_bottleneck import _parse_kernel_shape_hint
+        h = _parse_kernel_shape_hint(
+            "_matmul_ogs_NNT_bf16xfp16_8x256x128x1"
+        )
+        assert h["M"] == 8 and h["N"] == 256 and h["K"] == 128 and h["BS"] == 1
+        assert h["dtype_a"] == "bf16" and h["dtype_w"] == "fp16"
+        assert h["swiglu_fused"] is False
+
+    def test_p_matmul_ogs_shape(self):
+        from pipeline.kernel_bottleneck import _parse_kernel_shape_hint
+        h = _parse_kernel_shape_hint(
+            "_p_matmul_ogs_NNT_bf16xbf16_64x512x256x1_swiglu"
+        )
+        assert h["M"] == 64 and h["N"] == 512 and h["K"] == 256
+        assert h["swiglu_fused"] is True
+
+    def test_aiter_gemm_shape(self):
+        from pipeline.kernel_bottleneck import _parse_kernel_shape_hint
+        h = _parse_kernel_shape_hint(
+            "_gemm_a16_w16_kernel_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_256_GROUP_SIZE_M_2"
+        )
+        assert h["M"] == 32 and h["N"] == 16 and h["K"] == 256
+        assert h["dtype_a"] == "bf16" and h["dtype_w"] == "bf16"
+
+    def test_unknown_kernel_returns_empty(self):
+        from pipeline.kernel_bottleneck import _parse_kernel_shape_hint
+        h = _parse_kernel_shape_hint("some_random_function")
+        assert h["M"] is None and h["N"] is None and h["K"] is None
+
+    def test_model_config_pulled_in(self):
+        from pipeline.kernel_bottleneck import _parse_kernel_shape_hint
+        h = _parse_kernel_shape_hint(
+            "_matmul_ogs_NNT_bf16xmxfp4_16x128x256x1_swiglu",
+            benchmark_config={
+                "model_config": {
+                    "num_experts": 32, "top_k": 4, "model_id": "gpt-oss-20b",
+                }
+            },
+        )
+        assert h["num_experts"] == 32 and h["top_k"] == 4
+        assert h["model_id"] == "gpt-oss-20b"
+
+    def test_model_config_alternate_keys(self):
+        # DeepSeek uses `n_routed_experts`; Mixtral uses `num_local_experts`
+        # and `num_experts_per_tok`. Both must populate the same dict keys.
+        from pipeline.kernel_bottleneck import _parse_kernel_shape_hint
+        h = _parse_kernel_shape_hint(
+            "_matmul_ogs_NNT_bf16xfp16_8x256x128x1",
+            benchmark_config={
+                "model_config": {
+                    "num_local_experts": 8,
+                    "num_experts_per_tok": 2,
+                }
+            },
+        )
+        assert h["num_experts"] == 8 and h["top_k"] == 2
+
+
+# ── reward_backends.py — Gluon static check ──────────────────────────────────
+
+
+class TestGluonStaticCheck:
+    """Verify that valid Gluon kernels pass and invalid ones are rejected."""
+
+    def test_gluon_decorator_accepted(self):
+        from graders.reward_backends import run_gluon_static_check
+        code = (
+            "import torch\n"
+            "import triton\n"
+            "from triton.experimental import gluon\n"
+            "from triton.experimental.gluon import language as gl\n"
+            "@gluon.jit\n"
+            "def k(p, n, B: gl.constexpr, layout: gl.constexpr):\n"
+            "    pid = gl.program_id(0)\n"
+            "    offs = pid * B + gl.arange(0, B, layout=layout)\n"
+            "    gl.store(p + offs, gl.load(p + offs))\n"
+        )
+        ok, reason = run_gluon_static_check(code)
+        assert ok, f"valid Gluon kernel rejected: {reason}"
+
+    def test_no_jit_rejected(self):
+        from graders.reward_backends import run_gluon_static_check
+        code = (
+            "import torch\n"
+            "from triton.experimental import gluon\n"
+            "def not_a_kernel(x): return x + 1\n"
+        )
+        ok, reason = run_gluon_static_check(code)
+        assert not ok and reason.startswith("no_jit:")
+
+    def test_blocked_subprocess_import(self):
+        from graders.reward_backends import run_gluon_static_check
+        code = (
+            "import subprocess\n"
+            "from triton.experimental import gluon\n"
+            "from triton.experimental.gluon import language as gl\n"
+            "@gluon.jit\n"
+            "def k(p):\n"
+            "    pass\n"
+        )
+        ok, reason = run_gluon_static_check(code)
+        assert not ok and "blocked_import" in reason
+
+    def test_resolve_kernel_backend_gluon(self):
+        from graders.reward_backends import (
+            KERNEL_BACKEND_GLUON, resolve_kernel_backend,
+        )
+        assert resolve_kernel_backend("gluon") == KERNEL_BACKEND_GLUON
+        assert resolve_kernel_backend("paged_attn_decode_gluon") == KERNEL_BACKEND_GLUON
+        # Any spec ending with `_gluon` falls into the gluon backend.
+        assert resolve_kernel_backend("rms_norm_gluon") == KERNEL_BACKEND_GLUON
 
 
 # ── bottleneck.py — match_to_kernel_spec ──────────────────────────────────────

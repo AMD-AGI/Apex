@@ -55,7 +55,7 @@ import tempfile
 import textwrap
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -158,6 +158,21 @@ _KERNEL_SPEC_TO_MODULE: dict[str, dict[str, str]] = {
         "aiter": "aiter.fused_moe",
         "vllm": "vllm.model_executor.layers.fused_moe.fused_moe",
     },
+    # OpenAI `triton_kernels` MoE pipeline (model-agnostic; used by gpt-oss
+    # today and any future workload that adopts the OGS design). Each spec
+    # carries fallback rows for aiter and vllm so the same target works on
+    # different installs without code changes.
+    "moe_ogs_matmul": {
+        "triton_kernels": "triton_kernels.matmul_ogs_details._matmul_ogs",
+        "aiter": "aiter.ops.triton.fused_moe",
+        "vllm": "vllm.model_executor.layers.fused_moe.fused_moe",
+    },
+    "moe_ogs_routing": {
+        "triton_kernels": "triton_kernels.routing_details._routing_compute",
+    },
+    "moe_ogs_finalize": {
+        "triton_kernels": "triton_kernels.matmul_ogs_details._finalize_matmul",
+    },
     "rms_norm": {
         "aiter": "aiter.ops.triton.normalization.rmsnorm",
         "vllm": "vllm.model_executor.layers.layernorm",
@@ -197,6 +212,13 @@ _LIBRARY_PREFIXES: dict[str, list[str]] = {
              "vllm.model_executor.layers.fused_moe", "vllm.distributed"],
     "sglang": ["sglang.srt.layers", "sglang.srt.layers.attention"],
     "pytorch": ["torch.nn.modules", "torch.nn.functional"],
+    "triton_kernels": [
+        "triton_kernels.matmul_ogs_details",
+        "triton_kernels.routing_details",
+        "triton_kernels.topk_details",
+        "triton_kernels.reduction_details",
+        "triton_kernels",
+    ],
 }
 
 _HIP_SPEC_TO_SO: dict[str, dict[str, str]] = {
@@ -1667,6 +1689,16 @@ class WorkloadConfig:
     agent_model_simple: str = ""
     agent_model_complex: str = ""
     tampering_speedup_cap: float = 0.0
+    # When non-empty (currently only "gluon"), instructs the agent to rewrite
+    # the baseline kernel in the named DSL even if the bottleneck classifier
+    # didn't pick it as the source.
+    rewrite_as: str = ""
+    # Prompt-driven env-policy task (Phase 3). When True, after kernel
+    # rewrites the pipeline asks the agent to propose a `VLLM_ROCM_USE_AITER_*`
+    # diff and runs an additional benchmark draw with that diff applied so
+    # the contribution can be attributed independently from kernel rewrites.
+    enable_env_policy: bool = False
+    env_policy_agent: str = ""
 
     def __post_init__(self):
         if not self.agent_model:
@@ -1925,6 +1957,11 @@ def _find_baseline_sources(kernel_spec: str, library: str = "aiter") -> list[str
 
     For aiter: prefers role="impl" sources.
     For vllm/sglang: includes sources whose library matches, regardless of role.
+
+    If the local `tools/rocm/<lib>/<path>` checkout does not contain the file,
+    fall back to the matching pip-installed package's source tree (works for
+    `triton_kernels`, `aiter`, and `vllm` whether running in the host venv
+    or inside the `vllm-rocm` docker image).
     """
     try:
         from kernel_prompt import KERNEL_SPECS
@@ -1936,27 +1973,77 @@ def _find_baseline_sources(kernel_spec: str, library: str = "aiter") -> list[str
                         if source.role != "impl":
                             continue
                         for p in source.paths:
-                            full = REPO_ROOT / "tools" / "rocm" / p
-                            if full.exists():
-                                paths.append(str(full))
+                            resolved = _resolve_source_path(p)
+                            if resolved:
+                                paths.append(resolved)
                 else:
                     for source in ks.sources:
                         src_lib = getattr(source, "library", "")
                         if src_lib == library or source.role == "wrapper":
                             for p in source.paths:
-                                full = REPO_ROOT / "tools" / "rocm" / p
-                                if full.exists():
-                                    paths.append(str(full))
+                                resolved = _resolve_source_path(p)
+                                if resolved:
+                                    paths.append(resolved)
                 if not paths:
                     for source in ks.sources:
                         for p in source.paths:
-                            full = REPO_ROOT / "tools" / "rocm" / p
-                            if full.exists():
-                                paths.append(str(full))
+                            resolved = _resolve_source_path(p)
+                            if resolved:
+                                paths.append(resolved)
                 return paths
     except Exception as e:
         print(f"  [warn] Could not resolve baseline sources for {kernel_spec}: {e}")
     return []
+
+
+def _resolve_source_path(rel_path: str) -> str:
+    """Resolve a baseline-source rel-path to an absolute on-disk path.
+
+    Tries the local `tools/rocm/<rel_path>` checkout first; falls back to
+    the matching pip-installed package's source tree when the vendored
+    file is missing. Returns "" when neither location has the file.
+    """
+    full = REPO_ROOT / "tools" / "rocm" / rel_path
+    if full.exists():
+        return str(full)
+    return _resolve_installed_source_path(rel_path)
+
+
+def _resolve_installed_source_path(rel_path: str) -> str:
+    """Walk an installed top-level Python package to find `rel_path`.
+
+    `rel_path` is a `tools/rocm`-relative string like
+    `triton_kernels/matmul_ogs_details/_matmul_ogs.py` or
+    `aiter/aiter/ops/triton/pa_decode.py`. The top dir is the package
+    name; if the second segment repeats the package name (the way aiter
+    is vendored as `aiter/aiter/...`) we strip it before looking inside
+    the installed tree.
+    """
+    import importlib.util as _ilu
+
+    p = Path(rel_path)
+    parts = p.parts
+    if not parts:
+        return ""
+
+    candidates: list[tuple[str, Path]] = []
+    candidates.append((parts[0], Path(*parts[1:]) if len(parts) > 1 else Path()))
+    if len(parts) >= 2 and parts[1] == parts[0]:
+        candidates.append((parts[0], Path(*parts[2:]) if len(parts) > 2 else Path()))
+
+    for top_pkg, sub in candidates:
+        try:
+            spec = _ilu.find_spec(top_pkg)
+        except (ValueError, ModuleNotFoundError):
+            spec = None
+        if spec is None or not spec.submodule_search_locations:
+            continue
+        for root in spec.submodule_search_locations:
+            cand = Path(root) / sub if str(sub) else Path(root)
+            if cand.is_file():
+                return str(cand.resolve())
+
+    return ""
 
 
 def _fixup_aiter_imports(filepath: Path) -> None:
@@ -2169,6 +2256,88 @@ def _snapshot_environment() -> dict:
         except Exception:
             versions[pkg] = "not installed"
     return {"env_vars": env_vars, "package_versions": versions}
+
+
+def _discover_aiter_env_flags() -> list[dict]:
+    """Discover all `VLLM_ROCM_USE_AITER_*` flags available on this install.
+
+    Tries (in order):
+      1. Import `vllm.envs` and read its `environment_variables` dict
+         (vllm exposes a structured map there).
+      2. Locate the on-disk `vllm/envs.py` source file (in either a
+         pip-installed package or a vendored checkout) and grep its lines
+         for `VLLM_ROCM_USE_AITER_*` definitions, capturing default
+         values and trailing comment docstrings.
+
+    Returns a list of `{"name", "default", "doc"}` dicts. Empty list when
+    `vllm` is not installed AND no envs.py source can be found — callers
+    should treat the empty list as "env-policy not actionable on this
+    host" and skip the env-policy task gracefully.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    try:
+        import vllm.envs as _vlenv  # type: ignore
+        env_map = getattr(_vlenv, "environment_variables", None)
+        if isinstance(env_map, dict):
+            for name, _factory in env_map.items():
+                if not (isinstance(name, str)
+                        and name.startswith("VLLM_ROCM_USE_AITER")):
+                    continue
+                if name in seen:
+                    continue
+                default = ""
+                try:
+                    default = str(_factory())
+                except Exception:
+                    pass
+                doc = (getattr(_factory, "__doc__", "") or "").strip()
+                out.append({"name": name, "default": default, "doc": doc})
+                seen.add(name)
+    except Exception as exc:  # pragma: no cover - vllm not importable
+        _log.debug("vllm.envs import failed: %s", exc)
+
+    src_path = _locate_vllm_envs_source()
+    if src_path and src_path.exists():
+        try:
+            text = src_path.read_text()
+        except Exception:
+            text = ""
+        if text:
+            import re as _re
+            pat = _re.compile(
+                r'^\s*"(VLLM_ROCM_USE_AITER\w*)"\s*:\s*lambda[^,]*?,?\s*'
+                r'(?:#\s*(.*))?$',
+                _re.MULTILINE,
+            )
+            for m in pat.finditer(text):
+                name = m.group(1)
+                if name in seen:
+                    continue
+                doc = (m.group(2) or "").strip()
+                out.append({"name": name, "default": "", "doc": doc})
+                seen.add(name)
+
+    return out
+
+
+def _locate_vllm_envs_source() -> Optional[Path]:
+    """Return the on-disk path of `vllm/envs.py`, or None if not found."""
+    import importlib.util as _ilu
+    try:
+        spec = _ilu.find_spec("vllm")
+    except Exception:
+        spec = None
+    if spec and spec.submodule_search_locations:
+        for root in spec.submodule_search_locations:
+            cand = Path(root) / "envs.py"
+            if cand.is_file():
+                return cand
+    cand = REPO_ROOT / "tools" / "rocm" / "vllm" / "vllm" / "envs.py"
+    if cand.is_file():
+        return cand
+    return None
 
 
 def _extract_timing_from_raw(raw: dict) -> tuple[float, float]:
@@ -2606,7 +2775,35 @@ def _build_kernel_prompt(
     origin_lib = kernel.origin_library if kernel.origin_library != "unknown" else "aiter"
     baseline_sources = _find_baseline_sources(spec, library=origin_lib)
 
-    rich_prompt = _try_build_rich_prompt(spec, model_id, framework, gpu_arch, origin_lib)
+    # If the bottleneck classifier already says this is a Gluon kernel, ask the
+    # agent to keep it in Gluon. Otherwise honour the explicit `rewrite_as`
+    # setting on the WorkloadConfig (set by `--rewrite-as gluon`).
+    rewrite_as = ""
+    if getattr(kernel, "category", "") == "gluon":
+        rewrite_as = "gluon"
+    elif getattr(config, "rewrite_as", ""):
+        rewrite_as = str(config.rewrite_as).lower()
+
+    # moe_ogs_* specs are model-agnostic; we always want a Gluon rewrite
+    # since the existing OpenAI ogs kernels are already plain Triton.
+    if spec.startswith("moe_ogs_") and not rewrite_as:
+        rewrite_as = "gluon"
+
+    # Shape/dtype/expert hints come from the trace (NOT hard-coded). The
+    # template uses them to render real workload values; without a hint the
+    # template falls back to placeholders and the agent reads them off the
+    # model card itself.
+    try:
+        from kernel_bottleneck import _parse_kernel_shape_hint  # type: ignore
+        shape_hint = _parse_kernel_shape_hint(kernel.name, benchmark_config)
+    except Exception as e:  # pragma: no cover
+        print(f"    [warn] shape-hint extraction failed: {e}")
+        shape_hint = None
+
+    rich_prompt = _try_build_rich_prompt(
+        spec, model_id, framework, gpu_arch, origin_lib,
+        rewrite_as=rewrite_as, shape_hint=shape_hint,
+    )
 
     source_sections = []
     for src_path in baseline_sources[:3]:
@@ -2698,10 +2895,16 @@ def _build_kernel_prompt(
 def _try_build_rich_prompt(
     kernel_spec: str, model_id: str, framework: str, gpu_arch: str,
     origin_library: str = "aiter",
+    rewrite_as: str = "",
+    shape_hint: dict | None = None,
 ) -> str:
     """Try to build a rich prompt using kernel_prompt.py templates.
 
     Returns the rich prompt text, or empty string if the model/kernel isn't found.
+    Pass ``rewrite_as="gluon"`` to instruct the agent to produce a Gluon
+    (@gluon.jit) rewrite even when the baseline is plain Triton.
+    Pass ``shape_hint`` (from `_parse_kernel_shape_hint`) so model-agnostic
+    specs (moe_ogs_*) can render real tile/dtype/expert values.
     """
     try:
         kernel = KERNEL_MAP.get(kernel_spec)
@@ -2727,6 +2930,8 @@ def _try_build_rich_prompt(
             framework=framework,
             gpu_arch=gpu_arch,
             origin_library=origin_library,
+            rewrite_as=rewrite_as,
+            shape_hint=shape_hint,
         )
         return result.get("prompt", "")
     except Exception as e:
@@ -2779,6 +2984,49 @@ def _serialize_agent_messages(messages: list) -> list[dict]:
     return serialized
 
 
+def _persist_iteration_prompt(
+    task_dir: Path,
+    iteration: int,
+    user_prompt: str,
+    system_prompt: str,
+    config: WorkloadConfig,
+    model_override: str = "",
+) -> None:
+    """Save the exact agent prompt for this iteration to <task_dir>/prompts/.
+
+    Three artifacts per iteration:
+      - iter_NNN_user.md   : the full user-facing prompt (incl. previous reflection)
+      - iter_NNN_system.md : the system prompt
+      - iter_NNN_meta.json : agent/model/turn metadata for cross-referencing
+
+    Best-effort: a write failure must never abort the agent loop.
+    """
+    try:
+        prompts_dir = task_dir / "prompts"
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"iter_{iteration:03d}"
+        (prompts_dir / f"{stem}_user.md").write_text(user_prompt)
+        if system_prompt:
+            (prompts_dir / f"{stem}_system.md").write_text(system_prompt)
+        meta = {
+            "iteration": iteration,
+            "agent_backend": config.agent_backend,
+            "agent_model": model_override or config.agent_model,
+            "max_turns": config.max_turns_per_iter,
+            "kernel_type": getattr(config, "kernel_type", ""),
+            "rewrite_as": getattr(config, "rewrite_as", ""),
+            "dry_run": bool(config.dry_run),
+            "user_prompt_chars": len(user_prompt),
+            "system_prompt_chars": len(system_prompt or ""),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        (prompts_dir / f"{stem}_meta.json").write_text(
+            json.dumps(meta, indent=2)
+        )
+    except Exception as exc:
+        print(f"    [prompt-persist] warning: {exc}")
+
+
 def _run_agent_iteration(
     task_dir: Path,
     prompt: str,
@@ -2790,6 +3038,15 @@ def _run_agent_iteration(
     full_prompt = prompt
     if previous_reflection:
         full_prompt = previous_reflection + "\n\n---\n\n" + prompt
+
+    _persist_iteration_prompt(
+        task_dir,
+        iteration,
+        full_prompt,
+        SYSTEM_PROMPT,
+        config,
+        model_override=model_override,
+    )
 
     if config.dry_run:
         solution = task_dir / "solution.py"
@@ -2823,6 +3080,306 @@ def _run_agent_iteration(
 
 _SIMPLE_KERNELS = {"rms_norm", "silu_mul", "act_quant_fp8", "rope_embedding", "kv_cache_ops", "softmax"}
 _COMPLEX_KERNELS = {"fused_moe", "mla_attn", "flash_attn_prefill"}
+
+
+def _parse_env_policy_response(text: str) -> dict:
+    """Parse the agent's env-policy YAML reply.
+
+    Returns a dict
+        {
+          "env_diff": {KEY: VALUE},
+          "rationale": {KEY: str},
+          "risk": {KEY: str},
+          "raw": <agent's raw text>,
+          "parse_error": <str or "">,
+        }
+
+    Best-effort: a malformed reply yields an empty `env_diff` and a
+    populated `parse_error` so callers can still log something useful.
+    """
+    out = {"env_diff": {}, "rationale": {}, "risk": {},
+           "raw": text or "", "parse_error": ""}
+    if not text:
+        out["parse_error"] = "empty agent response"
+        return out
+
+    import re as _re
+    m = _re.search(r"```ya?ml\s*\n(.*?)\n```", text, _re.DOTALL | _re.IGNORECASE)
+    block = m.group(1) if m else text
+
+    try:
+        import yaml as _yaml
+        parsed = _yaml.safe_load(block) or {}
+    except Exception as exc:
+        out["parse_error"] = f"yaml parse: {exc}"
+        return out
+
+    if not isinstance(parsed, dict):
+        out["parse_error"] = "top-level yaml is not a mapping"
+        return out
+
+    for key in ("env_diff", "rationale", "risk"):
+        v = parsed.get(key)
+        if isinstance(v, dict):
+            out[key] = {str(k): str(val) for k, val in v.items()}
+    return out
+
+
+def _run_env_policy_iteration(
+    task_dir: Path,
+    bottlenecks: list,
+    config: WorkloadConfig,
+    framework: str,
+    gpu_arch: str,
+    model_id: str,
+    benchmark_summary: str = "",
+    agent_backend: str = "",
+) -> dict:
+    """Prompt-driven env-policy task: ask the agent for a VLLM_ROCM_USE_AITER_*
+    env diff for the current workload.
+
+    Runs through the same `_run_agent_iteration` machinery as the kernel-rewrite
+    loop so cursor / codex / claude all share one code path. Returns the parsed
+    diff dict (see `_parse_env_policy_response`) plus a `messages` list and a
+    persisted `task_dir` for traceability.
+    """
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "prompts"))
+        from env_policy_prompt import render_env_policy_prompt
+    except Exception as exc:
+        print(f"  [env-policy] could not import prompt template: {exc}")
+        return {"env_diff": {}, "rationale": {}, "risk": {}, "raw": "",
+                "parse_error": f"prompt template import failed: {exc}",
+                "task_dir": str(task_dir), "messages": []}
+
+    available_flags = _discover_aiter_env_flags()
+    if not available_flags:
+        print("  [env-policy] no VLLM_ROCM_USE_AITER_* flags discovered on this "
+              "install; skipping env-policy task")
+        return {"env_diff": {}, "rationale": {}, "risk": {}, "raw": "",
+                "parse_error": "no flags discovered",
+                "task_dir": str(task_dir), "messages": []}
+
+    current_envs = {k: v for k, v in os.environ.items()
+                    if k.startswith("VLLM_ROCM_USE_AITER")}
+
+    bottleneck_payload = []
+    for k in bottlenecks[:20]:
+        if hasattr(k, "name"):
+            bottleneck_payload.append({
+                "name": getattr(k, "name", "?"),
+                "category": getattr(k, "category", "?"),
+                "percent_total": getattr(k, "percent_total", 0.0),
+                "total_time_us": getattr(k, "total_time_us", 0.0),
+                "calls": getattr(k, "calls", 0),
+                "matched_kernel_spec": getattr(k, "matched_kernel_spec", None),
+                "origin_library": getattr(k, "origin_library", "?"),
+            })
+        elif isinstance(k, dict):
+            bottleneck_payload.append(k)
+
+    prompt = render_env_policy_prompt(
+        framework=framework,
+        gpu_arch=gpu_arch,
+        model_id=model_id,
+        bottlenecks=bottleneck_payload,
+        available_flags=available_flags,
+        current_envs=current_envs,
+        benchmark_summary=benchmark_summary,
+    )
+
+    task_dir.mkdir(parents=True, exist_ok=True)
+    inputs_dir = task_dir / "inputs"
+    inputs_dir.mkdir(exist_ok=True)
+    try:
+        (inputs_dir / "bottlenecks.json").write_text(
+            json.dumps(bottleneck_payload, indent=2)
+        )
+        (inputs_dir / "available_flags.json").write_text(
+            json.dumps(available_flags, indent=2)
+        )
+        (inputs_dir / "current_envs.json").write_text(
+            json.dumps(current_envs, indent=2)
+        )
+    except Exception as exc:
+        print(f"  [env-policy] failed to persist inputs: {exc}")
+
+    cfg = config
+    if agent_backend and agent_backend != config.agent_backend:
+        try:
+            from agents.backends import resolve_default_model
+            cfg = replace(
+                config,
+                agent_backend=agent_backend,
+                agent_model=resolve_default_model(agent_backend),
+            )
+        except Exception:
+            cfg = replace(config, agent_backend=agent_backend)
+
+    messages, _solution_written = _run_agent_iteration(
+        task_dir=task_dir,
+        prompt=prompt,
+        config=cfg,
+        iteration=1,
+    )
+
+    raw_text = ""
+    for msg in messages or []:
+        c = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(c, str):
+            raw_text += "\n" + c
+        elif isinstance(c, list):
+            for block in c:
+                t = block.get("text") if isinstance(block, dict) else None
+                if isinstance(t, str):
+                    raw_text += "\n" + t
+
+    response_path = task_dir / "agent_response.md"
+    if not response_path.exists() and raw_text.strip():
+        try:
+            response_path.write_text(raw_text)
+        except Exception:
+            pass
+    elif response_path.exists():
+        try:
+            raw_text = response_path.read_text() or raw_text
+        except Exception:
+            pass
+
+    parsed = _parse_env_policy_response(raw_text)
+    parsed["task_dir"] = str(task_dir)
+    parsed["messages"] = messages or []
+    parsed["available_flags"] = [f["name"] for f in available_flags]
+
+    parsed["env_diff"] = {
+        k: v for k, v in parsed["env_diff"].items()
+        if k in {f["name"] for f in available_flags}
+    }
+
+    try:
+        (task_dir / "env_policy.json").write_text(
+            json.dumps({k: v for k, v in parsed.items()
+                        if k != "messages"}, indent=2)
+        )
+    except Exception as exc:
+        print(f"  [env-policy] could not persist parsed result: {exc}")
+
+    if parsed["env_diff"]:
+        print(f"  [env-policy] agent proposed {len(parsed['env_diff'])} flag(s): "
+              f"{sorted(parsed['env_diff'].keys())}")
+    else:
+        print(f"  [env-policy] agent proposed no flag changes "
+              f"(parse_error={parsed['parse_error'] or 'none'})")
+    return parsed
+
+
+def _run_env_policy_benchmark(
+    *,
+    config: WorkloadConfig,
+    bottlenecks: list,
+    framework: str,
+    gpu_arch: str,
+    model_id: str,
+    baseline_tps: float,
+    final_tps: float,
+    results_dir: Path,
+) -> dict:
+    """Run the env-policy agent task and benchmark with the resulting diff.
+
+    Returns a dict with keys:
+        env_policy: parsed agent reply (env_diff / rationale / risk).
+        env_policy_tps: TPS measured with the agent's diff applied.
+        env_policy_applied: True iff the agent proposed a non-empty diff
+            AND the benchmark with that diff actually ran successfully.
+        improvement_vs_baseline / improvement_vs_final: ratios for the
+            report aggregator.
+    """
+    summary = (
+        f"baseline TPS={baseline_tps:.1f}, final-with-rewrites TPS={final_tps:.1f}"
+    )
+    backend = config.env_policy_agent or config.agent_backend
+
+    task_dir = results_dir / "env_policy"
+    parsed = _run_env_policy_iteration(
+        task_dir=task_dir,
+        bottlenecks=bottlenecks,
+        config=config,
+        framework=framework,
+        gpu_arch=gpu_arch,
+        model_id=model_id,
+        benchmark_summary=summary,
+        agent_backend=backend,
+    )
+
+    record: dict = {
+        "agent_backend": backend,
+        "agent_proposal": parsed,
+        "env_policy_tps": 0.0,
+        "env_policy_applied": False,
+        "env_policy_benchmark": {},
+        "improvement_vs_baseline": 0.0,
+        "improvement_vs_final": 0.0,
+    }
+
+    diff = parsed.get("env_diff", {}) or {}
+    if not diff:
+        print("  [env-policy] no diff to apply; skipping benchmark draw.")
+        return record
+
+    print(f"  [env-policy] applying {len(diff)} flag(s) and benchmarking…")
+
+    saved: dict[str, Optional[str]] = {}
+    try:
+        for k, v in diff.items():
+            saved[k] = os.environ.get(k)
+            os.environ[k] = str(v)
+        bench = _run_benchmark_multi(config, label="env-policy")
+    finally:
+        for k, prev in saved.items():
+            if prev is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
+
+    env_tps = extract_tps(bench)
+    bench["_kernel_patches_applied"] = False
+    bench["_env_policy_applied"] = True
+    bench["_env_policy_diff"] = diff
+
+    record["env_policy_benchmark"] = bench
+    record["env_policy_tps"] = env_tps
+    record["env_policy_applied"] = env_tps > 0
+    if baseline_tps > 0 and env_tps > 0:
+        record["improvement_vs_baseline"] = env_tps / baseline_tps
+    if final_tps > 0 and env_tps > 0:
+        record["improvement_vs_final"] = env_tps / final_tps
+
+    print(f"  [env-policy] env-policy TPS: {env_tps:.1f} tok/s")
+    if baseline_tps > 0:
+        print(f"  [env-policy] vs baseline:   "
+              f"{record['improvement_vs_baseline']:.4f}x")
+    if final_tps > 0:
+        print(f"  [env-policy] vs rewrites:   "
+              f"{record['improvement_vs_final']:.4f}x")
+
+    try:
+        (results_dir / "env_policy_summary.json").write_text(
+            json.dumps({
+                "agent_backend": backend,
+                "env_diff": diff,
+                "rationale": parsed.get("rationale", {}),
+                "risk": parsed.get("risk", {}),
+                "baseline_tps": baseline_tps,
+                "final_tps": final_tps,
+                "env_policy_tps": env_tps,
+                "improvement_vs_baseline": record["improvement_vs_baseline"],
+                "improvement_vs_final": record["improvement_vs_final"],
+            }, indent=2)
+        )
+    except Exception as exc:
+        print(f"  [env-policy] could not persist summary: {exc}")
+
+    return record
 
 
 def _estimate_kernel_difficulty(kernel: BottleneckKernel) -> str:
@@ -2970,7 +3527,13 @@ def _optimize_kernel(
             )
         else:
             print("    Grading with Magpie...")
-            _kb = getattr(kernel, "kernel_type", "triton") or "triton"
+            # Prefer the classifier category ("gluon"/"triton"/"hip") over the
+            # spec name so the static check uses the right whitelist.
+            _kb = (
+                getattr(kernel, "category", "")
+                or getattr(kernel, "kernel_type", "triton")
+                or "triton"
+            )
             with _GPU_GRADE_LOCK:
                 kr = grade_task(task_dir, isolate_caches=True, gpu_device=0,
                                 speedup_cap=config.tampering_speedup_cap,
@@ -4237,6 +4800,39 @@ def _run_workload_optimization_inner(
         print(f"  WARNING: No kernel patches were applied for this benchmark run")
     print(f"  Duration: {step_timings['benchmark_final']:.1f}s")
 
+    # Step 7b (optional): prompt-driven env-policy benchmark draw.
+    # Always attributed independently from kernel rewrites so the report can
+    # tell which delta came from which agent task.
+    env_policy_record: dict = {}
+    if getattr(config, "enable_env_policy", False) and not config.dry_run:
+        print(f"\n{'─'*65}")
+        print(f"  Step 7b: Env-Policy Agent + Benchmark Draw")
+        print(f"{'─'*65}")
+        t_step = time.monotonic()
+        try:
+            env_policy_record = _run_env_policy_benchmark(
+                config=config,
+                bottlenecks=selected,
+                framework=config.framework or "vllm",
+                gpu_arch=config.gpu_arch or "gfx950",
+                model_id=str(benchmark_cfg.get("benchmark", {})
+                             .get("model", config.framework or "")),
+                baseline_tps=baseline_tps,
+                final_tps=final_tps,
+                results_dir=results_dir,
+            )
+            trajectory.env_policy = env_policy_record
+            trajectory.env_policy_tps = float(
+                env_policy_record.get("env_policy_tps", 0.0) or 0.0
+            )
+        except Exception as exc:
+            print(f"  [env-policy] step failed: {exc}")
+            import traceback
+            traceback.print_exc()
+            trajectory.errors.append(f"env-policy step failed: {str(exc)[:200]}")
+        step_timings["env_policy"] = time.monotonic() - t_step
+        print(f"  Duration: {step_timings['env_policy']:.1f}s")
+
     # Step 8: Compute trajectory reward
     print(f"\n{'─'*65}")
     print(f"  Step 8: Compute Trajectory Reward")
@@ -4346,12 +4942,39 @@ def _run_workload_optimization_inner(
     print(f"\n{'='*65}")
     print(f"  WORKLOAD OPTIMIZATION COMPLETE")
     print(f"{'='*65}")
+    # Phase 4 honest summary: only call the delta an "Improvement" when at
+    # least one kernel patch was injected (or env-policy was applied) AND the
+    # delta cleared the noise floor. Otherwise the number is measurement
+    # noise and reporting it as Improvement misleads anyone skim-reading
+    # the run log.
+    patches_injected = len(reinjected) > 0
+    env_policy_applied_summary = bool(env_policy_record.get("env_diff"))
+    stat_sig = (
+        baseline_tps > 0
+        and final_tps > 0
+        and _is_improvement_significant(baseline_result, final_result)
+    )
     print(f"  Workload:       {workload_id}")
     print(f"  Kernels:        {len(kernel_opt_results)} optimized, {len(reinjected)} re-injected")
     print(f"  Baseline TPS:   {baseline_tps:.1f}")
     print(f"  Final TPS:      {final_tps:.1f}")
     if baseline_tps > 0 and final_tps > 0:
-        print(f"  Improvement:    {final_tps/baseline_tps:.4f}x")
+        ratio = final_tps / baseline_tps
+        if not patches_injected and not env_policy_applied_summary:
+            # No agent action was applied to the running engine — anything
+            # we measured is run-to-run noise.
+            print(f"  TPS delta:      {ratio:.4f}x  [noise / not injected]")
+        elif not stat_sig:
+            print(f"  TPS delta:      {ratio:.4f}x  [within noise floor; not significant]")
+        else:
+            print(f"  Improvement:    {ratio:.4f}x")
+    if env_policy_applied_summary:
+        ep_tps = float(env_policy_record.get("env_policy_tps", 0.0) or 0.0)
+        if baseline_tps > 0 and ep_tps > 0:
+            print(f"  Env-policy TPS: {ep_tps:.1f}  ({ep_tps/baseline_tps:.4f}x vs baseline)")
+        diff_keys = sorted((env_policy_record.get("env_diff") or {}).keys())
+        if diff_keys:
+            print(f"  Env-policy diff: {diff_keys}")
     print(f"  Model reward:   {trajectory.model_reward:.4f} ({trajectory.trajectory_quality})")
     print(f"  Duration:       {trajectory.total_duration_s:.1f}s")
     print(f"  Trajectory ID:  {tid}")
@@ -4409,6 +5032,9 @@ def _init_config_from_args(args) -> WorkloadConfig:
         agent_model_simple=getattr(args, "agent_model_simple", ""),
         agent_model_complex=getattr(args, "agent_model_complex", ""),
         tampering_speedup_cap=getattr(args, "tampering_speedup_cap", 0.0),
+        rewrite_as=(getattr(args, "rewrite_as", "") or "").lower(),
+        enable_env_policy=bool(getattr(args, "enable_env_policy", False)),
+        env_policy_agent=(getattr(args, "env_policy_agent", "") or "").lower(),
     )
 
 
@@ -4620,7 +5246,11 @@ def cmd_grade(args):
         _create_task_config(task_dir, kernel, config, baseline_sources)
 
         print(f"  Grading {spec}...")
-        _kb = getattr(kernel, "kernel_type", "triton") or "triton"
+        _kb = (
+            getattr(kernel, "category", "")
+            or getattr(kernel, "kernel_type", "triton")
+            or "triton"
+        )
         kr = grade_task(task_dir, speedup_cap=config.tampering_speedup_cap,
                         compute_rl_reward=True, require_tags=False,
                         kernel_backend=_kb)
@@ -5140,6 +5770,14 @@ def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
     if spec_path:
         with open(spec_path) as f:
             raw = yaml.safe_load(f)
+        gt = raw.get("ground_truth", {}) or {}
+        # Allow `rewrite_as: gluon` at top level of the YAML for ergonomics.
+        if raw.get("rewrite_as") and "rewrite_as" not in gt:
+            gt["rewrite_as"] = str(raw["rewrite_as"]).lower()
+        # Allow CLI override (--rewrite-as gluon takes precedence over YAML).
+        cli_rewrite = (getattr(args, "rewrite_as", "") or "").lower()
+        if cli_rewrite:
+            gt["rewrite_as"] = cli_rewrite
         return KernelStandaloneDefinition(
             task_id=raw.get("task_id", ""),
             kernel_path=raw.get("kernel_path", ""),
@@ -5149,7 +5787,7 @@ def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
             gpu_arch=raw.get("gpu_arch", getattr(args, "gpu", "gfx950")),
             framework=raw.get("framework", ""),
             solution_path=raw.get("solution_path", "") or getattr(args, "solution", "") or "",
-            ground_truth=raw.get("ground_truth", {}),
+            ground_truth=gt,
         )
 
     kernel_path = getattr(args, "kernel", "")
@@ -5215,6 +5853,10 @@ def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
                     gt["source_library"] = gt_spec.source_library
                     print(f"    Auto-discovered Accordo config for '{kname}' from {gt_spec.source_library}")
 
+    rewrite_as = (getattr(args, "rewrite_as", "") or "").lower()
+    if rewrite_as:
+        gt["rewrite_as"] = rewrite_as
+
     return KernelStandaloneDefinition(
         kernel_path=kernel_path,
         kernel_type=getattr(args, "kernel_type", "triton"),
@@ -5235,7 +5877,7 @@ def _create_standalone_task_config(
     from ground_truth import GroundTruthSpec
 
     kernel_python = _detect_kernel_python()
-    ext = ".py" if kdef.kernel_type in ("triton", "pytorch") else ".hip"
+    ext = ".py" if kdef.kernel_type in ("triton", "gluon", "pytorch") else ".hip"
     gt = kdef.ground_truth
 
     baseline_path = f"./baseline{ext}"
@@ -5392,9 +6034,23 @@ within the configured tolerance. This is for HIP/C++ kernels where source-level
 comparison is not feasible.
 """
 
+    # `--rewrite-as gluon` keeps the baseline file as-is but instructs the agent
+    # to write a Gluon-flavoured solution (@gluon.jit). We treat it just like
+    # `--kernel-type gluon` for prompting purposes.
+    rewrite_as = (kdef.ground_truth.get("rewrite_as", "") or "").lower()
+    is_gluon = (kdef.kernel_type == "gluon") or (rewrite_as == "gluon")
+
     # Build skill recommendations based on kernel type
     skill_recommendations = []
-    if kdef.kernel_type == "triton":
+    if is_gluon:
+        skill_recommendations = [
+            "tools/skills/gluon-kernel-optimization/SKILL.md",
+            "tools/skills/gluon-kernel-reflection-prompts/SKILL.md",
+            # Falling back to Triton skills is still useful — Gluon shares the
+            # frontend, JIT, and many idioms.
+            "tools/skills/triton-kernel-optimization/SKILL.md",
+        ]
+    elif kdef.kernel_type == "triton":
         skill_recommendations = [
             "tools/skills/triton-kernel-optimization/SKILL.md",
             "tools/skills/triton-kernel-reflection-prompts/SKILL.md",
@@ -5416,16 +6072,53 @@ comparison is not feasible.
 
     sol_ext = "py" if kdef.kernel_type != "hip" else "hip"
 
-    prompt = textwrap.dedent(f"""\
-# Kernel Optimization Task: {kdef.kernel_name or kdef.kernel_type}
+    # Gluon-specific addendum injected near the top of the prompt so the agent
+    # sees it before the per-step instructions.
+    gluon_addendum = ""
+    if is_gluon:
+        gluon_addendum = textwrap.dedent("""\
+        ## Gluon mode (REQUIRED)
 
-{kdef.description or f"Optimize the {kdef.kernel_type} kernel for AMD {gpu_arch}."}
+        Your solution **MUST** use the Gluon dialect of Triton:
+
+        - Imports: `from triton.experimental import gluon` and
+          `from triton.experimental.gluon import language as gl`
+        - Decorate device kernels with `@gluon.jit` (NOT `@triton.jit`).
+        - Allocate index tensors with `gl.arange(0, N, layout=<BlockedLayout>)`.
+        - On AMD MI300X / CDNA3, wavefront size is **64**, so `BlockedLayout`
+          must use `threads_per_warp=[64]` (or `[1, 64]` etc.). Using `[32]`
+          will compile but waste half the lanes.
+        - Use `gl.SliceLayout(dim=D, parent=L)` for per-axis 1D index tensors,
+          then broadcast back via `[:, None]` / `[None, :]` (zero-cost).
+        - Reductions (`gl.sum`, `gl.max`, `gl.min`) return tensors with
+          `SliceLayout`, broadcast-compatible with the input layout.
+        - For coalesced global memory: place the most threads of the layout
+          on the inner-contiguous tensor dimension and set
+          `size_per_thread` along that dim to 2 or 4 to get
+          `global_load_dwordx{2,4}`.
+        - Avoid `gl.convert_layout` unless absolutely necessary — it spills
+          to LDS.
+        - For matmul on MI300X consider `gl.amd.cdna3.mfma(...)` and
+          `gl.DotOperandLayout`.
+
+        See `tools/skills/gluon-kernel-optimization/SKILL.md` for the
+        complete idiom reference and `tools/gluon_rag/` for known-good
+        Gluon kernels you can read for inspiration.
+        """)
+
+    effective_type = "gluon" if is_gluon else kdef.kernel_type
+    prompt = textwrap.dedent(f"""\
+# Kernel Optimization Task: {kdef.kernel_name or effective_type}
+
+{kdef.description or f"Optimize the {effective_type} kernel for AMD {gpu_arch}."}
 
 {arch_section}
 
+{gluon_addendum}
+
 ## Baseline Kernel
 
-**Type:** {kdef.kernel_type}
+**Type:** {effective_type}{' (rewrite-as)' if rewrite_as == 'gluon' and kdef.kernel_type != 'gluon' else ''}
 **Framework:** {kdef.framework or 'standalone'}
 **Task directory:** `{task_dir}`
 
@@ -5523,7 +6216,7 @@ def cmd_optimize_kernel(args):
     task_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy baseline kernel to task directory
-    ext = ".py" if kdef.kernel_type in ("triton", "pytorch") else ".hip"
+    ext = ".py" if kdef.kernel_type in ("triton", "gluon", "pytorch") else ".hip"
     baseline_dst = task_dir / f"baseline{ext}"
     if kdef.kernel_path and Path(kdef.kernel_path).exists():
         shutil.copy2(kdef.kernel_path, baseline_dst)
@@ -5708,7 +6401,7 @@ def cmd_grade_kernel(args):
     task_dir = output_dir / kdef.task_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = ".py" if kdef.kernel_type in ("triton", "pytorch") else ".hip"
+    ext = ".py" if kdef.kernel_type in ("triton", "gluon", "pytorch") else ".hip"
 
     # Copy baseline
     baseline_dst = task_dir / f"baseline{ext}"
@@ -5790,8 +6483,14 @@ def _add_kernel_spec_args(parser):
     g.add_argument("--kernel", default="",
                    help="Path to baseline kernel file (alternative to --kernel-spec)")
     g.add_argument("--kernel-type", default="triton",
-                   choices=["triton", "hip", "pytorch"],
-                   help="Kernel type: triton, hip, or pytorch (default: triton)")
+                   choices=["triton", "gluon", "hip", "pytorch"],
+                   help="Kernel type: triton, gluon, hip, or pytorch (default: triton)")
+    g.add_argument("--rewrite-as", default="",
+                   choices=["", "gluon"],
+                   help="If set to 'gluon', the agent is asked to produce a Gluon "
+                        "(@gluon.jit) rewrite of the baseline kernel even when the "
+                        "baseline is plain Triton. Equivalent to --kernel-type gluon "
+                        "but keeps the baseline file unchanged.")
     g.add_argument("--kernel-name", default="",
                    help="Human-readable kernel name (for prompts)")
     g.add_argument("--description", default="",
@@ -5851,7 +6550,7 @@ def _add_benchmark_args(parser):
 
 def _add_kernel_filter_args(parser):
     parser.add_argument("--kernel-types", default="all",
-                        help="Comma-separated: triton,hip,ck,asm,all (default: all)")
+                        help="Comma-separated: triton,gluon,hip,ck,asm,all (default: all)")
     parser.add_argument("--kernels", default="all",
                         help="Comma-separated kernel spec names, or 'all'")
     parser.add_argument("--top-k", type=int, default=10,
@@ -5860,6 +6559,12 @@ def _add_kernel_filter_args(parser):
                         default="post-filter",
                         help="Filter order: post-filter (type filter before top-k) or "
                              "pre-filter (top-k before type filter). Default: post-filter")
+    parser.add_argument("--rewrite-as", default="", choices=["", "gluon"],
+                        help="If 'gluon', the agent is asked to produce a Gluon "
+                             "(@gluon.jit) rewrite of every selected kernel even "
+                             "if the baseline is plain Triton. Combine with "
+                             "'--kernel-types triton,gluon' to also include "
+                             "kernels that are already Gluon.")
 
 
 def _add_agent_args(parser):
@@ -5881,6 +6586,15 @@ def _add_agent_args(parser):
                         help="Agent model for complex kernels (model routing)")
     parser.add_argument("--tampering-speedup-cap", type=float, default=0.0,
                         help="Configurable speedup cap when benchmark tampering detected (0=default 1.0x)")
+    parser.add_argument("--enable-env-policy", action="store_true",
+                        help="After kernel rewrites, run a prompt-driven "
+                             "env-policy task: ask the agent to propose a "
+                             "VLLM_ROCM_USE_AITER_* diff and benchmark "
+                             "with it applied as a separate draw.")
+    parser.add_argument("--env-policy-agent", default="",
+                        choices=["", "cursor", "codex", "claude"],
+                        help="Agent to use for the env-policy task. "
+                             "Defaults to --agent-backend.")
 
 
 def main():

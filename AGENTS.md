@@ -153,7 +153,7 @@ python3 workload_optimizer.py identify -r <RESULTS_DIR> --kernel-types triton --
 python3 workload_optimizer.py identify -r <RESULTS_DIR> --top-k 5
 ```
 
-`--kernel-types`: comma-separated filter — `triton`, `hip`, `ck`, `asm`, or `all` (default: all).
+`--kernel-types`: comma-separated filter — `triton`, `gluon`, `hip`, `ck`, `asm`, or `all` (default: all).
 `--top-k`: how many top kernels by GPU time % to keep (default: 10).
 
 Produces: `identified_kernels` list in `pipeline_state.json`.
@@ -281,6 +281,17 @@ Produces: `tasks.json`, `export_metadata.json`, optionally `sft_warmstart.jsonl`
 Optimize any kernel from any library (aiter, vLLM, sglang, torch, MIOpen, CK, etc.)
 without running the full E2E model pipeline. The agent receives the baseline kernel,
 MCP tools, and correctness definition, then iterates to produce an optimized solution.
+
+> **Runtime note (`aiter` / `triton_kernels` host install).** The standalone
+> harness imports the baseline kernel module directly, so the underlying Python
+> package must be importable in the active interpreter. If `aiter` and
+> `triton_kernels` are NOT pip-installed in your `.venv`, run `optimize-kernel`
+> inside the `vllm/vllm-openai-rocm:v0.15.1` (or newer) image where both are
+> pre-installed, OR `pip install -e tools/rocm/aiter` and `pip install
+> -e tools/rocm/triton_kernels` in the host venv first. The pipeline now
+> falls back to the installed package's source tree when the local
+> `tools/rocm/<lib>/<path>` checkout is missing the requested file, so the
+> same campaign works in either environment without code changes.
 
 ```bash
 # Triton kernel with PyTorch reference correctness
@@ -455,7 +466,8 @@ types (e.g. `fused_moe` → pytorch, `kv_cache_ops` → library_test).
 | `--min-score 100` | export-rl | Minimum kernel score to include |
 | `--kernel-spec <YAML>` | optimize-kernel, grade-kernel | YAML file with full kernel definition |
 | `--kernel <PATH>` | optimize-kernel, grade-kernel | Path to baseline kernel file |
-| `--kernel-type triton` | optimize-kernel, grade-kernel | Kernel type: triton, hip, or pytorch |
+| `--kernel-type triton` | optimize-kernel, grade-kernel | Kernel type: triton, gluon, hip, or pytorch |
+| `--rewrite-as gluon` | optimize-kernel, optimize, run | Ask the agent to produce a Gluon (`@gluon.jit`) rewrite of the baseline. Combine with `--kernel-types triton,gluon` for the full pipeline. |
 | `--kernel-name <NAME>` | optimize-kernel, grade-kernel | Human-readable kernel name |
 | `--correctness-mode pytorch` | optimize-kernel, grade-kernel | Correctness: pytorch, library_test, or accordo |
 | `--reference <PATH>` | optimize-kernel, grade-kernel | PyTorch reference implementation (pytorch mode) |
@@ -529,6 +541,8 @@ Seven MCP servers (configured in `mcp_config.json`) provide agents with domain-s
 | triton-hip-reference-kernel-search | `tools/skills/triton-hip-reference-kernel-search/SKILL.md` | Searching Triton/HIP kernel patterns from reference corpus |
 | triton-kernel-optimization | `tools/skills/triton-kernel-optimization/SKILL.md` | Writing or tuning Triton GPU kernels (autotuning, fused ops, profiling) |
 | triton-kernel-reflection-prompts | `tools/skills/triton-kernel-reflection-prompts/SKILL.md` | Reflection prompts for reviewing/fixing AMD-targeted Triton kernels |
+| gluon-kernel-optimization | `tools/skills/gluon-kernel-optimization/SKILL.md` | Writing or tuning Gluon (`@gluon.jit`) kernels: layouts, MFMA paths, reductions, MI300X/MI355X tuning |
+| gluon-kernel-reflection-prompts | `tools/skills/gluon-kernel-reflection-prompts/SKILL.md` | Reflection prompts for diagnosing failed Gluon iterations (compile, correctness, layout regressions) |
 
 ### Data Dependencies (tools/)
 
@@ -607,6 +621,124 @@ The `origin_library` field in `pipeline_state.json` identifies the source per ke
 The pipeline adapts import fixups, module resolution, and prompt generation per library.
 
 Use `--kernel-types triton` to target reliably patchable kernels.
+
+## Gluon kernel support
+
+Apex understands **Gluon** (`triton.experimental.gluon`) as a first-class
+kernel category alongside `triton`, `hip`, `ck`, `asm`. Gluon kernels go
+through the same JIT/compile/grade pipeline as Triton kernels, but with a
+different prompt, a different skill, a different static check, and (where
+provided) a different curated reference corpus.
+
+### When Apex picks the gluon path
+
+- The bottleneck classifier in `pipeline/kernel_bottleneck.py` matches a
+  known Gluon kernel name (currently the catalogue from
+  `tools/rocm/aiter/aiter/ops/triton/gluon/`). To extend the catalogue,
+  add the function name to `_GLUON_KERNEL_NAMES`.
+- The user passes `--kernel-type gluon` to `optimize-kernel` or
+  `grade-kernel`.
+- The user passes `--rewrite-as gluon` to any of `optimize-kernel`,
+  `optimize`, or `run`. This forces the agent to produce a Gluon
+  (`@gluon.jit`) rewrite even when the baseline is plain Triton.
+
+### What changes when gluon is active
+
+| Subsystem | Behaviour |
+|---|---|
+| Bottleneck filter | `--kernel-types gluon` keeps only the `gluon` category (or combine: `--kernel-types triton,gluon`). |
+| Prompt | A "Gluon mode (REQUIRED)" addendum is prepended to the agent prompt with imports, decorator, layout rules, and links to the skill + RAG corpus. |
+| Skill recommendations | `tools/skills/gluon-kernel-optimization/SKILL.md` and `gluon-kernel-reflection-prompts/SKILL.md` are read first; the standard Triton skill is appended as fallback. |
+| Static check | `graders.reward_backends.run_gluon_static_check` accepts the `triton.experimental.gluon` namespace and `@gluon.jit` decorators (the regular Triton check would reject these). |
+| Reward backend | `resolve_kernel_backend("gluon")` and `resolve_kernel_backend("<spec>_gluon")` both map to `KERNEL_BACKEND_GLUON`. |
+| RAG corpus | `tools/gluon_rag/` contains symlinked tutorials, aiter Gluon kernels, and small standalone examples. |
+
+### Examples
+
+```bash
+# 1. Rewrite a Triton baseline as Gluon (standalone)
+python3 workload_optimizer.py optimize-kernel \
+  --kernel files/gluon_vector_add_baseline.py \
+  --kernel-type gluon \
+  --kernel-name vector_add \
+  --correctness-mode pytorch \
+  --reference files/gluon_vector_add_baseline.py \
+  -r /tmp/gluon_va_results --max-iterations 3
+
+# 2. Force the multi-kernel pipeline to emit Gluon for every selected
+#    bottleneck (Triton baselines get rewritten in Gluon, Gluon baselines
+#    stay in Gluon).
+python3 workload_optimizer.py run -r /tmp/results_gluon \
+  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml \
+  --kernel-types triton,gluon --rewrite-as gluon \
+  --top-k 5 --max-iterations 3
+
+# 3. Identify-only: see which currently-shipping kernels Apex thinks are
+#    Gluon vs Triton vs HIP.
+python3 workload_optimizer.py identify -r /tmp/results -b <bench> \
+  --kernel-types gluon --top-k 20
+```
+
+### Adding a new Gluon kernel name
+
+When a new aiter / sglang / vllm Gluon kernel ships, add its function name
+to `_GLUON_KERNEL_NAMES` in `pipeline/kernel_bottleneck.py`:
+
+```python
+_GLUON_KERNEL_NAMES = [
+    # existing entries ...
+    "_my_new_gluon_kernel",   # from <library>/<path>/<file>.py
+]
+```
+
+This is enough to make `identify` route it as `gluon` and the optimizer to
+read the Gluon skill instead of the Triton one.
+
+### Multi-agent Gluon evaluation
+
+Apex ships a turnkey harness for comparing the three agent backends
+(`claude`, `codex`, `cursor`) on Gluon optimization workloads:
+
+- `scripts/run_gluon_agent_eval.sh` — driver that runs three scenarios per
+  agent on real GPU:
+  - **Scenario A**: optimize a Gluon baseline (`files/gluon_vector_add_baseline.py`).
+  - **Scenario B**: optimize a Triton baseline asking for a Gluon rewrite
+    (`files/triton_rms_norm_baseline.py` + `--rewrite-as gluon`).
+  - **Scenario C**: full GPT-OSS-20B `run` with `--rewrite-as gluon`,
+    `--top-k 10 --max-iterations 3 --leaderboard`.
+- `scripts/aggregate_gluon_eval_report.py` — walks the results tree and
+  emits `results/gluon_eval/SUMMARY.md` with per-scenario tables and
+  links to every saved prompt, best solution, and run log.
+
+Quick start:
+
+```bash
+# All scenarios all agents (full e2e takes hours per agent):
+scripts/run_gluon_agent_eval.sh
+
+# Subsets:
+SCENARIOS="A B" AGENTS="codex cursor" scripts/run_gluon_agent_eval.sh
+DRY_RUN=1 AGENTS=claude SCENARIOS=A scripts/run_gluon_agent_eval.sh
+```
+
+Knobs: `RESULTS_ROOT`, `GPU` (default `gfx950`), `MAX_ITERS_AB`,
+`MAX_TURNS_AB`, `MAX_ITERS_C`, `MAX_TURNS_C`, `TOP_K_C`, `TIMEOUT_AB`
+(default `90m`), `TIMEOUT_C` (default `12h`), `MAGPIE_ROOT`. The harness
+never invokes the agent CLIs directly — every agent only ever sees the
+natural-language task prompt produced by `_build_standalone_kernel_prompt`
+(or the per-kernel pipeline prompt for scenario C).
+
+**Per-iteration prompt artifacts.** Every agent iteration now writes
+three files under `<task_dir>/prompts/`:
+
+| File | Contents |
+|------|----------|
+| `iter_NNN_user.md`   | Full user-facing prompt (incl. previous reflection). |
+| `iter_NNN_system.md` | System prompt that was passed to the backend. |
+| `iter_NNN_meta.json` | `{agent_backend, agent_model, max_turns, kernel_type, rewrite_as, ts, *_chars, dry_run}`. |
+
+These are the source of truth for "what did the agent actually see?" and
+are the columns that show up in `SUMMARY.md`.
 
 ## Session isolation
 

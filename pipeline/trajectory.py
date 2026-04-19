@@ -135,6 +135,12 @@ class WorkloadTrajectoryRecord:
     final_benchmark: dict = field(default_factory=dict)
     final_tps: float = 0.0
 
+    # Optional prompt-driven env-policy task (Phase 3 enabler).
+    # Populated only when --enable-env-policy is set. Records the agent's
+    # proposed env diff plus the benchmark draw run with that diff applied.
+    env_policy: dict = field(default_factory=dict)
+    env_policy_tps: float = 0.0
+
     # Reward
     per_kernel_scores: list[float] = field(default_factory=list)
     avg_kernel_score: float = 0.0

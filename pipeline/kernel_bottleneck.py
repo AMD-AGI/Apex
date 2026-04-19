@@ -5,11 +5,17 @@ bottleneck.py — Kernel bottleneck extraction and classification from Magpie
 benchmark results.
 
 Parses benchmark_report.json output from Magpie's benchmark mode,
-classifies kernel names into categories (triton, hip, ck, asm), and maps
+classifies kernel names into categories (triton, hip, ck, asm, gluon), and maps
 them back to KERNEL_SPECS kernel types for optimization.
 
 Categories:
-  - triton: Triton JIT-compiled kernels
+  - gluon:  Triton kernels written with @gluon.jit (lower-level layout-aware DSL).
+            These are still compiled through Triton, so their profiler names
+            look identical to regular Triton kernels — they are recognized by
+            matching against a curated list of known Gluon kernel function
+            names (currently sourced from aiter/aiter/ops/triton/gluon/).
+            Checked before `triton` so they don't get mis-classified.
+  - triton: Triton JIT-compiled kernels (@triton.jit)
   - hip:    HIP/CUDA native kernels (PyTorch, custom CUDA/HIP)
   - ck:     Composable Kernel (CK) library kernels
   - asm:    Assembly-optimized aiter kernels (MFMA-heavy, hand-tuned)
@@ -40,7 +46,50 @@ _TRITON_PATTERNS = [
     re.compile(r"triton::"),
     re.compile(r"^kernel_unified_attention"),
     re.compile(r"_gemm_a\d+_w\d+_kernel_BLOCK_SIZE"),
+    # OpenAI `triton_kernels` package — these are real @triton.jit kernels
+    # used by any model that adopts the OpenAI MoE / matmul-with-routing
+    # design (gpt-oss, future MoE workloads). They were previously
+    # mis-classified as ASM; the source is plain Triton at
+    # /…/triton_kernels/{matmul_ogs_details,routing_details,topk_details,
+    # reduction_details}/*.py and is fully agent-rewritable.
+    re.compile(r"^_matmul_ogs_"),
+    re.compile(r"^_p_matmul_ogs"),
+    re.compile(r"^_topk_forward"),
+    re.compile(r"^_combined_routing"),
+    re.compile(r"^_sum_bitmatrix"),
+    re.compile(r"^_finalize_matmul"),
 ]
+
+# Gluon kernels are also JIT-compiled through Triton, so we cannot tell them
+# apart from a profile entry's substring alone. Instead we maintain a list of
+# known Gluon function names (extend as new ones land in aiter/sglang/vllm).
+# Any kernel whose name STARTS WITH one of these tokens (after the optional
+# `_` underscore prefix Triton may add) is classified as `gluon`.
+#
+# To find more candidates, search any third-party tree for `@gluon.jit\ndef _?([A-Za-z0-9_]+)`.
+_GLUON_KERNEL_NAMES = [
+    # aiter/aiter/ops/triton/gluon/
+    "_gemm_a8w8_kernel",
+    "_gemm_a8w8_preshuffled_kernel",
+    "_gemm_a8w8_blockscale_kernel",
+    "_gemm_a8w8_blockscale_reduce_kernel",
+    "_gemm_afp4wfp4_kernel",
+    "_gemm_afp4wfp4_reduce_kernel",
+    "_pa_decode_gluon_kernel",
+    "_pa_mqa_logits",
+    # User additions: append your @gluon.jit kernel function names here.
+]
+# Triton appends specialization suffixes to kernel function names in the
+# profile (e.g. `_gemm_a8w8_kernel_d_BLOCK_M=128_BLOCK_N=128`), so we anchor
+# only the leading boundary and allow any trailing characters.
+_GLUON_PATTERNS = [
+    re.compile(rf"(^|[^A-Za-z0-9_]){re.escape(name)}")
+    for name in _GLUON_KERNEL_NAMES
+]
+# Allow opt-in keyword: kernels whose profile name contains this token are
+# always classified as gluon. Useful for libraries that adopt a naming
+# convention like `..._gluon_kernel` or for downstream forks.
+_GLUON_TOKEN_PATTERN = re.compile(r"(^|_)gluon(_|$)", re.IGNORECASE)
 
 _CK_PATTERNS = [
     re.compile(r"ck_tile"),
@@ -55,11 +104,6 @@ _CK_PATTERNS = [
 ]
 
 _ASM_PATTERNS = [
-    re.compile(r"^_matmul_ogs_"),
-    re.compile(r"^_topk_forward"),
-    re.compile(r"^_combined_routing"),
-    re.compile(r"^_sum_bitmatrix"),
-    re.compile(r"^_finalize_matmul"),
     re.compile(r"_asm"),
     re.compile(r"fused_moe_bf16_asm"),
     re.compile(r"reduce_segments$"),
@@ -77,14 +121,23 @@ _HIP_PATTERNS = [
 
 # Mapping profiler kernel names → KERNEL_SPECS kernel_type.
 # Order matters: first match wins.
+#
+# The three `moe_ogs_*` specs target the OpenAI `triton_kernels` MoE pipeline.
+# They are model-agnostic: any workload (gpt-oss-20b/120b, Mixtral, future MoE
+# models) that adopts OpenAI's outer-grouped-scattered matmul design will hit
+# them. Listed BEFORE the legacy `fused_moe` entry so the more specific OGS
+# patterns win.
 _SPEC_MAPPING: list[tuple[re.Pattern, str]] = [
     (re.compile(r"cross_device_reduce|rcclGenericKernel|allreduce|all_reduce", re.I), "all_reduce"),
     (re.compile(r"flash_attn|flash_attention|pa_prefill|fmha_fwd", re.I), "flash_attn_prefill"),
     (re.compile(r"paged_attn|pa_decode|paged_attention", re.I), "paged_attn_decode"),
     (re.compile(r"unified_attention", re.I), "paged_attn_decode"),
     (re.compile(r"mla_attn|mla_decode|multi_head_latent", re.I), "mla_attn"),
-    (re.compile(r"fused_moe|topk_forward|combined_routing|sum_bitmatrix|finalize_matmul_scatter|moe_forward", re.I), "fused_moe"),
-    (re.compile(r"matmul_ogs|gemm.*swiglu|gemm_a16_w16|gemm_bf16|gemm_a\d+_w\d+.*BLOCK", re.I), "gemm_bf16"),
+    (re.compile(r"^_matmul_ogs_|^_p_matmul_ogs"), "moe_ogs_matmul"),
+    (re.compile(r"^_topk_forward|^_combined_routing|^_sum_bitmatrix"), "moe_ogs_routing"),
+    (re.compile(r"^_finalize_matmul"), "moe_ogs_finalize"),
+    (re.compile(r"^fused_moe|moe_forward", re.I), "fused_moe"),
+    (re.compile(r"gemm.*swiglu|gemm_a16_w16|gemm_bf16|gemm_a\d+_w\d+.*BLOCK", re.I), "gemm_bf16"),
     (re.compile(r"gemm.*fp8|gemm.*w8a8|gemm.*a8w8", re.I), "gemm_w8a8"),
     (re.compile(r"rmsnorm|rms_norm|Rmsnorm2dFwd", re.I), "rms_norm"),
     (re.compile(r"rope|rotary", re.I), "rope_embedding"),
@@ -107,6 +160,12 @@ _SPEC_TO_AITER_ENV: dict[str, str] = {
     "silu_mul": "VLLM_ROCM_USE_AITER",
     "kv_cache_ops": "VLLM_ROCM_USE_AITER",
     "all_reduce": "VLLM_ROCM_USE_AITER",
+    # OpenAI `triton_kernels` MoE pipeline has no env-flag fallback —
+    # the agent must produce code (Triton or Gluon rewrite). The empty
+    # string is treated as "no env knob" by callers that read this map.
+    "moe_ogs_matmul": "",
+    "moe_ogs_routing": "",
+    "moe_ogs_finalize": "",
 }
 
 
@@ -144,12 +203,19 @@ class BottleneckKernel:
 
 
 def classify_kernel(name: str) -> str:
-    """Classify a profiler kernel name into triton/hip/ck/asm/unknown.
+    """Classify a profiler kernel name into gluon/triton/hip/ck/asm/unknown.
 
-    Check order: triton → ck → asm → hip → unknown.
-    Triton is checked first so that Triton-compiled GEMM kernels (which
-    contain BLOCK_SIZE in the name) are not mis-classified as CK DeviceGemm.
+    Check order: gluon → triton → ck → asm → hip → unknown.
+    Gluon is checked before Triton because Gluon kernels also match
+    `^triton_` / Triton patterns once they go through the Triton JIT.
+    Triton is checked next so Triton-compiled GEMM kernels (which contain
+    BLOCK_SIZE in the name) are not mis-classified as CK DeviceGemm.
     """
+    if _GLUON_TOKEN_PATTERN.search(name):
+        return "gluon"
+    for pat in _GLUON_PATTERNS:
+        if pat.search(name):
+            return "gluon"
     for pat in _TRITON_PATTERNS:
         if pat.search(name):
             return "triton"
@@ -171,6 +237,100 @@ def match_to_kernel_spec(kernel_name: str) -> Optional[str]:
         if pat.search(kernel_name):
             return spec_type
     return None
+
+
+# Regex used by `_parse_kernel_shape_hint` to extract tile/dtype info from
+# triton-emitted names. Two shape conventions show up in real traces:
+#   * OpenAI ogs:   `_matmul_ogs_NNT_<dtypeA>x<dtypeW>_<M>x<N>x<K>x<BS>[_swiglu]`
+#   * aiter gemm:   `_gemm_a<bA>_w<bW>_kernel_BLOCK_SIZE_M_<M>_BLOCK_SIZE_N_<N>_BLOCK_SIZE_K_<K>_…`
+# Both resolve to the same dict shape so callers do not need to special-case.
+_OGS_SHAPE_RE = re.compile(
+    r"^_(?:p_)?matmul_ogs_[A-Z]{3}_"
+    r"(?P<dtype>[a-z0-9]+x[a-z0-9]+)_"
+    r"(?P<M>\d+)x(?P<N>\d+)x(?P<K>\d+)x(?P<BS>\d+)"
+)
+_AITER_GEMM_SHAPE_RE = re.compile(
+    r"_gemm_a(?P<bA>\d+)_w(?P<bW>\d+)_kernel.*?"
+    r"BLOCK_SIZE_M_(?P<M>\d+).*?"
+    r"BLOCK_SIZE_N_(?P<N>\d+).*?"
+    r"BLOCK_SIZE_K_(?P<K>\d+)"
+)
+
+
+def _parse_kernel_shape_hint(
+    kernel_name: str,
+    benchmark_config: Optional[dict] = None,
+) -> dict:
+    """Extract tile / dtype hints from a triton-emitted kernel name.
+
+    The returned dict is fed into the prompt template so that the Gluon
+    rewrite addendum renders real workload shapes instead of hard-coded
+    constants. All keys are optional; callers should treat missing values
+    as "unknown — let the agent read it from the model card".
+
+    Returns:
+        {
+          "M": int|None, "N": int|None, "K": int|None, "BS": int|None,
+          "dtype_a": str|None, "dtype_w": str|None,
+          "swiglu_fused": bool,
+          "num_experts": int|None, "top_k": int|None,
+          "model_id": str|None,
+        }
+    """
+    out: dict = {
+        "M": None, "N": None, "K": None, "BS": None,
+        "dtype_a": None, "dtype_w": None,
+        "swiglu_fused": False,
+        "num_experts": None, "top_k": None,
+        "model_id": None,
+    }
+
+    m = _OGS_SHAPE_RE.match(kernel_name)
+    if m:
+        out["M"] = int(m.group("M"))
+        out["N"] = int(m.group("N"))
+        out["K"] = int(m.group("K"))
+        out["BS"] = int(m.group("BS"))
+        dtype = m.group("dtype")
+        parts = dtype.split("x", 1)
+        if len(parts) == 2:
+            out["dtype_a"], out["dtype_w"] = parts[0], parts[1]
+        out["swiglu_fused"] = "_swiglu" in kernel_name
+    else:
+        m2 = _AITER_GEMM_SHAPE_RE.search(kernel_name)
+        if m2:
+            out["M"] = int(m2.group("M"))
+            out["N"] = int(m2.group("N"))
+            out["K"] = int(m2.group("K"))
+            bA, bW = int(m2.group("bA")), int(m2.group("bW"))
+            out["dtype_a"] = {16: "bf16", 8: "fp8", 4: "fp4"}.get(bA, f"a{bA}")
+            out["dtype_w"] = {16: "bf16", 8: "fp8", 4: "fp4"}.get(bW, f"w{bW}")
+
+    if benchmark_config:
+        model_cfg = (
+            benchmark_config.get("model_config")
+            or benchmark_config.get("model")
+            or {}
+        )
+        if isinstance(model_cfg, dict):
+            for k, dst in (
+                ("num_experts", "num_experts"),
+                ("num_local_experts", "num_experts"),
+                ("n_routed_experts", "num_experts"),
+                ("top_k", "top_k"),
+                ("num_experts_per_tok", "top_k"),
+                ("model_id", "model_id"),
+                ("model", "model_id"),
+            ):
+                v = model_cfg.get(k)
+                if v is not None and out.get(dst) is None:
+                    out[dst] = v
+        if out.get("model_id") is None:
+            v = benchmark_config.get("model_id") or benchmark_config.get("model")
+            if isinstance(v, str):
+                out["model_id"] = v
+
+    return out
 
 
 def detect_origin_library(
@@ -212,7 +372,9 @@ def detect_origin_library(
             return "aiter"
 
     category = classify_kernel(kernel_name)
-    if category == "triton":
+    if category in ("triton", "gluon"):
+        # Gluon kernels in the wild today are exclusively shipped by aiter,
+        # but if AITER is off they would have to come from vllm/sglang.
         return "aiter" if aiter_enabled else "vllm"
     if category in ("ck", "asm"):
         return "aiter"

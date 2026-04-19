@@ -1,0 +1,1 @@
+/home/sirafati/gluon-learning/examples/06_softmax_row.py

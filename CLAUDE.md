@@ -282,6 +282,17 @@ Optimize any kernel from any library (aiter, vLLM, sglang, torch, MIOpen, CK, et
 without running the full E2E model pipeline. The agent receives the baseline kernel,
 MCP tools, and correctness definition, then iterates to produce an optimized solution.
 
+> **Runtime note (`aiter` / `triton_kernels` host install).** The standalone
+> harness imports the baseline kernel module directly, so the underlying Python
+> package must be importable in the active interpreter. If `aiter` and
+> `triton_kernels` are NOT pip-installed in your `.venv`, run `optimize-kernel`
+> inside the `vllm/vllm-openai-rocm:v0.15.1` (or newer) image where both are
+> pre-installed, OR `pip install -e tools/rocm/aiter` and `pip install
+> -e tools/rocm/triton_kernels` in the host venv first. The pipeline now
+> falls back to the installed package's source tree when the local
+> `tools/rocm/<lib>/<path>` checkout is missing the requested file, so the
+> same campaign works in either environment without code changes.
+
 ```bash
 # Triton kernel with PyTorch reference correctness
 python3 workload_optimizer.py optimize-kernel \
@@ -607,6 +618,60 @@ The `origin_library` field in `pipeline_state.json` identifies the source per ke
 The pipeline adapts import fixups, module resolution, and prompt generation per library.
 
 Use `--kernel-types triton` to target reliably patchable kernels.
+
+## Gluon kernel support and multi-agent evaluation
+
+Apex treats Gluon (`triton.experimental.gluon` / `@gluon.jit`) as a
+first-class kernel category alongside `triton`, `hip`, `ck`, and `asm`.
+
+| Surface | Behavior |
+|---------|----------|
+| `--kernel-types gluon` (or `triton,gluon`) | Filters bottlenecks classified as Gluon by `pipeline/kernel_bottleneck.py`. |
+| `--rewrite-as gluon` | Asks the agent to produce a `@gluon.jit` rewrite of every selected kernel, even if the baseline is plain Triton. Combine with `--kernel-types triton,gluon` to also include real Gluon kernels. |
+| Standalone | `optimize-kernel --kernel-type gluon` and `optimize-kernel --kernel-type triton --rewrite-as gluon` both inject the Gluon prompt addendum (`BlockedLayout` / `threads_per_warp=[64]` / `gl.SliceLayout` / `gl.amd.cdna3.mfma`). |
+| Static check | `graders.reward_backends.run_gluon_static_check` accepts the `triton.experimental.gluon` namespace and `@gluon.jit` decorators. |
+| Skills | `tools/skills/gluon-kernel-optimization/SKILL.md` and `tools/skills/gluon-kernel-reflection-prompts/SKILL.md` are recommended ahead of the standard Triton skill. |
+| RAG | `tools/gluon_rag/` contains symlinked Triton tutorials, aiter Gluon kernels, and small standalone examples. |
+
+### Multi-agent Gluon evaluation harness
+
+`scripts/run_gluon_agent_eval.sh` drives all three agent backends
+(`claude`, `codex`, `cursor`) on real GPU through three scenarios:
+
+- **A** — optimize a Gluon baseline (`files/gluon_vector_add_baseline.py`).
+- **B** — optimize a Triton baseline asking for a Gluon rewrite
+  (`files/triton_rms_norm_baseline.py` + `--rewrite-as gluon`).
+- **C** — full GPT-OSS-20B `run` with `--rewrite-as gluon`,
+  `--top-k 10 --max-iterations 3 --leaderboard`.
+
+Then `scripts/aggregate_gluon_eval_report.py` walks the results and
+emits `results/gluon_eval/SUMMARY.md` with per-scenario tables and links
+to every saved prompt, best solution, and run log.
+
+```bash
+scripts/run_gluon_agent_eval.sh                                # all
+SCENARIOS="A B" AGENTS="codex cursor" scripts/run_gluon_agent_eval.sh
+DRY_RUN=1 AGENTS=claude SCENARIOS=A scripts/run_gluon_agent_eval.sh
+```
+
+Knobs (env vars): `RESULTS_ROOT`, `GPU` (default `gfx950`), `MAX_ITERS_AB`,
+`MAX_TURNS_AB`, `MAX_ITERS_C`, `MAX_TURNS_C`, `TOP_K_C`, `TIMEOUT_AB`
+(default `90m`), `TIMEOUT_C` (default `12h`), `MAGPIE_ROOT`. The harness
+never invokes the agent CLIs directly — every agent only ever sees the
+natural-language task prompt produced by the prompt builder.
+
+### Per-iteration prompt artifacts
+
+Every agent iteration writes three files under `<task_dir>/prompts/`:
+
+| File | Contents |
+|------|----------|
+| `iter_NNN_user.md`   | Full user-facing prompt (incl. previous reflection). |
+| `iter_NNN_system.md` | System prompt that was passed to the backend. |
+| `iter_NNN_meta.json` | `{agent_backend, agent_model, max_turns, kernel_type, rewrite_as, ts, *_chars, dry_run}`. |
+
+These are the source of truth for "what did the agent actually see?" and
+are surfaced as columns in `SUMMARY.md`.
 
 ## Session isolation
 

@@ -19,10 +19,12 @@ import re
 
 KERNEL_BACKEND_TRITON = "triton"
 KERNEL_BACKEND_HIP = "hip"
+KERNEL_BACKEND_GLUON = "gluon"
 
 SUPPORTED_KERNEL_BACKENDS: frozenset[str] = frozenset({
     KERNEL_BACKEND_TRITON,
     KERNEL_BACKEND_HIP,
+    KERNEL_BACKEND_GLUON,
 })
 
 # Apex kernel spec → backend mapping
@@ -34,6 +36,13 @@ TRITON_SPECS: frozenset[str] = frozenset({
 
 HIP_SPECS: frozenset[str] = frozenset({
     "gemm_w8a8", "gemm_bf16", "all_reduce",
+})
+
+# Apex kernel specs that correspond to a Gluon (@gluon.jit) implementation.
+# These are passed through to the gluon backend for static screening, so the
+# checker accepts `from triton.experimental.gluon import language as gl` etc.
+GLUON_SPECS: frozenset[str] = frozenset({
+    "paged_attn_decode_gluon",
 })
 
 
@@ -62,6 +71,8 @@ def resolve_kernel_backend(kernel_type_str: str) -> str:
     backend = kernel_type_str.strip().lower()
     if backend in SUPPORTED_KERNEL_BACKENDS:
         return backend
+    if backend in GLUON_SPECS or backend.endswith("_gluon"):
+        return KERNEL_BACKEND_GLUON
     if backend in TRITON_SPECS:
         return KERNEL_BACKEND_TRITON
     if backend in HIP_SPECS:
@@ -101,7 +112,7 @@ def normalize_answer_for_backend(answer: str, backend: str) -> str:
     normalized = strip_markdown_code_fence(answer).strip()
     if backend == KERNEL_BACKEND_HIP:
         return normalized
-    if backend == KERNEL_BACKEND_TRITON:
+    if backend in (KERNEL_BACKEND_TRITON, KERNEL_BACKEND_GLUON):
         return normalized
     raise ValueError(f"Unsupported backend: {backend}")
 
@@ -111,6 +122,22 @@ def normalize_answer_for_backend(answer: str, backend: str) -> str:
 ALLOWED_IMPORTS: frozenset[str] = frozenset({
     "triton",
     "triton.language",
+    "math",
+    "torch",
+})
+
+# Gluon kernels live under triton.experimental.gluon and use the same
+# whitelist plus the gluon namespace.
+GLUON_ALLOWED_IMPORTS: frozenset[str] = frozenset({
+    "triton",
+    "triton.language",
+    "triton.experimental",
+    "triton.experimental.gluon",
+    "triton.experimental.gluon.language",
+    "triton.experimental.gluon.language.amd",
+    "triton.experimental.gluon.language.amd.cdna3",
+    "triton.experimental.gluon.language.amd.cdna4",
+    "triton.experimental.gluon.language.nvidia",
     "math",
     "torch",
 })
@@ -277,6 +304,146 @@ def run_triton_static_check(
     return True, ""
 
 
+# ── Gluon static checks ──────────────────────────────────────────────────────
+
+
+def run_gluon_static_check(
+    code: str,
+    allowed_imports: list[str] | None = None,
+) -> tuple[bool, str]:
+    """
+    Parse a Gluon kernel source and enforce a whitelist similar to Triton's.
+
+    The differences vs. ``run_triton_static_check`` are:
+    1. The import whitelist allows the ``triton.experimental.gluon`` namespace.
+    2. The decorator requirement is ``@gluon.jit`` (or ``@triton.experimental.gluon.jit``)
+       *or* ``@triton.jit`` — both are valid in Gluon-friendly solutions.
+    3. All other safety checks (blocked builtins, blocked modules, blocked
+       torch attrs, hardcoded literal returns) are identical.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return False, f"SyntaxError: {exc}"
+
+    allowed_set: frozenset[str] = (
+        frozenset(allowed_imports) if allowed_imports is not None
+        else GLUON_ALLOWED_IMPORTS
+    )
+
+    alias_map: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                alias_map[local] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                local = alias.asname or alias.name
+                full = f"{node.module}.{alias.name}" if node.module else alias.name
+                alias_map[local] = full
+
+    def _canonical(name: str) -> str:
+        return alias_map.get(name, name)
+
+    def _is_literal_tree(node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return all(_is_literal_tree(child) for child in node.elts)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            return _is_literal_tree(node.operand)
+        return False
+
+    # Import whitelist
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if alias.name not in allowed_set and top not in allowed_set:
+                    return False, f"blocked_import: '{alias.name}' is not whitelisted"
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            top = module.split(".")[0]
+            if module not in allowed_set and top not in allowed_set:
+                return False, f"blocked_import: 'from {module} import ...' is not whitelisted"
+            if top == "torch" or _canonical(top) == "torch":
+                for alias in node.names:
+                    if alias.name in BLOCKED_TORCH_ATTRS:
+                        return False, (
+                            f"blocked_import: 'from torch import {alias.name}' "
+                            "imports a blocked torch computation"
+                        )
+
+    # Blocked builtins
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in BLOCKED_BUILTINS:
+                return False, f"blocked_builtin: call to '{func.id}()' is forbidden"
+
+    # Blocked module access and torch attrs
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            root = node
+            while isinstance(root, ast.Attribute):
+                root = root.value  # type: ignore[assignment]
+            if not isinstance(root, ast.Name):
+                continue
+            canonical = _canonical(root.id)
+            top_canonical = canonical.split(".")[0]
+
+            if top_canonical in BLOCKED_MODULES:
+                return False, (
+                    f"blocked_module: access to '{root.id}.{node.attr}' is forbidden"
+                )
+            if canonical == "torch" or top_canonical == "torch":
+                if node.attr in BLOCKED_TORCH_ATTRS:
+                    return False, (
+                        f"blocked_torch_attr: '{root.id}.{node.attr}' "
+                        "is a blocked torch computation"
+                    )
+
+    # @gluon.jit OR @triton.jit decorator requirement (Gluon kernels are
+    # legal Triton too — accept either so wrappers / helper kernels pass).
+    has_jit = False
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Attribute) and dec.attr == "jit":
+                root = dec.value
+                if isinstance(root, ast.Name):
+                    canon = _canonical(root.id)
+                    canon_top = canon.split(".")[0]
+                    if canon_top in ("triton", "gluon"):
+                        has_jit = True
+                    if "gluon" in canon:
+                        has_jit = True
+                elif isinstance(root, ast.Attribute) and root.attr == "gluon":
+                    has_jit = True
+    if not has_jit:
+        return False, "no_jit: no @gluon.jit or @triton.jit decorated function found"
+
+    # Hardcoded output detection
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        val = node.value
+        if (
+            isinstance(val, ast.Call)
+            and isinstance(val.func, ast.Attribute)
+            and isinstance(val.func.value, ast.Name)
+            and _canonical(val.func.value.id) == "torch"
+            and val.func.attr == "tensor"
+            and val.args
+            and _is_literal_tree(val.args[0])
+        ):
+            return False, "hardcoded_output: 'return torch.tensor(...)' with literal values"
+
+    return True, ""
+
+
 # ── HIP static checks ────────────────────────────────────────────────────────
 
 _HIP_REQUIRED_MARKERS: tuple[str, ...] = (
@@ -359,6 +526,8 @@ def run_backend_static_check(
     """
     if backend == KERNEL_BACKEND_TRITON:
         return run_triton_static_check(code, allowed_imports=allowed_imports)
+    if backend == KERNEL_BACKEND_GLUON:
+        return run_gluon_static_check(code, allowed_imports=allowed_imports)
     if backend == KERNEL_BACKEND_HIP:
         return run_hip_static_check(code)
     raise ValueError(f"Unsupported backend: {backend}")

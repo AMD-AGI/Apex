@@ -874,9 +874,27 @@ def _attach_gated_reward(
         result.raw["rl_reward"] = None
         return
 
-    # Determine backend from file extension if not provided
+    # Determine backend from file extension if not provided.
+    # For .py solutions, peek at the source to distinguish Gluon (uses
+    # `triton.experimental.gluon` or `@gluon.jit`) from plain Triton.
     if kernel_backend is None:
-        kernel_backend = "hip" if solution.suffix in (".hip", ".cu") else "triton"
+        if solution.suffix in (".hip", ".cu"):
+            kernel_backend = "hip"
+        else:
+            kernel_backend = "triton"
+            if (
+                "triton.experimental.gluon" in solution_str
+                or "@gluon.jit" in solution_str
+            ):
+                kernel_backend = "gluon"
+    # Caller-supplied backends like "gluon" or library spec names are
+    # normalised below by the reward pipeline via resolve_kernel_backend().
+    elif kernel_backend not in ("triton", "gluon", "hip"):
+        try:
+            from graders.reward_backends import resolve_kernel_backend
+            kernel_backend = resolve_kernel_backend(kernel_backend)
+        except Exception:
+            pass
 
     # Extract timing from raw results
     raw = result.raw
