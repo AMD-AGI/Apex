@@ -262,6 +262,11 @@ For command benchmarks:
 
 See [examples/benchmark_command_template.yaml](/root/burak/Apex/examples/benchmark_command_template.yaml:1) for a generic command-benchmark template.
 
+For a portable FastVideo WAN text-to-video template, see
+[examples/benchmark_fastvideo_wan_t2v_template.yaml](/root/burak/Apex/examples/benchmark_fastvideo_wan_t2v_template.yaml:1).
+It uses the command-benchmark path with `timed_mean_s` latency scoring and a rocprof
+kernel-stats CSV for bottleneck identification, without machine-specific paths.
+
 ### Standalone Kernel Optimization
 
 Optimize a single kernel without running the full pipeline:
