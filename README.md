@@ -267,6 +267,30 @@ For a portable FastVideo WAN text-to-video template, see
 It uses the command-benchmark path with `timed_mean_s` latency scoring and a rocprof
 kernel-stats CSV for bottleneck identification, without machine-specific paths.
 
+Example FastVideo end-to-end optimization run:
+
+```bash
+source .venv/bin/activate
+
+export FASTVIDEO_REPO=/path/to/FastVideo
+export FASTVIDEO_BASELINE_REPO=/path/to/FastVideo_baseline
+export FASTVIDEO_COMPARE_SCRIPT=/path/to/fastvideo_compare_e2e.py
+export FASTVIDEO_PROFILER_CSV=/path/to/rocprof_fastvideo_kernel_stats.csv
+export FASTVIDEO_BASELINE_RESULT_JSON=/tmp/fastvideo_baseline.json
+export FASTVIDEO_OPTIMIZED_RESULT_JSON=/tmp/fastvideo_optimized.json
+export APEX_VENV_ACTIVATE=$(pwd)/.venv/bin/activate
+
+python3 workload_optimizer.py run \
+  -r ./results_fastvideo \
+  -b ./examples/benchmark_fastvideo_wan_t2v_template.yaml \
+  --framework fastvideo \
+  --gpu gfx942 \
+  --kernel-types triton \
+  --top-k 5 \
+  --max-iterations 3 \
+  --max-turns 25
+```
+
 ### Standalone Kernel Optimization
 
 Optimize a single kernel without running the full pipeline:
