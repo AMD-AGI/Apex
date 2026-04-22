@@ -49,6 +49,8 @@ from score import (
     ModelResult,
     parse_benchmark_config,
     run_magpie_benchmark,
+    run_command_benchmark,
+    benchmark_ratio,
     parse_benchmark_result,
     extract_tps,
 )
@@ -100,6 +102,31 @@ def baseline_benchmark(
     return result
 
 
+def _run_configured_model_benchmark(cfg: dict, variant: str, timeout: int = 1800) -> dict:
+    section = cfg.get(variant, {})
+    if not isinstance(section, dict):
+        return {"error": f"{variant} benchmark section must be a mapping"}
+    command = section.get("command", "")
+    if not command:
+        return {"error": f"{variant} benchmark command missing"}
+
+    bench_cfg = cfg.get("benchmark", {})
+    env = {
+        "APEX_BENCHMARK_VARIANT": variant,
+        "APEX_BENCHMARK_FRAMEWORK": cfg.get("framework", ""),
+        "APEX_BENCHMARK_MODEL": cfg.get("model", ""),
+    }
+    cwd = section.get("cwd") or bench_cfg.get("cwd")
+    result_json = section.get("result_json") or bench_cfg.get("result_json")
+    return run_command_benchmark(
+        command=command,
+        cwd=cwd,
+        timeout=timeout,
+        env_overrides=env,
+        result_json=result_json,
+    )
+
+
 def grade_task_model(task_dir: Path) -> ModelResult:
     """
     Run kernel grader + e2e benchmark for one task directory.
@@ -135,6 +162,51 @@ def grade_task_model(task_dir: Path) -> ModelResult:
         )
 
     cfg = parse_benchmark_config(benchmark_cfg)
+    bench_cfg = cfg.get("benchmark", {})
+    if isinstance(bench_cfg, dict) and bench_cfg.get("kind", "").lower() == "command":
+        baseline_bench = _run_configured_model_benchmark(cfg, "baseline")
+        if "error" in baseline_bench:
+            return ModelResult(
+                model_id=task_id,
+                kernel_score=k_score,
+                raw=baseline_bench,
+                error=f"baseline benchmark: {baseline_bench['error']}",
+            )
+
+        optimized_bench = _run_configured_model_benchmark(cfg, "optimized")
+        if "error" in optimized_bench:
+            return ModelResult(
+                model_id=task_id,
+                kernel_score=k_score,
+                raw={"baseline": baseline_bench, "optimized": optimized_bench},
+                error=f"optimized benchmark: {optimized_bench['error']}",
+            )
+
+        metric = bench_cfg.get("metric", "")
+        goal = bench_cfg.get("goal", "maximize")
+        ratio = benchmark_ratio(baseline_bench, optimized_bench, metric=metric, goal=goal)
+        if ratio <= 0:
+            metric_name = metric or ("throughput" if goal != "minimize" else "latency")
+            return ModelResult(
+                model_id=task_id,
+                kernel_score=k_score,
+                raw={"baseline": baseline_bench, "optimized": optimized_bench},
+                error=f"configured benchmark produced no valid {metric_name} ratio",
+            )
+
+        return ModelResult(
+            model_id=task_id,
+            kernel_score=k_score,
+            e2e_throughput_ratio=ratio,
+            raw={
+                "benchmark_kind": "command",
+                "metric": metric,
+                "goal": goal,
+                "baseline": baseline_bench,
+                "optimized": optimized_bench,
+            },
+        )
+
     framework   = cfg.get("framework", "sglang")
     model       = cfg.get("model", "")
     precision   = cfg.get("precision", "fp8")

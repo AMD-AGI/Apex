@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -155,25 +156,168 @@ def parse_benchmark_config(config_path: Path) -> dict:
     """
     Parse our benchmark.yaml (written by the agent) into a dict.
 
-    Expected schema (from model_prompt.py template):
-      framework: sglang
-      model: meta-llama/Llama-3.1-8B-Instruct
-      gpu:
-        device: 0
-        arch: gfx950
-      baseline:
-        framework_config: {}
-      optimized:
-        patch: ./solution.py
-      workload:
-        input_len: 512
-        output_len: 128
-        num_prompts: 200
-        concurrency: 32
-      precision: fp8
+    Supported schemas:
+
+    1. Magpie-native serving benchmark config:
+       framework: sglang
+       model: meta-llama/Llama-3.1-8B-Instruct
+       gpu:
+         device: 0
+         arch: gfx950
+       baseline:
+         framework_config: {}
+       optimized:
+         patch: ./solution.py
+       workload:
+         input_len: 512
+         output_len: 128
+         num_prompts: 200
+         concurrency: 32
+       precision: fp8
+
+    2. Command-driven benchmark config for custom workloads:
+       framework: custom_model
+       model: org/example-model
+       benchmark:
+         kind: command
+         parser: json
+         metric: timed_mean_s
+         goal: minimize
+       baseline:
+         command: "python3 /tmp/run_baseline_benchmark.py ..."
+         result_json: /tmp/baseline_result.json
+       optimized:
+         command: "python3 /tmp/run_optimized_benchmark.py ..."
+         result_json: /tmp/optimized_result.json
     """
     with open(config_path) as f:
         return yaml.safe_load(f) or {}
+
+
+_TRUSTED_BENCH_CMD_PREFIXES = (
+    "python ",
+    "python3 ",
+    "python -m ",
+    "python3 -m ",
+    "pytest ",
+    "bash -lc ",
+    "bash -c ",
+)
+
+
+def _lookup_metric_path(raw: dict, metric_path: str) -> float:
+    cur = raw
+    for part in metric_path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return 0.0
+        cur = cur[part]
+    try:
+        return float(cur)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_benchmark_goal(goal: str) -> str:
+    normalized = (goal or "maximize").strip().lower()
+    if normalized in ("max", "maximize", "higher_is_better"):
+        return "maximize"
+    if normalized in ("min", "minimize", "lower_is_better"):
+        return "minimize"
+    return "maximize"
+
+
+def _extract_metric_value(raw: dict, metric: str) -> float:
+    if metric:
+        if "." in metric:
+            return _lookup_metric_path(raw, metric)
+        try:
+            return float(raw.get(metric, 0.0))
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+    return extract_tps(raw)
+
+
+def benchmark_ratio(raw_baseline: dict, raw_optimized: dict, metric: str = "", goal: str = "maximize") -> float:
+    baseline_value = _extract_metric_value(raw_baseline, metric)
+    optimized_value = _extract_metric_value(raw_optimized, metric)
+    if baseline_value <= 0 or optimized_value <= 0:
+        return 0.0
+    if _normalize_benchmark_goal(goal) == "minimize":
+        return baseline_value / optimized_value
+    return optimized_value / baseline_value
+
+
+def run_command_benchmark(
+    command: str,
+    cwd: str | None = None,
+    timeout: int = 1800,
+    env_overrides: Optional[dict[str, str]] = None,
+    result_json: str | None = None,
+) -> dict:
+    """Run a trusted benchmark command and return parsed JSON output when possible."""
+    stripped = command.strip()
+    if not stripped:
+        return {"error": "empty benchmark command"}
+    if not any(stripped.startswith(p) for p in _TRUSTED_BENCH_CMD_PREFIXES):
+        return {"error": f"benchmark command rejected: {stripped[:80]}"}
+
+    env = os.environ.copy()
+    if env_overrides:
+        env.update({k: str(v) for k, v in env_overrides.items()})
+
+    shell_chars = ("|", "&&", "||", ";", "$", "`", ">", "<")
+    use_shell = any(ch in stripped for ch in shell_chars)
+    cmd: str | list[str] = stripped if use_shell else shlex.split(stripped)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd or None,
+            env=env,
+            shell=use_shell,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": f"benchmark command timed out ({timeout}s)"}
+    except FileNotFoundError as e:
+        return {"error": f"benchmark command not found: {e}"}
+
+    if proc.returncode != 0:
+        return {
+            "error": f"benchmark command failed (exit {proc.returncode})",
+            "stdout": proc.stdout[-1000:],
+            "stderr": proc.stderr[-1000:],
+        }
+
+    if result_json:
+        result_path = Path(result_json)
+        if result_path.exists():
+            try:
+                with open(result_path) as f:
+                    raw = json.load(f)
+                raw.setdefault("_apex_command", stripped)
+                raw.setdefault("_apex_result_json", str(result_path))
+                return raw
+            except Exception as e:
+                return {"error": f"could not parse benchmark result json: {e}"}
+
+    stdout = proc.stdout.strip()
+    if stdout:
+        try:
+            raw = json.loads(stdout)
+            raw.setdefault("_apex_command", stripped)
+            return raw
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "_apex_command": stripped,
+        "stdout": proc.stdout[-1000:],
+        "stderr": proc.stderr[-1000:],
+    }
 
 
 # ── Magpie invocation ────────────────────────────────────────────────────────

@@ -1,0 +1,27 @@
+framework: custom_model
+model: org/example-model
+gpu:
+  device: 0
+  arch: gfx942
+
+benchmark:
+  kind: command
+  parser: json
+  metric: timed_mean_s
+  goal: minimize
+
+baseline:
+  cwd: /path/to/workdir
+  command: >
+    bash -lc 'source /path/to/venv/bin/activate &&
+    python3 /path/to/run_baseline_benchmark.py
+    --output-json /tmp/baseline_result.json'
+  result_json: /tmp/baseline_result.json
+
+optimized:
+  cwd: /path/to/workdir
+  command: >
+    bash -lc 'source /path/to/venv/bin/activate &&
+    python3 /path/to/run_optimized_benchmark.py
+    --output-json /tmp/optimized_result.json'
+  result_json: /tmp/optimized_result.json
