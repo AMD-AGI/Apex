@@ -33,6 +33,21 @@ class ModelConfig:
     notes:          str          = ""
 
 
+@dataclass
+class VideoModelConfig:
+    hf_id:          str
+    family:         str
+    params_b:       float
+    latent_channels:int
+    spatial_downsample: int
+    temporal_downsample: int
+    max_frames:     int
+    default_height: int
+    default_width:  int
+    frameworks:     list[str]    = field(default_factory=list)  # fastvideo
+    notes:          str          = ""
+
+
 # ── Model registry ─────────────────────────────────────────────────────────────
 # 21 models; ~15 distinct kernel shapes for good RL diversity.
 
@@ -268,6 +283,23 @@ MODELS: list[ModelConfig] = [
     ),
 ]
 
+
+VIDEO_MODELS: list[VideoModelConfig] = [
+    VideoModelConfig(
+        hf_id="FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        family="fastvideo_wan",
+        params_b=1.3,
+        latent_channels=16,
+        spatial_downsample=8,
+        temporal_downsample=4,
+        max_frames=61,
+        default_height=448,
+        default_width=832,
+        frameworks=["fastvideo"],
+        notes="Text-to-video diffusion workload; video sparse attention + VAE decode critical path",
+    ),
+]
+
 # ── Convenience groupings ──────────────────────────────────────────────────────
 
 def by_attention(attn_type: str) -> list[ModelConfig]:
@@ -286,8 +318,13 @@ def in_framework(framework: str) -> list[ModelConfig]:
     return [m for m in MODELS if framework in m.frameworks]
 
 
+def video_in_framework(framework: str) -> list[VideoModelConfig]:
+    return [m for m in VIDEO_MODELS if framework in m.frameworks]
+
+
 if __name__ == "__main__":
     print(f"Total models: {len(MODELS)}")
+    print(f"  Video:    {len(VIDEO_MODELS)}")
     print(f"  Dense:    {len(dense_models())}")
     print(f"  MoE:      {len(moe_models())}")
     print(f"  GQA:      {len(by_attention('gqa'))}")
@@ -297,3 +334,5 @@ if __name__ == "__main__":
     print(f"  vLLM:     {len(in_framework('vllm'))}")
     for m in MODELS:
         print(f"  {m.hf_id:55s}  {m.params_b:6.1f}B  {m.attention:15s}  {m.mlp_type}")
+    for m in VIDEO_MODELS:
+        print(f"  {m.hf_id:55s}  {m.params_b:6.1f}B  video_generation")

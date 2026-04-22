@@ -216,6 +216,28 @@ class TestExtractBottlenecks:
         kernels = extract_bottlenecks({})
         assert kernels == []
 
+    def test_extracts_from_fastvideo_profiler_csv(self, tmp_path):
+        from pipeline.kernel_bottleneck import extract_bottlenecks
+
+        profiler_csv = tmp_path / "fastvideo_kernel_stats.csv"
+        profiler_csv.write_text(
+            "Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev\n"
+            "_attn_fwd_sparse,867,3689000000,4254901.96,27.05,0,0,0\n"
+            "map_to_index_kernel,867,120000000,138408.30,0.88,0,0,0\n"
+            "attn_fwd,212,165000000,778301.88,1.21,0,0,0\n"
+        )
+
+        kernels = extract_bottlenecks({}, profiler_csv=str(profiler_csv), top_k=10)
+
+        assert [k.matched_kernel_spec for k in kernels] == [
+            "video_sparse_attn",
+            "fastvideo_linear_attn",
+            "fastvideo_sparse_index",
+        ]
+        assert [k.category for k in kernels] == ["triton", "triton", "triton"]
+        assert kernels[0].calls == 867
+        assert kernels[0].percent_total == pytest.approx(27.05)
+
 
 # ── bottleneck.py — filter functions ──────────────────────────────────────────
 
@@ -503,6 +525,25 @@ class TestWorkloadOptimizerDryRun:
 
         for k in trajectory.bottleneck_kernels:
             assert k["category"] == "ck"
+
+
+class TestFastVideoSourceResolution:
+    def test_find_baseline_sources_supports_absolute_fastvideo_paths(self):
+        from workload_optimizer import _find_baseline_sources
+
+        paths = _find_baseline_sources("video_sparse_attn", library="fastvideo")
+
+        assert paths
+        assert any(path.endswith("block_sparse_attn_triton.py") for path in paths)
+        assert all(path.startswith("/tmp/FastVideo/") for path in paths)
+
+    def test_reference_section_renders_absolute_fastvideo_paths(self):
+        from workload_optimizer import _build_reference_section
+
+        section = _build_reference_section("video_sparse_attn", [])
+
+        assert "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/block_sparse_attn_triton.py" in section
+        assert "tools/rocm//tmp/FastVideo" not in section
 
     def test_specific_kernel_filter(self, benchmark_config_file, benchmark_result, tmp_path):
         from workload_optimizer import WorkloadConfig, run_workload_optimization

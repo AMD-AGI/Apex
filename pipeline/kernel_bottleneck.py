@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import csv
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,11 @@ _TRITON_PATTERNS = [
     re.compile(r"triton::"),
     re.compile(r"^kernel_unified_attention"),
     re.compile(r"_gemm_a\d+_w\d+_kernel_BLOCK_SIZE"),
+    re.compile(r"^_attn_fwd_sparse$", re.IGNORECASE),
+    re.compile(r"^attn_fwd$", re.IGNORECASE),
+    re.compile(r"^map_to_index_kernel$", re.IGNORECASE),
+    re.compile(r"^topk_index_to_map_kernel$", re.IGNORECASE),
+    re.compile(r"^triton_sta_kernel$", re.IGNORECASE),
 ]
 
 _CK_PATTERNS = [
@@ -78,6 +84,10 @@ _HIP_PATTERNS = [
 # Mapping profiler kernel names → KERNEL_SPECS kernel_type.
 # Order matters: first match wins.
 _SPEC_MAPPING: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"_attn_fwd_sparse|VIDEO_SPARSE_ATTN|block_sparse_attn", re.I), "video_sparse_attn"),
+    (re.compile(r"map_to_index_kernel|topk_index_to_map_kernel", re.I), "fastvideo_sparse_index"),
+    (re.compile(r"^attn_fwd$|sla_triton", re.I), "fastvideo_linear_attn"),
+    (re.compile(r"triton_sta_kernel|sliding_tile_attention", re.I), "fastvideo_sliding_tile_attn"),
     (re.compile(r"cross_device_reduce|rcclGenericKernel|allreduce|all_reduce", re.I), "all_reduce"),
     (re.compile(r"flash_attn|flash_attention|pa_prefill|fmha_fwd", re.I), "flash_attn_prefill"),
     (re.compile(r"paged_attn|pa_decode|paged_attention", re.I), "paged_attn_decode"),
@@ -288,11 +298,58 @@ def _extract_from_per_run_reports(
     return result
 
 
+def _extract_from_profiler_csv(
+    profiler_csv: str,
+    config_envs: Optional[dict] = None,
+) -> list[BottleneckKernel]:
+    """Parse a rocprof-style kernel stats CSV.
+
+    Expected columns include:
+      Name, Calls, TotalDurationNs, AverageNs, Percentage
+    """
+    path = Path(profiler_csv)
+    if not path.exists():
+        return []
+
+    kernels: list[BottleneckKernel] = []
+    try:
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = (row.get("Name") or row.get("KernelName") or row.get("Kernel") or "").strip()
+                if not name:
+                    continue
+                total_ns = float(row.get("TotalDurationNs") or row.get("TotalNs") or row.get("DurationNs") or 0.0)
+                avg_ns = float(row.get("AverageNs") or row.get("AvgNs") or row.get("MeanNs") or 0.0)
+                calls = int(float(row.get("Calls") or row.get("Count") or 0))
+                pct = float(row.get("Percentage") or row.get("Pct") or row.get("Percent") or 0.0)
+                bk = BottleneckKernel(
+                    name=name,
+                    total_time_us=total_ns / 1000.0,
+                    calls=calls,
+                    avg_time_us=avg_ns / 1000.0,
+                    percent_total=pct,
+                )
+                bk.category = classify_kernel(name)
+                bk.matched_kernel_spec = match_to_kernel_spec(name)
+                bk.origin_library = detect_origin_library(name, bk.matched_kernel_spec, config_envs)
+                kernels.append(bk)
+    except Exception as e:
+        _log.debug("profiler CSV parse failed for %s: %s", profiler_csv, e)
+        return []
+
+    kernels.sort(key=lambda k: k.total_time_us, reverse=True)
+    if kernels:
+        print(f"  Loaded {len(kernels)} kernel(s) from profiler CSV: {profiler_csv}")
+    return kernels
+
+
 def extract_bottlenecks(
     benchmark_result: dict,
     top_k: int = 20,
     config_envs: Optional[dict] = None,
     per_run_dir: Optional[str] = None,
+    profiler_csv: Optional[str] = None,
 ) -> list[BottleneckKernel]:
     """
     Parse a Magpie benchmark_report.json and return the top bottleneck kernels
@@ -302,7 +359,8 @@ def extract_bottlenecks(
       1. gap_analysis.top_kernels  (richest data)
       2. kernel_summary            (aggregated from traces)
       3. top_bottlenecks           (names only, no timing)
-      4. per-run benchmark reports (fallback when aggregated data is corrupted)
+      4. profiler CSV (rocprof kernel stats for custom frameworks)
+      5. per-run benchmark reports (fallback when aggregated data is corrupted)
 
     Args:
         config_envs: Benchmark config envs dict for library detection.
@@ -361,6 +419,9 @@ def extract_bottlenecks(
             bk.matched_kernel_spec = match_to_kernel_spec(name)
             bk.origin_library = detect_origin_library(name, bk.matched_kernel_spec, config_envs)
             kernels.append(bk)
+
+    if not kernels and profiler_csv:
+        kernels = _extract_from_profiler_csv(profiler_csv, config_envs)
 
     if not kernels and per_run_dir:
         kernels = _extract_from_per_run_reports(per_run_dir, config_envs)

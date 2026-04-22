@@ -378,16 +378,18 @@ def validate_prompts(framework: str = "sglang") -> dict:
     """Validate prompt constructors and return stats."""
     from kernel_prompt import all_prompts as kp_all, KERNEL_SPECS, DEFAULT_TARGET
     from model_prompt import all_prompts as mp_all
-    from models import MODELS
-    from configs import CONFIGS
+    from models import MODELS, VIDEO_MODELS
+    from configs import CONFIGS, VIDEO_CONFIGS
 
-    kernel_prompts = list(kp_all(framework=framework, gpu_arch=DEFAULT_TARGET))
+    kernel_prompts = [] if framework == "fastvideo" else list(kp_all(framework=framework, gpu_arch=DEFAULT_TARGET))
     model_prompts  = list(mp_all(framework=framework, gpu_arch=DEFAULT_TARGET))
+    model_count = len(MODELS) + len(VIDEO_MODELS)
+    config_count = len(CONFIGS) + len(VIDEO_CONFIGS)
 
     return {
-        "models":         len(MODELS),
+        "models":         model_count,
         "kernel_specs":   len(KERNEL_SPECS),
-        "configs":        len(CONFIGS),
+        "configs":        config_count,
         "kernel_prompts": len(kernel_prompts),
         "model_prompts":  len(model_prompts),
         "framework":      framework,
@@ -476,7 +478,7 @@ def main():
                         help="Skip Claude Code call; write a trivial solution and grade it")
     parser.add_argument("--eval-type", choices=["kernel", "model"], default="kernel",
                         help="Type of eval to run (default: kernel)")
-    parser.add_argument("--framework", choices=["sglang", "vllm", "both"], default="sglang",
+    parser.add_argument("--framework", choices=["sglang", "vllm", "fastvideo", "both", "all"], default="sglang",
                         help="Framework for prompt validation (default: sglang)")
     args = parser.parse_args()
 

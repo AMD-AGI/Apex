@@ -29,6 +29,21 @@ class InferenceConfig:
     notes:        str    = ""
 
 
+@dataclass(frozen=True)
+class VideoInferenceConfig:
+    config_id:    str
+    scenario:     str    # offline | interactive
+    height:       int
+    width:        int
+    video_length: int
+    infer_steps:  int
+    concurrency:  int
+    precision:    str    # bf16 | fp16 | fp8
+    framework:    str    # fastvideo
+    source:       str    # custom
+    notes:        str    = ""
+
+
 CONFIGS: list[InferenceConfig] = [
 
     # ── MLPerf Inference v4/v5 scenarios ─────────────────────────────────────
@@ -163,6 +178,36 @@ CONFIGS: list[InferenceConfig] = [
 ]
 
 
+VIDEO_CONFIGS: list[VideoInferenceConfig] = [
+    VideoInferenceConfig(
+        config_id="wan-t2v-e2e",
+        scenario="offline",
+        height=448,
+        width=832,
+        video_length=61,
+        infer_steps=3,
+        concurrency=1,
+        precision="bf16",
+        framework="fastvideo",
+        source="custom",
+        notes="FastVideo WAN end-to-end generation configuration matching current optimization harness",
+    ),
+    VideoInferenceConfig(
+        config_id="wan-t2v-latency",
+        scenario="interactive",
+        height=448,
+        width=832,
+        video_length=61,
+        infer_steps=1,
+        concurrency=1,
+        precision="bf16",
+        framework="fastvideo",
+        source="custom",
+        notes="Short-run latency-oriented smoke configuration for quick validation",
+    ),
+]
+
+
 # ── Subsets ───────────────────────────────────────────────────────────────────
 
 def by_precision(p: str)  -> list[InferenceConfig]: return [c for c in CONFIGS if c.precision == p]
@@ -174,6 +219,7 @@ def high_concurrency()    -> list[InferenceConfig]: return [c for c in CONFIGS i
 
 if __name__ == "__main__":
     print(f"Total configs: {len(CONFIGS)}")
+    print(f"  Video configs: {len(VIDEO_CONFIGS)}")
     print(f"  MLPerf:       {len(by_source('mlperf'))}")
     print(f"  InferenceMAX: {len(by_source('inferencemax'))}")
     print(f"  Custom:       {len(by_source('custom'))}")

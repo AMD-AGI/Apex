@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "prompts"))
-from models        import MODELS, ModelConfig, moe_models, dense_models
-from configs       import CONFIGS, InferenceConfig
+from models        import MODELS, VIDEO_MODELS, ModelConfig, VideoModelConfig, moe_models, dense_models
+from configs       import CONFIGS, VIDEO_CONFIGS, InferenceConfig, VideoInferenceConfig
 from kernel_prompt import (
     all_prompts as kernel_all_prompts,
     applicable_kernels,
@@ -90,6 +90,15 @@ class TestModelRegistry:
         large = [m for m in MODELS if m.params_b >= 70]
         assert len(large) >= 2
 
+    def test_video_models_present(self):
+        assert len(VIDEO_MODELS) >= 1
+
+    def test_video_frameworks_non_empty(self):
+        for m in VIDEO_MODELS:
+            assert len(m.frameworks) >= 1
+            assert m.max_frames > 0
+            assert m.default_height > 0 and m.default_width > 0
+
 
 # ── configs.py ────────────────────────────────────────────────────────────────
 
@@ -132,6 +141,13 @@ class TestConfigRegistry:
 
     def test_has_high_concurrency_config(self):
         assert any(c.concurrency >= 128 for c in CONFIGS)
+
+    def test_video_configs_present(self):
+        assert len(VIDEO_CONFIGS) >= 1
+        for c in VIDEO_CONFIGS:
+            assert c.height > 0 and c.width > 0
+            assert c.video_length > 0
+            assert c.infer_steps > 0
 
 
 # ── kernel_prompt.py ──────────────────────────────────────────────────────────
@@ -352,6 +368,19 @@ class TestModelPromptGeneration:
     def test_model_prompt_mentions_identify_kernel_origin(self, prompts):
         for p in prompts[:5]:
             assert "identify_kernel_origin" in p["prompt"]
+
+    def test_fastvideo_prompts_generate(self):
+        prompts = list(model_all_prompts(framework="fastvideo", gpu_arch=DEFAULT_TARGET))
+        assert len(prompts) >= 1
+        assert all(p["framework"] == "fastvideo" for p in prompts)
+
+    def test_fastvideo_prompt_mentions_command_benchmark(self):
+        prompt = list(model_all_prompts(framework="fastvideo", gpu_arch=DEFAULT_TARGET))[0]
+        text = prompt["prompt"]
+        assert "kind: command" in text
+        assert "goal: minimize" in text
+        assert "timed_mean_s" in text
+        assert "fastvideo" in text.lower()
 
 
 class TestBuildKernelPrompt:

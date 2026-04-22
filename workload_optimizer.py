@@ -72,6 +72,7 @@ sys.path.insert(0, str(REPO_ROOT / "pipeline"))
 
 from score import (
     KernelResult,
+    run_command_benchmark,
     cleanup_inference_server,
     run_magpie_benchmark,
     run_magpie_compare,
@@ -1220,7 +1221,78 @@ def _ensure_inferencex_path(benchmark_config_path: str) -> None:
     print(f"  [auto-config] Set inferencex_path={resolved}")
 
 
-def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> dict:
+def _read_benchmark_yaml(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _benchmark_section_from_path(path: str) -> dict:
+    if not path:
+        return {}
+    try:
+        return _read_benchmark_yaml(path).get("benchmark", {})
+    except Exception:
+        return {}
+
+
+def _is_command_benchmark(config: "WorkloadConfig") -> bool:
+    return _benchmark_section_from_path(config.benchmark_config).get("kind", "").lower() == "command"
+
+
+def _benchmark_metric_name(config: "WorkloadConfig") -> str:
+    return _benchmark_section_from_path(config.benchmark_config).get("metric", "")
+
+
+def _benchmark_goal(config: "WorkloadConfig") -> str:
+    return _benchmark_section_from_path(config.benchmark_config).get("goal", "maximize")
+
+
+def _benchmark_label(config: "WorkloadConfig") -> str:
+    return _benchmark_metric_name(config) or ("TPS" if not _is_command_benchmark(config) else "benchmark metric")
+
+
+def _extract_benchmark_value(result: dict, config: "WorkloadConfig") -> float:
+    metric = _benchmark_metric_name(config)
+    if not metric:
+        return extract_tps(result)
+    cur = result
+    for part in metric.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return 0.0
+        cur = cur[part]
+    try:
+        return float(cur)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _run_configured_benchmark(config: "WorkloadConfig", variant: str) -> dict:
+    cfg = _read_benchmark_yaml(config.benchmark_config)
+    bench = cfg.get("benchmark", {})
+    section = cfg.get(variant, {})
+    if not isinstance(section, dict):
+        return {"error": f"{variant} benchmark section must be a mapping", "success": False}
+    command = section.get("command", "")
+    if not command:
+        return {"error": f"{variant} benchmark command missing", "success": False}
+    cwd = section.get("cwd") or bench.get("cwd")
+    result_json = section.get("result_json") or bench.get("result_json")
+    result = run_command_benchmark(
+        command=command,
+        cwd=cwd,
+        timeout=config.benchmark_timeout,
+        env_overrides={
+            "APEX_BENCHMARK_VARIANT": variant,
+            "APEX_BENCHMARK_FRAMEWORK": config.framework or "",
+        },
+        result_json=result_json,
+    )
+    if "error" not in result:
+        result.setdefault("success", True)
+    return result
+
+
+def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark", variant: str = "baseline") -> dict:
     """Run benchmark N times and return result with averaged throughput + statistics.
 
     Includes warmup run, CV-based outlier rejection, and minimum completion ratio
@@ -1228,14 +1300,16 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
     """
     import copy as _copy
 
-    _ensure_inferencex_path(config.benchmark_config)
+    if not _is_command_benchmark(config):
+        _ensure_inferencex_path(config.benchmark_config)
     _cleanup_stale_tmp()
     gpu_health = _check_gpu_health()
+    metric_label = _benchmark_label(config)
 
     n = getattr(config, "num_benchmark_runs", 1)
     if n <= 1:
         cleanup_inference_server()
-        result = run_magpie_benchmark(
+        result = _run_configured_benchmark(config, variant) if _is_command_benchmark(config) else run_magpie_benchmark(
             framework=config.framework or "vllm",
             model="",
             benchmark_config_path=config.benchmark_config,
@@ -1243,12 +1317,14 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
             docker_image=config.docker_image,
         )
         cleanup_inference_server()
-        tps = extract_tps(result)
+        score = _extract_benchmark_value(result, config)
         result["_multi_run"] = {
             "num_runs": 1,
-            "individual_tps": [round(tps, 2)],
-            "mean_tps": round(tps, 2),
-            "std_tps": 0.0,
+            "individual_scores": [round(score, 4)],
+            "mean_score": round(score, 4),
+            "std_score": 0.0,
+            "metric": metric_label,
+            "goal": _benchmark_goal(config),
             "cv_pct": 0.0,
             "note": "single-run -- no statistical confidence",
             "gpu_health": gpu_health,
@@ -1258,13 +1334,16 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
     # Warmup run (discarded): clears JIT, page faults, first-request overhead
     print(f"    Warmup run (discarded)...")
     cleanup_inference_server()
-    run_magpie_benchmark(
-        framework=config.framework or "vllm",
-        model="",
-        benchmark_config_path=config.benchmark_config,
-        timeout=config.benchmark_timeout,
-        docker_image=config.docker_image,
-    )
+    if _is_command_benchmark(config):
+        _run_configured_benchmark(config, variant)
+    else:
+        run_magpie_benchmark(
+            framework=config.framework or "vllm",
+            model="",
+            benchmark_config_path=config.benchmark_config,
+            timeout=config.benchmark_timeout,
+            docker_image=config.docker_image,
+        )
     cleanup_inference_server()
 
     all_tps: list[float] = []
@@ -1272,14 +1351,14 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
     for i in range(n):
         print(f"    Run {i+1}/{n}...")
         cleanup_inference_server()
-        result = run_magpie_benchmark(
+        result = _run_configured_benchmark(config, variant) if _is_command_benchmark(config) else run_magpie_benchmark(
             framework=config.framework or "vllm",
             model="",
             benchmark_config_path=config.benchmark_config,
             timeout=config.benchmark_timeout,
             docker_image=config.docker_image,
         )
-        tps = extract_tps(result)
+        tps = _extract_benchmark_value(result, config)
         run_failed = (
             result.get("success") is False or
             bool(result.get("error")) or
@@ -1289,7 +1368,7 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
             err = result.get("error")
             if not err:
                 errs = result.get("errors") or []
-                err = errs[0] if errs else "benchmark produced no throughput"
+                err = errs[0] if errs else f"benchmark produced no {metric_label}"
             print(f"    Run {i+1}/{n}: FAILED ({str(err)[:100]})")
             continue
 
@@ -1304,7 +1383,10 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
 
         all_tps.append(tps)
         all_results.append(result)
-        print(f"    Run {i+1}/{n}: {tps:.1f} tok/s")
+        if metric_label == "TPS":
+            print(f"    Run {i+1}/{n}: {tps:.1f} tok/s")
+        else:
+            print(f"    Run {i+1}/{n}: {tps:.4f} {metric_label}")
 
         # Save per-run report
         if hasattr(config, "output_dir") and config.output_dir:
@@ -1335,7 +1417,10 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
         dropped_val = all_tps.pop(worst_idx)
         all_results.pop(worst_idx)
         dropped_values.append(dropped_val)
-        print(f"    CV={cv_pct:.1f}% > {MAX_CV_PCT}% — dropped outlier {dropped_val:.1f} tok/s")
+        if metric_label == "TPS":
+            print(f"    CV={cv_pct:.1f}% > {MAX_CV_PCT}% — dropped outlier {dropped_val:.1f} tok/s")
+        else:
+            print(f"    CV={cv_pct:.1f}% > {MAX_CV_PCT}% — dropped outlier {dropped_val:.4f} {metric_label}")
         mean_tps = sum(all_tps) / len(all_tps)
         std_tps = (sum((t - mean_tps) ** 2 for t in all_tps) / len(all_tps)) ** 0.5
         cv_pct = std_tps / mean_tps * 100 if mean_tps > 0 else 0
@@ -1348,20 +1433,38 @@ def _run_benchmark_multi(config: "WorkloadConfig", label: str = "benchmark") -> 
 
     if "throughput" in avg_result and isinstance(avg_result["throughput"], dict):
         avg_result["throughput"]["output_throughput"] = mean_tps
+    elif _is_command_benchmark(config):
+        metric = _benchmark_metric_name(config)
+        if metric:
+            cur = avg_result
+            parts = metric.split(".")
+            for part in parts[:-1]:
+                nxt = cur.get(part)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    cur[part] = nxt
+                cur = nxt
+            cur[parts[-1]] = mean_tps
     avg_result["_multi_run"] = {
         "num_runs": len(all_tps),
-        "individual_tps": [round(t, 2) for t in all_tps],
-        "mean_tps": round(mean_tps, 2),
-        "std_tps": round(std_tps, 2),
+        "individual_scores": [round(t, 4) for t in all_tps],
+        "mean_score": round(mean_tps, 4),
+        "std_score": round(std_tps, 4),
+        "metric": metric_label,
+        "goal": _benchmark_goal(config),
         "cv_pct": round(cv_pct, 2),
         "cv_warning": cv_pct > MAX_CV_PCT,
         "warmup_run": True,
-        "outliers_dropped": [round(d, 2) for d in dropped_values] if dropped_values else None,
+        "outliers_dropped": [round(d, 4) for d in dropped_values] if dropped_values else None,
         "gpu_health": gpu_health,
     }
 
-    print(f"    {label}: {mean_tps:.1f} +/- {std_tps:.1f} tok/s "
-          f"(CV={cv_pct:.1f}%, n={len(all_tps)})")
+    if metric_label == "TPS":
+        print(f"    {label}: {mean_tps:.1f} +/- {std_tps:.1f} tok/s "
+              f"(CV={cv_pct:.1f}%, n={len(all_tps)})")
+    else:
+        print(f"    {label}: {mean_tps:.4f} +/- {std_tps:.4f} {metric_label} "
+              f"(CV={cv_pct:.1f}%, n={len(all_tps)})")
     return avg_result
 
 
@@ -1373,20 +1476,21 @@ def _is_improvement_significant(baseline_result: dict, final_result: dict) -> bo
     if not b_multi or not f_multi:
         return True
 
-    b_mean = b_multi.get("mean_tps", 0)
-    b_std = b_multi.get("std_tps", 0)
-    f_mean = f_multi.get("mean_tps", 0)
-    f_std = f_multi.get("std_tps", 0)
+    b_mean = b_multi.get("mean_score", b_multi.get("mean_tps", 0))
+    b_std = b_multi.get("std_score", b_multi.get("std_tps", 0))
+    f_mean = f_multi.get("mean_score", f_multi.get("mean_tps", 0))
+    f_std = f_multi.get("std_score", f_multi.get("std_tps", 0))
+    goal = b_multi.get("goal", "maximize")
 
     if b_mean <= 0 or f_mean <= 0:
         return True
 
-    improvement = f_mean - b_mean
+    improvement = (b_mean - f_mean) if goal == "minimize" else (f_mean - b_mean)
     combined_std = (b_std ** 2 + f_std ** 2) ** 0.5
 
     if combined_std > 0 and improvement < 2 * combined_std:
-        print(f"  WARNING: Improvement {improvement:.1f} tok/s < 2*std {2 * combined_std:.1f} tok/s")
-        print(f"  The throughput change is NOT statistically significant")
+        print(f"  WARNING: Improvement {improvement:.4f} < 2*std {2 * combined_std:.4f}")
+        print(f"  The benchmark change is NOT statistically significant")
         return False
     return True
 
@@ -1690,9 +1794,12 @@ def _run_initial_benchmark(config: WorkloadConfig) -> dict:
     if config.dry_run:
         return _dry_run_benchmark_result()
 
-    print(f"  Running Magpie benchmark with config: {config.benchmark_config}")
-    print(f"  This may take 10-90 minutes for large models...")
-    result = _run_benchmark_multi(config, label="baseline")
+    if _is_command_benchmark(config):
+        print(f"  Running command benchmark with config: {config.benchmark_config}")
+    else:
+        print(f"  Running Magpie benchmark with config: {config.benchmark_config}")
+        print(f"  This may take 10-90 minutes for large models...")
+    result = _run_benchmark_multi(config, label="baseline", variant="baseline")
 
     if cache_path and result.get("success"):
         try:
@@ -1730,12 +1837,21 @@ def _select_kernels(benchmark_result: dict, config: WorkloadConfig, state: "Pipe
     top_k_mode = getattr(config, "top_k_mode", "post-filter")
 
     config_envs = None
+    profiler_csv = None
     if state:
         bench_cfg = state._data.get("benchmark_config", {})
         config_envs = bench_cfg.get("benchmark", {}).get("envs")
+        profiler_csv = (
+            bench_cfg.get("benchmark", {}).get("profiler_csv")
+            or bench_cfg.get("baseline", {}).get("profiler_csv")
+        )
     if not config_envs:
         bench_cfg = getattr(config, "_benchmark_config", None) or {}
         config_envs = bench_cfg.get("benchmark", {}).get("envs")
+        profiler_csv = profiler_csv or (
+            bench_cfg.get("benchmark", {}).get("profiler_csv")
+            or bench_cfg.get("baseline", {}).get("profiler_csv")
+        )
 
     per_run_dir = None
     if config.output_dir:
@@ -1744,7 +1860,13 @@ def _select_kernels(benchmark_result: dict, config: WorkloadConfig, state: "Pipe
             per_run_dir = str(runs_path)
 
     if top_k_mode == "post-filter" and config.kernel_types:
-        all_bottlenecks = extract_bottlenecks(benchmark_result, top_k=200, config_envs=config_envs, per_run_dir=per_run_dir)
+        all_bottlenecks = extract_bottlenecks(
+            benchmark_result,
+            top_k=200,
+            config_envs=config_envs,
+            per_run_dir=per_run_dir,
+            profiler_csv=profiler_csv,
+        )
         print(f"\n  All bottleneck kernels ({len(all_bottlenecks)} total):")
         print(format_bottleneck_table(all_bottlenecks[:20]))
         if len(all_bottlenecks) > 20:
@@ -1754,7 +1876,13 @@ def _select_kernels(benchmark_result: dict, config: WorkloadConfig, state: "Pipe
         type_str = ",".join(config.kernel_types)
         print(f"\n  After type filter ({type_str}): {len(filtered)} kernels")
     else:
-        all_bottlenecks = extract_bottlenecks(benchmark_result, top_k=config.top_k, config_envs=config_envs, per_run_dir=per_run_dir)
+        all_bottlenecks = extract_bottlenecks(
+            benchmark_result,
+            top_k=config.top_k,
+            config_envs=config_envs,
+            per_run_dir=per_run_dir,
+            profiler_csv=profiler_csv,
+        )
         print(f"\n  All bottleneck kernels ({len(all_bottlenecks)}):")
         print(format_bottleneck_table(all_bottlenecks))
 
@@ -1864,6 +1992,20 @@ def _find_baseline_sources(kernel_spec: str, library: str = "aiter") -> list[str
     For aiter: prefers role="impl" sources.
     For vllm/sglang: includes sources whose library matches, regardless of role.
     """
+    def _resolve_source_path(path_str: str) -> Optional[Path]:
+        candidate = Path(path_str)
+        if candidate.is_absolute():
+            return candidate if candidate.exists() else None
+        if candidate.exists():
+            return candidate
+        repo_candidate = REPO_ROOT / path_str
+        if repo_candidate.exists():
+            return repo_candidate
+        rocm_candidate = REPO_ROOT / "tools" / "rocm" / path_str
+        if rocm_candidate.exists():
+            return rocm_candidate
+        return None
+
     try:
         from kernel_prompt import KERNEL_SPECS
         for ks in KERNEL_SPECS:
@@ -1874,22 +2016,22 @@ def _find_baseline_sources(kernel_spec: str, library: str = "aiter") -> list[str
                         if source.role != "impl":
                             continue
                         for p in source.paths:
-                            full = REPO_ROOT / "tools" / "rocm" / p
-                            if full.exists():
+                            full = _resolve_source_path(p)
+                            if full:
                                 paths.append(str(full))
                 else:
                     for source in ks.sources:
                         src_lib = getattr(source, "library", "")
                         if src_lib == library or source.role == "wrapper":
                             for p in source.paths:
-                                full = REPO_ROOT / "tools" / "rocm" / p
-                                if full.exists():
+                                full = _resolve_source_path(p)
+                                if full:
                                     paths.append(str(full))
                 if not paths:
                     for source in ks.sources:
                         for p in source.paths:
-                            full = REPO_ROOT / "tools" / "rocm" / p
-                            if full.exists():
+                            full = _resolve_source_path(p)
+                            if full:
                                 paths.append(str(full))
                 return paths
     except Exception as e:
@@ -2454,16 +2596,32 @@ def _build_reference_section(kernel_spec: str, baseline_sources: list[str]) -> s
     if not kernel_def or not kernel_def.sources:
         return ""
 
+    def _display_source_path(path_str: str) -> str:
+        candidate = Path(path_str)
+        if candidate.is_absolute():
+            return path_str
+        return f"tools/rocm/{path_str}"
+
+    def _source_exists(path_str: str) -> bool:
+        candidate = Path(path_str)
+        if candidate.is_absolute():
+            return candidate.exists()
+        if candidate.exists():
+            return True
+        if (REPO_ROOT / path_str).exists():
+            return True
+        return (REPO_ROOT / "tools" / "rocm" / path_str).exists()
+
     lines = ["## Reference Implementations (from ROCm libraries)\n"]
     for src in kernel_def.sources:
         role_tag = f" ({src.role})" if src.role != "impl" else " (primary)"
         lines.append(f"### {src.library}{role_tag}")
         for p in src.paths:
-            full = REPO_ROOT / "tools" / "rocm" / p
-            if full.exists():
-                lines.append(f"  - `tools/rocm/{p}` (exists on disk)")
+            display_path = _display_source_path(p)
+            if _source_exists(p):
+                lines.append(f"  - `{display_path}` (exists on disk)")
             else:
-                lines.append(f"  - `tools/rocm/{p}`")
+                lines.append(f"  - `{display_path}`")
         lines.append("")
 
     lines.append(
@@ -2657,6 +2815,8 @@ def _try_build_rich_prompt(
                     model = m
                     break
         if not model:
+            if framework == "fastvideo":
+                return ""
             model = MODELS[0]
 
         result = _build_rich_kernel_prompt(
@@ -3174,7 +3334,7 @@ def _smoke_test_e2e(config: WorkloadConfig, baseline_tps: float) -> bool:
         return True
     print(f"    Smoke-test: running single E2E benchmark with patches active...")
     cleanup_inference_server()
-    result = run_magpie_benchmark(
+    result = _run_configured_benchmark(config, "optimized") if _is_command_benchmark(config) else run_magpie_benchmark(
         framework=config.framework or "vllm",
         model="",
         benchmark_config_path=config.benchmark_config,
@@ -3182,9 +3342,13 @@ def _smoke_test_e2e(config: WorkloadConfig, baseline_tps: float) -> bool:
         docker_image=config.docker_image,
     )
     cleanup_inference_server()
-    smoke_tps = extract_tps(result)
-    ratio = smoke_tps / baseline_tps if baseline_tps > 0 else 0
-    print(f"    Smoke-test: {smoke_tps:.1f} tok/s vs baseline {baseline_tps:.1f} tok/s ({ratio:.2f}x)")
+    smoke_tps = _extract_benchmark_value(result, config)
+    goal = _benchmark_goal(config)
+    ratio = (baseline_tps / smoke_tps) if (baseline_tps > 0 and smoke_tps > 0 and goal == "minimize") else ((smoke_tps / baseline_tps) if baseline_tps > 0 else 0)
+    if _benchmark_label(config) == "TPS":
+        print(f"    Smoke-test: {smoke_tps:.1f} tok/s vs baseline {baseline_tps:.1f} tok/s ({ratio:.2f}x)")
+    else:
+        print(f"    Smoke-test: {smoke_tps:.4f} {_benchmark_label(config)} vs baseline {baseline_tps:.4f} ({ratio:.2f}x)")
     if ratio < SMOKE_TEST_REGRESSION_THRESHOLD:
         print(f"    SMOKE-TEST FAILED: {ratio:.2f}x < {SMOKE_TEST_REGRESSION_THRESHOLD}x "
               f"-- rolling back all patches")
@@ -3250,7 +3414,7 @@ def _check_baseline_drift(config: WorkloadConfig, original_baseline_tps: float) 
         return original_baseline_tps
     print(f"  Baseline drift check: running single unpatched benchmark...")
     cleanup_inference_server()
-    result = run_magpie_benchmark(
+    result = _run_configured_benchmark(config, "baseline") if _is_command_benchmark(config) else run_magpie_benchmark(
         framework=config.framework or "vllm",
         model="",
         benchmark_config_path=config.benchmark_config,
@@ -3258,13 +3422,17 @@ def _check_baseline_drift(config: WorkloadConfig, original_baseline_tps: float) 
         docker_image=config.docker_image,
     )
     cleanup_inference_server()
-    current_tps = extract_tps(result)
+    current_tps = _extract_benchmark_value(result, config)
     if current_tps <= 0:
-        print(f"  Baseline drift check: could not extract TPS, using original")
+        print(f"  Baseline drift check: could not extract {_benchmark_label(config)}, using original")
         return original_baseline_tps
     drift_ratio = current_tps / original_baseline_tps
-    print(f"  Baseline drift check: {current_tps:.1f} tok/s "
-          f"(original: {original_baseline_tps:.1f}, drift: {drift_ratio:.2f}x)")
+    if _benchmark_label(config) == "TPS":
+        print(f"  Baseline drift check: {current_tps:.1f} tok/s "
+              f"(original: {original_baseline_tps:.1f}, drift: {drift_ratio:.2f}x)")
+    else:
+        print(f"  Baseline drift check: {current_tps:.4f} {_benchmark_label(config)} "
+              f"(original: {original_baseline_tps:.4f}, drift: {drift_ratio:.2f}x)")
     if drift_ratio < 0.85 or drift_ratio > 1.15:
         print(f"  WARNING: >15% baseline drift detected — GPU state may have changed")
     return current_tps
@@ -3336,7 +3504,7 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
             if not backups:
                 print(f"  All patches failed verification — running unpatched benchmark")
                 _restore_kernel_patches({}, lock_fd)
-                result = _run_benchmark_multi(config, label="final (unpatched)")
+                result = _run_benchmark_multi(config, label="final (unpatched)", variant="optimized")
                 result["_kernel_patches_applied"] = False
                 result["_patched_kernels"] = []
                 return result
@@ -3370,14 +3538,14 @@ def _run_final_benchmark(config: WorkloadConfig, baseline_tps: float = 0.0) -> d
                         _clear_pycache(fp)
                         _SESSION_BACKUPS.pop(str(fp), None)
                     _restore_kernel_patches({}, lock_fd)
-                    result = _run_benchmark_multi(config, label="final (unpatched, smoke-test rollback)")
+                    result = _run_benchmark_multi(config, label="final (unpatched, smoke-test rollback)", variant="optimized")
                     result["_kernel_patches_applied"] = False
                     result["_patched_kernels"] = []
                     result["_smoke_test_failed"] = True
                     return result
 
             print(f"  Running final E2E benchmark with {len(backups)} verified patched kernel(s)...")
-            result = _run_benchmark_multi(config, label="final (patched)")
+            result = _run_benchmark_multi(config, label="final (patched)", variant="optimized")
             result["_kernel_patches_applied"] = len(backups) > 0
             result["_patched_kernels"] = [str(p) for p in backups.keys()]
             result["_baseline_drift"] = {
@@ -5103,6 +5271,7 @@ def _parse_kernel_spec(args) -> KernelStandaloneDefinition:
                     print(f"    Auto-discovered PyTorch reference for '{kname}' from {gt_spec.source_library}")
     elif corr_mode == "library_test":
         gt["unit_test_command"] = getattr(args, "test_cmd", "")
+        gt["benchmark_command"] = getattr(args, "bench_cmd", "")
         gt["repo_url"] = getattr(args, "repo_url", "")
         gt["working_directory"] = getattr(args, "working_directory", "")
         kname = getattr(args, "kernel_name", "")
@@ -5225,7 +5394,7 @@ def _create_standalone_task_config(
         "optimized": {"path": f"./solution{ext}"},
         "correctness": correctness_cfg,
         "performance": {
-            "command": kernel_python,
+            "command": gt.get("benchmark_command") or kernel_python,
             "warmup_iterations": 10,
             "iterations": 100,
         },
@@ -5238,6 +5407,8 @@ def _create_standalone_task_config(
             "protected_file_hashes": protected_hashes,
         },
     }
+    if gt.get("benchmark_command"):
+        cfg["performance"]["benchmark_command"] = gt["benchmark_command"]
 
     config_path = task_dir / "config.yaml"
     with open(config_path, "w") as f:
@@ -5725,6 +5896,8 @@ def _add_kernel_spec_args(parser):
                    help="Path to test shapes generator file (pytorch mode)")
     c.add_argument("--test-cmd", default="",
                    help="Unit test command (library_test mode)")
+    c.add_argument("--bench-cmd", default="",
+                   help="Benchmark command for performance measurement; used by Magpie and grader fallback")
     c.add_argument("--repo-url", default="",
                    help="Repository URL (library_test mode)")
     c.add_argument("--working-directory", default="",

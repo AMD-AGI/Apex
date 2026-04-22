@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Iterator
 
 sys.path.insert(0, str(Path(__file__).parent))
-from models  import MODELS, ModelConfig
-from configs import CONFIGS, InferenceConfig
+from models  import MODELS, VIDEO_MODELS, ModelConfig, VideoModelConfig
+from configs import CONFIGS, VIDEO_CONFIGS, InferenceConfig, VideoInferenceConfig
 from kernel_prompt import detect_gpu, ARCH_MAP, DEFAULT_TARGET
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -74,6 +74,14 @@ def precision_notes(precision: str) -> str:
         "fp4":  "FP4 (MXFP4/NF4; 2× memory savings over FP8; requires MI355 CDNA4)",
         "int8": "INT8 (weight-only quantization; AWQ/GPTQ style)",
     }.get(precision, precision)
+
+
+def _frameworks_to_render(framework: str) -> list[str]:
+    if framework == "both":
+        return ["sglang", "vllm"]
+    if framework == "all":
+        return ["sglang", "vllm", "fastvideo"]
+    return [framework]
 
 
 # ── Prompt template ───────────────────────────────────────────────────────────
@@ -245,6 +253,82 @@ Also use **kernel-rag** MCP `search_library_code` for optimization patterns.
 """
 
 
+FASTVIDEO_PROMPT_TEMPLATE = """\
+You are an expert GPU kernel engineer specializing in AMD ROCm optimization.
+
+## Target hardware
+{gpu_name} ({gpu_arch})
+- Architecture: {cdna_gen}
+- Wavefront size: 64 threads; MFMA matrix units
+- Compile target: --offload-arch={gpu_arch}
+
+## Model
+{model_id}
+- Framework: {framework}
+- Family: {family}
+- Params: ~{params_b}B
+- Latent channels: {latent_channels}
+- Downsample: spatial/{spatial_downsample}, temporal/{temporal_downsample}
+- Max frames: {max_frames}
+
+## Generation configuration
+Config ID:      {config_id} [{source}]
+Scenario:       {scenario}
+Resolution:     {height}x{width}
+Video length:   {video_length} frames
+Infer steps:    {infer_steps}
+Concurrency:    {concurrency}
+Precision:      {precision_desc}
+Target metric:  mean end-to-end generation time (seconds) — lower is better
+
+## Expected bottlenecks
+Based on the configuration above, the expected performance bottleneck(s) are:
+{bottleneck}
+
+## Task
+
+1. **Identify** the bottleneck kernel(s) in the FastVideo pipeline by profiling the existing E2E harness and collecting the top kernels by GPU time.
+2. **Optimize** the bottleneck kernel(s). Place ALL modified files in `output/{task_id}/`.
+3. **Write** two config files:
+   - `output/{task_id}/config.yaml` — Magpie/kernel compare config for the individual kernel
+   - `output/{task_id}/benchmark.yaml` — command-driven model benchmark config for FastVideo
+
+## output/{task_id}/benchmark.yaml template
+```yaml
+benchmark:
+  framework: fastvideo
+  model: {model_id}
+  kind: command
+  metric: timed_mean_s
+  goal: minimize
+baseline:
+  command: "<baseline_fastvideo_e2e_command>"
+  result_json: /tmp/{task_id}_baseline.json
+optimized:
+  command: "<optimized_fastvideo_e2e_command>"
+  result_json: /tmp/{task_id}_optimized.json
+```
+
+## Key optimization strategies for this config
+{strategy_notes}
+
+## Available MCP tools
+
+Use the same MCP stack as other Apex model tasks:
+- `source-finder` to locate Triton/HIP/CK/MIOpen implementations
+- `kernel-rag` to find ROCm optimization patterns
+- `gpu-info` for architecture-specific tuning guidance
+- `fusion-advisor` to spot fusion opportunities
+- `magpie` for kernel-level compare / analysis
+
+## Framework guidance
+
+- Do not assume FastVideo behaves like an autoregressive LLM serving stack.
+- Focus on attention kernels, VAE decode kernels, tensor movement overhead, and any model-specific indexing/conversion kernels in the generation path.
+- Use the command-driven benchmark config above for end-to-end scoring rather than Magpie's built-in `vllm` / `sglang` benchmark mode.
+"""
+
+
 def strategy_notes(model: ModelConfig, cfg: InferenceConfig) -> str:
     notes = []
     if cfg.precision == "fp8":
@@ -270,6 +354,32 @@ def strategy_notes(model: ModelConfig, cfg: InferenceConfig) -> str:
     return "\n".join(f"- {n}" for n in notes)
 
 
+def fastvideo_bottleneck_hint(model: VideoModelConfig, cfg: VideoInferenceConfig) -> str:
+    hints = [
+        "  - Video sparse attention forward/backward can dominate denoising time",
+        "  - VAE decode path often exposes grouped-convolution, transpose, and upsample hotspots",
+        "  - Dense mask/index conversion and tensor movement can create avoidable overhead in the sparse-attention path",
+    ]
+    if cfg.video_length >= 61:
+        hints.append("  - Long clip length increases attention and decode pressure across temporal blocks")
+    if cfg.infer_steps <= 1:
+        hints.append("  - Very low infer-step runs amplify fixed per-call overhead and launch latency")
+    return "\n".join(hints)
+
+
+def fastvideo_strategy_notes(model: VideoModelConfig, cfg: VideoInferenceConfig) -> str:
+    notes = [
+        "Profile the existing FastVideo E2E harness before selecting kernels; do not pre-select from names alone",
+        "Prioritize custom Triton/HIP kernels and Python-side format/index conversions before library kernels you do not own",
+        "Validate with the same prompt, resolution, and video length used in the benchmark config",
+    ]
+    if cfg.video_length >= 61:
+        notes.append("Check temporal tiling and block-sparse metadata overhead for long clips")
+    if cfg.scenario == "interactive":
+        notes.append("Favor latency reductions and launch-count reductions over purely throughput-oriented batching")
+    return "\n".join(f"- {n}" for n in notes)
+
+
 def num_prompts_for_config(cfg: InferenceConfig) -> int:
     """Reasonable prompt count for a benchmark run."""
     if cfg.scenario == "offline":
@@ -278,6 +388,57 @@ def num_prompts_for_config(cfg: InferenceConfig) -> int:
         return 50
     else:
         return min(cfg.concurrency * 8, 1000)
+
+
+def build_fastvideo_prompt(
+    model: VideoModelConfig,
+    cfg: VideoInferenceConfig,
+    framework: str,
+    gpu_arch: str = DEFAULT_TARGET,
+) -> dict:
+    gpu_name = ARCH_MAP.get(gpu_arch, gpu_arch)
+    cdna_gen = "CDNA4" if gpu_arch == "gfx950" else "CDNA3" if gpu_arch in ("gfx942", "gfx940") else "CDNA2"
+    task_id = make_task_id(model, cfg, framework)
+    prompt = FASTVIDEO_PROMPT_TEMPLATE.format(
+        gpu_name=gpu_name,
+        gpu_arch=gpu_arch,
+        cdna_gen=cdna_gen,
+        model_id=model.hf_id,
+        framework=framework,
+        family=model.family,
+        params_b=model.params_b,
+        latent_channels=model.latent_channels,
+        spatial_downsample=model.spatial_downsample,
+        temporal_downsample=model.temporal_downsample,
+        max_frames=model.max_frames,
+        config_id=cfg.config_id,
+        source=cfg.source,
+        scenario=cfg.scenario,
+        height=cfg.height,
+        width=cfg.width,
+        video_length=cfg.video_length,
+        infer_steps=cfg.infer_steps,
+        concurrency=cfg.concurrency,
+        precision_desc=precision_notes(cfg.precision),
+        bottleneck=fastvideo_bottleneck_hint(model, cfg),
+        task_id=task_id,
+        strategy_notes=fastvideo_strategy_notes(model, cfg),
+    )
+    return {
+        "task_id": task_id,
+        "model_id": model.hf_id,
+        "config_id": cfg.config_id,
+        "framework": framework,
+        "gpu_arch": gpu_arch,
+        "precision": cfg.precision,
+        "height": cfg.height,
+        "width": cfg.width,
+        "video_length": cfg.video_length,
+        "infer_steps": cfg.infer_steps,
+        "concurrency": cfg.concurrency,
+        "scenario": cfg.scenario,
+        "prompt": prompt,
+    }
 
 
 def build_model_prompt(
@@ -332,9 +493,18 @@ def build_model_prompt(
 
 def all_prompts(framework: str = "both", gpu_arch: str = DEFAULT_TARGET) -> Iterator[dict]:
     """Yield one prompt dict per (model, config, framework) triple."""
-    frameworks = ["sglang", "vllm"] if framework == "both" else [framework]
-    for model in MODELS:
-        for fw in frameworks:
+    frameworks = _frameworks_to_render(framework)
+    for fw in frameworks:
+        if fw == "fastvideo":
+            for model in VIDEO_MODELS:
+                if fw not in model.frameworks:
+                    continue
+                for cfg in VIDEO_CONFIGS:
+                    if cfg.framework != fw:
+                        continue
+                    yield build_fastvideo_prompt(model, cfg, fw, gpu_arch=gpu_arch)
+            continue
+        for model in MODELS:
             if fw not in model.frameworks:
                 continue
             for cfg in CONFIGS:
@@ -349,7 +519,7 @@ def main():
     parser = argparse.ArgumentParser(description="Model-level prompt constructor")
     parser.add_argument("--target",    default=None,
                         help="GPU arch (e.g. gfx950). Default: auto-detect, else MI355X")
-    parser.add_argument("--framework", default="sglang", choices=["sglang", "vllm", "both"])
+    parser.add_argument("--framework", default="sglang", choices=["sglang", "vllm", "fastvideo", "both", "all"])
     parser.add_argument("--task-id",   default=None,
                         help="Print a single prompt for this task_id")
     parser.add_argument("--list",      action="store_true",
@@ -362,6 +532,8 @@ def main():
     fw       = args.framework
 
     prompts = list(all_prompts(framework=fw, gpu_arch=gpu_arch))
+    framework_models = len(VIDEO_MODELS) if fw == "fastvideo" else len(MODELS)
+    framework_configs = len(VIDEO_CONFIGS) if fw == "fastvideo" else len(CONFIGS)
 
     if args.list:
         for p in prompts:
@@ -384,8 +556,8 @@ def main():
 
     # Default: summary
     print(f"Model-level prompts  (gpu={gpu_arch}, framework={fw})")
-    print(f"  Models:  {len(MODELS)}")
-    print(f"  Configs: {len(CONFIGS)}")
+    print(f"  Models:  {framework_models}")
+    print(f"  Configs: {framework_configs}")
     print(f"  Total (model × config × framework) triples: {len(prompts)}")
     by_prec = {}
     for p in prompts:

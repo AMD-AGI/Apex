@@ -87,6 +87,55 @@ class KernelSpec:
 
 KERNEL_SPECS: list[KernelSpec] = [
     KernelSpec(
+        kernel_type="video_sparse_attn",
+        description="FastVideo block-sparse video attention forward kernel",
+        applies_to="all",
+        triton=True,
+        sources=(
+            KernelSource("fastvideo", (
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/block_sparse_attn_triton.py",
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/block_sparse_attn.py",
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/ops.py",
+            )),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="fastvideo_sparse_index",
+        description="FastVideo sparse attention index/map conversion kernels",
+        applies_to="all",
+        triton=True,
+        sources=(
+            KernelSource("fastvideo", (
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/index.py",
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/block_sparse_attn.py",
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/ops.py",
+            )),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="fastvideo_linear_attn",
+        description="FastVideo Triton sparse linear attention kernel",
+        applies_to="all",
+        triton=True,
+        sources=(
+            KernelSource("fastvideo", (
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/sla_triton.py",
+            )),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="fastvideo_sliding_tile_attn",
+        description="FastVideo sliding-tile attention Triton kernel",
+        applies_to="all",
+        triton=True,
+        sources=(
+            KernelSource("fastvideo", (
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/st_attn_triton.py",
+                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/ops.py",
+            )),
+        ),
+    ),
+    KernelSpec(
         kernel_type="flash_attn_prefill",
         description="Flash attention for the prefill (prompt) phase",
         applies_to="all",
