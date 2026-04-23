@@ -5,7 +5,7 @@
 #   cd Apex && bash setup.sh
 #
 # What it does:
-#   1. Parse CLI flags (--skip-downloads, --skip-tools, --venv=PATH, --non-interactive)
+#   1. Parse CLI flags (--skip-downloads, --skip-tools, --venv=PATH, --non-interactive, --fastvideo)
 #   2. Let you choose: Claude Code, Codex, Cursor Agent, or any combination
 #   3. Create/reuse a Python venv and install core dependencies + PyTorch for ROCm
 #   4. Optionally clone ROCm repos + download architecture docs (for source-finder & RAG)
@@ -41,11 +41,73 @@ warn() { echo -e "  ${YELLOW}!${NC} $1"; }
 fail() { echo -e "  ${RED}✗${NC} $1"; }
 info() { echo -e "  ${CYAN}→${NC} $1"; }
 
+fastvideo_preflight() {
+    echo "▸ FastVideo preflight (--fastvideo)..."
+
+    local env_template="$APEX_ROOT/files/fastvideo_e2e/env.example"
+    local env_target="$APEX_ROOT/.env.fastvideo"
+
+    if [[ -f "$env_target" ]]; then
+        ok "FastVideo env template already exists: $env_target"
+    elif [[ -f "$env_template" ]]; then
+        cp "$env_template" "$env_target"
+        ok "Created FastVideo env template: $env_target"
+    else
+        warn "FastVideo env template missing: $env_template"
+    fi
+
+    if command -v rocminfo &>/dev/null; then
+        ok "rocminfo found: $(command -v rocminfo)"
+    else
+        warn "rocminfo not found — ROCm runtime may be incomplete"
+    fi
+
+    if $PYTHON -c "import torch; assert torch.cuda.is_available()" &>/dev/null; then
+        ok "PyTorch CUDA/ROCm device visible"
+    else
+        warn "PyTorch cannot see a GPU yet — real FastVideo grading/E2E runs will not work"
+    fi
+
+    if $PYTHON -c "import triton" &>/dev/null; then
+        ok "Triton import works"
+    else
+        warn "Triton import failed"
+    fi
+
+    [[ -d "$APEX_ROOT/files/fastvideo_snapshots" ]] \
+        && ok "Vendored FastVideo snapshots present" \
+        || warn "Vendored FastVideo snapshots missing"
+    [[ -d "$APEX_ROOT/examples/fastvideo_kernel_specs" ]] \
+        && ok "FastVideo standalone specs present" \
+        || warn "FastVideo standalone specs missing"
+    [[ -f "$APEX_ROOT/examples/benchmark_fastvideo_wan_t2v_local_template.yaml" ]] \
+        && ok "Repo-local FastVideo E2E template present" \
+        || warn "Repo-local FastVideo E2E template missing"
+
+    echo ""
+    echo "  FastVideo next steps:"
+    echo "    1. Review and edit: $env_target"
+    echo "    2. Standalone vendored kernel optimization:"
+    echo "       source $VENV/bin/activate"
+    echo "       python3 workload_optimizer.py optimize-kernel \\"
+    echo "         -r $RESULTS_DIR \\"
+    echo "         --kernel-spec examples/fastvideo_kernel_specs/video_sparse_attn.yaml \\"
+    echo "         --agent-backend codex"
+    echo "    3. FastVideo E2E optimization:"
+    echo "       source $env_target"
+    echo "       python3 workload_optimizer.py run \\"
+    echo "         -r $RESULTS_DIR/fastvideo \\"
+    echo "         -b ./examples/benchmark_fastvideo_wan_t2v_local_template.yaml \\"
+    echo "         --framework fastvideo --gpu gfx942 --kernel-types triton --top-k 5"
+    echo ""
+}
+
 # ── CLI Flags ────────────────────────────────────────────────────────────────
 
 SKIP_DOWNLOADS=false
 SKIP_TOOLS=false
 NON_INTERACTIVE=false
+FASTVIDEO_MODE=false
 USER_VENV=""
 
 while [[ $# -gt 0 ]]; do
@@ -53,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         --skip-downloads) SKIP_DOWNLOADS=true; shift ;;
         --skip-tools)     SKIP_TOOLS=true; shift ;;
         --non-interactive) NON_INTERACTIVE=true; shift ;;
+        --fastvideo)     FASTVIDEO_MODE=true; shift ;;
         --venv=*)         USER_VENV="${1#--venv=}"; shift ;;
         --venv)           USER_VENV="$2"; shift 2 ;;
         -h|--help)
@@ -62,6 +125,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --venv=PATH         Use or create venv at PATH (default: .venv)"
             echo "  --skip-downloads    Skip cloning ROCm repos and downloading docs"
             echo "  --skip-tools        Skip MCP + Magpie installation"
+            echo "  --fastvideo         Run FastVideo standalone/E2E preflight and create .env.fastvideo"
             echo "  --non-interactive   Accept all defaults (no prompts)"
             echo "  -h, --help          Show this help"
             exit 0
@@ -536,6 +600,10 @@ mkdir -p "$RESULTS_DIR"
 ok "Results dir: $RESULTS_DIR"
 echo ""
 
+if [[ "$FASTVIDEO_MODE" == "true" ]]; then
+    fastvideo_preflight
+fi
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 9. Verify & Summary
 # ═════════════════════════════════════════════════════════════════════════════
@@ -618,4 +686,13 @@ echo "      --kernel path/to/kernel.py \\"
 echo "      --kernel-name rms_norm --kernel-type triton \\"
 echo "      --agent-backend cursor"
 echo ""
+if [[ "$FASTVIDEO_MODE" == "true" ]]; then
+    echo " 5. FastVideo setup/preflight:"
+    echo "    source $APEX_ROOT/.env.fastvideo"
+    echo "    python3 workload_optimizer.py run \\"
+    echo "      -r $RESULTS_DIR/fastvideo \\"
+    echo "      -b ./examples/benchmark_fastvideo_wan_t2v_local_template.yaml \\"
+    echo "      --framework fastvideo --gpu gfx942 --kernel-types triton --top-k 5"
+    echo ""
+fi
 echo "═══════════════════════════════════════════════════════"

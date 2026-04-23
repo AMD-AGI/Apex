@@ -1,0 +1,40 @@
+framework: fastvideo
+model: ${FASTVIDEO_MODEL_NAME}
+gpu:
+  device: 0
+  arch: gfx942
+
+benchmark:
+  kind: command
+  parser: json
+  metric: timed_mean_s
+  goal: minimize
+  profiler_csv: ${FASTVIDEO_PROFILER_CSV}
+
+baseline:
+  cwd: ${FASTVIDEO_BASELINE_REPO}
+  command: >
+    bash -lc 'source ${APEX_VENV_ACTIVATE} &&
+    export FASTVIDEO_ATTENTION_BACKEND=VIDEO_SPARSE_ATTN &&
+    export PYTHONPATH=${FASTVIDEO_BASELINE_REPO}:${FASTVIDEO_BASELINE_REPO}/fastvideo-kernel/python &&
+    python3 ${FASTVIDEO_COMPARE_SCRIPT}
+    --repo-root ${FASTVIDEO_BASELINE_REPO}
+    --model-name ${FASTVIDEO_MODEL_NAME}
+    --output-dir ${FASTVIDEO_E2E_OUTPUT_DIR}/baseline
+    --timed-runs 2
+    --output-json ${FASTVIDEO_BASELINE_RESULT_JSON}'
+  result_json: ${FASTVIDEO_BASELINE_RESULT_JSON}
+
+optimized:
+  cwd: ${FASTVIDEO_REPO}
+  command: >
+    bash -lc 'source ${APEX_VENV_ACTIVATE} &&
+    export FASTVIDEO_ATTENTION_BACKEND=VIDEO_SPARSE_ATTN &&
+    export PYTHONPATH=${FASTVIDEO_REPO}:${FASTVIDEO_REPO}/fastvideo-kernel/python &&
+    python3 ${FASTVIDEO_COMPARE_SCRIPT}
+    --repo-root ${FASTVIDEO_REPO}
+    --model-name ${FASTVIDEO_MODEL_NAME}
+    --output-dir ${FASTVIDEO_E2E_OUTPUT_DIR}/optimized
+    --timed-runs 2
+    --output-json ${FASTVIDEO_OPTIMIZED_RESULT_JSON}'
+  result_json: ${FASTVIDEO_OPTIMIZED_RESULT_JSON}

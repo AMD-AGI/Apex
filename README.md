@@ -267,6 +267,59 @@ For a portable FastVideo WAN text-to-video template, see
 It uses the command-benchmark path with `timed_mean_s` latency scoring and a rocprof
 kernel-stats CSV for bottleneck identification, without machine-specific paths.
 
+For a repo-local FastVideo E2E scaffold inside Apex, use:
+
+- [examples/benchmark_fastvideo_wan_t2v_local_template.yaml](/root/burak/Apex/examples/benchmark_fastvideo_wan_t2v_local_template.yaml:1)
+- [compare_e2e.py](/root/burak/Apex/files/fastvideo_e2e/compare_e2e.py)
+- [profile_e2e.py](/root/burak/Apex/files/fastvideo_e2e/profile_e2e.py)
+- [env.example](/root/burak/Apex/files/fastvideo_e2e/env.example)
+
+This keeps the Apex-owned benchmark scripts and config in-repo. The remaining
+external inputs are the FastVideo source checkouts, model assets, and runtime
+profiling outputs.
+
+FastVideo requirements:
+
+- For standalone vendored kernel optimization in Apex:
+  - Apex repo checkout
+  - Apex Python environment (`.venv`) with working PyTorch + Triton + ROCm stack
+  - MI300X or compatible ROCm GPU for real grading/benchmarking
+  - An agent backend (`codex`, `claude`, or `cursor`) if you want Apex to generate optimizations automatically
+- For FastVideo E2E optimization:
+  - Everything above, plus:
+  - A real `FASTVIDEO_REPO` checkout
+  - A baseline `FASTVIDEO_BASELINE_REPO` checkout or clean comparison branch
+  - Access to the FastVideo model assets, for example `FastVideo/FastWan2.1-T2V-1.3B-Diffusers`
+  - A profiler CSV path for kernel identification (`FASTVIDEO_PROFILER_CSV`)
+  - Sufficient local disk for model cache, generated outputs, and profiler traces
+
+What Apex now provides in-repo:
+
+- Repo-local standalone kernel snapshots under `files/fastvideo_snapshots/`
+- Standalone kernel specs under `examples/fastvideo_kernel_specs/`
+- Repo-local FastVideo E2E helper scripts under `files/fastvideo_e2e/`
+
+What Apex still does not bundle:
+
+- The full FastVideo repository
+- Model weights or Hugging Face credentials
+- ROCm, PyTorch, or Triton installation
+- rocprof output generation by itself; you still need to collect the profiler CSV from a real FastVideo run
+
+Recommended install flow for FastVideo users:
+
+```bash
+cd Apex
+bash setup.sh --fastvideo
+```
+
+This does the normal Apex setup and then:
+
+- creates `.env.fastvideo` from the repo template if it does not exist
+- checks ROCm, PyTorch, and Triton availability
+- verifies that the vendored FastVideo standalone snapshots and E2E template are present
+- prints the next commands for standalone and E2E FastVideo workflows
+
 Example FastVideo end-to-end optimization run:
 
 ```bash
@@ -289,6 +342,41 @@ python3 workload_optimizer.py run \
   --top-k 5 \
   --max-iterations 3 \
   --max-turns 25
+```
+
+Repo-local E2E setup:
+
+```bash
+cd Apex
+bash setup.sh --fastvideo
+source .venv/bin/activate
+
+export APEX_ROOT=$(pwd)
+source .env.fastvideo
+
+# Replace these with your actual checkouts.
+export FASTVIDEO_REPO=/path/to/FastVideo
+export FASTVIDEO_BASELINE_REPO=/path/to/FastVideo_baseline
+
+python3 workload_optimizer.py run \
+  -r ./results_fastvideo \
+  -b ./examples/benchmark_fastvideo_wan_t2v_local_template.yaml \
+  --framework fastvideo \
+  --gpu gfx942 \
+  --kernel-types triton \
+  --top-k 5 \
+  --max-iterations 3 \
+  --max-turns 25
+```
+
+To generate a repo-local profile summary before running Apex:
+
+```bash
+source .venv/bin/activate
+python3 files/fastvideo_e2e/profile_e2e.py \
+  --repo-root $FASTVIDEO_REPO \
+  --model-name $FASTVIDEO_MODEL_NAME \
+  --output-dir $FASTVIDEO_E2E_OUTPUT_DIR/profile
 ```
 
 FastVideo Triton kernels currently recognized and patchable by Apex:
