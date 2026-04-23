@@ -287,6 +287,19 @@ python3 workload_optimizer.py optimize-kernel \
   --max-turns 25
 ```
 
+FastVideo kernels supported by Apex:
+
+| Kernel | Framework | Notes |
+|---|---|---|
+| `video_sparse_attn` | Triton | Block-sparse video attention |
+| `fastvideo_sparse_index` | Triton | Sparse index gather/scatter helpers |
+| `fastvideo_linear_attn` | Triton | Linear attention kernel |
+| `fastvideo_sliding_tile_attn` | Triton | Sliding-tile attention kernel |
+| `fastvideo_turbodiffusion_rmsnorm` | Triton | TurboDiffusion RMSNorm |
+| `fastvideo_turbodiffusion_layernorm` | Triton | TurboDiffusion LayerNorm |
+| `fastvideo_sla_preprocess` | Triton | SLA preprocessing kernels |
+| `fastvideo_longcat_bsa` | Triton | LongCat block-sparse attention |
+
 FastVideo E2E optimization:
 
 ```bash
