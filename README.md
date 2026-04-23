@@ -291,6 +291,26 @@ python3 workload_optimizer.py run \
   --max-turns 25
 ```
 
+FastVideo Triton kernels currently recognized and patchable by Apex:
+
+| Apex kernel spec | Primary FastVideo source | Description |
+|---|---|---|
+| `video_sparse_attn` | `files/fastvideo_snapshots/video_sparse_attn.py` | Block-sparse video attention forward kernel. |
+| `fastvideo_sparse_index` | `files/fastvideo_snapshots/fastvideo_sparse_index.py` | Sparse attention index and map conversion kernels. |
+| `fastvideo_linear_attn` | `files/fastvideo_snapshots/fastvideo_linear_attn.py` | Sparse linear attention Triton kernel. |
+| `fastvideo_sliding_tile_attn` | `files/fastvideo_snapshots/fastvideo_sliding_tile_attn.py` | Sliding-tile attention Triton kernel. |
+| `fastvideo_turbodiffusion_rmsnorm` | `files/fastvideo_snapshots/fastvideo_turbodiffusion_rmsnorm.py` | TurboDiffusion Triton RMSNorm kernel. |
+| `fastvideo_turbodiffusion_layernorm` | `files/fastvideo_snapshots/fastvideo_turbodiffusion_layernorm.py` | TurboDiffusion Triton LayerNorm kernels. |
+| `fastvideo_sla_preprocess` | `files/fastvideo_snapshots/fastvideo_sla_preprocess.py` | SLA preprocessing and routing Triton kernels such as `compress_kernel`. |
+| `fastvideo_longcat_bsa` | `files/fastvideo_snapshots/fastvideo_longcat_bsa.py` | Vendored LongCat block-sparse attention Triton kernels. |
+
+Notes:
+
+- These are the FastVideo kernel specs Apex can map back to editable source files today.
+- A given workload/profile may only activate a subset of these kernels.
+- Some entries group multiple related Triton helper kernels under one Apex kernel spec.
+- Self-contained standalone kernel specs for these vendored snapshots live under `examples/fastvideo_kernel_specs/`.
+
 ### Standalone Kernel Optimization
 
 Optimize a single kernel without running the full pipeline:

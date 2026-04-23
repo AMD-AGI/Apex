@@ -46,6 +46,13 @@ _TRITON_PATTERNS = [
     re.compile(r"^map_to_index_kernel$", re.IGNORECASE),
     re.compile(r"^topk_index_to_map_kernel$", re.IGNORECASE),
     re.compile(r"^triton_sta_kernel$", re.IGNORECASE),
+    re.compile(r"^_rms_norm_fwd_fused$", re.IGNORECASE),
+    re.compile(r"^_layer_norm_(?:param|noparam)_fwd_fused$", re.IGNORECASE),
+    re.compile(r"^compress_kernel$", re.IGNORECASE),
+    re.compile(r"^_attn_fwd_gating$", re.IGNORECASE),
+    re.compile(r"^create_mask_from_indices_kernel$", re.IGNORECASE),
+    re.compile(r"^_attn_fwd_bsa_varlen(?:_align)?$", re.IGNORECASE),
+    re.compile(r"^_attn_bwd_(?:dkdv|dq)_bsa_varlen(?:_align)?(?:_wrapper)?$", re.IGNORECASE),
 ]
 
 _CK_PATTERNS = [
@@ -88,6 +95,10 @@ _SPEC_MAPPING: list[tuple[re.Pattern, str]] = [
     (re.compile(r"map_to_index_kernel|topk_index_to_map_kernel", re.I), "fastvideo_sparse_index"),
     (re.compile(r"^attn_fwd$|sla_triton", re.I), "fastvideo_linear_attn"),
     (re.compile(r"triton_sta_kernel|sliding_tile_attention", re.I), "fastvideo_sliding_tile_attn"),
+    (re.compile(r"^_rms_norm_fwd_fused$", re.I), "fastvideo_turbodiffusion_rmsnorm"),
+    (re.compile(r"^_layer_norm_(?:param|noparam)_fwd_fused$", re.I), "fastvideo_turbodiffusion_layernorm"),
+    (re.compile(r"^compress_kernel$|^_attn_fwd_gating$", re.I), "fastvideo_sla_preprocess"),
+    (re.compile(r"^create_mask_from_indices_kernel$|^_attn_fwd_bsa_varlen(?:_align)?$|^_attn_bwd_(?:dkdv|dq)_bsa_varlen(?:_align)?(?:_wrapper)?$", re.I), "fastvideo_longcat_bsa"),
     (re.compile(r"cross_device_reduce|rcclGenericKernel|allreduce|all_reduce", re.I), "all_reduce"),
     (re.compile(r"flash_attn|flash_attention|pa_prefill|fmha_fwd", re.I), "flash_attn_prefill"),
     (re.compile(r"paged_attn|pa_decode|paged_attention", re.I), "paged_attn_decode"),
@@ -117,6 +128,17 @@ _SPEC_TO_AITER_ENV: dict[str, str] = {
     "silu_mul": "VLLM_ROCM_USE_AITER",
     "kv_cache_ops": "VLLM_ROCM_USE_AITER",
     "all_reduce": "VLLM_ROCM_USE_AITER",
+}
+
+_FASTVIDEO_KERNEL_SPECS = {
+    "video_sparse_attn",
+    "fastvideo_sparse_index",
+    "fastvideo_linear_attn",
+    "fastvideo_sliding_tile_attn",
+    "fastvideo_turbodiffusion_rmsnorm",
+    "fastvideo_turbodiffusion_layernorm",
+    "fastvideo_sla_preprocess",
+    "fastvideo_longcat_bsa",
 }
 
 
@@ -204,6 +226,8 @@ def detect_origin_library(
         return "sglang"
     if re.search(r"^void at::native::", kernel_name):
         return "pytorch"
+    if kernel_spec in _FASTVIDEO_KERNEL_SPECS:
+        return "fastvideo"
 
     def _env(key: str, default: str = "0") -> str:
         if config_envs:

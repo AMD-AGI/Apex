@@ -93,9 +93,7 @@ KERNEL_SPECS: list[KernelSpec] = [
         triton=True,
         sources=(
             KernelSource("fastvideo", (
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/block_sparse_attn_triton.py",
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/block_sparse_attn.py",
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/ops.py",
+                "files/fastvideo_snapshots/video_sparse_attn.py",
             )),
         ),
     ),
@@ -106,9 +104,7 @@ KERNEL_SPECS: list[KernelSpec] = [
         triton=True,
         sources=(
             KernelSource("fastvideo", (
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/index.py",
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/block_sparse_attn.py",
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/ops.py",
+                "files/fastvideo_snapshots/fastvideo_sparse_index.py",
             )),
         ),
     ),
@@ -119,7 +115,7 @@ KERNEL_SPECS: list[KernelSpec] = [
         triton=True,
         sources=(
             KernelSource("fastvideo", (
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/sla_triton.py",
+                "files/fastvideo_snapshots/fastvideo_linear_attn.py",
             )),
         ),
     ),
@@ -130,8 +126,51 @@ KERNEL_SPECS: list[KernelSpec] = [
         triton=True,
         sources=(
             KernelSource("fastvideo", (
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/st_attn_triton.py",
-                "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/ops.py",
+                "files/fastvideo_snapshots/fastvideo_sliding_tile_attn.py",
+            )),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="fastvideo_turbodiffusion_rmsnorm",
+        description="FastVideo TurboDiffusion Triton RMSNorm kernel",
+        applies_to="all",
+        triton=True,
+        sources=(
+            KernelSource("fastvideo", (
+                "files/fastvideo_snapshots/fastvideo_turbodiffusion_rmsnorm.py",
+            )),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="fastvideo_turbodiffusion_layernorm",
+        description="FastVideo TurboDiffusion Triton LayerNorm kernels",
+        applies_to="all",
+        triton=True,
+        sources=(
+            KernelSource("fastvideo", (
+                "files/fastvideo_snapshots/fastvideo_turbodiffusion_layernorm.py",
+            )),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="fastvideo_sla_preprocess",
+        description="FastVideo SLA Triton preprocessing and routing kernels",
+        applies_to="all",
+        triton=True,
+        sources=(
+            KernelSource("fastvideo", (
+                "files/fastvideo_snapshots/fastvideo_sla_preprocess.py",
+            )),
+        ),
+    ),
+    KernelSpec(
+        kernel_type="fastvideo_longcat_bsa",
+        description="FastVideo vendored LongCat block-sparse attention Triton kernels",
+        applies_to="all",
+        triton=True,
+        sources=(
+            KernelSource("fastvideo", (
+                "files/fastvideo_snapshots/fastvideo_longcat_bsa.py",
             )),
         ),
     ),

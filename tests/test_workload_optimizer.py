@@ -235,8 +235,47 @@ class TestExtractBottlenecks:
             "fastvideo_sparse_index",
         ]
         assert [k.category for k in kernels] == ["triton", "triton", "triton"]
+        assert [k.origin_library for k in kernels] == ["fastvideo", "fastvideo", "fastvideo"]
         assert kernels[0].calls == 867
         assert kernels[0].percent_total == pytest.approx(27.05)
+
+    def test_fastvideo_sliding_tile_kernel_maps_to_fastvideo(self, tmp_path):
+        from pipeline.kernel_bottleneck import extract_bottlenecks
+
+        profiler_csv = tmp_path / "fastvideo_sta_kernel_stats.csv"
+        profiler_csv.write_text(
+            "Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev\n"
+            "triton_sta_kernel,64,64000000,1000000,3.50,0,0,0\n"
+        )
+
+        kernels = extract_bottlenecks({}, profiler_csv=str(profiler_csv), top_k=10)
+
+        assert len(kernels) == 1
+        assert kernels[0].matched_kernel_spec == "fastvideo_sliding_tile_attn"
+        assert kernels[0].origin_library == "fastvideo"
+
+    def test_extracts_additional_fastvideo_triton_kernels(self, tmp_path):
+        from pipeline.kernel_bottleneck import extract_bottlenecks
+
+        profiler_csv = tmp_path / "fastvideo_extra_triton_stats.csv"
+        profiler_csv.write_text(
+            "Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev\n"
+            "_rms_norm_fwd_fused,320,128000000,400000,2.10,0,0,0\n"
+            "_layer_norm_param_fwd_fused,128,64000000,500000,1.40,0,0,0\n"
+            "compress_kernel,256,32000000,125000,0.80,0,0,0\n"
+            "_attn_fwd_bsa_varlen,96,96000000,1000000,1.75,0,0,0\n"
+        )
+
+        kernels = extract_bottlenecks({}, profiler_csv=str(profiler_csv), top_k=10)
+
+        assert [k.matched_kernel_spec for k in kernels] == [
+            "fastvideo_turbodiffusion_rmsnorm",
+            "fastvideo_longcat_bsa",
+            "fastvideo_turbodiffusion_layernorm",
+            "fastvideo_sla_preprocess",
+        ]
+        assert all(k.category == "triton" for k in kernels)
+        assert all(k.origin_library == "fastvideo" for k in kernels)
 
 
 # ── bottleneck.py — filter functions ──────────────────────────────────────────
@@ -534,16 +573,32 @@ class TestFastVideoSourceResolution:
         paths = _find_baseline_sources("video_sparse_attn", library="fastvideo")
 
         assert paths
-        assert any(path.endswith("block_sparse_attn_triton.py") for path in paths)
-        assert all(path.startswith("/tmp/FastVideo/") for path in paths)
+        assert paths == ["files/fastvideo_snapshots/video_sparse_attn.py"]
 
     def test_reference_section_renders_absolute_fastvideo_paths(self):
         from workload_optimizer import _build_reference_section
 
         section = _build_reference_section("video_sparse_attn", [])
 
-        assert "/tmp/FastVideo/fastvideo-kernel/python/fastvideo_kernel/triton_kernels/block_sparse_attn_triton.py" in section
-        assert "tools/rocm//tmp/FastVideo" not in section
+        assert "files/fastvideo_snapshots/video_sparse_attn.py" in section
+        assert "tools/rocm/files/fastvideo_snapshots" not in section
+
+    @pytest.mark.parametrize(
+        ("kernel_spec", "expected_suffix"),
+        [
+            ("fastvideo_turbodiffusion_rmsnorm", "files/fastvideo_snapshots/fastvideo_turbodiffusion_rmsnorm.py"),
+            ("fastvideo_turbodiffusion_layernorm", "files/fastvideo_snapshots/fastvideo_turbodiffusion_layernorm.py"),
+            ("fastvideo_sla_preprocess", "files/fastvideo_snapshots/fastvideo_sla_preprocess.py"),
+            ("fastvideo_longcat_bsa", "files/fastvideo_snapshots/fastvideo_longcat_bsa.py"),
+        ],
+    )
+    def test_find_baseline_sources_for_all_fastvideo_triton_modules(self, kernel_spec, expected_suffix):
+        from workload_optimizer import _find_baseline_sources
+
+        paths = _find_baseline_sources(kernel_spec, library="fastvideo")
+
+        assert paths
+        assert any(path == expected_suffix for path in paths)
 
     def test_specific_kernel_filter(self, benchmark_config_file, benchmark_result, tmp_path):
         from workload_optimizer import WorkloadConfig, run_workload_optimization

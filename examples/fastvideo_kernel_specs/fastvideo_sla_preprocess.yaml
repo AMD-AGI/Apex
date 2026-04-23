@@ -1,0 +1,9 @@
+task_id: fastvideo_sla_preprocess
+kernel_path: files/fastvideo_snapshots/fastvideo_sla_preprocess.py
+kernel_type: triton
+kernel_name: fastvideo_sla_preprocess
+description: "Optimize the vendored FastVideo SLA preprocessing Triton snapshot for MI300X/gfx942."
+gpu_arch: gfx942
+framework: fastvideo
+ground_truth:
+  mode: pytorch

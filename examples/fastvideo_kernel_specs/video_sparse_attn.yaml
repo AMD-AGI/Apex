@@ -1,0 +1,9 @@
+task_id: fastvideo_video_sparse_attn
+kernel_path: files/fastvideo_snapshots/video_sparse_attn.py
+kernel_type: triton
+kernel_name: video_sparse_attn
+description: "Optimize the vendored FastVideo block-sparse video attention Triton snapshot for MI300X/gfx942."
+gpu_arch: gfx942
+framework: fastvideo
+ground_truth:
+  mode: pytorch

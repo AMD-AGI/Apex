@@ -2600,6 +2600,8 @@ def _build_reference_section(kernel_spec: str, baseline_sources: list[str]) -> s
         candidate = Path(path_str)
         if candidate.is_absolute():
             return path_str
+        if candidate.exists() or (REPO_ROOT / path_str).exists():
+            return path_str
         return f"tools/rocm/{path_str}"
 
     def _source_exists(path_str: str) -> bool:

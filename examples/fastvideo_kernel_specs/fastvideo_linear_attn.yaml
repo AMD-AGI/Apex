@@ -1,0 +1,9 @@
+task_id: fastvideo_linear_attn
+kernel_path: files/fastvideo_snapshots/fastvideo_linear_attn.py
+kernel_type: triton
+kernel_name: fastvideo_linear_attn
+description: "Optimize the vendored FastVideo sparse-linear attention Triton snapshot for MI300X/gfx942."
+gpu_arch: gfx942
+framework: fastvideo
+ground_truth:
+  mode: pytorch

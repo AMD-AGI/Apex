@@ -1,0 +1,9 @@
+task_id: fastvideo_longcat_bsa
+kernel_path: files/fastvideo_snapshots/fastvideo_longcat_bsa.py
+kernel_type: triton
+kernel_name: fastvideo_longcat_bsa
+description: "Optimize the vendored FastVideo LongCat block-sparse attention Triton snapshot for MI300X/gfx942."
+gpu_arch: gfx942
+framework: fastvideo
+ground_truth:
+  mode: pytorch
