@@ -19,7 +19,7 @@ def topk_index_to_map_kernel(
     index_h_stride,
     index_q_stride,
     index_kv_stride,
-    topk,
+    topk: tl.constexpr,
 ):
     b, h, q = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     index_ptr_base = index_ptr + b * index_bs_stride + h * index_h_stride + q * index_q_stride
@@ -45,7 +45,7 @@ def map_to_index_kernel(
     index_num_bs_stride,
     index_num_h_stride,
     index_num_q_stride,
-    num_kv_blocks,
+    num_kv_blocks: tl.constexpr,
 ):
     b, h, q = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     index_ptr_base = index_ptr + b * index_bs_stride + h * index_h_stride + q * index_q_stride

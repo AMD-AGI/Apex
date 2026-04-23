@@ -44,7 +44,7 @@ def _attn_fwd(
     o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
 
     q = tl.load(q_ptrs, mask=offs_m[:, None] < L)
-    for block_idx in tl.range(topk):
+    for block_idx in tl.static_range(topk):
         idx_n = tl.load(lut_ptr + block_idx)
         n_mask = offs_n < L - idx_n * BLOCK_N
         k = tl.load(k_ptrs + idx_n * BLOCK_N * D, mask=n_mask[None, :])
@@ -92,7 +92,7 @@ def sparse_linear_attention_forward(
         dim,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        num_warps=8,
+        num_warps=4 if dim == 64 else 8,
         num_stages=3,
     )
     return out, lse
