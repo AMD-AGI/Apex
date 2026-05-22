@@ -4457,6 +4457,38 @@ def cmd_benchmark(args):
     print(f"  State saved to {state.path}")
 
 
+def cmd_trace_kernel(args):
+    """Trace one kernel/op workload by patching its Python launch/wrapper site."""
+    from kernel_tracing.runner import TraceKernelConfig, run_trace_kernel
+
+    cfg = TraceKernelConfig(
+        results_dir=Path(args.results_dir),
+        kernel_name=args.kernel_name,
+        kernel_file=Path(args.kernel_file),
+        trace_mode=getattr(args, "trace_mode", "auto"),
+        kernel_type=getattr(args, "kernel_type", ""),
+        patch_strategy=getattr(args, "patch_strategy", "auto"),
+        benchmark_config=getattr(args, "benchmark_config", "") or "",
+        run_cmd=getattr(args, "run_cmd", "") or "",
+        max_records=getattr(args, "max_records", 100000),
+        sample_rate=getattr(args, "sample_rate", 1.0),
+        small_tensor_stats=getattr(args, "small_tensor_stats", False),
+        trace_all=getattr(args, "trace_all", False),
+        agent_backend=getattr(args, "agent_backend", "claude"),
+        agent_model=getattr(args, "agent_model", None),
+        agent_max_turns=getattr(args, "agent_max_turns", 8),
+        benchmark_timeout=getattr(args, "benchmark_timeout", 5400),
+        docker_image=getattr(args, "docker_image", ""),
+        framework=getattr(args, "framework", ""),
+        dry_run=getattr(args, "dry_run", False),
+        repo_root=REPO_ROOT,
+    )
+    if bool(cfg.benchmark_config) == bool(cfg.run_cmd) and not cfg.dry_run:
+        raise SystemExit("trace-kernel requires exactly one of --run-cmd or -b/--benchmark-config")
+    result = run_trace_kernel(cfg)
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def cmd_identify(args):
     """Step 2-4: Identify, classify, filter bottleneck kernels."""
     t0 = time.monotonic()
@@ -5895,6 +5927,40 @@ def main():
     _add_common_args(p)
     _add_benchmark_args(p)
 
+    # -- trace-kernel --
+    p = subparsers.add_parser(
+        "trace-kernel",
+        help="Trace one Triton launch or Python-visible HIP/custom op workload",
+    )
+    p.add_argument("-r", "--results-dir", required=True,
+                   help="Directory for trace outputs")
+    p.add_argument("--kernel-name", required=True,
+                   help="Target Triton kernel or Python op name")
+    p.add_argument("--kernel-file", required=True,
+                   help="Python file containing the launch site or wrapper")
+    p.add_argument("--trace-mode", default="auto",
+                   choices=["auto", "triton-launch", "aiter-compile-ops",
+                            "vllm-custom-op", "sglang-custom-op", "agent"])
+    p.add_argument("--kernel-type", default="",
+                   help="Compatibility alias: triton maps to triton-launch")
+    p.add_argument("--patch-strategy", default="auto",
+                   choices=["auto", "static", "agent"])
+    p.add_argument("-b", "--benchmark-config", default="",
+                   help="Magpie benchmark YAML config")
+    p.add_argument("--run-cmd", default="",
+                   help="Local command to run for tracing")
+    p.add_argument("--max-records", type=int, default=100000)
+    p.add_argument("--sample-rate", type=float, default=1.0)
+    p.add_argument("--small-tensor-stats", action="store_true")
+    p.add_argument("--trace-all", action="store_true")
+    p.add_argument("--agent-backend", default="claude", choices=["claude", "codex", "cursor"])
+    p.add_argument("--agent-model", default=None)
+    p.add_argument("--agent-max-turns", type=int, default=8)
+    p.add_argument("--benchmark-timeout", type=int, default=5400)
+    p.add_argument("--docker-image", default="")
+    p.add_argument("--framework", default="")
+    p.add_argument("--dry-run", action="store_true")
+
     # -- identify --
     p = subparsers.add_parser("identify",
                               help="Step 2-4: Identify & filter bottleneck kernels")
@@ -6032,6 +6098,7 @@ def main():
 
     handlers = {
         "benchmark": cmd_benchmark,
+        "trace-kernel": cmd_trace_kernel,
         "identify": cmd_identify,
         "list-kernels": cmd_list_kernels,
         "optimize": cmd_optimize,
