@@ -121,26 +121,31 @@ def apex_trace_event(kind, kernel_name, source_file, line, args=None, kwargs=Non
     global _COUNT
     if not _enabled():
         return
+    is_diagnostic_event = kind == "module_import"
     target = os.environ.get("APEX_TRACE_KERNEL_NAME", "")
-    if kind != "module_import" and target and kernel_name not in ("", target):
+    if not is_diagnostic_event and target and kernel_name not in ("", target):
         return
     kind_filter = os.environ.get("APEX_TRACE_KIND", "")
-    if kind != "module_import" and kind_filter and kind != kind_filter:
+    if not is_diagnostic_event and kind_filter and kind != kind_filter:
         return
-    try:
-        max_records = int(os.environ.get("APEX_TRACE_MAX_RECORDS", "100000"))
-    except ValueError:
-        max_records = 100000
-    try:
-        sample_rate = float(os.environ.get("APEX_TRACE_SAMPLE_RATE", "1.0"))
-    except ValueError:
-        sample_rate = 1.0
-    if sample_rate < 1.0 and random.random() > sample_rate:
-        return
-    with _LOCK:
-        if _COUNT >= max_records:
+
+    # Diagnostic import events tell Apex whether the overlay was actually used.
+    # They are intentionally exempt from sampling and max-record throttling.
+    if not is_diagnostic_event:
+        try:
+            max_records = int(os.environ.get("APEX_TRACE_MAX_RECORDS", "100000"))
+        except ValueError:
+            max_records = 100000
+        try:
+            sample_rate = float(os.environ.get("APEX_TRACE_SAMPLE_RATE", "1.0"))
+        except ValueError:
+            sample_rate = 1.0
+        if sample_rate < 1.0 and random.random() > sample_rate:
             return
-        _COUNT += 1
+        with _LOCK:
+            if _COUNT >= max_records:
+                return
+            _COUNT += 1
     event = {
         "schema_version": 1,
         "ts_ns": time.time_ns(),

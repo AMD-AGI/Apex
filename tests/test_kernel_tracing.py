@@ -18,6 +18,7 @@ from kernel_tracing.postprocess import postprocess_trace
 from kernel_tracing.runner import TraceKernelConfig, run_trace_kernel
 from kernel_tracing.runtime import write_runtime_file
 from kernel_tracing.serializer import serialize_value
+from kernel_tracing.patch_wrapper import patch_aiter_compile_ops_file
 
 
 def _synthetic_source() -> str:
@@ -101,6 +102,43 @@ def wrapper(q, flag):
     compile(text, str(out), "exec")
 
 
+def test_patch_aiter_compile_ops_central_hook(tmp_path):
+    src = tmp_path / "core.py"
+    src.write_text("""
+def torch_compile_guard(**_kwargs):
+    def deco(fn):
+        return fn
+    return deco
+
+def compile_ops(_md_name, fc_name=None, ffi_type="pybind", develop=False):
+    def decorator(func):
+        loadName = fc_name if fc_name is not None else func.__name__
+        if ffi_type == "ctypes":
+            def ctypes_wrapper(*args, **kwargs):
+                return ctypes_caller(*args, **kwargs)
+            return ctypes_wrapper
+        elif ffi_type == "pybind":
+            def wrapper(*args, custom_build_args={}, **kwargs):
+                return op(*args, **kwargs)
+            return wrapper
+    return decorator
+""", encoding="utf-8")
+    out = tmp_path / "patched" / "aiter" / "jit" / "core.py"
+    result = patch_aiter_compile_ops_file(
+        source_path=src,
+        output_path=out,
+        trace_kind="hip_python_op",
+        module_name="aiter.jit.core",
+        package_rel_path="aiter/jit/core.py",
+    )
+    text = out.read_text(encoding="utf-8")
+    assert "compile_ops.ctypes_wrapper" in text
+    assert "compile_ops.pybind_wrapper" in text
+    assert "kernel_name=loadName" in text
+    assert len(result.events) == 2
+    compile(text, str(out), "exec")
+
+
 def test_local_overlay_import_smoke(tmp_path):
     results = tmp_path / "results"
     patched_dir = results / "patched_files"
@@ -124,6 +162,37 @@ def test_local_overlay_import_smoke(tmp_path):
     subprocess.run([sys.executable, "-c", "import mod"], env=env, check=True)
     raw = "\n".join(p.read_text() for p in (results / "trace_raw").glob("*.jsonl"))
     assert '"kind": "module_import"' in raw
+
+
+def test_module_import_bypasses_sampling_and_max_records(tmp_path):
+    results = tmp_path / "results"
+    patched_dir = results / "patched_files"
+    write_runtime_file(patched_dir)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{patched_dir}:{env.get('PYTHONPATH', '')}"
+    env["APEX_TRACE_ENABLED"] = "1"
+    env["APEX_TRACE_OUTPUT_DIR"] = str(results / "trace_raw")
+    env["APEX_TRACE_KERNEL_NAME"] = "target_kernel"
+    env["APEX_TRACE_MAX_RECORDS"] = "0"
+    env["APEX_TRACE_SAMPLE_RATE"] = "0"
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from apex_kernel_tracing_runtime import apex_trace_event\n"
+                "apex_trace_event(kind='module_import', kernel_name='other', "
+                "source_file='x.py', line=1)\n"
+                "apex_trace_event(kind='triton_launch', kernel_name='target_kernel', "
+                "source_file='x.py', line=2)\n"
+            ),
+        ],
+        env=env,
+        check=True,
+    )
+    raw = "\n".join(p.read_text() for p in (results / "trace_raw").glob("*.jsonl"))
+    assert '"kind": "module_import"' in raw
+    assert '"kind": "triton_launch"' not in raw
 
 
 def test_run_trace_kernel_run_cmd_smoke(tmp_path):
@@ -160,6 +229,42 @@ mod.wrapper(T(), T(), 64, {"EXTRA": True})
     assert "some_kernel" in raw
     ranges = json.loads((tmp_path / "results" / "workload_ranges.json").read_text())
     assert ranges["total_calls"] == 1
+
+
+def test_run_trace_kernel_aiter_mode_patches_compile_ops_core(tmp_path):
+    core = tmp_path / "tools" / "rocm" / "aiter" / "aiter" / "jit" / "core.py"
+    core.parent.mkdir(parents=True)
+    core.write_text("""
+def compile_ops(_md_name, fc_name=None, ffi_type="pybind", develop=False):
+    def decorator(func):
+        loadName = fc_name if fc_name is not None else func.__name__
+        if ffi_type == "ctypes":
+            def ctypes_wrapper(*args, **kwargs):
+                return ctypes_caller(*args, **kwargs)
+            return ctypes_wrapper
+        elif ffi_type == "pybind":
+            def wrapper(*args, custom_build_args={}, **kwargs):
+                return op(*args, **kwargs)
+            return wrapper
+    return decorator
+""", encoding="utf-8")
+    wrapper = tmp_path / "tools" / "rocm" / "aiter" / "aiter" / "ops" / "moe_op.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("def fmoe(): pass\n", encoding="utf-8")
+    result = run_trace_kernel(TraceKernelConfig(
+        results_dir=tmp_path / "results",
+        kernel_name="fmoe",
+        kernel_file=wrapper,
+        trace_mode="aiter-compile-ops",
+        dry_run=True,
+        repo_root=tmp_path,
+    ))
+    assert result["mode"] == "aiter-compile-ops"
+    assert result["patched_file"].endswith("patched_files/overlay/aiter/jit/core.py")
+    manifest = json.loads(
+        (tmp_path / "results" / "patched_files" / "patch_manifest.json").read_text()
+    )
+    assert "aiter.jit.core" in manifest["overlay_modules"]
 
 
 def test_postprocess_shape_ranges(tmp_path):

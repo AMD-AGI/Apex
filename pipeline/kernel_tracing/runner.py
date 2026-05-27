@@ -26,7 +26,7 @@ from .overlay import (
     write_overlay_support,
 )
 from .patch_triton import PatchResult, patch_triton_launch_file
-from .patch_wrapper import patch_wrapper_entry_file
+from .patch_wrapper import patch_aiter_compile_ops_file, patch_wrapper_entry_file
 from .postprocess import postprocess_trace
 from .runtime import write_runtime_file
 
@@ -68,8 +68,14 @@ def _trace_kind_for_mode(mode: str) -> str:
 
 
 def _prepare_static_patch(config: TraceKernelConfig, mode: str) -> PatchResult:
-    module_name, package_rel_path = infer_module_mapping(config.kernel_file, config.repo_root)
-    source_path = _source_for_patch(config, module_name, package_rel_path)
+    fallback_source = config.kernel_file
+    if mode == "aiter-compile-ops":
+        module_name = "aiter.jit.core"
+        package_rel_path = "aiter/jit/core.py"
+        fallback_source = config.repo_root / "tools" / "rocm" / "aiter" / "aiter" / "jit" / "core.py"
+    else:
+        module_name, package_rel_path = infer_module_mapping(config.kernel_file, config.repo_root)
+    source_path = _source_for_patch(config, module_name, package_rel_path, fallback_source)
     patched_files_dir = config.results_dir / "patched_files"
     output_path = overlay_path_for(patched_files_dir, package_rel_path)
     if mode == "triton-launch":
@@ -77,6 +83,14 @@ def _prepare_static_patch(config: TraceKernelConfig, mode: str) -> PatchResult:
             source_path=source_path,
             output_path=output_path,
             kernel_name=config.kernel_name,
+            module_name=module_name,
+            package_rel_path=package_rel_path,
+        )
+    if mode == "aiter-compile-ops":
+        return patch_aiter_compile_ops_file(
+            source_path=source_path,
+            output_path=output_path,
+            trace_kind=_trace_kind_for_mode(mode),
             module_name=module_name,
             package_rel_path=package_rel_path,
         )
@@ -119,11 +133,12 @@ def _base_trace_env(config: TraceKernelConfig, *, docker: bool = False) -> dict[
     root = "/apex_trace" if docker else str(config.results_dir)
     patched_files = f"{root}/patched_files" if docker else str(config.results_dir / "patched_files")
     trace_raw = f"{root}/trace_raw" if docker else str(config.results_dir / "trace_raw")
+    target_kernel = "" if config.trace_all else config.kernel_name
     env.update({
         "APEX_TRACE_ENABLED": "1",
         "APEX_TRACE_PATCH_MANIFEST": f"{patched_files}/patch_manifest.json",
         "APEX_TRACE_OUTPUT_DIR": trace_raw,
-        "APEX_TRACE_KERNEL_NAME": config.kernel_name,
+        "APEX_TRACE_KERNEL_NAME": target_kernel,
         "APEX_TRACE_MAX_RECORDS": str(config.max_records),
         "APEX_TRACE_SAMPLE_RATE": str(config.sample_rate),
         "APEX_TRACE_SMALL_TENSOR_STATS": "1" if config.small_tensor_stats else "0",
@@ -183,7 +198,12 @@ def _resolve_benchmark_docker_image(config: TraceKernelConfig) -> str:
     return os.environ.get("APEX_VLLM_ROCM_IMAGE", "vllm/vllm-openai-rocm:v0.19.0")
 
 
-def _source_for_patch(config: TraceKernelConfig, module_name: str, package_rel_path: str) -> Path:
+def _source_for_patch(
+    config: TraceKernelConfig,
+    module_name: str,
+    package_rel_path: str,
+    fallback_source: Path | None = None,
+) -> Path:
     """Prefer the container-installed module source for Docker E2E tracing.
 
     Host checkouts under tools/rocm can drift from the benchmark image. Patching
@@ -191,11 +211,12 @@ def _source_for_patch(config: TraceKernelConfig, module_name: str, package_rel_p
     kernel signatures. Container source extraction keeps the patched wrapper in
     lockstep with the image actually running the workload.
     """
+    fallback_source = fallback_source or config.kernel_file
     if not config.benchmark_config or _detect_magpie_run_mode() != "docker":
-        return config.kernel_file
+        return fallback_source
     image = _resolve_benchmark_docker_image(config)
     if not image or shutil.which("docker") is None:
-        return config.kernel_file
+        return fallback_source
     out = config.results_dir / "container_sources" / package_rel_path
     out.parent.mkdir(parents=True, exist_ok=True)
     code = (
@@ -219,12 +240,12 @@ def _source_for_patch(config: TraceKernelConfig, module_name: str, package_rel_p
             timeout=120,
         )
     except Exception:
-        return config.kernel_file
+        return fallback_source
     if proc.returncode != 0 or "__APEX_SOURCE_BEGIN__" not in proc.stdout:
-        return config.kernel_file
+        return fallback_source
     _container_path, source = proc.stdout.split("__APEX_SOURCE_BEGIN__\n", 1)
     if "apex_trace_event" in source:
-        return config.kernel_file
+        return fallback_source
     out.write_text(source, encoding="utf-8")
     return out
 
@@ -291,10 +312,12 @@ def _run_trace_benchmark(config: TraceKernelConfig) -> dict:
     return result
 
 
-def _has_target_event(results_dir: Path, kernel_name: str) -> bool:
+def _has_target_event(results_dir: Path, kernel_name: str, *, trace_all: bool = False) -> bool:
     for path in (results_dir / "trace_raw").glob("*.jsonl"):
         for line in path.read_text(encoding="utf-8").splitlines():
-            if kernel_name in line and '"module_import"' not in line:
+            if '"module_import"' in line:
+                continue
+            if trace_all or not kernel_name or kernel_name in line:
                 return True
     return False
 
@@ -356,7 +379,11 @@ def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
     ranges = postprocess_trace(config.results_dir)
     result["run_result"] = run_result
     result["workload_ranges"] = ranges
-    result["target_event_found"] = _has_target_event(config.results_dir, config.kernel_name)
+    result["target_event_found"] = _has_target_event(
+        config.results_dir,
+        config.kernel_name,
+        trace_all=config.trace_all,
+    )
     result["success"] = bool(run_result.get("success", True)) and result["target_event_found"]
     (config.results_dir / "trace_result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"

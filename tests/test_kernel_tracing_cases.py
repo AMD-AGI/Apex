@@ -11,7 +11,7 @@ sys.path.insert(0, str(REPO_ROOT / "pipeline"))
 from kernel_tracing.mode_detection import detect_trace_mode
 from kernel_tracing.overlay import infer_module_mapping, overlay_path_for
 from kernel_tracing.patch_triton import patch_triton_launch_file
-from kernel_tracing.patch_wrapper import patch_wrapper_entry_file
+from kernel_tracing.patch_wrapper import patch_aiter_compile_ops_file, patch_wrapper_entry_file
 from kernel_tracing.test_cases import TRACE_TEST_CASES
 
 
@@ -35,7 +35,12 @@ def test_required_repo_case_patchability(case, tmp_path):
         assert mode == "agent"
         return
 
-    module_name, package_rel_path = infer_module_mapping(source, REPO_ROOT)
+    if case.patch_path == "aiter-compile-ops":
+        module_name = "aiter.jit.core"
+        package_rel_path = "aiter/jit/core.py"
+        source = REPO_ROOT / "tools/rocm/aiter/aiter/jit/core.py"
+    else:
+        module_name, package_rel_path = infer_module_mapping(source, REPO_ROOT)
     output = overlay_path_for(tmp_path / "patched_files", package_rel_path)
     if case.patch_path == "triton-launch":
         result = patch_triton_launch_file(
@@ -45,9 +50,16 @@ def test_required_repo_case_patchability(case, tmp_path):
             module_name=module_name,
             package_rel_path=package_rel_path,
         )
+    elif case.patch_path == "aiter-compile-ops":
+        result = patch_aiter_compile_ops_file(
+            source_path=source,
+            output_path=output,
+            trace_kind="hip_python_op",
+            module_name=module_name,
+            package_rel_path=package_rel_path,
+        )
     else:
         kind = {
-            "aiter-compile-ops": "hip_python_op",
             "vllm-custom-op": "vllm_python_op",
             "sglang-custom-op": "sglang_python_op",
         }[case.patch_path]
