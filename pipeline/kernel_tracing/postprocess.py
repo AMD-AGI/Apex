@@ -125,7 +125,27 @@ def _write_summary(results_dir: Path, result: dict) -> None:
         "",
     ]
     for idx, group in enumerate(result["groups"][:10], 1):
-        lines.append(f"{idx}. count={group['count']} percent={group['percent']}")
-        lines.append(f"   signature={group['signature']}")
-        lines.append(f"   shape_ranges={group['shape_ranges']}")
+        lines.extend([
+            f"### {idx}. count={group['count']} percent={group['percent']}",
+            "",
+            "**Signature**",
+            "",
+            "| Field | Value |",
+            "|---|---|",
+        ])
+        for key, value in group["signature"].items():
+            lines.append(f"| `{key}` | `{value}` |")
+        lines.extend([
+            "",
+            "**Shape Ranges**",
+            "",
+            "| Tensor | Dim | Min | Max |",
+            "|---|---:|---:|---:|",
+        ])
+        for key, value in sorted(group["shape_ranges"].items()):
+            tensor, _, dim = key.rpartition(".shape.")
+            lines.append(
+                f"| `{tensor}` | {dim} | {value.get('min')} | {value.get('max')} |"
+            )
+        lines.append("")
     (results_dir / "workload_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -283,6 +283,10 @@ def test_postprocess_shape_ranges(tmp_path):
     shape_ranges = result["groups"][0]["shape_ranges"]
     assert shape_ranges["q.shape.0"] == {"min": 1, "max": 8}
     assert shape_ranges["q.shape.1"] == {"min": 64, "max": 64}
+    summary = (tmp_path / "workload_summary.md").read_text(encoding="utf-8")
+    assert "| Field | Value |" in summary
+    assert "| Tensor | Dim | Min | Max |" in summary
+    assert "| `q` | 0 | 1 | 8 |" in summary
 
 
 def test_agent_fallback_uses_existing_backend(monkeypatch, tmp_path):
