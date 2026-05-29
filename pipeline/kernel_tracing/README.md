@@ -11,13 +11,17 @@ This feature is meant to answer one practical question:
 ```bash
 python3 workload_optimizer.py trace-kernel \
   -r /path/to/results_trace \
-  --kernel-name kernel_unified_attention_2d \
-  --kernel-file /root/Apex/tools/rocm/aiter/aiter/ops/triton/attention/unified_attention.py \
-  --trace-mode triton-launch \
-  --patch-strategy static \
+  --kernel-id aiter.triton.unified_attention_2d \
   --max-records 200 \
   --sample-rate 1.0 \
   -b /root/Magpie/examples/benchmarks/benchmark_vllm_gptoss_20b.yaml
+```
+
+List supported IDs with:
+
+```bash
+python3 workload_optimizer.py list-trace-kernels
+python3 workload_optimizer.py list-trace-kernels --repo vllm --kernel-type hip
 ```
 
 `trace-kernel` has two phases:
@@ -67,17 +71,13 @@ Important files:
 | Argument | Required | Description |
 |---|---:|---|
 | `-r, --results-dir` | yes | Directory for trace outputs, patched overlay, benchmark result, and postprocessed summaries. |
-| `--kernel-name` | yes | Target Triton kernel name or Python-visible op name. Used for patching and runtime filtering unless `--trace-all` is set. |
-| `--kernel-file` | yes | Source file used to infer the package module and patch strategy. For Triton this is the launch file. For wrapper/custom-op modes this is the wrapper file. |
-| `--trace-mode` | no | Trace strategy. Use `auto`, `triton-launch`, `aiter-compile-ops`, `vllm-custom-op`, `sglang-custom-op`, or `agent`. |
-| `--kernel-type` | no | Compatibility alias. `triton` maps to `triton-launch`; `hip` leaves mode detection on `auto`. Prefer `--trace-mode` for new usage. |
-| `--patch-strategy` | no | `static`, `agent`, or `auto`. Static patching handles known patterns; agent fallback is for irregular source patterns. |
+| `--kernel-id` | yes | Supported trace target ID from `list-trace-kernels`. The registry supplies kernel name, source file, trace mode, and patch strategy. |
 | `-b, --benchmark-config` | one of `-b` or `--run-cmd` | Magpie benchmark YAML to run after patching. |
 | `--run-cmd` | one of `-b` or `--run-cmd` | Local command to run after patching. Useful for op tests and small repros. |
 | `--max-records` | no | Maximum non-diagnostic trace events per process. `module_import` diagnostics do not consume this budget. |
 | `--sample-rate` | no | Sampling probability for non-diagnostic events. Use `1.0` for smoke tests, then lower it for high-frequency kernels. |
 | `--small-tensor-stats` | no | Collect min/max/percentile-like small tensor content summaries where supported. Disabled by default because it can synchronize GPU work. |
-| `--trace-all` | no | Disable runtime filtering by `--kernel-name`. Useful for central hooks, especially `aiter-compile-ops`, when the real low-level op name is unknown. |
+| `--trace-all` | no | Disable runtime filtering by the registry kernel name. Useful for central hooks, especially `aiter-compile-ops`, when the real low-level op name is unknown. |
 | `--benchmark-timeout` | no | Timeout in seconds for the benchmark or run command. |
 | `--docker-image` | no | Override benchmark Docker image. Otherwise Apex uses the benchmark config or default vLLM ROCm image. |
 | `--framework` | no | Framework passed to Magpie benchmark, usually `vllm` or `sglang`. Defaults to `vllm`. |
@@ -139,10 +139,6 @@ This captures the tensor/scalar metadata before the wrapper calls `torch.ops._C.
 
 Patches Python-visible SGLang custom-op wrappers. This is similar to `vllm-custom-op`, but aimed at SGLang `jit_kernel` and ROCm wrapper modules.
 
-### `agent`
-
-Uses the configured Apex agent backend to generate a patch when the static patcher cannot handle the source pattern. Use this for aliases such as `kernel`, indirect launch helpers, or deeply custom dispatch logic.
-
 ## Docker Overlay Behavior
 
 For `-b/--benchmark-config` runs, Apex usually runs through Magpie. If Magpie selects Docker:
@@ -192,11 +188,11 @@ The patched module was not imported, or tracing was not enabled in the process t
 
 Use this workflow for a new target:
 
-1. Start with `--sample-rate 1.0 --max-records 200`.
-2. For central hooks, add `--trace-all`.
-3. Confirm `module_import` exists.
-4. Confirm target runtime events exist.
-5. If target events do not exist, choose a different wrapper or use `--trace-all` to discover the real low-level name.
+1. Run `list-trace-kernels` and choose a supported `--kernel-id`.
+2. Start with `--sample-rate 1.0 --max-records 200`.
+3. For central hooks, add `--trace-all`.
+4. Confirm `module_import` exists.
+5. Confirm target runtime events exist.
 6. Once the target is confirmed, lower `--sample-rate` and raise `--max-records` for distribution collection.
 
 ## Examples
@@ -217,10 +213,7 @@ This traces a known aiter Triton launch used by GPT-OSS 20B when vLLM routes att
 ```bash
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_unified_attention_2d \
-  --kernel-name kernel_unified_attention_2d \
-  --kernel-file /root/Apex/tools/rocm/aiter/aiter/ops/triton/attention/unified_attention.py \
-  --trace-mode triton-launch \
-  --patch-strategy static \
+  --kernel-id aiter.triton.unified_attention_2d \
   --max-records 200 \
   --sample-rate 1.0 \
   --benchmark-timeout 2700 \
@@ -240,10 +233,7 @@ This traces the Python-visible vLLM cache wrapper before it calls the compiled c
 ```bash
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_vllm_reshape_and_cache_flash \
-  --kernel-name reshape_and_cache_flash \
-  --kernel-file /root/Apex/tools/rocm/vllm/vllm/_custom_ops.py \
-  --trace-mode vllm-custom-op \
-  --patch-strategy static \
+  --kernel-id vllm.hip.reshape_and_cache_flash \
   --max-records 200 \
   --sample-rate 1.0 \
   --benchmark-timeout 2700 \
@@ -262,10 +252,7 @@ Use this when you know a high-level aiter path is involved, but you do not yet k
 ```bash
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_compile_ops_discovery \
-  --kernel-name fused_moe \
-  --kernel-file /root/Apex/tools/rocm/aiter/aiter/fused_moe.py \
-  --trace-mode aiter-compile-ops \
-  --patch-strategy static \
+  --kernel-id aiter.hip.fmoe \
   --trace-all \
   --max-records 200 \
   --sample-rate 1.0 \
@@ -290,15 +277,12 @@ print(names)
 PY
 ```
 
-Then rerun with the actual `--kernel-name`, for example:
+Then rerun with the actual supported low-level `--kernel-id`, for example:
 
 ```bash
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_fmoe \
-  --kernel-name fmoe \
-  --kernel-file /root/Apex/tools/rocm/aiter/aiter/fused_moe.py \
-  --trace-mode aiter-compile-ops \
-  --patch-strategy static \
+  --kernel-id aiter.hip.fmoe \
   --max-records 10000 \
   --sample-rate 0.01 \
   --benchmark-timeout 2700 \
@@ -312,10 +296,7 @@ Use `--dry-run` to validate that the patch can be generated and compiled without
 ```bash
 python3 workload_optimizer.py trace-kernel \
   -r /tmp/apex_trace_dry_unified_attention \
-  --kernel-name kernel_unified_attention_2d \
-  --kernel-file /root/Apex/tools/rocm/aiter/aiter/ops/triton/attention/unified_attention.py \
-  --trace-mode triton-launch \
-  --patch-strategy static \
+  --kernel-id aiter.triton.unified_attention_2d \
   --dry-run
 ```
 
@@ -328,10 +309,7 @@ Use `--run-cmd` when you want to run a small op test or repro command instead of
 ```bash
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_local_pa_decode \
-  --kernel-name _paged_attn_decode_v1_wo_dot_kernel \
-  --kernel-file /root/Apex/tools/rocm/aiter/aiter/ops/triton/attention/pa_decode.py \
-  --trace-mode triton-launch \
-  --patch-strategy static \
+  --kernel-id aiter.triton.paged_attn_decode_v1_wo_dot \
   --max-records 200 \
   --sample-rate 1.0 \
   --run-cmd 'python3 -m pytest /root/Apex/tools/rocm/aiter/op_tests/triton_tests/attention/test_pa_decode.py -x'

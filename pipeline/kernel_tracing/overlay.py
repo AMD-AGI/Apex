@@ -13,6 +13,7 @@ IMPORTER_SOURCE = r'''
 from __future__ import annotations
 
 import importlib.abc
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -21,25 +22,40 @@ from pathlib import Path
 
 
 class _OverlayLoader(importlib.abc.Loader):
-    def __init__(self, fullname, path):
+    def __init__(self, fullname, path, package_paths=None, real_origin=None):
         self.fullname = fullname
         self.path = Path(path)
+        self.package_paths = [Path(p) for p in (package_paths or [])]
+        self.real_origin = Path(real_origin) if real_origin else None
 
     def create_module(self, spec):
         return None
 
     def exec_module(self, module):
-        module.__file__ = str(self.path)
+        module_file = self.real_origin or self.path
+        module.__file__ = str(module_file)
         module.__loader__ = self
         module.__package__ = self.fullname.rpartition(".")[0]
+        if getattr(module, "__spec__", None) is not None:
+            module.__spec__.loader = self
+            module.__spec__.origin = str(module_file)
+        if os.environ.get("APEX_TRACE_ALLOW_PACKAGE_PATH_INSERT", "0") == "1":
+            package_paths = list(self.package_paths)
+            if self.real_origin:
+                package_paths.append(self.real_origin.parent)
+            for package_path in reversed(package_paths):
+                for candidate in (package_path, package_path / "utils"):
+                    candidate_str = str(candidate)
+                    if candidate.exists() and candidate_str not in sys.path:
+                        sys.path.insert(0, candidate_str)
         try:
             from apex_kernel_tracing_runtime import apex_trace_event
             apex_trace_event(
                 kind="module_import",
                 kernel_name=os.environ.get("APEX_TRACE_KERNEL_NAME", ""),
-                source_file=str(self.path),
+                source_file=str(module_file),
                 line=0,
-                extra={"module_name": self.fullname},
+                extra={"module_name": self.fullname, "patched_file": str(self.path)},
             )
         except Exception:
             pass
@@ -59,7 +75,13 @@ class _OverlayFinder(importlib.abc.MetaPathFinder):
         patched = self.root / rel
         if not patched.exists():
             return None
-        loader = _OverlayLoader(fullname, patched)
+        real_origin = None
+        try:
+            real_spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+            real_origin = getattr(real_spec, "origin", None) if real_spec else None
+        except Exception:
+            real_origin = None
+        loader = _OverlayLoader(fullname, patched, path, real_origin)
         return importlib.util.spec_from_file_location(fullname, patched, loader=loader)
 
 
@@ -187,7 +209,18 @@ set -e
 REAL_DOCKER="${{APEX_TRACE_REAL_DOCKER:-{real_docker}}}"
 if [ "$1" = "run" ]; then
   shift
-  exec "$REAL_DOCKER" run -v "${{APEX_TRACE_HOST_RESULTS_DIR}}:/apex_trace" "$@"
+  args=()
+  if [ "${{APEX_TRACE_KEEP_DOCKER:-0}}" = "1" ]; then
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" != "--rm" ]; then
+        args+=("$1")
+      fi
+      shift
+    done
+  else
+    args=("$@")
+  fi
+  exec "$REAL_DOCKER" run -v "${{APEX_TRACE_HOST_RESULTS_DIR}}:/apex_trace" "${{args[@]}}"
 fi
 exec "$REAL_DOCKER" "$@"
 """,

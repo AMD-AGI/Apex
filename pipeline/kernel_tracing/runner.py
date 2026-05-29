@@ -36,6 +36,8 @@ class TraceKernelConfig:
     results_dir: Path
     kernel_name: str
     kernel_file: Path
+    kernel_id: str = ""
+    registry_entry: dict[str, Any] | None = None
     trace_mode: str = "auto"
     kernel_type: str = ""
     patch_strategy: str = "auto"
@@ -101,6 +103,7 @@ def _prepare_static_patch(config: TraceKernelConfig, mode: str) -> PatchResult:
         trace_kind=_trace_kind_for_mode(mode),
         module_name=module_name,
         package_rel_path=package_rel_path,
+        trace_all=config.trace_all,
     )
 
 
@@ -109,6 +112,8 @@ def _write_trace_config(config: TraceKernelConfig, mode: str, patch_result: Patc
     data["results_dir"] = str(config.results_dir)
     data["kernel_file"] = str(config.kernel_file)
     data["repo_root"] = str(config.repo_root)
+    data["kernel_id"] = config.kernel_id
+    data["registry_entry"] = config.registry_entry
     data["resolved_trace_mode"] = mode
     if patch_result:
         data["patch_result"] = {
@@ -312,14 +317,30 @@ def _run_trace_benchmark(config: TraceKernelConfig) -> dict:
     return result
 
 
-def _has_target_event(results_dir: Path, kernel_name: str, *, trace_all: bool = False) -> bool:
+def _trace_event_flags(results_dir: Path, kernel_name: str) -> dict[str, bool]:
+    flags = {"any_event_found": False, "target_event_found": False}
     for path in (results_dir / "trace_raw").glob("*.jsonl"):
         for line in path.read_text(encoding="utf-8").splitlines():
-            if '"module_import"' in line:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
                 continue
-            if trace_all or not kernel_name or kernel_name in line:
-                return True
-    return False
+            if event.get("kind") == "module_import":
+                continue
+            flags["any_event_found"] = True
+            extra = event.get("extra") if isinstance(event.get("extra"), dict) else {}
+            candidates = {
+                str(value)
+                for value in (
+                    event.get("kernel_name"),
+                    extra.get("load_name"),
+                    extra.get("wrapper"),
+                )
+                if value is not None
+            }
+            if not kernel_name or kernel_name in candidates:
+                flags["target_event_found"] = True
+    return flags
 
 
 def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
@@ -345,7 +366,13 @@ def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
             agent_max_turns=config.agent_max_turns,
         ))
         _write_trace_config(config, mode, None)
-        result = {"success": True, "mode": mode, "agent_manifest": agent_manifest}
+        result = {
+            "success": True,
+            "mode": mode,
+            "kernel_id": config.kernel_id,
+            "registry_entry": config.registry_entry,
+            "agent_manifest": agent_manifest,
+        }
     else:
         patch_result = _prepare_static_patch(config, mode)
         _compile_patched(patch_result.patched_path)
@@ -361,6 +388,8 @@ def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
         result = {
             "success": True,
             "mode": mode,
+            "kernel_id": config.kernel_id,
+            "registry_entry": config.registry_entry,
             "patched_file": str(patch_result.patched_path),
             "events": patch_result.events,
         }
@@ -379,12 +408,12 @@ def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
     ranges = postprocess_trace(config.results_dir)
     result["run_result"] = run_result
     result["workload_ranges"] = ranges
-    result["target_event_found"] = _has_target_event(
-        config.results_dir,
-        config.kernel_name,
-        trace_all=config.trace_all,
+    event_flags = _trace_event_flags(config.results_dir, config.kernel_name)
+    result.update(event_flags)
+    result["event_found"] = (
+        event_flags["any_event_found"] if config.trace_all else event_flags["target_event_found"]
     )
-    result["success"] = bool(run_result.get("success", True)) and result["target_event_found"]
+    result["success"] = bool(run_result.get("success", True)) and result["event_found"]
     (config.results_dir / "trace_result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
     )

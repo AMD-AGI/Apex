@@ -15,10 +15,10 @@ from kernel_tracing.agent_harness import AgentPatchRequest, run_agent_patch_fall
 from kernel_tracing.overlay import ModuleMapping, write_overlay_support
 from kernel_tracing.patch_triton import patch_triton_launch_file
 from kernel_tracing.postprocess import postprocess_trace
-from kernel_tracing.runner import TraceKernelConfig, run_trace_kernel
+from kernel_tracing.runner import TraceKernelConfig, _trace_event_flags, run_trace_kernel
 from kernel_tracing.runtime import write_runtime_file
 from kernel_tracing.serializer import serialize_value
-from kernel_tracing.patch_wrapper import patch_aiter_compile_ops_file
+from kernel_tracing.patch_wrapper import patch_aiter_compile_ops_file, patch_wrapper_entry_file
 
 
 def _synthetic_source() -> str:
@@ -134,9 +134,209 @@ def compile_ops(_md_name, fc_name=None, ffi_type="pybind", develop=False):
     text = out.read_text(encoding="utf-8")
     assert "compile_ops.ctypes_wrapper" in text
     assert "compile_ops.pybind_wrapper" in text
-    assert "kernel_name=loadName" in text
+    assert "kernel_name=_apex_trace_load_name" in text
+    assert "'develop': _apex_trace_develop" in text
     assert len(result.events) == 2
     compile(text, str(out), "exec")
+
+
+def test_patch_aiter_compile_ops_handles_wrapper_local_load_name(tmp_path, monkeypatch):
+    src = tmp_path / "core.py"
+    src.write_text("""
+import functools
+
+def op(*args, **kwargs):
+    return "ok"
+
+def compile_ops(_md_name, fc_name=None, gen_func=None, gen_fake=None):
+    def decorator(func):
+        func.arg_checked = False
+
+        @functools.wraps(func)
+        def wrapper(*args, custom_build_args={}, **kwargs):
+
+            loadName = fc_name
+            md_name = _md_name
+            if fc_name is None:
+                loadName = func.__name__
+            return op(*args, **kwargs)
+
+        return wrapper
+    return decorator
+""", encoding="utf-8")
+    out = tmp_path / "patched" / "aiter" / "jit" / "core.py"
+    result = patch_aiter_compile_ops_file(
+        source_path=src,
+        output_path=out,
+        trace_kind="hip_python_op",
+        module_name="aiter.jit.core",
+        package_rel_path="aiter/jit/core.py",
+    )
+    text = out.read_text(encoding="utf-8")
+    assert "kernel_name=loadName" not in text
+    assert "kernel_name=_apex_trace_load_name" in text
+    assert len(result.events) == 1
+    compile(text, str(out), "exec")
+
+    events = []
+    runtime = type(sys)("apex_kernel_tracing_runtime")
+    runtime.apex_trace_event = lambda **event: events.append(event)
+    monkeypatch.setitem(sys.modules, "apex_kernel_tracing_runtime", runtime)
+
+    namespace = {"__file__": str(out)}
+    exec(compile(text, str(out), "exec"), namespace)
+
+    def moe_sorting_fwd():
+        return None
+
+    wrapped = namespace["compile_ops"]("module_moe_sorting")(moe_sorting_fwd)
+    assert wrapped("token_ids", dispatch_policy=0) == "ok"
+    assert events[0]["kernel_name"] == "moe_sorting_fwd"
+    assert events[0]["extra"]["load_name"] == "moe_sorting_fwd"
+    assert events[0]["extra"]["develop"] is False
+
+
+def test_patch_aiter_compile_ops_skips_uncheckable_annotations(tmp_path, monkeypatch):
+    src = tmp_path / "core.py"
+    src.write_text("""
+import inspect
+import types
+import typing
+
+def op(*args, **kwargs):
+    return "ok"
+
+def compile_ops(_md_name, fc_name=None, gen_func=None, gen_fake=None):
+    def decorator(func):
+        func.arg_checked = False
+
+        def wrapper(*args, custom_build_args={}, **kwargs):
+            loadName = fc_name
+            if fc_name is None:
+                loadName = func.__name__
+
+            def check_args():
+                sig = inspect.signature(func)
+                func.__signature__ = sig
+                ann = {k: v.annotation for k, v in sig.parameters.items()}
+                ann["return"] = sig.return_annotation
+                callargs = inspect.getcallargs(func, *args, **kwargs)
+                enum_types = []
+                for el, arg in callargs.items():
+                    expected_type = ann[el]
+                    got_type = type(arg)
+                    origin = typing.get_origin(expected_type)
+                    sub_t = typing.get_args(expected_type)
+
+                    if origin is None:
+                        if not isinstance(arg, expected_type) and not (
+                            any(el in str(expected_type) for el in enum_types)
+                            and isinstance(arg, int)
+                        ):
+                            raise TypeError(
+                                f"{loadName}: {el} needs to be {expected_type} but got {got_type}"
+                            )
+                    elif origin is list:
+                        if not isinstance(arg, list):
+                            raise TypeError(
+                                f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
+                            )
+                    elif origin is typing.Union or origin is types.UnionType:
+                        if arg is not None and not isinstance(arg, sub_t):
+                            raise TypeError(
+                                f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
+                            )
+                    else:
+                        raise TypeError(f"Unsupported type: {expected_type}")
+                return True
+
+            func.arg_checked = check_args()
+            return op(*args, **kwargs)
+
+        return wrapper
+    return decorator
+""", encoding="utf-8")
+    out = tmp_path / "patched" / "aiter" / "jit" / "core.py"
+    patch_aiter_compile_ops_file(
+        source_path=src,
+        output_path=out,
+        trace_kind="hip_python_op",
+        module_name="aiter.jit.core",
+        package_rel_path="aiter/jit/core.py",
+    )
+    text = out.read_text(encoding="utf-8")
+    assert "expected_type is inspect._empty" in text
+    assert "not isinstance(expected_type, type)" in text
+    compile(text, str(out), "exec")
+
+    events = []
+    runtime = type(sys)("apex_kernel_tracing_runtime")
+    runtime.apex_trace_event = lambda **event: events.append(event)
+    monkeypatch.setitem(sys.modules, "apex_kernel_tracing_runtime", runtime)
+
+    namespace = {"__file__": str(out)}
+    exec(compile(text, str(out), "exec"), namespace)
+
+    def rmsnorm2d_fwd(x):
+        return x
+
+    wrapped = namespace["compile_ops"]("module_rmsnorm")(rmsnorm2d_fwd)
+    assert wrapped("tensor") == "ok"
+    assert events[0]["kernel_name"] == "rmsnorm2d_fwd"
+
+
+def test_patch_wrapper_trace_all_instruments_top_level_functions(tmp_path):
+    src = tmp_path / "custom_ops.py"
+    src.write_text("""
+def first(x):
+    return x
+
+def second(x):
+    return x
+
+class Helper:
+    def method(self, x):
+        return x
+
+def outer(x):
+    def nested(y):
+        return y
+    return nested(x)
+""", encoding="utf-8")
+    out = tmp_path / "patched" / "custom_ops.py"
+    result = patch_wrapper_entry_file(
+        source_path=src,
+        output_path=out,
+        kernel_name="first",
+        trace_kind="vllm_python_op",
+        module_name="custom_ops",
+        package_rel_path="custom_ops.py",
+        trace_all=True,
+    )
+    names = {event["kernel_name"] for event in result.events}
+    assert names == {"first", "second", "outer"}
+    text = out.read_text(encoding="utf-8")
+    assert "kernel_name='second'" in text
+    assert "kernel_name='method'" not in text
+    assert "kernel_name='nested'" not in text
+    compile(text, str(out), "exec")
+
+
+def test_trace_event_flags_separate_any_and_target(tmp_path):
+    raw = tmp_path / "trace_raw"
+    raw.mkdir()
+    events = [
+        {"kind": "module_import", "kernel_name": "target"},
+        {"kind": "vllm_python_op", "kernel_name": "other"},
+    ]
+    (raw / "trace_pid1_rank0.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    assert _trace_event_flags(tmp_path, "target") == {
+        "any_event_found": True,
+        "target_event_found": False,
+    }
 
 
 def test_local_overlay_import_smoke(tmp_path):
@@ -162,6 +362,51 @@ def test_local_overlay_import_smoke(tmp_path):
     subprocess.run([sys.executable, "-c", "import mod"], env=env, check=True)
     raw = "\n".join(p.read_text() for p in (results / "trace_raw").glob("*.jsonl"))
     assert '"kind": "module_import"' in raw
+
+
+def test_overlay_import_preserves_package_sibling_utils(tmp_path):
+    site_root = tmp_path / "site"
+    real_pkg = site_root / "pkg" / "jit"
+    real_utils = real_pkg / "utils"
+    real_utils.mkdir(parents=True)
+    (site_root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (real_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (real_utils / "chip_info.py").write_text("VALUE = 'real-utils'\n", encoding="utf-8")
+    real_core = real_pkg / "core.py"
+    real_core.write_text("from chip_info import VALUE\n", encoding="utf-8")
+
+    results = tmp_path / "results"
+    patched_dir = results / "patched_files"
+    write_runtime_file(patched_dir)
+    patched = patched_dir / "overlay" / "pkg" / "jit" / "core.py"
+    patched.parent.mkdir(parents=True)
+    patched.write_text("from chip_info import VALUE\n", encoding="utf-8")
+    write_overlay_support(
+        results_dir=results,
+        mappings=[ModuleMapping("pkg.jit.core", "pkg/jit/core.py", real_core, patched)],
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{patched_dir}:{site_root}:{env.get('PYTHONPATH', '')}"
+    env["APEX_TRACE_ENABLED"] = "1"
+    env["APEX_TRACE_OUTPUT_DIR"] = str(results / "trace_raw")
+    env["APEX_TRACE_KERNEL_NAME"] = "k"
+    env["APEX_TRACE_ALLOW_PACKAGE_PATH_INSERT"] = "1"
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib; import pkg.jit.core as c; "
+                "assert c.VALUE == 'real-utils'; "
+                f"assert pathlib.Path(c.__file__) == pathlib.Path({str(real_core)!r})"
+            ),
+        ],
+        env=env,
+        check=True,
+    )
+    raw = "\n".join(p.read_text() for p in (results / "trace_raw").glob("*.jsonl"))
+    assert '"module_name": "pkg.jit.core"' in raw
 
 
 def test_module_import_bypasses_sampling_and_max_records(tmp_path):
