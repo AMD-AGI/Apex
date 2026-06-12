@@ -7,7 +7,7 @@ import re
 import textwrap
 from pathlib import Path
 
-from .patch_triton import PatchResult, _import_insert_index
+from .patch_triton import PatchResult, RUNTIME_IMPORT_SOURCE, _import_insert_index
 
 
 def _docstring_insert_line(node: ast.FunctionDef) -> int:
@@ -36,7 +36,7 @@ def _apply_insertions(source: str, tree: ast.Module, insertions: list[tuple[int,
     if "apex_kernel_tracing_runtime" not in source:
         insertions.append((
             _import_insert_index(tree),
-            "from apex_kernel_tracing_runtime import apex_trace_event",
+            RUNTIME_IMPORT_SOURCE.rstrip(),
         ))
     for line_idx, text in sorted(insertions, key=lambda x: x[0], reverse=True):
         indent = ""

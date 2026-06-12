@@ -9,6 +9,23 @@ from pathlib import Path
 from typing import Iterable
 
 
+RUNTIME_IMPORT_SOURCE = """\
+try:
+    from apex_kernel_tracing_runtime import apex_trace_event
+except ModuleNotFoundError:
+    import importlib.util as _apex_trace_importlib_util
+    _apex_trace_runtime_spec = _apex_trace_importlib_util.spec_from_file_location(
+        "apex_kernel_tracing_runtime",
+        "/apex_trace/patched_files/apex_kernel_tracing_runtime.py",
+    )
+    _apex_trace_runtime_mod = _apex_trace_importlib_util.module_from_spec(
+        _apex_trace_runtime_spec
+    )
+    _apex_trace_runtime_spec.loader.exec_module(_apex_trace_runtime_mod)
+    apex_trace_event = _apex_trace_runtime_mod.apex_trace_event
+"""
+
+
 @dataclass
 class PatchResult:
     source_path: Path
@@ -64,12 +81,7 @@ def _insert_import(body: list[ast.stmt]) -> list[ast.stmt]:
         and body[idx].module == "__future__"
     ):
         idx += 1
-    imp = ast.ImportFrom(
-        module="apex_kernel_tracing_runtime",
-        names=[ast.alias(name="apex_trace_event")],
-        level=0,
-    )
-    return body[:idx] + [imp] + body[idx:]
+    return body[:idx] + ast.parse(RUNTIME_IMPORT_SOURCE).body + body[idx:]
 
 
 def _dict_from_keywords(keywords: Iterable[ast.keyword]) -> ast.Dict:
@@ -305,7 +317,7 @@ def patch_triton_launch_file(
     if "apex_kernel_tracing_runtime" not in source:
         insertions.append((
             _import_insert_index(tree),
-            "from apex_kernel_tracing_runtime import apex_trace_event",
+            RUNTIME_IMPORT_SOURCE.rstrip(),
         ))
 
     for line_idx, text in sorted(insertions, key=lambda x: x[0], reverse=True):

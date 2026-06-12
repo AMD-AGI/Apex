@@ -52,7 +52,10 @@ class _OverlayLoader(importlib.abc.Loader):
             from apex_kernel_tracing_runtime import apex_trace_event
             apex_trace_event(
                 kind="module_import",
-                kernel_name=os.environ.get("APEX_TRACE_KERNEL_NAME", ""),
+                kernel_name=os.environ.get(
+                    "APEX_TRACE_KERNEL_NAME",
+                    os.environ.get("APEX_TRACE_KERNEL_NAMES", ""),
+                ),
                 source_file=str(module_file),
                 line=0,
                 extra={"module_name": self.fullname, "patched_file": str(self.path)},
@@ -155,6 +158,13 @@ def overlay_path_for(patched_files_dir: Path, package_rel_path: str) -> Path:
     return patched_files_dir / "overlay" / package_rel_path
 
 
+def _container_source_file(mapping: ModuleMapping) -> str:
+    sidecar = mapping.source_path.with_suffix(mapping.source_path.suffix + ".container_path")
+    if sidecar.exists():
+        return sidecar.read_text(encoding="utf-8").strip()
+    return ""
+
+
 def write_overlay_support(
     *,
     results_dir: Path,
@@ -180,6 +190,7 @@ def write_overlay_support(
                 "source_file": str(m.source_path),
                 "patched_file": str(m.patched_path),
                 "container_patched_file": f"/apex_trace/patched_files/overlay/{m.package_rel_path}",
+                "container_source_file": _container_source_file(m),
             }
             for m in mappings
         ],
@@ -220,7 +231,27 @@ if [ "$1" = "run" ]; then
   else
     args=("$@")
   fi
-  exec "$REAL_DOCKER" run -v "${{APEX_TRACE_HOST_RESULTS_DIR}}:/apex_trace" "${{args[@]}}"
+  mount_args=(-v "${{APEX_TRACE_HOST_RESULTS_DIR}}:/apex_trace")
+  manifest="${{APEX_TRACE_HOST_RESULTS_DIR}}/patched_files/patch_manifest.json"
+  if [ -f "$manifest" ]; then
+    while IFS=$'\t' read -r host_file container_file; do
+      if [ -n "$host_file" ] && [ -n "$container_file" ] && [ -f "$host_file" ]; then
+        mount_args+=("-v" "$host_file:$container_file:ro")
+      fi
+    done < <(python3 - "$manifest" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+for item in data.get("patched_files", []):
+    host = item.get("patched_file") or ""
+    container = item.get("container_source_file") or ""
+    if host and container:
+        print(host + "\t" + container)
+PY
+)
+  fi
+  exec "$REAL_DOCKER" run "${{mount_args[@]}}" "${{args[@]}}"
 fi
 exec "$REAL_DOCKER" "$@"
 """,

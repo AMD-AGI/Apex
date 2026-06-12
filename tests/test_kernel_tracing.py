@@ -15,7 +15,12 @@ from kernel_tracing.agent_harness import AgentPatchRequest, run_agent_patch_fall
 from kernel_tracing.overlay import ModuleMapping, write_overlay_support
 from kernel_tracing.patch_triton import patch_triton_launch_file
 from kernel_tracing.postprocess import postprocess_trace
-from kernel_tracing.runner import TraceKernelConfig, _trace_event_flags, run_trace_kernel
+from kernel_tracing.runner import (
+    TraceKernelConfig,
+    TraceKernelTarget,
+    _trace_event_flags,
+    run_trace_kernel,
+)
 from kernel_tracing.runtime import write_runtime_file
 from kernel_tracing.serializer import serialize_value
 from kernel_tracing.patch_wrapper import patch_aiter_compile_ops_file, patch_wrapper_entry_file
@@ -38,6 +43,23 @@ def wrapper(q, k, block, config):
         BLOCK_SIZE=block,
         **config,
     )
+"""
+
+
+def _synthetic_two_kernel_source() -> str:
+    return """
+class DummyKernel:
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            return "ok"
+        return launch
+
+first_kernel = DummyKernel()
+second_kernel = DummyKernel()
+
+def wrapper(q, k, block):
+    first_kernel[(q.shape[0], block)](q, key=k, BLOCK_SIZE=block)
+    second_kernel[(k.shape[0], block)](k, query=q, BLOCK_SIZE=block)
 """
 
 
@@ -474,6 +496,65 @@ mod.wrapper(T(), T(), 64, {"EXTRA": True})
     assert "some_kernel" in raw
     ranges = json.loads((tmp_path / "results" / "workload_ranges.json").read_text())
     assert ranges["total_calls"] == 1
+
+
+def test_run_trace_kernel_multiple_targets_same_file(tmp_path):
+    src = tmp_path / "mod.py"
+    src.write_text(_synthetic_two_kernel_source(), encoding="utf-8")
+    script = tmp_path / "smoke.py"
+    script.write_text("""
+class T:
+    shape = (2, 3)
+    dtype = "fake"
+    device = "cpu"
+    layout = "strided"
+    requires_grad = False
+    def stride(self): return (3, 1)
+    def is_contiguous(self): return True
+    def numel(self): return 6
+    def element_size(self): return 4
+    def data_ptr(self): return 123
+
+import mod
+mod.wrapper(T(), T(), 64)
+""", encoding="utf-8")
+    cmd = f"{sys.executable} {script}"
+    result = run_trace_kernel(TraceKernelConfig(
+        results_dir=tmp_path / "results",
+        kernel_name="first_kernel",
+        kernel_file=src,
+        run_cmd=cmd,
+        max_records=10,
+        repo_root=tmp_path,
+        targets=[
+            TraceKernelTarget(
+                kernel_name="first_kernel",
+                kernel_file=src,
+                kernel_id="synthetic.first",
+                trace_mode="triton-launch",
+                kernel_type="triton",
+                patch_strategy="static",
+            ),
+            TraceKernelTarget(
+                kernel_name="second_kernel",
+                kernel_file=src,
+                kernel_id="synthetic.second",
+                trace_mode="triton-launch",
+                kernel_type="triton",
+                patch_strategy="static",
+            ),
+        ],
+    ))
+    assert result["success"] is True
+    assert result["target_events_found"] == {
+        "first_kernel": True,
+        "second_kernel": True,
+    }
+    raw = (tmp_path / "results" / "trace_raw.jsonl").read_text(encoding="utf-8")
+    assert "first_kernel" in raw
+    assert "second_kernel" in raw
+    ranges = json.loads((tmp_path / "results" / "workload_ranges.json").read_text())
+    assert ranges["total_calls"] == 2
 
 
 def test_run_trace_kernel_aiter_mode_patches_compile_ops_core(tmp_path):

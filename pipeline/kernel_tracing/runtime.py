@@ -21,7 +21,15 @@ _COUNT = 0
 
 
 def _enabled():
-    return os.environ.get("APEX_TRACE_ENABLED", "0") not in ("", "0", "false", "False")
+    enabled = os.environ.get("APEX_TRACE_ENABLED")
+    if enabled is not None:
+        return enabled not in ("", "0", "false", "False")
+    # Some model servers sanitize worker-process environments. The patch
+    # manifest is enough signal that this process belongs to a trace run.
+    return bool(
+        os.environ.get("APEX_TRACE_PATCH_MANIFEST")
+        or Path("/apex_trace/patched_files/patch_manifest.json").exists()
+    )
 
 
 def _is_tensor(value):
@@ -147,10 +155,27 @@ def _rank_info():
 
 
 def _output_file():
-    out_dir = Path(os.environ.get("APEX_TRACE_OUTPUT_DIR", "."))
+    out_dir_raw = os.environ.get("APEX_TRACE_OUTPUT_DIR", "")
+    if out_dir_raw:
+        out_dir = Path(out_dir_raw)
+    else:
+        manifest = os.environ.get("APEX_TRACE_PATCH_MANIFEST", "")
+        if manifest:
+            out_dir = Path(manifest).parent.parent / "trace_raw"
+        elif Path("/apex_trace/patched_files/patch_manifest.json").exists():
+            out_dir = Path("/apex_trace/trace_raw")
+        else:
+            out_dir = Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
     rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
     return out_dir / f"trace_pid{os.getpid()}_rank{rank}.jsonl"
+
+
+def _target_kernel_names():
+    raw = os.environ.get("APEX_TRACE_KERNEL_NAMES", "")
+    if not raw:
+        raw = os.environ.get("APEX_TRACE_KERNEL_NAME", "")
+    return {name.strip() for name in raw.split(",") if name.strip()}
 
 
 def _apex_trace_event_impl(kind, kernel_name, source_file, line, args=None, kwargs=None, grid=None, extra=None):
@@ -158,8 +183,8 @@ def _apex_trace_event_impl(kind, kernel_name, source_file, line, args=None, kwar
     if not _enabled():
         return
     is_diagnostic_event = kind == "module_import"
-    target = os.environ.get("APEX_TRACE_KERNEL_NAME", "")
-    if not is_diagnostic_event and target and kernel_name not in ("", target):
+    targets = _target_kernel_names()
+    if not is_diagnostic_event and targets and kernel_name not in targets and kernel_name != "":
         return
     kind_filter = os.environ.get("APEX_TRACE_KIND", "")
     if not is_diagnostic_event and kind_filter and kind != kind_filter:

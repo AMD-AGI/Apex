@@ -129,11 +129,17 @@ def find_supported_kernel(
     entries = load_supported_kernels(
         path=path,
         repo_root=repo_root,
-        validate_files=validate_files,
+        validate_files=False,
     )
     by_id = {entry.id: entry for entry in entries}
     if kernel_id in by_id:
-        return by_id[kernel_id]
+        entry = by_id[kernel_id]
+        if validate_files:
+            if repo_root is None:
+                raise ValueError("repo_root is required when validate_files=True")
+            if not entry.resolved_file(repo_root).exists():
+                raise ValueError(f"{entry.id}: missing kernel_file {entry.kernel_file}")
+        return entry
 
     suggestions = difflib.get_close_matches(kernel_id, sorted(by_id), n=3, cutoff=0.35)
     hint = ""

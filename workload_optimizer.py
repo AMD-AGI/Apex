@@ -4458,28 +4458,58 @@ def cmd_benchmark(args):
 
 
 def cmd_trace_kernel(args):
-    """Trace one kernel/op workload by patching its Python launch/wrapper site."""
+    """Trace one or more kernel/op workloads by patching Python launch/wrapper sites."""
     from kernel_tracing.registry import find_supported_kernel
-    from kernel_tracing.runner import TraceKernelConfig, run_trace_kernel
+    from kernel_tracing.runner import TraceKernelConfig, TraceKernelTarget, run_trace_kernel
 
+    kernel_ids: list[str] = []
+    for raw in getattr(args, "kernel_ids", None) or []:
+        kernel_ids.extend(part.strip() for part in str(raw).split(",") if part.strip())
+    if not kernel_ids:
+        raise SystemExit("trace-kernel requires at least one --kernel-id")
+    deduped_kernel_ids = []
+    seen_kernel_ids = set()
+    for kernel_id in kernel_ids:
+        if kernel_id in seen_kernel_ids:
+            continue
+        deduped_kernel_ids.append(kernel_id)
+        seen_kernel_ids.add(kernel_id)
+
+    entries = []
     try:
-        entry = find_supported_kernel(
-            args.kernel_id,
-            repo_root=REPO_ROOT,
-            validate_files=True,
-        )
+        entries = [
+            find_supported_kernel(
+                kernel_id,
+                repo_root=REPO_ROOT,
+                validate_files=False,
+            )
+            for kernel_id in deduped_kernel_ids
+        ]
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    first = entries[0]
+    targets = [
+        TraceKernelTarget(
+            kernel_name=entry.kernel_name,
+            kernel_file=entry.resolved_file(REPO_ROOT),
+            kernel_id=entry.id,
+            registry_entry=entry.as_dict(),
+            trace_mode=entry.trace_mode,
+            kernel_type=entry.kernel_type,
+            patch_strategy=entry.patch_strategy,
+        )
+        for entry in entries
+    ]
     cfg = TraceKernelConfig(
         results_dir=Path(args.results_dir),
-        kernel_name=entry.kernel_name,
-        kernel_file=entry.resolved_file(REPO_ROOT),
-        kernel_id=entry.id,
-        registry_entry=entry.as_dict(),
-        trace_mode=entry.trace_mode,
-        kernel_type=entry.kernel_type,
-        patch_strategy=entry.patch_strategy,
+        kernel_name=first.kernel_name,
+        kernel_file=first.resolved_file(REPO_ROOT),
+        kernel_id=first.id,
+        registry_entry=first.as_dict(),
+        trace_mode=first.trace_mode,
+        kernel_type=first.kernel_type,
+        patch_strategy=first.patch_strategy,
         benchmark_config=getattr(args, "benchmark_config", "") or "",
         run_cmd=getattr(args, "run_cmd", "") or "",
         max_records=getattr(args, "max_records", 100000),
@@ -4494,6 +4524,7 @@ def cmd_trace_kernel(args):
         framework=getattr(args, "framework", ""),
         dry_run=getattr(args, "dry_run", False),
         repo_root=REPO_ROOT,
+        targets=targets,
     )
     if bool(cfg.benchmark_config) == bool(cfg.run_cmd) and not cfg.dry_run:
         raise SystemExit("trace-kernel requires exactly one of --run-cmd or -b/--benchmark-config")
@@ -4505,7 +4536,7 @@ def cmd_list_trace_kernels(args):
     """List supported trace-kernel whitelist entries."""
     from kernel_tracing.registry import load_supported_kernels
 
-    entries = load_supported_kernels(repo_root=REPO_ROOT, validate_files=True)
+    entries = load_supported_kernels(repo_root=REPO_ROOT, validate_files=False)
     repo_filter = (getattr(args, "repo", "") or "").strip()
     type_filter = (getattr(args, "kernel_type", "") or "").strip()
     if repo_filter:
@@ -4527,6 +4558,53 @@ def cmd_list_trace_kernels(args):
     for row in rows:
         print("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
     print(f"\n{len(rows)} supported trace kernels")
+
+
+def cmd_update_trace_kernel_registry(args):
+    """Refresh the trace-kernel whitelist from benchmark Docker images."""
+    from kernel_tracing.registry import SUPPORTED_KERNELS_PATH
+    from kernel_tracing.registry_update import RegistryUpdateError, update_trace_kernel_registry
+
+    output_path = Path(getattr(args, "output", "") or SUPPORTED_KERNELS_PATH)
+    report_arg = getattr(args, "report", "") or ""
+    report_path = Path(report_arg) if report_arg else None
+    try:
+        result = update_trace_kernel_registry(
+            repo_root=REPO_ROOT,
+            gpu_arch=getattr(args, "gpu_arch", "gfx950"),
+            frameworks=getattr(args, "frameworks", "sglang,vllm"),
+            output_path=output_path,
+            report_path=report_path,
+            write=getattr(args, "write", False),
+            sglang_image=getattr(args, "sglang_image", ""),
+            vllm_image=getattr(args, "vllm_image", ""),
+            vllm_commit=getattr(args, "vllm_commit", ""),
+        )
+    except RegistryUpdateError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    mode = "write" if result.wrote_registry else "dry-run"
+    print(f"Trace kernel registry update ({mode})")
+    print(f"  output: {result.output_path}")
+    for framework, image in result.images.items():
+        print(f"  image[{framework}]: {image}")
+    print(f"  repos: {', '.join(result.selected_repos)}")
+    diff = result.diff
+    print(f"  kernels: {diff['old_count']} -> {diff['new_count']} ({diff['delta']:+d})")
+    print(
+        "  changes: "
+        f"added={len(diff['added'])}, "
+        f"removed={len(diff['removed'])}, "
+        f"changed={len(diff['changed'])}"
+    )
+    for repo, change in diff["source_commit_changes"].items():
+        old = change["old"] or "<none>"
+        new = change["new"] or "<none>"
+        print(f"  source_commits[{repo}]: {old} -> {new}")
+    if result.report_path:
+        print(f"  report: {result.report_path}")
+    if not result.wrote_registry:
+        print("  registry not written; pass --write to update the YAML")
 
 
 def cmd_identify(args):
@@ -5974,8 +6052,9 @@ def main():
     )
     p.add_argument("-r", "--results-dir", required=True,
                    help="Directory for trace outputs")
-    p.add_argument("--kernel-id", required=True,
-                   help="Supported trace kernel ID. Use list-trace-kernels to inspect IDs.")
+    p.add_argument("--kernel-id", dest="kernel_ids", action="append", required=True,
+                   help="Supported trace kernel ID. Repeat or pass comma-separated IDs. "
+                        "Use list-trace-kernels to inspect IDs.")
     p.add_argument("-b", "--benchmark-config", default="",
                    help="Magpie benchmark YAML config")
     p.add_argument("--run-cmd", default="",
@@ -5998,6 +6077,28 @@ def main():
                    help="Filter by source repo")
     p.add_argument("--kernel-type", default="", choices=["", "triton", "hip"],
                    help="Filter by kernel type")
+
+    # -- update-trace-kernel-registry --
+    p = subparsers.add_parser(
+        "update-trace-kernel-registry",
+        help="Refresh the trace-kernel whitelist from benchmark Docker images",
+    )
+    p.add_argument("--gpu-arch", default="gfx950",
+                   help="GPU architecture used for Magpie image lookup (default: gfx950)")
+    p.add_argument("--frameworks", default="sglang,vllm",
+                   help="Comma-separated frameworks to refresh (default: sglang,vllm)")
+    p.add_argument("--sglang-image", default="",
+                   help="Override the Magpie image for SGLang/AITER source discovery")
+    p.add_argument("--vllm-image", default="",
+                   help="Override the Magpie image for vLLM source discovery")
+    p.add_argument("--vllm-commit", default="",
+                   help="Explicit vLLM source commit if package version cannot map to a tag")
+    p.add_argument("--output", default=str(REPO_ROOT / "pipeline" / "kernel_tracing" / "supported_kernels.yaml"),
+                   help="Registry YAML path to update")
+    p.add_argument("--report", default="",
+                   help="Optional Markdown diff report path")
+    p.add_argument("--write", action="store_true",
+                   help="Write the updated registry YAML; default is dry-run")
 
     # -- identify --
     p = subparsers.add_parser("identify",
@@ -6138,6 +6239,7 @@ def main():
         "benchmark": cmd_benchmark,
         "trace-kernel": cmd_trace_kernel,
         "list-trace-kernels": cmd_list_trace_kernels,
+        "update-trace-kernel-registry": cmd_update_trace_kernel_registry,
         "identify": cmd_identify,
         "list-kernels": cmd_list_kernels,
         "optimize": cmd_optimize,

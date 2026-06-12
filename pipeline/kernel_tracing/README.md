@@ -24,6 +24,18 @@ python3 workload_optimizer.py list-trace-kernels
 python3 workload_optimizer.py list-trace-kernels --repo vllm --kernel-type hip
 ```
 
+Trace multiple supported IDs in one workload run by repeating `--kernel-id`
+or passing a comma-separated list:
+
+```bash
+python3 workload_optimizer.py trace-kernel \
+  -r /path/to/results_trace_multi \
+  --kernel-id aiter.hip.ck_moe_stage2 \
+  --kernel-id aiter.hip.mla_reduce_v1,aiter.triton.fused_rms_mxfp4_quant_kernel \
+  --max-records 2000 \
+  -b /root/Magpie/examples/benchmarks/benchmark_sglang_dsr1.yaml
+```
+
 `trace-kernel` has two phases:
 
 1. Build a temporary patched overlay under the results directory.
@@ -71,13 +83,13 @@ Important files:
 | Argument | Required | Description |
 |---|---:|---|
 | `-r, --results-dir` | yes | Directory for trace outputs, patched overlay, benchmark result, and postprocessed summaries. |
-| `--kernel-id` | yes | Supported trace target ID from `list-trace-kernels`. The registry supplies kernel name, source file, trace mode, and patch strategy. |
+| `--kernel-id` | yes | Supported trace target ID from `list-trace-kernels`. Repeat or pass comma-separated IDs to trace multiple targets in one workload run. The registry supplies kernel name, source file, trace mode, and patch strategy. |
 | `-b, --benchmark-config` | one of `-b` or `--run-cmd` | Magpie benchmark YAML to run after patching. |
 | `--run-cmd` | one of `-b` or `--run-cmd` | Local command to run after patching. Useful for op tests and small repros. |
 | `--max-records` | no | Maximum non-diagnostic trace events per process. `module_import` diagnostics do not consume this budget. |
 | `--sample-rate` | no | Sampling probability for non-diagnostic events. Use `1.0` for smoke tests, then lower it for high-frequency kernels. |
 | `--small-tensor-stats` | no | Collect min/max/percentile-like small tensor content summaries where supported. Disabled by default because it can synchronize GPU work. |
-| `--trace-all` | no | Disable runtime filtering by the registry kernel name. Useful for central hooks, especially `aiter-compile-ops`, when the real low-level op name is unknown. |
+| `--trace-all` | no | Disable runtime filtering by the registry kernel name. Useful for central hooks, especially `aiter-compile-ops`, when the real low-level op name is unknown. With multi-target tracing this may also collect extra events from broad wrapper files. |
 | `--benchmark-timeout` | no | Timeout in seconds for the benchmark or run command. |
 | `--docker-image` | no | Override benchmark Docker image. Otherwise Apex uses the benchmark config or default vLLM ROCm image. |
 | `--framework` | no | Framework passed to Magpie benchmark, usually `vllm` or `sglang`. Defaults to `vllm`. |
@@ -194,6 +206,41 @@ Use this workflow for a new target:
 4. Confirm `module_import` exists.
 5. Confirm target runtime events exist.
 6. Once the target is confirmed, lower `--sample-rate` and raise `--max-records` for distribution collection.
+
+## Registry Maintenance
+
+The supported kernel registry can be refreshed from the benchmark Docker images
+used by Magpie. The command copies Python source trees from the selected images,
+discovers traceable launch/wrapper sites, records source image provenance, and
+optionally writes the updated YAML.
+
+Dry-run with a Markdown diff report:
+
+```bash
+python3 workload_optimizer.py update-trace-kernel-registry \
+  --gpu-arch gfx950 \
+  --frameworks sglang,vllm \
+  --report /tmp/trace_kernel_registry_diff.md
+```
+
+Write `pipeline/kernel_tracing/supported_kernels.yaml`:
+
+```bash
+python3 workload_optimizer.py update-trace-kernel-registry \
+  --gpu-arch gfx950 \
+  --frameworks sglang,vllm \
+  --write
+```
+
+Use `--sglang-image`, `--vllm-image`, or `--vllm-commit` when the automatic
+Magpie image or vLLM tag resolution is not the desired source of truth.
+
+Registries generated from Docker images include a `source_images` section.
+Those entries may point at package versions that do not exactly match the local
+`tools/rocm/*` checkouts, so schema and listing commands do not require every
+registry file path to exist locally. During Docker tracing, Apex can extract the
+container source and bind-mount the patched file back over the original package
+path.
 
 ## Examples
 
