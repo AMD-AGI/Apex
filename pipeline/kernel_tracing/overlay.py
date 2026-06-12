@@ -208,11 +208,26 @@ def write_overlay_support(
     return path
 
 
-def write_docker_wrapper(results_dir: Path) -> Path:
+def write_docker_wrapper(
+    results_dir: Path,
+    *,
+    extra_mounts: list[tuple[Path | str, str]] | None = None,
+) -> Path:
     """Create a docker wrapper that injects the tracing volume into docker run."""
     wrapper_dir = results_dir / "docker_wrapper"
     wrapper_dir.mkdir(parents=True, exist_ok=True)
     real_docker = shutil.which("docker") or "/usr/bin/docker"
+    extra_mounts_path = wrapper_dir / "extra_mounts.tsv"
+    if extra_mounts:
+        extra_mounts_path.write_text(
+            "".join(
+                f"{Path(host).resolve()}\t{container}\n"
+                for host, container in extra_mounts
+            ),
+            encoding="utf-8",
+        )
+    elif extra_mounts_path.exists():
+        extra_mounts_path.unlink()
     wrapper = wrapper_dir / "docker"
     wrapper.write_text(
         f"""#!/usr/bin/env bash
@@ -232,6 +247,7 @@ if [ "$1" = "run" ]; then
     args=("$@")
   fi
   mount_args=(-v "${{APEX_TRACE_HOST_RESULTS_DIR}}:/apex_trace")
+  extra_mount_args=()
   manifest="${{APEX_TRACE_HOST_RESULTS_DIR}}/patched_files/patch_manifest.json"
   if [ -f "$manifest" ]; then
     while IFS=$'\t' read -r host_file container_file; do
@@ -250,6 +266,39 @@ for item in data.get("patched_files", []):
         print(host + "\t" + container)
 PY
 )
+  fi
+  extra_mounts="${{APEX_TRACE_HOST_RESULTS_DIR}}/docker_wrapper/extra_mounts.tsv"
+  if [ -f "$extra_mounts" ]; then
+    while IFS=$'\t' read -r host_file container_file; do
+      if [ -n "$host_file" ] && [ -n "$container_file" ] && [ -f "$host_file" ]; then
+        extra_mount_args+=("-v" "$host_file:$container_file:ro")
+      fi
+    done < "$extra_mounts"
+  fi
+  if [ "${{#extra_mount_args[@]}}" -gt 0 ]; then
+    args_before_image=()
+    set -- "${{args[@]}}"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --)
+          args_before_image+=("$1")
+          shift
+          break
+          ;;
+        -e|-v|--env|--volume|--mount|--name|-w|--workdir|--entrypoint|--shm-size|--ipc|--network|--device|--cap-add|--security-opt|--gpus|--user)
+          args_before_image+=("$1" "$2")
+          shift 2
+          ;;
+        --*=*|-*)
+          args_before_image+=("$1")
+          shift
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+    exec "$REAL_DOCKER" run "${{mount_args[@]}}" "${{args_before_image[@]}}" "${{extra_mount_args[@]}}" "$@"
   fi
   exec "$REAL_DOCKER" run "${{mount_args[@]}}" "${{args[@]}}"
 fi

@@ -36,12 +36,24 @@ python3 workload_optimizer.py trace-kernel \
   -b /root/Magpie/examples/benchmarks/benchmark_sglang_dsr1.yaml
 ```
 
+For the DeepSeek R1 SGLang multi-kernel shape-analysis workflow, use the
+checked-in example script and override the benchmark config as needed:
+
+```bash
+BENCH_CONFIG=tmp/benchmark_sglang_dsr1_isl8192_osl1024.yaml \
+RESULTS_DIR=tmp/results_trace_deepseek_r1_isl8192_osl1024_example \
+bash pipeline/kernel_tracing/trace_deepseek_r1_multi_kernels_example.sh
+```
+
 `trace-kernel` has two phases:
 
 1. Build a temporary patched overlay under the results directory.
 2. Run either a Magpie benchmark or a user-provided command with that overlay enabled.
 
 It does not edit the source checkout in place. For Docker benchmarks, Apex bind-mounts the results directory into the benchmark container and injects the patched overlay through `PYTHONPATH`.
+
+By default the CLI writes the full JSON result to stdout and a compact human
+summary to stderr.
 
 ## Outputs
 
@@ -56,6 +68,7 @@ All outputs are written under `-r/--results-dir`.
 |   +-- trace_pid<PID>_rank<RANK>.jsonl
 +-- workload_ranges.json
 +-- workload_summary.md
++-- target_kernel_tensor_shapes.json
 +-- patched_files/
 |   +-- apex_kernel_tracing_runtime.py
 |   +-- apex_kernel_tracing_importer.py
@@ -75,6 +88,7 @@ Important files:
 - `trace_raw.jsonl`: merged raw trace events.
 - `workload_ranges.json`: grouped shape/dtype/scalar ranges.
 - `workload_summary.md`: compact human-readable summary.
+- `target_kernel_tensor_shapes.json`: target-kernel-oriented shape summary grouped by traced kernel name.
 - `patched_files/patch_manifest.json`: module-to-overlay mapping.
 - `trace_result.json`: final status, benchmark result, and whether a target event was found.
 
@@ -93,6 +107,7 @@ Important files:
 | `--benchmark-timeout` | no | Timeout in seconds for the benchmark or run command. |
 | `--docker-image` | no | Override benchmark Docker image. Otherwise Apex uses the benchmark config or default vLLM ROCm image. |
 | `--framework` | no | Framework passed to Magpie benchmark, usually `vllm` or `sglang`. Defaults to `vllm`. |
+| `--disable-benchmark-cuda-graph` | no | For Docker benchmarks, generate a temporary no-cudagraph copy of the selected InferenceX benchmark script and bind-mount it into the container. SGLang launches get `--disable-cuda-graph --disable-piecewise-cuda-graph`; vLLM launches get `--enforce-eager`. |
 | `--dry-run` | no | Generate and compile the patched overlay, then stop before running workload. |
 
 ## Trace Modes
@@ -173,7 +188,7 @@ The importer records a `module_import` event whenever a patched overlay module i
 
 ### Case 1: `module_import` and target events exist
 
-The overlay was imported and the target launch/wrapper executed. This is the ideal result. Inspect `workload_ranges.json` and `workload_summary.md`.
+The overlay was imported and the target launch/wrapper executed. This is the ideal result. Inspect `workload_ranges.json`, `workload_summary.md`, and `target_kernel_tensor_shapes.json`.
 
 ### Case 2: only `module_import` exists
 

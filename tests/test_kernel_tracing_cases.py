@@ -312,6 +312,7 @@ def test_trace_kernel_cli_uses_kernel_id_dry_run(tmp_path):
             str(results),
             "--kernel-id",
             "vllm.hip.reshape_and_cache_flash",
+            "--disable-benchmark-cuda-graph",
             "--dry-run",
         ],
         cwd=REPO_ROOT,
@@ -326,7 +327,9 @@ def test_trace_kernel_cli_uses_kernel_id_dry_run(tmp_path):
     trace_config = json.loads((results / "trace_config.json").read_text(encoding="utf-8"))
     assert trace_config["kernel_id"] == "vllm.hip.reshape_and_cache_flash"
     assert trace_config["kernel_name"] == "reshape_and_cache_flash"
+    assert trace_config["disable_benchmark_cuda_graph"] is True
     assert trace_config["registry_entry"]["kernel_file"] == "tools/rocm/vllm/vllm/_custom_ops.py"
+    assert "Trace result:" in proc.stderr
 
 
 def test_trace_kernel_cli_bad_kernel_id_suggests_list(tmp_path):

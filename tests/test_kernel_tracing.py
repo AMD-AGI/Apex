@@ -12,12 +12,14 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "pipeline"))
 
 from kernel_tracing.agent_harness import AgentPatchRequest, run_agent_patch_fallback
-from kernel_tracing.overlay import ModuleMapping, write_overlay_support
+from kernel_tracing.overlay import ModuleMapping, write_docker_wrapper, write_overlay_support
 from kernel_tracing.patch_triton import patch_triton_launch_file
 from kernel_tracing.postprocess import postprocess_trace
 from kernel_tracing.runner import (
     TraceKernelConfig,
     TraceKernelTarget,
+    _prepare_no_cudagraph_benchmark_script,
+    _rewrite_benchmark_script_disable_cuda_graph,
     _trace_event_flags,
     run_trace_kernel,
 )
@@ -496,6 +498,11 @@ mod.wrapper(T(), T(), 64, {"EXTRA": True})
     assert "some_kernel" in raw
     ranges = json.loads((tmp_path / "results" / "workload_ranges.json").read_text())
     assert ranges["total_calls"] == 1
+    target_shapes = json.loads(
+        (tmp_path / "results" / "target_kernel_tensor_shapes.json").read_text()
+    )
+    assert target_shapes["trace_result"]["success"] is True
+    assert target_shapes["targets"]["some_kernel"]["events"] == 1
 
 
 def test_run_trace_kernel_multiple_targets_same_file(tmp_path):
@@ -555,6 +562,12 @@ mod.wrapper(T(), T(), 64)
     assert "second_kernel" in raw
     ranges = json.loads((tmp_path / "results" / "workload_ranges.json").read_text())
     assert ranges["total_calls"] == 2
+    target_shapes = json.loads(
+        (tmp_path / "results" / "target_kernel_tensor_shapes.json").read_text()
+    )
+    assert set(target_shapes["targets"]) == {"first_kernel", "second_kernel"}
+    assert target_shapes["targets"]["first_kernel"]["events"] == 1
+    assert target_shapes["targets"]["second_kernel"]["events"] == 1
 
 
 def test_run_trace_kernel_aiter_mode_patches_compile_ops_core(tmp_path):
@@ -586,11 +599,130 @@ def compile_ops(_md_name, fc_name=None, ffi_type="pybind", develop=False):
         repo_root=tmp_path,
     ))
     assert result["mode"] == "aiter-compile-ops"
+    assert ((tmp_path / "results" / "trace_raw").stat().st_mode & 0o777) == 0o777
     assert result["patched_file"].endswith("patched_files/overlay/aiter/jit/core.py")
     manifest = json.loads(
         (tmp_path / "results" / "patched_files" / "patch_manifest.json").read_text()
     )
     assert "aiter.jit.core" in manifest["overlay_modules"]
+
+
+def test_rewrite_sglang_deepseek_cuda_graph_script():
+    source = """#!/usr/bin/env bash
+python3 -m sglang.launch_server \\
+--model-path $MODEL \\
+--cuda-graph-max-bs=128 \\
+--max-running-requests 128 > $SERVER_LOG 2>&1 &
+"""
+    rewritten = _rewrite_benchmark_script_disable_cuda_graph(
+        source,
+        source_path=Path("dsr1_fp4_mi355x.sh"),
+    )
+    assert "--cuda-graph-max-bs" not in rewritten
+    assert "--disable-cuda-graph" in rewritten
+    assert "--disable-piecewise-cuda-graph" in rewritten
+    assert "--max-running-requests 128" in rewritten
+
+
+def test_rewrite_sglang_qwen_cuda_graph_variable_arg():
+    source = """#!/usr/bin/env bash
+python3 -m sglang.launch_server \\
+    --model-path $MODEL \\
+    --cuda-graph-max-bs $CONC \\
+    --disable-radix-cache \\
+    --page-size 16 > $SERVER_LOG 2>&1 &
+"""
+    rewritten = _rewrite_benchmark_script_disable_cuda_graph(
+        source,
+        source_path=Path("qwen3.5_fp8_mi355x.sh"),
+    )
+    assert "--cuda-graph-max-bs" not in rewritten
+    assert "    --disable-cuda-graph \\" in rewritten
+    assert "    --disable-piecewise-cuda-graph \\" in rewritten
+    assert "    --disable-radix-cache \\" in rewritten
+
+
+def test_rewrite_vllm_kimi_adds_enforce_eager():
+    source = """#!/usr/bin/env bash
+vllm serve $MODEL --port $PORT \\
+--tensor-parallel-size=$TP \\
+--trust-remote-code > $SERVER_LOG 2>&1 &
+"""
+    rewritten = _rewrite_benchmark_script_disable_cuda_graph(
+        source,
+        source_path=Path("kimik2.5_fp4_mi355x.sh"),
+    )
+    assert "--enforce-eager \\" in rewritten
+    assert "--trust-remote-code" in rewritten
+
+
+def test_prepare_no_cudagraph_benchmark_script_resolves_config_script(tmp_path):
+    repo_root = tmp_path
+    script = (
+        repo_root
+        / "tools"
+        / "magpie"
+        / "InferenceX"
+        / "benchmarks"
+        / "single_node"
+        / "fixed_seq_len"
+        / "qwen3.5_fp8_mi355x.sh"
+    )
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        """#!/usr/bin/env bash
+python3 -m sglang.launch_server \\
+    --model-path $MODEL \\
+    --cuda-graph-max-bs $CONC \\
+    --max-running-requests $CONC
+""",
+        encoding="utf-8",
+    )
+    bench = tmp_path / "bench.yaml"
+    bench.write_text(
+        """benchmark:
+  framework: sglang
+  benchmark_script: single_node/fixed_seq_len/qwen3.5_fp8_mi355x.sh
+""",
+        encoding="utf-8",
+    )
+
+    host_script, container_script = _prepare_no_cudagraph_benchmark_script(
+        TraceKernelConfig(
+            results_dir=tmp_path / "results",
+            kernel_name="some_kernel",
+            kernel_file=tmp_path / "kernel.py",
+            benchmark_config=str(bench),
+            repo_root=repo_root,
+        )
+    )
+
+    text = host_script.read_text(encoding="utf-8")
+    assert host_script.is_file()
+    assert container_script == (
+        "/opt/InferenceX/benchmarks/single_node/fixed_seq_len/qwen3.5_fp8_mi355x.sh"
+    )
+    assert "--cuda-graph-max-bs" not in text
+    assert "--disable-cuda-graph" in text
+
+
+def test_write_docker_wrapper_includes_extra_mounts(tmp_path):
+    host_script = tmp_path / "no_cudagraph.sh"
+    host_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    wrapper_dir = write_docker_wrapper(
+        tmp_path,
+        extra_mounts=[
+            (
+                host_script,
+                "/opt/InferenceX/benchmarks/single_node/fixed_seq_len/no_cudagraph.sh",
+            )
+        ],
+    )
+    extra_mounts = (wrapper_dir / "extra_mounts.tsv").read_text(encoding="utf-8")
+    wrapper = (wrapper_dir / "docker").read_text(encoding="utf-8")
+    assert str(host_script.resolve()) in extra_mounts
+    assert "/opt/InferenceX/benchmarks/single_node/fixed_seq_len/no_cudagraph.sh" in extra_mounts
+    assert "extra_mounts.tsv" in wrapper
 
 
 def test_postprocess_shape_ranges(tmp_path):
@@ -613,6 +745,10 @@ def test_postprocess_shape_ranges(tmp_path):
     assert "| Field | Value |" in summary
     assert "| Tensor | Dim | Min | Max |" in summary
     assert "| `q` | 0 | 1 | 8 |" in summary
+    target_shapes = json.loads((tmp_path / "target_kernel_tensor_shapes.json").read_text())
+    assert target_shapes["targets"]["k"]["events"] == 2
+    assert target_shapes["targets"]["k"]["group_count"] == 1
+    assert target_shapes["workload_ranges"]["total_calls"] == 2
 
 
 def test_agent_fallback_uses_existing_backend(monkeypatch, tmp_path):

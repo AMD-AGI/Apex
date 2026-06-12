@@ -4457,6 +4457,35 @@ def cmd_benchmark(args):
     print(f"  State saved to {state.path}")
 
 
+def _format_trace_kernel_summary(result: dict, results_dir: Path) -> str:
+    lines = [
+        "Trace result:",
+        f"  success: {result.get('success')}",
+        f"  any_event_found: {result.get('any_event_found')}",
+        f"  target_event_found: {result.get('target_event_found')}",
+    ]
+    if result.get("dry_run"):
+        lines.append("  dry_run: True")
+
+    missing = result.get("missing_kernel_names") or []
+    if missing:
+        lines.append("  missing_kernel_names:")
+        for name in missing:
+            lines.append(f"    - {name}")
+
+    ranges = result.get("workload_ranges")
+    if isinstance(ranges, dict):
+        lines.extend([
+            "",
+            "Workload ranges:",
+            f"  total_events: {ranges.get('total_events')}",
+            f"  total_calls: {ranges.get('total_calls')}",
+            f"  groups: {len(ranges.get('groups', []))}",
+            f"  summary: {results_dir / 'workload_summary.md'}",
+        ])
+    return "\n".join(lines)
+
+
 def cmd_trace_kernel(args):
     """Trace one or more kernel/op workloads by patching Python launch/wrapper sites."""
     from kernel_tracing.registry import find_supported_kernel
@@ -4522,6 +4551,7 @@ def cmd_trace_kernel(args):
         benchmark_timeout=getattr(args, "benchmark_timeout", 5400),
         docker_image=getattr(args, "docker_image", ""),
         framework=getattr(args, "framework", ""),
+        disable_benchmark_cuda_graph=getattr(args, "disable_benchmark_cuda_graph", False),
         dry_run=getattr(args, "dry_run", False),
         repo_root=REPO_ROOT,
         targets=targets,
@@ -4530,6 +4560,7 @@ def cmd_trace_kernel(args):
         raise SystemExit("trace-kernel requires exactly one of --run-cmd or -b/--benchmark-config")
     result = run_trace_kernel(cfg)
     print(json.dumps(result, indent=2, sort_keys=True))
+    print(_format_trace_kernel_summary(result, cfg.results_dir), file=sys.stderr)
 
 
 def cmd_list_trace_kernels(args):
@@ -6066,6 +6097,9 @@ def main():
     p.add_argument("--benchmark-timeout", type=int, default=5400)
     p.add_argument("--docker-image", default="")
     p.add_argument("--framework", default="")
+    p.add_argument("--disable-benchmark-cuda-graph", action="store_true",
+                   help="Patch the selected InferenceX benchmark script in Docker "
+                        "to disable SGLang/vLLM cuda graph capture while tracing")
     p.add_argument("--dry-run", action="store_true")
 
     # -- list-trace-kernels --

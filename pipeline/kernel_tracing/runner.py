@@ -27,7 +27,7 @@ from .overlay import (
 )
 from .patch_triton import PatchResult, patch_triton_launch_file
 from .patch_wrapper import patch_aiter_compile_ops_file, patch_wrapper_entry_file
-from .postprocess import postprocess_trace
+from .postprocess import postprocess_trace, write_target_kernel_tensor_shapes
 from .runtime import write_runtime_file
 
 
@@ -64,6 +64,7 @@ class TraceKernelConfig:
     benchmark_timeout: int = 5400
     docker_image: str = ""
     framework: str = ""
+    disable_benchmark_cuda_graph: bool = False
     dry_run: bool = False
     repo_root: Path = Path(__file__).resolve().parents[2]
     targets: list[TraceKernelTarget] = field(default_factory=list)
@@ -285,6 +286,183 @@ def _detect_magpie_run_mode() -> str:
         return "local"
 
 
+_CUDA_GRAPH_ARG_RE = re.compile(
+    r"(?<!\S)--cuda-graph-max-bs(?:=\S+|\s+(?:\"[^\"]+\"|'[^']+'|[^\s\\]+))"
+)
+
+
+def _benchmark_section(config_path: str) -> dict[str, Any]:
+    data = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    return data.get("benchmark", data)
+
+
+def _inferencex_benchmark_roots(config: TraceKernelConfig) -> list[Path]:
+    roots: list[Path] = []
+    candidates: list[Path] = []
+    magpie_root = os.environ.get("MAGPIE_ROOT", "").strip()
+    if magpie_root:
+        candidates.append(Path(magpie_root))
+    candidates.append(config.repo_root / "tools" / "magpie")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        benchmarks = candidate / "InferenceX" / "benchmarks"
+        try:
+            resolved = benchmarks.resolve()
+        except OSError:
+            resolved = benchmarks
+        if resolved in seen or not benchmarks.exists():
+            continue
+        roots.append(benchmarks)
+        seen.add(resolved)
+    return roots
+
+
+def _find_inferencex_benchmark_script(
+    benchmarks_root: Path,
+    script_name: str,
+) -> Path | None:
+    script_name = script_name.strip().lstrip("/")
+    if not script_name:
+        return None
+
+    direct = benchmarks_root / script_name
+    if direct.is_file():
+        return direct
+
+    basename = Path(script_name).name
+    for match in benchmarks_root.rglob(basename):
+        if not match.is_file():
+            continue
+        rel = match.relative_to(benchmarks_root).as_posix()
+        if rel == script_name or rel.endswith(f"/{script_name}") or basename == script_name:
+            return match
+    return None
+
+
+def _resolve_inferencex_benchmark_script(
+    config: TraceKernelConfig,
+) -> tuple[Path, Path]:
+    if not config.benchmark_config:
+        raise ValueError("--disable-benchmark-cuda-graph requires -b/--benchmark-config")
+    bench = _benchmark_section(config.benchmark_config)
+    script_name = str(bench.get("benchmark_script") or "").strip()
+    if not script_name:
+        raise ValueError(
+            "--disable-benchmark-cuda-graph requires benchmark.benchmark_script "
+            "in the benchmark config"
+        )
+
+    searched: list[str] = []
+    for root in _inferencex_benchmark_roots(config):
+        searched.append(str(root))
+        script = _find_inferencex_benchmark_script(root, script_name)
+        if script is not None:
+            return script, script.relative_to(root)
+
+    raise ValueError(
+        "Could not resolve benchmark_script for --disable-benchmark-cuda-graph: "
+        f"{script_name!r}. Searched: {', '.join(searched) or '<none>'}"
+    )
+
+
+def _remove_cuda_graph_max_bs(lines: list[str]) -> tuple[list[str], bool]:
+    out: list[str] = []
+    removed = False
+    for line in lines:
+        new_line, count = _CUDA_GRAPH_ARG_RE.subn("", line)
+        if count:
+            removed = True
+            new_line = re.sub(r"[ \t]+\\$", r" \\", new_line.rstrip())
+            if new_line.strip() in {"", "\\"}:
+                continue
+        out.append(new_line)
+    return out, removed
+
+
+def _insert_launch_flags(
+    lines: list[str],
+    *,
+    marker: re.Pattern[str],
+    flags: list[str],
+    source_path: Path,
+) -> bool:
+    text = "\n".join(lines)
+    missing_flags = [flag for flag in flags if flag not in text]
+    if not missing_flags:
+        return True
+
+    for idx, line in enumerate(lines):
+        if not marker.search(line):
+            continue
+        if not line.rstrip().endswith("\\"):
+            raise ValueError(
+                "Cannot inject cuda graph disable flags into one-line benchmark "
+                f"launch command in {source_path}"
+            )
+        indent = "    "
+        for next_line in lines[idx + 1:]:
+            if next_line.strip():
+                match = re.match(r"^(\s*)", next_line)
+                indent = match.group(1) if match else indent
+                break
+        additions = [f"{indent}{flag} \\" for flag in missing_flags]
+        lines[idx + 1:idx + 1] = additions
+        return True
+    return False
+
+
+def _rewrite_benchmark_script_disable_cuda_graph(
+    text: str,
+    *,
+    source_path: Path,
+) -> str:
+    lines, _removed = _remove_cuda_graph_max_bs(text.splitlines())
+    joined = "\n".join(lines)
+
+    if "sglang.launch_server" in joined:
+        found = _insert_launch_flags(
+            lines,
+            marker=re.compile(r"\bsglang\.launch_server\b"),
+            flags=["--disable-cuda-graph", "--disable-piecewise-cuda-graph"],
+            source_path=source_path,
+        )
+    elif re.search(r"\bvllm\s+serve\b", joined):
+        found = _insert_launch_flags(
+            lines,
+            marker=re.compile(r"\bvllm\s+serve\b"),
+            flags=["--enforce-eager"],
+            source_path=source_path,
+        )
+    else:
+        found = False
+
+    if not found:
+        raise ValueError(
+            "Cannot disable benchmark cuda graph because no recognizable "
+            f"SGLang or vLLM launch command was found in {source_path}"
+        )
+
+    trailing_newline = "\n" if text.endswith("\n") else ""
+    return "\n".join(lines) + trailing_newline
+
+
+def _prepare_no_cudagraph_benchmark_script(
+    config: TraceKernelConfig,
+) -> tuple[Path, str]:
+    source_path, rel_path = _resolve_inferencex_benchmark_script(config)
+    output_path = config.results_dir / "no_cudagraph_benchmarks" / rel_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rewritten = _rewrite_benchmark_script_disable_cuda_graph(
+        source_path.read_text(encoding="utf-8"),
+        source_path=source_path,
+    )
+    output_path.write_text(rewritten, encoding="utf-8")
+    output_path.chmod(0o755)
+    container_path = f"/opt/InferenceX/benchmarks/{rel_path.as_posix()}"
+    return output_path, container_path
+
+
 def _resolve_benchmark_docker_image(config: TraceKernelConfig) -> str:
     if config.docker_image:
         return config.docker_image
@@ -466,10 +644,24 @@ def _run_trace_benchmark(config: TraceKernelConfig) -> dict:
     from score import run_magpie_benchmark
 
     mode = _detect_magpie_run_mode()
+    extra_mounts: list[tuple[Path, str]] = []
+    no_cudagraph_overlay: dict[str, str] | None = None
+    if config.disable_benchmark_cuda_graph:
+        if mode != "docker":
+            raise ValueError(
+                "--disable-benchmark-cuda-graph currently requires Docker benchmark mode"
+            )
+        host_script, container_script = _prepare_no_cudagraph_benchmark_script(config)
+        extra_mounts.append((host_script, container_script))
+        no_cudagraph_overlay = {
+            "host_script": str(host_script),
+            "container_script": container_script,
+        }
+
     traced_cfg = _merge_benchmark_envs(config.benchmark_config, config, docker=(mode == "docker"))
     env = _base_trace_env(config, docker=False)
     if mode == "docker":
-        wrapper_dir = write_docker_wrapper(config.results_dir)
+        wrapper_dir = write_docker_wrapper(config.results_dir, extra_mounts=extra_mounts)
         env["APEX_TRACE_HOST_RESULTS_DIR"] = str(config.results_dir)
         env["APEX_TRACE_REAL_DOCKER"] = shutil.which("docker") or "/usr/bin/docker"
         env["PATH"] = f"{wrapper_dir}:{env.get('PATH', '')}"
@@ -480,6 +672,10 @@ def _run_trace_benchmark(config: TraceKernelConfig) -> dict:
             benchmark_config_path=str(traced_cfg),
             timeout=config.benchmark_timeout,
             docker_image=config.docker_image,
+        )
+    if no_cudagraph_overlay is not None:
+        result.setdefault("trace_kernel_overlays", {})["no_cudagraph_benchmark_script"] = (
+            no_cudagraph_overlay
         )
     (config.results_dir / "benchmark").mkdir(parents=True, exist_ok=True)
     (config.results_dir / "benchmark" / "benchmark_result.json").write_text(
@@ -605,7 +801,12 @@ def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
     config.kernel_file = Path(config.kernel_file)
     config.repo_root = Path(config.repo_root)
     config.results_dir.mkdir(parents=True, exist_ok=True)
-    (config.results_dir / "trace_raw").mkdir(parents=True, exist_ok=True)
+    trace_raw_dir = config.results_dir / "trace_raw"
+    trace_raw_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        trace_raw_dir.chmod(0o777)
+    except OSError:
+        pass
 
     targets = _targets_from_config(config)
     for target in targets:
@@ -718,6 +919,7 @@ def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
         event_flags["any_event_found"] if config.trace_all else event_flags["target_event_found"]
     )
     result["success"] = bool(run_result.get("success", True)) and result["event_found"]
+    write_target_kernel_tensor_shapes(config.results_dir, ranges, result)
     (config.results_dir / "trace_result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
     )
