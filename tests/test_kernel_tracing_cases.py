@@ -1,6 +1,5 @@
 import json
 import py_compile
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -17,74 +16,76 @@ from kernel_tracing.overlay import infer_module_mapping, overlay_path_for
 from kernel_tracing.patch_triton import patch_triton_launch_file
 from kernel_tracing.patch_wrapper import patch_aiter_compile_ops_file, patch_wrapper_entry_file
 from kernel_tracing.registry import (
-    SUPPORTED_KERNELS_PATH,
+    SGLANG_TRACE_IMAGE,
+    TRACE_IMAGE_REGISTRY_PATHS,
     VALID_KERNEL_TYPES,
     VALID_PATCH_STRATEGIES,
     VALID_TRACE_MODES,
+    VLLM_TRACE_IMAGE,
     load_supported_kernels,
+    supported_trace_images,
 )
 from kernel_tracing.discovery import discover_trace_kernel_entries
 from kernel_tracing import registry_update
 from kernel_tracing.registry_update import (
-    CommandResult,
-    resolve_vllm_tag_commit,
     update_trace_kernel_registry,
-    vllm_tag_from_version,
 )
 
 
-REGISTRY_RAW = yaml.safe_load(SUPPORTED_KERNELS_PATH.read_text(encoding="utf-8"))
-SUPPORTED_KERNELS = load_supported_kernels(repo_root=REPO_ROOT, validate_files=False)
+REGISTRIES_RAW = {
+    image: yaml.safe_load(TRACE_IMAGE_REGISTRY_PATHS[image].read_text(encoding="utf-8"))
+    for image in supported_trace_images()
+}
+SUPPORTED_BY_IMAGE = {
+    image: load_supported_kernels(
+        docker_image=image,
+        repo_root=REPO_ROOT,
+        validate_files=False,
+    )
+    for image in supported_trace_images()
+}
+SUPPORTED_KERNELS = [
+    entry
+    for image in supported_trace_images()
+    for entry in SUPPORTED_BY_IMAGE[image]
+]
 
-
-def _local_sources_match_registry() -> bool:
-    roots = {
-        "aiter": REPO_ROOT / "tools" / "rocm" / "aiter",
-        "vllm": REPO_ROOT / "tools" / "rocm" / "vllm",
-        "sglang": REPO_ROOT / "tools" / "rocm" / "sglang",
-    }
-    commits = REGISTRY_RAW.get("source_commits") or {}
-    for repo, root in roots.items():
-        proc = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            return False
-        if proc.stdout.strip() != commits.get(repo):
-            return False
-    return True
-
-
-LOCAL_SOURCES_MATCH_REGISTRY = _local_sources_match_registry()
+# Registries are generated from Docker image source, so local tools/rocm checkouts
+# are intentionally not treated as the source of truth for patchability tests.
+LOCAL_SOURCES_MATCH_REGISTRY = False
 
 
 def test_supported_kernel_registry_schema():
-    raw = REGISTRY_RAW
-    assert raw["schema_version"] == 1
-    assert set(raw["source_commits"]) == {"aiter", "vllm", "sglang"}
-    for commit in raw["source_commits"].values():
-        assert re.fullmatch(r"[0-9a-f]{40}", commit)
-    if "source_images" in raw:
-        assert isinstance(raw["source_images"], dict)
-        assert set(raw["source_images"]) <= {"aiter", "vllm", "sglang"}
+    assert set(REGISTRIES_RAW) == {VLLM_TRACE_IMAGE, SGLANG_TRACE_IMAGE}
+    for image, raw in REGISTRIES_RAW.items():
+        assert raw["schema_version"] == 2
+        assert raw["docker_image"] == image
+        assert raw["image_metadata"]["image"] == image
+        assert set(raw["package_sources"]) <= {"aiter", "vllm", "sglang"}
 
-    ids = [entry.id for entry in SUPPORTED_KERNELS]
-    assert len(ids) >= 1000
-    assert len(ids) == len(set(ids))
-    assert {entry.repo for entry in SUPPORTED_KERNELS} == {"aiter", "vllm", "sglang"}
-    assert {entry.kernel_type for entry in SUPPORTED_KERNELS} <= VALID_KERNEL_TYPES
-    assert {entry.trace_mode for entry in SUPPORTED_KERNELS} <= VALID_TRACE_MODES
-    assert {entry.patch_strategy for entry in SUPPORTED_KERNELS} <= VALID_PATCH_STRATEGIES
-    assert all(entry.patch_strategy == "static" for entry in SUPPORTED_KERNELS)
-    assert all(entry.trace_mode != "agent" for entry in SUPPORTED_KERNELS)
+        entries = SUPPORTED_BY_IMAGE[image]
+        ids = [entry.id for entry in entries]
+        assert len(ids) >= 500
+        assert len(ids) == len(set(ids))
+        assert {entry.kernel_type for entry in entries} <= VALID_KERNEL_TYPES
+        assert {entry.trace_mode for entry in entries} <= VALID_TRACE_MODES
+        assert {entry.patch_strategy for entry in entries} <= VALID_PATCH_STRATEGIES
+        assert all(entry.patch_strategy == "static" for entry in entries)
+        assert all(entry.trace_mode != "agent" for entry in entries)
+
+    vllm_ids = {entry.id for entry in SUPPORTED_BY_IMAGE[VLLM_TRACE_IMAGE]}
     assert {
         "vllm.hip.reshape_and_cache_flash",
         "vllm.triton.gumbel_sample",
         "aiter.triton.unified_attention_2d",
         "aiter.hip.moe_sorting_fwd",
-    } <= set(ids)
+    } <= vllm_ids
+    sglang_ids = {entry.id for entry in SUPPORTED_BY_IMAGE[SGLANG_TRACE_IMAGE]}
+    assert {
+        "sglang.triton.fused_append_shared_experts_kernel",
+        "aiter.triton.unified_attention_2d",
+        "aiter.hip.moe_sorting_fwd",
+    } <= sglang_ids
 
 
 @pytest.mark.parametrize(
@@ -94,7 +95,7 @@ def test_supported_kernel_registry_schema():
 )
 def test_supported_kernel_patchability(entry, tmp_path):
     if not LOCAL_SOURCES_MATCH_REGISTRY:
-        pytest.skip("local tools/rocm checkout does not match registry source_commits")
+        pytest.skip("fixed registries are generated from Docker image sources")
     source = entry.resolved_file(REPO_ROOT)
     if not source.exists():
         pytest.skip(f"registry entry comes from Docker source not present locally: {entry.kernel_file}")
@@ -148,6 +149,8 @@ def test_list_trace_kernels_filters():
             sys.executable,
             "workload_optimizer.py",
             "list-trace-kernels",
+            "--docker-image",
+            VLLM_TRACE_IMAGE,
             "--repo",
             "vllm",
             "--kernel-type",
@@ -158,16 +161,16 @@ def test_list_trace_kernels_filters():
         text=True,
         check=True,
     )
+    assert f"Docker image: {VLLM_TRACE_IMAGE}" in proc.stdout
     assert "vllm.hip.reshape_and_cache_flash" in proc.stdout
     assert "aiter." not in proc.stdout
     assert "supported trace kernels" in proc.stdout
 
 
 def test_discovery_covers_supported_kernel_registry():
-    if REGISTRY_RAW.get("source_images"):
-        pytest.skip("registry was generated from Docker images; local checkout may intentionally drift")
+    pytest.skip("fixed registries are generated from Docker images; local checkout may intentionally drift")
     if not LOCAL_SOURCES_MATCH_REGISTRY:
-        pytest.skip("local tools/rocm checkout does not match registry source_commits")
+        pytest.skip("fixed registries are generated from Docker image sources")
     discovered_ids = {
         entry.id
         for entry in discover_trace_kernel_entries(REPO_ROOT)
@@ -176,27 +179,34 @@ def test_discovery_covers_supported_kernel_registry():
     assert supported_ids <= discovered_ids
 
 
-def test_registry_schema_accepts_source_images(tmp_path):
+def test_registry_schema_accepts_image_metadata(tmp_path):
+    entry = next(entry for entry in SUPPORTED_BY_IMAGE[VLLM_TRACE_IMAGE] if entry.repo == "vllm")
     registry = {
-        "schema_version": 1,
-        "source_commits": {
-            "aiter": "a" * 40,
-            "vllm": "b" * 40,
-            "sglang": "c" * 40,
+        "schema_version": 2,
+        "docker_image": VLLM_TRACE_IMAGE,
+        "image_metadata": {
+            "image": VLLM_TRACE_IMAGE,
+            "image_id": "sha256:test",
         },
-        "source_images": {
+        "package_sources": {
             "vllm": {
-                "image": "vllm/vllm-openai-rocm:v0.19.1",
+                "image": VLLM_TRACE_IMAGE,
                 "package_version": "0.19.1+rocm721",
-                "commit_resolution": "git ls-remote",
+                "source_path": "/usr/local/lib/python3.12/dist-packages/vllm",
+                "registry_path": "tools/rocm/vllm/vllm",
             }
         },
-        "kernels": [SUPPORTED_KERNELS[0].as_dict()],
+        "kernels": [entry.as_dict()],
     }
-    path = tmp_path / "supported_kernels.yaml"
+    path = tmp_path / "vllm.yaml"
     path.write_text(yaml.safe_dump(registry, sort_keys=False), encoding="utf-8")
-    loaded = load_supported_kernels(path=path, repo_root=REPO_ROOT, validate_files=False)
-    assert loaded[0].id == SUPPORTED_KERNELS[0].id
+    loaded = load_supported_kernels(
+        docker_image=VLLM_TRACE_IMAGE,
+        path=path,
+        repo_root=REPO_ROOT,
+        validate_files=False,
+    )
+    assert loaded[0].id == entry.id
 
 
 def test_discovery_from_repo_shaped_root(tmp_path):
@@ -221,84 +231,64 @@ def test_discovery_from_repo_shaped_root(tmp_path):
     assert entries[0].kernel_file == "tools/rocm/vllm/vllm/sample_kernel.py"
 
 
-def test_vllm_version_maps_to_remote_tag():
-    assert vllm_tag_from_version("0.19.1+rocm721") == "v0.19.1"
-
-    def fake_run(cmd):
-        assert "refs/tags/v0.19.1" in cmd
-        return CommandResult(
-            stdout="b1388b1fbf5aaef47937fabe98931211684666a6\trefs/tags/v0.19.1\n",
-            stderr="",
-        )
-
-    commit, tag, method = resolve_vllm_tag_commit("0.19.1+rocm721", run=fake_run)
-    assert commit == "b1388b1fbf5aaef47937fabe98931211684666a6"
-    assert tag == "v0.19.1"
-    assert "git ls-remote" in method
-
-
 def test_update_registry_dry_run_does_not_write_yaml(tmp_path, monkeypatch):
-    output = tmp_path / "supported_kernels.yaml"
-    output.write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "source_commits": {
-                    "aiter": "a" * 40,
-                    "vllm": "b" * 40,
-                    "sglang": "c" * 40,
+    outputs = {
+        image: tmp_path / f"{idx}.yaml"
+        for idx, image in enumerate(supported_trace_images())
+    }
+    for image, output in outputs.items():
+        output.write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": 2,
+                    "docker_image": image,
+                    "image_metadata": {"image": image},
+                    "package_sources": {"vllm": {"image": image}},
+                    "kernels": [],
                 },
-                "kernels": [],
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-    before = output.read_text(encoding="utf-8")
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+    before = {image: path.read_text(encoding="utf-8") for image, path in outputs.items()}
+    monkeypatch.setattr(registry_update, "TRACE_IMAGE_REGISTRY_PATHS", outputs)
+
+    def fake_generate_registry_for_image(*, image, temp_root):
+        del temp_root
+        repo = "vllm" if image == VLLM_TRACE_IMAGE else "sglang"
+        entry = {
+            "id": f"{repo}.triton.sample_kernel",
+            "repo": repo,
+            "kernel_type": "triton",
+            "kernel_name": "sample_kernel",
+            "kernel_file": f"tools/rocm/{repo}/{repo}/sample_kernel.py",
+            "trace_mode": "triton-launch",
+            "patch_strategy": "static",
+        }
+        return {
+            "schema_version": 2,
+            "docker_image": image,
+            "image_metadata": {"image": image, "image_id": "sha256:test"},
+            "package_sources": {repo: {"image": image, "source_path": "/pkg"}},
+            "kernels": [entry],
+        }, [repo]
 
     monkeypatch.setattr(
         registry_update,
-        "resolve_framework_images",
-        lambda **_: {"vllm": "fixture/vllm:latest"},
+        "_generate_registry_for_image",
+        fake_generate_registry_for_image,
     )
-
-    def fake_copy_vllm_sources(*, image, temp_root, source_commits, source_images, vllm_commit=""):
-        del image, vllm_commit
-        source = temp_root / "tools" / "rocm" / "vllm" / "vllm" / "sample_kernel.py"
-        source.parent.mkdir(parents=True)
-        source.write_text(
-            "\n".join([
-                "import triton",
-                "@triton.jit",
-                "def sample_kernel(x):",
-                "    return",
-                "def wrapper(x):",
-                "    sample_kernel[(1,)](x)",
-            ]),
-            encoding="utf-8",
-        )
-        source_commits["vllm"] = "d" * 40
-        source_images["vllm"] = {
-            "image": "fixture/vllm:latest",
-            "package_version": "0.19.1+rocm721",
-            "commit": "d" * 40,
-            "commit_resolution": "fixture",
-        }
-
-    monkeypatch.setattr(registry_update, "_copy_vllm_sources", fake_copy_vllm_sources)
 
     report = tmp_path / "diff.md"
     result = update_trace_kernel_registry(
         repo_root=REPO_ROOT,
-        frameworks="vllm",
-        output_path=output,
         report_path=report,
         write=False,
     )
-    assert output.read_text(encoding="utf-8") == before
+    assert {image: path.read_text(encoding="utf-8") for image, path in outputs.items()} == before
     assert report.exists()
-    assert result.diff["new_count"] == 1
-    assert result.diff["added"] == ["vllm.triton.sample_kernel"]
+    assert result.diffs[VLLM_TRACE_IMAGE]["new_count"] == 1
+    assert result.diffs[VLLM_TRACE_IMAGE]["added"] == ["vllm.triton.sample_kernel"]
 
 
 def test_trace_kernel_cli_uses_kernel_id_dry_run(tmp_path):
@@ -312,6 +302,8 @@ def test_trace_kernel_cli_uses_kernel_id_dry_run(tmp_path):
             str(results),
             "--kernel-id",
             "vllm.hip.reshape_and_cache_flash",
+            "--docker-image",
+            VLLM_TRACE_IMAGE,
             "--disable-benchmark-cuda-graph",
             "--dry-run",
         ],
@@ -327,6 +319,7 @@ def test_trace_kernel_cli_uses_kernel_id_dry_run(tmp_path):
     trace_config = json.loads((results / "trace_config.json").read_text(encoding="utf-8"))
     assert trace_config["kernel_id"] == "vllm.hip.reshape_and_cache_flash"
     assert trace_config["kernel_name"] == "reshape_and_cache_flash"
+    assert trace_config["docker_image"] == VLLM_TRACE_IMAGE
     assert trace_config["disable_benchmark_cuda_graph"] is True
     assert trace_config["registry_entry"]["kernel_file"] == "tools/rocm/vllm/vllm/_custom_ops.py"
     assert "Trace result:" in proc.stderr
@@ -342,6 +335,8 @@ def test_trace_kernel_cli_bad_kernel_id_suggests_list(tmp_path):
             str(tmp_path / "trace"),
             "--kernel-id",
             "vllm.hip.reshape_and_cache_flahs",
+            "--docker-image",
+            VLLM_TRACE_IMAGE,
             "--dry-run",
         ],
         cwd=REPO_ROOT,
@@ -351,3 +346,74 @@ def test_trace_kernel_cli_bad_kernel_id_suggests_list(tmp_path):
     assert proc.returncode != 0
     assert "Unsupported trace kernel id" in proc.stderr
     assert "list-trace-kernels" in proc.stderr
+
+
+def test_list_trace_kernels_requires_image():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "workload_optimizer.py",
+            "list-trace-kernels",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "requires --docker-image or -b/--benchmark-config" in proc.stderr
+
+
+def test_list_trace_kernels_supported_images():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "workload_optimizer.py",
+            "list-trace-kernels",
+            "--supported-images",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert VLLM_TRACE_IMAGE in proc.stdout
+    assert SGLANG_TRACE_IMAGE in proc.stdout
+
+
+def test_list_trace_kernels_resolves_sglang_benchmark_config():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "workload_optimizer.py",
+            "list-trace-kernels",
+            "-b",
+            "tools/magpie/examples/benchmarks/benchmark_sqlang_amd_dsr1_fp4.yaml",
+            "--repo",
+            "sglang",
+            "--kernel-type",
+            "triton",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert f"Docker image: {SGLANG_TRACE_IMAGE}" in proc.stdout
+    assert "sglang.triton.fused_append_shared_experts_kernel" in proc.stdout
+
+
+def test_list_trace_kernels_rejects_unsupported_image():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "workload_optimizer.py",
+            "list-trace-kernels",
+            "--docker-image",
+            "vllm/vllm-openai-rocm:nightly",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "Unsupported trace-kernel Docker image" in proc.stderr

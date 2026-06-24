@@ -4489,7 +4489,12 @@ def _format_trace_kernel_summary(result: dict, results_dir: Path) -> str:
 def cmd_trace_kernel(args):
     """Trace one or more kernel/op workloads by patching Python launch/wrapper sites."""
     from kernel_tracing.registry import find_supported_kernel
-    from kernel_tracing.runner import TraceKernelConfig, TraceKernelTarget, run_trace_kernel
+    from kernel_tracing.runner import (
+        TraceKernelConfig,
+        TraceKernelTarget,
+        resolve_trace_docker_image,
+        run_trace_kernel,
+    )
 
     kernel_ids: list[str] = []
     for raw in getattr(args, "kernel_ids", None) or []:
@@ -4504,11 +4509,22 @@ def cmd_trace_kernel(args):
         deduped_kernel_ids.append(kernel_id)
         seen_kernel_ids.add(kernel_id)
 
+    try:
+        resolved_image = resolve_trace_docker_image(
+            benchmark_config=getattr(args, "benchmark_config", "") or "",
+            docker_image=getattr(args, "docker_image", "") or "",
+            framework=getattr(args, "framework", "") or "",
+            repo_root=REPO_ROOT,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     entries = []
     try:
         entries = [
             find_supported_kernel(
                 kernel_id,
+                docker_image=resolved_image,
                 repo_root=REPO_ROOT,
                 validate_files=False,
             )
@@ -4549,7 +4565,7 @@ def cmd_trace_kernel(args):
         agent_model=getattr(args, "agent_model", None),
         agent_max_turns=getattr(args, "agent_max_turns", 8),
         benchmark_timeout=getattr(args, "benchmark_timeout", 5400),
-        docker_image=getattr(args, "docker_image", ""),
+        docker_image=resolved_image,
         framework=getattr(args, "framework", ""),
         disable_benchmark_cuda_graph=getattr(args, "disable_benchmark_cuda_graph", False),
         dry_run=getattr(args, "dry_run", False),
@@ -4564,10 +4580,37 @@ def cmd_trace_kernel(args):
 
 
 def cmd_list_trace_kernels(args):
-    """List supported trace-kernel whitelist entries."""
-    from kernel_tracing.registry import load_supported_kernels
+    """List supported trace-kernel whitelist entries for one Docker image."""
+    from kernel_tracing.registry import (
+        TRACE_IMAGE_REGISTRY_PATHS,
+        load_supported_kernels,
+        registry_summary,
+        supported_trace_images,
+    )
+    from kernel_tracing.runner import resolve_trace_docker_image
 
-    entries = load_supported_kernels(repo_root=REPO_ROOT, validate_files=False)
+    if getattr(args, "supported_images", False):
+        for image in supported_trace_images():
+            path = TRACE_IMAGE_REGISTRY_PATHS[image]
+            status = "present" if path.exists() else "missing"
+            print(f"{image}\t{path}\t{status}")
+        return
+
+    try:
+        resolved_image = resolve_trace_docker_image(
+            benchmark_config=getattr(args, "benchmark_config", "") or "",
+            docker_image=getattr(args, "docker_image", "") or "",
+            framework=getattr(args, "framework", "") or "",
+            repo_root=REPO_ROOT,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    entries = load_supported_kernels(
+        docker_image=resolved_image,
+        repo_root=REPO_ROOT,
+        validate_files=False,
+    )
     repo_filter = (getattr(args, "repo", "") or "").strip()
     type_filter = (getattr(args, "kernel_type", "") or "").strip()
     if repo_filter:
@@ -4584,6 +4627,10 @@ def cmd_list_trace_kernels(args):
         max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
         for i in range(len(headers))
     ]
+    summary = registry_summary(TRACE_IMAGE_REGISTRY_PATHS[resolved_image])
+    print(f"Docker image: {resolved_image}")
+    print(f"Registry: {summary['path']}")
+    print("")
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("  ".join("-" * widths[i] for i in range(len(headers))))
     for row in rows:
@@ -4592,46 +4639,34 @@ def cmd_list_trace_kernels(args):
 
 
 def cmd_update_trace_kernel_registry(args):
-    """Refresh the trace-kernel whitelist from benchmark Docker images."""
-    from kernel_tracing.registry import SUPPORTED_KERNELS_PATH
+    """Refresh fixed-image trace-kernel registries from supported Docker images."""
     from kernel_tracing.registry_update import RegistryUpdateError, update_trace_kernel_registry
 
-    output_path = Path(getattr(args, "output", "") or SUPPORTED_KERNELS_PATH)
     report_arg = getattr(args, "report", "") or ""
     report_path = Path(report_arg) if report_arg else None
     try:
         result = update_trace_kernel_registry(
             repo_root=REPO_ROOT,
-            gpu_arch=getattr(args, "gpu_arch", "gfx950"),
-            frameworks=getattr(args, "frameworks", "sglang,vllm"),
-            output_path=output_path,
             report_path=report_path,
             write=getattr(args, "write", False),
-            sglang_image=getattr(args, "sglang_image", ""),
-            vllm_image=getattr(args, "vllm_image", ""),
-            vllm_commit=getattr(args, "vllm_commit", ""),
         )
     except RegistryUpdateError as exc:
         raise SystemExit(str(exc)) from exc
 
     mode = "write" if result.wrote_registry else "dry-run"
     print(f"Trace kernel registry update ({mode})")
-    print(f"  output: {result.output_path}")
-    for framework, image in result.images.items():
-        print(f"  image[{framework}]: {image}")
-    print(f"  repos: {', '.join(result.selected_repos)}")
-    diff = result.diff
-    print(f"  kernels: {diff['old_count']} -> {diff['new_count']} ({diff['delta']:+d})")
-    print(
-        "  changes: "
-        f"added={len(diff['added'])}, "
-        f"removed={len(diff['removed'])}, "
-        f"changed={len(diff['changed'])}"
-    )
-    for repo, change in diff["source_commit_changes"].items():
-        old = change["old"] or "<none>"
-        new = change["new"] or "<none>"
-        print(f"  source_commits[{repo}]: {old} -> {new}")
+    for image, output_path in result.output_paths.items():
+        diff = result.diffs[image]
+        print(f"  image: {image}")
+        print(f"    output: {output_path}")
+        print(f"    repos: {', '.join(result.repos_by_image[image])}")
+        print(f"    kernels: {diff['old_count']} -> {diff['new_count']} ({diff['delta']:+d})")
+        print(
+            "    changes: "
+            f"added={len(diff['added'])}, "
+            f"removed={len(diff['removed'])}, "
+            f"changed={len(diff['changed'])}"
+        )
     if result.report_path:
         print(f"  report: {result.report_path}")
     if not result.wrote_registry:
@@ -6105,8 +6140,16 @@ def main():
     # -- list-trace-kernels --
     p = subparsers.add_parser(
         "list-trace-kernels",
-        help="List supported trace-kernel whitelist IDs",
+        help="List supported trace-kernel IDs for one supported Docker image",
     )
+    p.add_argument("-b", "--benchmark-config", default="",
+                   help="Benchmark YAML used to resolve the Docker image")
+    p.add_argument("--docker-image", default="",
+                   help="Supported Docker image whose trace registry should be listed")
+    p.add_argument("--framework", default="",
+                   help="Framework used when resolving an image from a benchmark config")
+    p.add_argument("--supported-images", action="store_true",
+                   help="List Docker images supported by trace-kernel registries")
     p.add_argument("--repo", default="", choices=["", "aiter", "vllm", "sglang"],
                    help="Filter by source repo")
     p.add_argument("--kernel-type", default="", choices=["", "triton", "hip"],
@@ -6115,24 +6158,12 @@ def main():
     # -- update-trace-kernel-registry --
     p = subparsers.add_parser(
         "update-trace-kernel-registry",
-        help="Refresh the trace-kernel whitelist from benchmark Docker images",
+        help="Regenerate fixed-image trace-kernel registries from supported Docker images",
     )
-    p.add_argument("--gpu-arch", default="gfx950",
-                   help="GPU architecture used for Magpie image lookup (default: gfx950)")
-    p.add_argument("--frameworks", default="sglang,vllm",
-                   help="Comma-separated frameworks to refresh (default: sglang,vllm)")
-    p.add_argument("--sglang-image", default="",
-                   help="Override the Magpie image for SGLang/AITER source discovery")
-    p.add_argument("--vllm-image", default="",
-                   help="Override the Magpie image for vLLM source discovery")
-    p.add_argument("--vllm-commit", default="",
-                   help="Explicit vLLM source commit if package version cannot map to a tag")
-    p.add_argument("--output", default=str(REPO_ROOT / "pipeline" / "kernel_tracing" / "supported_kernels.yaml"),
-                   help="Registry YAML path to update")
     p.add_argument("--report", default="",
                    help="Optional Markdown diff report path")
     p.add_argument("--write", action="store_true",
-                   help="Write the updated registry YAML; default is dry-run")
+                   help="Write the updated registry YAML files; default is dry-run")
 
     # -- identify --
     p = subparsers.add_parser("identify",

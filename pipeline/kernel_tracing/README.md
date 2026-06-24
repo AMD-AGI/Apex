@@ -12,6 +12,7 @@ This feature is meant to answer one practical question:
 python3 workload_optimizer.py trace-kernel \
   -r /path/to/results_trace \
   --kernel-id aiter.triton.unified_attention_2d \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
   --max-records 200 \
   --sample-rate 1.0 \
   -b /root/Magpie/examples/benchmarks/benchmark_vllm_gptoss_20b.yaml
@@ -20,8 +21,12 @@ python3 workload_optimizer.py trace-kernel \
 List supported IDs with:
 
 ```bash
-python3 workload_optimizer.py list-trace-kernels
-python3 workload_optimizer.py list-trace-kernels --repo vllm --kernel-type hip
+python3 workload_optimizer.py list-trace-kernels \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1
+python3 workload_optimizer.py list-trace-kernels \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --repo vllm --kernel-type hip
+python3 workload_optimizer.py list-trace-kernels --supported-images
 ```
 
 Trace multiple supported IDs in one workload run by repeating `--kernel-id`
@@ -32,6 +37,7 @@ python3 workload_optimizer.py trace-kernel \
   -r /path/to/results_trace_multi \
   --kernel-id aiter.hip.ck_moe_stage2 \
   --kernel-id aiter.hip.mla_reduce_v1,aiter.triton.fused_rms_mxfp4_quant_kernel \
+  --docker-image lmsysorg/sglang:v0.5.12-rocm720-mi35x \
   --max-records 2000 \
   -b /root/Magpie/examples/benchmarks/benchmark_sglang_dsr1.yaml
 ```
@@ -105,7 +111,7 @@ Important files:
 | `--small-tensor-stats` | no | Collect min/max/percentile-like small tensor content summaries where supported. Disabled by default because it can synchronize GPU work. |
 | `--trace-all` | no | Disable runtime filtering by the registry kernel name. Useful for central hooks, especially `aiter-compile-ops`, when the real low-level op name is unknown. With multi-target tracing this may also collect extra events from broad wrapper files. |
 | `--benchmark-timeout` | no | Timeout in seconds for the benchmark or run command. |
-| `--docker-image` | no | Override benchmark Docker image. Otherwise Apex uses the benchmark config or default vLLM ROCm image. |
+| `--docker-image` | no | Supported benchmark Docker image. Required for `--run-cmd`; optional with `-b` when the benchmark config resolves to a supported image. |
 | `--framework` | no | Framework passed to Magpie benchmark, usually `vllm` or `sglang`. Defaults to `vllm`. |
 | `--disable-benchmark-cuda-graph` | no | For Docker benchmarks, generate a temporary no-cudagraph copy of the selected InferenceX benchmark script and bind-mount it into the container. SGLang launches get `--disable-cuda-graph --disable-piecewise-cuda-graph`; vLLM launches get `--enforce-eager`. |
 | `--dry-run` | no | Generate and compile the patched overlay, then stop before running workload. |
@@ -215,7 +221,7 @@ The patched module was not imported, or tracing was not enabled in the process t
 
 Use this workflow for a new target:
 
-1. Run `list-trace-kernels` and choose a supported `--kernel-id`.
+1. Run `list-trace-kernels --docker-image <supported-image>` and choose a supported `--kernel-id`.
 2. Start with `--sample-rate 1.0 --max-records 200`.
 3. For central hooks, add `--trace-all`.
 4. Confirm `module_import` exists.
@@ -224,38 +230,40 @@ Use this workflow for a new target:
 
 ## Registry Maintenance
 
-The supported kernel registry can be refreshed from the benchmark Docker images
-used by Magpie. The command copies Python source trees from the selected images,
-discovers traceable launch/wrapper sites, records source image provenance, and
-optionally writes the updated YAML.
+Kernel tracing intentionally supports only these Docker images:
 
-Dry-run with a Markdown diff report:
+- `vllm/vllm-openai-rocm:v0.19.1`
+- `lmsysorg/sglang:v0.5.12-rocm720-mi35x`
+
+Each image has its own generated registry under
+`pipeline/kernel_tracing/registries/`. `trace-kernel` resolves the benchmark
+Docker image first, requires an exact match with the list above, and then loads
+only that image's registry. This keeps supported kernel IDs tied to the Python
+source that will actually run in the container.
+
+Dry-run both fixed registries with a Markdown diff report:
 
 ```bash
 python3 workload_optimizer.py update-trace-kernel-registry \
-  --gpu-arch gfx950 \
-  --frameworks sglang,vllm \
   --report /tmp/trace_kernel_registry_diff.md
 ```
 
-Write `pipeline/kernel_tracing/supported_kernels.yaml`:
+Write both fixed registry YAML files:
 
 ```bash
-python3 workload_optimizer.py update-trace-kernel-registry \
-  --gpu-arch gfx950 \
-  --frameworks sglang,vllm \
-  --write
+python3 workload_optimizer.py update-trace-kernel-registry --write
 ```
 
-Use `--sglang-image`, `--vllm-image`, or `--vllm-commit` when the automatic
-Magpie image or vLLM tag resolution is not the desired source of truth.
+The generator copies Python source from the two supported images, discovers
+traceable launch/wrapper sites, records image/package provenance, and writes:
 
-Registries generated from Docker images include a `source_images` section.
-Those entries may point at package versions that do not exactly match the local
-`tools/rocm/*` checkouts, so schema and listing commands do not require every
-registry file path to exist locally. During Docker tracing, Apex can extract the
-container source and bind-mount the patched file back over the original package
-path.
+- `pipeline/kernel_tracing/registries/vllm_v0_19_1.yaml`
+- `pipeline/kernel_tracing/registries/sglang_v0_5_12_rocm720_mi35x.yaml`
+
+Custom, nightly, digest-only, or other architecture images are not accepted by
+`trace-kernel`. During Docker tracing, Apex extracts the source file from the
+resolved supported image and fails hard if the file cannot be found, rather than
+falling back to a possibly mismatched local checkout.
 
 ## Examples
 
@@ -276,6 +284,7 @@ This traces a known aiter Triton launch used by GPT-OSS 20B when vLLM routes att
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_unified_attention_2d \
   --kernel-id aiter.triton.unified_attention_2d \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
   --max-records 200 \
   --sample-rate 1.0 \
   --benchmark-timeout 2700 \
@@ -296,6 +305,7 @@ This traces the Python-visible vLLM cache wrapper before it calls the compiled c
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_vllm_reshape_and_cache_flash \
   --kernel-id vllm.hip.reshape_and_cache_flash \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
   --max-records 200 \
   --sample-rate 1.0 \
   --benchmark-timeout 2700 \
@@ -315,6 +325,7 @@ Use this when you know a high-level aiter path is involved, but you do not yet k
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_compile_ops_discovery \
   --kernel-id aiter.hip.fmoe \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
   --trace-all \
   --max-records 200 \
   --sample-rate 1.0 \
@@ -345,6 +356,7 @@ Then rerun with the actual supported low-level `--kernel-id`, for example:
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_fmoe \
   --kernel-id aiter.hip.fmoe \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
   --max-records 10000 \
   --sample-rate 0.01 \
   --benchmark-timeout 2700 \
@@ -359,6 +371,7 @@ Use `--dry-run` to validate that the patch can be generated and compiled without
 python3 workload_optimizer.py trace-kernel \
   -r /tmp/apex_trace_dry_unified_attention \
   --kernel-id aiter.triton.unified_attention_2d \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
   --dry-run
 ```
 
@@ -366,12 +379,15 @@ This should produce `patched_files/overlay/...` and `trace_config.json`, but no 
 
 ### 5. Local command instead of Magpie
 
-Use `--run-cmd` when you want to run a small op test or repro command instead of an E2E Magpie benchmark.
+Use `--run-cmd` when you want to run a small op test or repro command instead
+of an E2E Magpie benchmark. `--docker-image` is still required so Apex can
+select the fixed registry that defines the supported kernel ID.
 
 ```bash
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_local_pa_decode \
   --kernel-id aiter.triton.paged_attn_decode_v1_wo_dot \
+  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
   --max-records 200 \
   --sample-rate 1.0 \
   --run-cmd 'python3 -m pytest /root/Apex/tools/rocm/aiter/op_tests/triton_tests/attention/test_pa_decode.py -x'

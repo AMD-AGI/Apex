@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .registry import load_supported_kernels
+from .registry import load_supported_kernels, supported_trace_images
 
 
 @dataclass(frozen=True)
@@ -26,5 +26,6 @@ TRACE_TEST_CASES: list[TraceTestCase] = [
         patch_path=entry.trace_mode,
         static_expected=entry.patch_strategy == "static",
     )
-    for entry in load_supported_kernels()
+    for image in supported_trace_images()
+    for entry in load_supported_kernels(docker_image=image)
 ]

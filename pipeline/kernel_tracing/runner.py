@@ -28,6 +28,7 @@ from .overlay import (
 from .patch_triton import PatchResult, patch_triton_launch_file
 from .patch_wrapper import patch_aiter_compile_ops_file, patch_wrapper_entry_file
 from .postprocess import postprocess_trace, write_target_kernel_tensor_shapes
+from .registry import SUPPORTED_TRACE_IMAGES, registry_path_for_image
 from .runtime import write_runtime_file
 
 
@@ -463,60 +464,64 @@ def _prepare_no_cudagraph_benchmark_script(
     return output_path, container_path
 
 
-def _resolve_benchmark_docker_image(config: TraceKernelConfig) -> str:
-    if config.docker_image:
-        return config.docker_image
-    bench: dict[str, Any] = {}
-    if config.benchmark_config:
-        try:
-            data = yaml.safe_load(Path(config.benchmark_config).read_text(encoding="utf-8")) or {}
-            bench = data.get("benchmark", data)
-            if bench.get("docker_image") or bench.get("image"):
-                return str(bench.get("docker_image") or bench.get("image"))
-        except Exception:
-            pass
-    try:
-        from Magpie.modes.benchmark.image_selector import ImageSelector
-
-        framework = config.framework or str(bench.get("framework") or "vllm")
-        gpu_arch = bench.get("gpu_arch")
-        return ImageSelector().select_image(
-            framework=framework,
-            gpu_arch=str(gpu_arch) if gpu_arch else None,
-        )
-    except Exception:
-        pass
-    framework = (config.framework or str(bench.get("framework") or "vllm")).lower()
-    gpu_arch = str(bench.get("gpu_arch") or "").strip()
-    if not gpu_arch:
-        try:
-            res = subprocess.run(
-                ["rocm-smi", "--showhw"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+def resolve_trace_docker_image(
+    *,
+    benchmark_config: str = "",
+    docker_image: str = "",
+    framework: str = "",
+    repo_root: Path | None = None,
+) -> str:
+    """Resolve and validate the Docker image for image-bound trace registries."""
+    if docker_image:
+        resolved = docker_image.strip()
+    else:
+        bench: dict[str, Any] = {}
+        if not benchmark_config:
+            raise ValueError(
+                "Trace kernel registry selection requires --docker-image or "
+                "-b/--benchmark-config"
             )
-            match = re.search(r"\bgfx\d+\b", res.stdout)
-            if match:
-                gpu_arch = match.group(0)
-        except Exception:
-            gpu_arch = ""
-    image_config = (
-        Path(os.environ.get("MAGPIE_ROOT", ""))
-        / "Magpie"
-        / "benchmark_images.yaml"
+        data = yaml.safe_load(Path(benchmark_config).read_text(encoding="utf-8")) or {}
+        bench = data.get("benchmark", data)
+        if bench.get("docker_image"):
+            resolved = str(bench["docker_image"]).strip()
+        else:
+            selected_framework = (framework or str(bench.get("framework") or "vllm")).lower()
+            gpu_arch = str(bench.get("gpu_arch") or "gfx950").strip()
+            try:
+                from Magpie.modes.benchmark.image_selector import ImageSelector
+
+                resolved = ImageSelector().select_image(
+                    framework=selected_framework,
+                    gpu_arch=gpu_arch,
+                )
+            except Exception:
+                image_config = (
+                    Path(os.environ.get("MAGPIE_ROOT", ""))
+                    / "Magpie"
+                    / "benchmark_images.yaml"
+                )
+                if not image_config.exists() and repo_root is not None:
+                    image_config = (
+                        repo_root
+                        / "tools"
+                        / "magpie"
+                        / "Magpie"
+                        / "benchmark_images.yaml"
+                    )
+                mapping = yaml.safe_load(image_config.read_text(encoding="utf-8")) or {}
+                resolved = str(mapping.get(selected_framework, {}).get(gpu_arch) or "")
+    registry_path_for_image(resolved)
+    return resolved
+
+
+def _resolve_benchmark_docker_image(config: TraceKernelConfig) -> str:
+    return resolve_trace_docker_image(
+        benchmark_config=config.benchmark_config,
+        docker_image=config.docker_image,
+        framework=config.framework,
+        repo_root=config.repo_root,
     )
-    if not image_config.exists():
-        image_config = config.repo_root / "tools" / "magpie" / "Magpie" / "benchmark_images.yaml"
-    if gpu_arch and image_config.exists():
-        try:
-            mapping = yaml.safe_load(image_config.read_text(encoding="utf-8")) or {}
-            image = mapping.get(framework, {}).get(gpu_arch)
-            if image:
-                return str(image)
-        except Exception:
-            pass
-    return os.environ.get("APEX_VLLM_ROCM_IMAGE", "vllm/vllm-openai-rocm:v0.19.0")
 
 
 def _source_for_patch(
@@ -536,8 +541,11 @@ def _source_for_patch(
     if not config.benchmark_config or _detect_magpie_run_mode() != "docker":
         return fallback_source
     image = _resolve_benchmark_docker_image(config)
-    if not image or shutil.which("docker") is None:
-        return fallback_source
+    if shutil.which("docker") is None:
+        raise RuntimeError(
+            "Docker benchmark tracing requires docker to extract the exact "
+            f"source for {module_name} from {image}."
+        )
     out = config.results_dir / "container_sources" / package_rel_path
     out.parent.mkdir(parents=True, exist_ok=True)
     code = (
@@ -588,13 +596,24 @@ def _source_for_patch(
             text=True,
             timeout=120,
         )
-    except Exception:
-        return fallback_source
+    except Exception as exc:
+        supported = ", ".join(SUPPORTED_TRACE_IMAGES)
+        raise RuntimeError(
+            f"Failed to extract {module_name} ({package_rel_path}) from {image}. "
+            f"Supported trace images: {supported}."
+        ) from exc
     if proc.returncode != 0 or "__APEX_SOURCE_BEGIN__" not in proc.stdout:
-        return fallback_source
+        stderr = proc.stderr.strip()
+        raise RuntimeError(
+            f"Could not find {module_name} ({package_rel_path}) in Docker image "
+            f"{image}. {stderr}"
+        )
     container_path_text, source = proc.stdout.split("__APEX_SOURCE_BEGIN__\n", 1)
     if "apex_trace_event" in source:
-        return fallback_source
+        raise RuntimeError(
+            f"Refusing to patch {module_name} from {image}: extracted source "
+            "already contains apex_trace_event."
+        )
     out.write_text(source, encoding="utf-8")
     container_path = container_path_text.strip().splitlines()[-1]
     if container_path:

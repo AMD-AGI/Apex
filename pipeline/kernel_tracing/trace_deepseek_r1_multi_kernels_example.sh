@@ -46,8 +46,8 @@ if [[ ! -f "$TRACE_BENCH" ]]; then
   exit 1
 fi
 
-# These cover the CSV analysis targets that are present in
-# pipeline/kernel_tracing/supported_kernels.yaml.
+# These cover the CSV analysis targets that are present in the fixed-image
+# trace registries under pipeline/kernel_tracing/registries/.
 # Keep this list explicit: different workload/model analyses often need
 # different kernel sets.
 KERNEL_IDS=(
