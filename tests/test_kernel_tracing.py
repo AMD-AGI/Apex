@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "pipeline"))
 
+import kernel_tracing.patch_triton as patch_triton
 from kernel_tracing.agent_harness import AgentPatchRequest, run_agent_patch_fallback
 from kernel_tracing.overlay import ModuleMapping, write_docker_wrapper, write_overlay_support
 from kernel_tracing.patch_triton import patch_triton_launch_file
@@ -23,8 +25,8 @@ from kernel_tracing.runner import (
     _trace_event_flags,
     run_trace_kernel,
 )
-from kernel_tracing.runtime import write_runtime_file
-from kernel_tracing.serializer import serialize_value
+from kernel_tracing.runtime import RUNTIME_SOURCE, write_runtime_file
+from kernel_tracing.serializer import runtime_serializer_source, serialize_value
 from kernel_tracing.patch_wrapper import patch_aiter_compile_ops_file, patch_wrapper_entry_file
 
 
@@ -75,6 +77,22 @@ def test_serialize_tensor_metadata_cpu():
     assert out["stride"] == list(x.stride())
     assert "data_ptr_hash" in out
     assert "values" not in out
+
+
+def test_runtime_source_embeds_shared_serializer():
+    assert runtime_serializer_source().strip() in RUNTIME_SOURCE
+    namespace = {"__file__": "apex_kernel_tracing_runtime.py"}
+    exec(compile(RUNTIME_SOURCE.lstrip(), "apex_kernel_tracing_runtime.py", "exec"), namespace)
+    sample = {"items": (1, [2, "x"])}
+    assert namespace["serialize_value"](sample) == serialize_value(sample)
+    assert "_serialize" not in namespace
+
+
+def test_triton_patch_module_has_single_entrypoint():
+    source = Path(patch_triton.__file__).read_text(encoding="utf-8")
+    parsed = ast.parse(source)
+    defs = [node.name for node in parsed.body if isinstance(node, ast.FunctionDef)]
+    assert defs.count("patch_triton_launch_file") == 1
 
 
 def test_patch_synthetic_triton_launch_compiles(tmp_path):

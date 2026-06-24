@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
+import textwrap
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Callable
 
 
 _MAX_DEPTH = 3
@@ -13,12 +15,29 @@ _MAX_ITEMS = 32
 
 
 def _is_tensor(value: Any) -> bool:
+    if _is_trace_unsafe_proxy(value):
+        return False
     return (
         hasattr(value, "shape")
         and hasattr(value, "dtype")
         and hasattr(value, "stride")
         and callable(getattr(value, "stride", None))
     )
+
+
+def _is_trace_unsafe_proxy(value: Any) -> bool:
+    typ = type(value)
+    mod = getattr(typ, "__module__", "")
+    name = getattr(typ, "__name__", "")
+    markers = (
+        "torch.fx",
+        "proxy_tensor",
+        "fake_tensor",
+        "torch._subclasses",
+    )
+    if any(marker in mod for marker in markers):
+        return True
+    return "Proxy" in name or "FakeTensor" in name
 
 
 def _hash_ptr(ptr: Any) -> str:
@@ -34,6 +53,14 @@ def serialize_value(value: Any, *, depth: int = 0, max_depth: int = _MAX_DEPTH) 
 
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+
+    if _is_trace_unsafe_proxy(value):
+        typ = type(value)
+        return {
+            "type": getattr(typ, "__name__", "proxy"),
+            "module": getattr(typ, "__module__", ""),
+            "skipped": "torch_tracing_proxy",
+        }
 
     if _is_tensor(value):
         out: dict[str, Any] = {
@@ -111,3 +138,23 @@ def serialize_args(args: Any) -> Any:
             for i, v in enumerate(args)
         }
     return serialize_value(args)
+
+
+def runtime_serializer_source() -> str:
+    """Return serializer code to embed in the generated standalone runtime."""
+    blocks: list[str | Callable[..., Any]] = [
+        f"_MAX_DEPTH = {_MAX_DEPTH}",
+        f"_MAX_ITEMS = {_MAX_ITEMS}",
+        _is_trace_unsafe_proxy,
+        _is_tensor,
+        _hash_ptr,
+        serialize_value,
+        serialize_args,
+    ]
+    rendered: list[str] = []
+    for block in blocks:
+        if isinstance(block, str):
+            rendered.append(block)
+        else:
+            rendered.append(textwrap.dedent(inspect.getsource(block)).strip())
+    return "\n\n".join(rendered) + "\n"
