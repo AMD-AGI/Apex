@@ -292,6 +292,9 @@ def test_update_registry_dry_run_does_not_write_yaml(tmp_path, monkeypatch):
 
 
 def test_trace_kernel_cli_uses_kernel_id_dry_run(tmp_path):
+    source = REPO_ROOT / "tools" / "rocm" / "vllm" / "vllm" / "_custom_ops.py"
+    if not source.exists():
+        pytest.skip(f"registry source fixture is not present in this checkout: {source}")
     results = tmp_path / "trace"
     proc = subprocess.run(
         [
@@ -381,13 +384,16 @@ def test_list_trace_kernels_supported_images():
 
 
 def test_list_trace_kernels_resolves_sglang_benchmark_config():
+    bench = REPO_ROOT / "tools" / "magpie" / "examples" / "benchmarks" / "benchmark_sqlang_amd_dsr1_fp4.yaml"
+    if not bench.exists():
+        pytest.skip(f"Magpie benchmark fixture is not present in this checkout: {bench}")
     proc = subprocess.run(
         [
             sys.executable,
             "workload_optimizer.py",
             "list-trace-kernels",
             "-b",
-            "tools/magpie/examples/benchmarks/benchmark_sqlang_amd_dsr1_fp4.yaml",
+            str(bench.relative_to(REPO_ROOT)),
             "--repo",
             "sglang",
             "--kernel-type",

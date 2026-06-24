@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -14,14 +15,19 @@ sys.path.insert(0, str(REPO_ROOT / "pipeline"))
 
 import kernel_tracing.patch_triton as patch_triton
 from kernel_tracing.agent_harness import AgentPatchRequest, run_agent_patch_fallback
+from kernel_tracing.mode_detection import detect_trace_mode, normalize_trace_mode
 from kernel_tracing.overlay import ModuleMapping, write_docker_wrapper, write_overlay_support
 from kernel_tracing.patch_triton import patch_triton_launch_file
 from kernel_tracing.postprocess import postprocess_trace
 from kernel_tracing.runner import (
     TraceKernelConfig,
     TraceKernelTarget,
+    _base_trace_env,
+    _merge_benchmark_envs,
     _prepare_no_cudagraph_benchmark_script,
     _rewrite_benchmark_script_disable_cuda_graph,
+    _source_for_patch,
+    _temporary_env,
     _trace_event_flags,
     run_trace_kernel,
 )
@@ -79,6 +85,107 @@ def test_serialize_tensor_metadata_cpu():
     assert "values" not in out
 
 
+def test_serialize_fake_tensor_metadata_without_torch():
+    class MockTensor:
+        shape = (2, 3)
+        dtype = "float16"
+        device = "cuda:0"
+        layout = "strided"
+        requires_grad = True
+
+        def stride(self):
+            return (3, 1)
+
+        def is_contiguous(self):
+            return False
+
+        def numel(self):
+            return 6
+
+        def element_size(self):
+            return 2
+
+        def data_ptr(self):
+            return 123456
+
+    out = serialize_value(MockTensor())
+    assert out["type"] == "tensor"
+    assert out["shape"] == [2, 3]
+    assert out["dtype"] == "float16"
+    assert out["device"] == "cuda:0"
+    assert out["stride"] == [3, 1]
+    assert out["is_contiguous"] is False
+    assert out["numel"] == 6
+    assert out["element_size"] == 2
+    assert out["data_ptr_hash"] != "123456"
+
+
+def test_serialize_tensor_metadata_tolerates_access_errors():
+    class FlakyTensor:
+        shape = (4,)
+        dtype = "float32"
+
+        def stride(self):
+            raise RuntimeError("stride unavailable")
+
+        def is_contiguous(self):
+            raise RuntimeError("contiguity unavailable")
+
+        def numel(self):
+            raise RuntimeError("numel unavailable")
+
+        def element_size(self):
+            raise RuntimeError("element size unavailable")
+
+        def data_ptr(self):
+            raise RuntimeError("data pointer unavailable")
+
+    out = serialize_value(FlakyTensor())
+    assert out["type"] == "tensor"
+    assert out["stride"] == []
+    assert out["is_contiguous"] is False
+    assert "numel" not in out
+    assert "element_size" not in out
+    assert "data_ptr_hash" not in out
+
+
+def test_serialize_proxy_values_are_skipped_before_tensor_detection():
+    class ProxyTensor:
+        shape = (8,)
+        dtype = "float16"
+
+        def stride(self):
+            return (1,)
+
+    ProxyTensor.__module__ = "torch.fx.proxy"
+    out = serialize_value(ProxyTensor())
+    assert out == {
+        "type": "ProxyTensor",
+        "module": "torch.fx.proxy",
+        "skipped": "torch_tracing_proxy",
+    }
+
+
+def test_serialize_collections_truncates_and_preserves_shapes():
+    wide = {f"k{i}": i for i in range(35)}
+    out = serialize_value({
+        "wide": wide,
+        "tuple": (1, "x"),
+        "list": [1, 2],
+        "callable": lambda: None,
+        "bytes": b"abc",
+        "deep": [[[[["too deep"]]]]],
+    })
+    assert out["wide"]["_truncated"] == 3
+    assert "k31" in out["wide"]
+    assert "k32" not in out["wide"]
+    assert out["tuple"] == {"type": "tuple", "items": [1, "x"]}
+    assert out["list"] == [1, 2]
+    assert out["callable"]["type"] == "callable"
+    assert out["bytes"]["type"] == "bytes"
+    assert out["deep"][0][0][0] == {"type": "list", "truncated": True}
+
+
 def test_runtime_source_embeds_shared_serializer():
     assert runtime_serializer_source().strip() in RUNTIME_SOURCE
     namespace = {"__file__": "apex_kernel_tracing_runtime.py"}
@@ -93,6 +200,39 @@ def test_triton_patch_module_has_single_entrypoint():
     parsed = ast.parse(source)
     defs = [node.name for node in parsed.body if isinstance(node, ast.FunctionDef)]
     assert defs.count("patch_triton_launch_file") == 1
+
+
+def test_normalize_trace_mode_handles_kernel_type_and_invalid_values():
+    assert normalize_trace_mode("AUTO", kernel_type="triton") == "triton-launch"
+    assert normalize_trace_mode("auto", kernel_type="hip") == "auto"
+    assert normalize_trace_mode(" vllm-custom-op ") == "vllm-custom-op"
+    with pytest.raises(ValueError, match="Unsupported trace mode"):
+        normalize_trace_mode("unknown")
+
+
+@pytest.mark.parametrize(
+    ("path_parts", "source", "kernel_name", "expected"),
+    [
+        (("mod.py",), "some_kernel[(1,)]()", "some_kernel", "triton-launch"),
+        (("mod.py",), "@triton.jit\ndef some_kernel():\n    pass\n", "some_kernel", "agent"),
+        (("aiter", "jit", "core.py"), "def compile_ops():\n    pass\n", "moe", "aiter-compile-ops"),
+        (("vllm", "_custom_ops.py"), "torch.ops.vllm.reshape_and_cache_flash()\n", "op", "vllm-custom-op"),
+        (("sglang", "ops.py"), "register_custom_op('x')\n", "op", "sglang-custom-op"),
+        (("plain.py",), "def wrapper():\n    return 1\n", "wrapper", "agent"),
+    ],
+)
+def test_detect_trace_mode_auto_patterns(tmp_path, path_parts, source, kernel_name, expected):
+    path = tmp_path.joinpath(*path_parts)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    assert detect_trace_mode(path, kernel_name) == expected
+
+
+def test_detect_trace_mode_keeps_explicit_request_and_generic_alias(tmp_path):
+    path = tmp_path / "mod.py"
+    path.write_text("kernel[(1,)]()\n", encoding="utf-8")
+    assert detect_trace_mode(path, "whatever", requested="sglang-custom-op") == "sglang-custom-op"
+    assert detect_trace_mode(path, "kernel") == "agent"
 
 
 def test_patch_synthetic_triton_launch_compiles(tmp_path):
@@ -379,6 +519,178 @@ def test_trace_event_flags_separate_any_and_target(tmp_path):
         "any_event_found": True,
         "target_event_found": False,
     }
+
+
+def test_trace_event_flags_tracks_multiple_targets_and_load_names(tmp_path):
+    raw = tmp_path / "trace_raw"
+    raw.mkdir()
+    (raw / "trace_pid1_rank0.jsonl").write_text(
+        "\n".join([
+            "{not json",
+            json.dumps({"kind": "module_import", "kernel_name": "ignored"}),
+            json.dumps({"kind": "triton_launch", "kernel_name": "first"}),
+            json.dumps({
+                "kind": "hip_python_op",
+                "kernel_name": "wrapper",
+                "extra": {"load_name": "second"},
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    assert _trace_event_flags(tmp_path, ["first", "second"]) == {
+        "any_event_found": True,
+        "target_event_found": True,
+    }
+    details = _trace_event_flags(
+        tmp_path,
+        ["first", "second", "missing"],
+        include_details=True,
+    )
+    assert details["target_event_found"] is False
+    assert details["target_events_found"] == {
+        "first": True,
+        "second": True,
+        "missing": False,
+    }
+    assert details["missing_kernel_names"] == ["missing"]
+
+
+def test_base_trace_env_uses_deduped_targets_and_trace_all(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "existing")
+    kernel = tmp_path / "kernel.py"
+    config = TraceKernelConfig(
+        results_dir=tmp_path / "results",
+        kernel_name="first",
+        kernel_file=kernel,
+        max_records=7,
+        sample_rate=0.25,
+        small_tensor_stats=True,
+        targets=[
+            TraceKernelTarget(kernel_name="first", kernel_file=kernel),
+            TraceKernelTarget(kernel_name="second", kernel_file=kernel),
+            TraceKernelTarget(kernel_name="first", kernel_file=kernel),
+        ],
+    )
+
+    env = _base_trace_env(config, docker=False)
+    assert env["APEX_TRACE_KERNEL_NAME"] == "first,second"
+    assert env["APEX_TRACE_KERNEL_NAMES"] == "first,second"
+    assert env["APEX_TRACE_MAX_RECORDS"] == "7"
+    assert env["APEX_TRACE_SAMPLE_RATE"] == "0.25"
+    assert env["APEX_TRACE_SMALL_TENSOR_STATS"] == "1"
+    assert env["APEX_TRACE_OUTPUT_DIR"] == str(tmp_path / "results" / "trace_raw")
+    assert env["PYTHONPATH"] == f"{tmp_path / 'results' / 'patched_files'}:existing"
+
+    docker_env = _base_trace_env(config, docker=True)
+    assert docker_env["APEX_TRACE_PATCH_MANIFEST"] == "/apex_trace/patched_files/patch_manifest.json"
+    assert docker_env["APEX_TRACE_OUTPUT_DIR"] == "/apex_trace/trace_raw"
+
+    config.trace_all = True
+    trace_all_env = _base_trace_env(config, docker=False)
+    assert trace_all_env["APEX_TRACE_KERNEL_NAME"] == ""
+    assert trace_all_env["APEX_TRACE_KERNEL_NAMES"] == ""
+
+
+def test_merge_benchmark_envs_preserves_existing_envs(tmp_path):
+    bench = tmp_path / "bench.yaml"
+    bench.write_text(
+        "benchmark:\n"
+        "  envs:\n"
+        "    PYTHONPATH: /existing/path\n"
+        "    KEEP_ME: keep\n"
+        "  docker_image: image:tag\n",
+        encoding="utf-8",
+    )
+    config = TraceKernelConfig(
+        results_dir=tmp_path / "results",
+        kernel_name="target",
+        kernel_file=tmp_path / "kernel.py",
+        max_records=3,
+    )
+
+    out = _merge_benchmark_envs(str(bench), config, docker=True)
+    data = yaml.safe_load(out.read_text(encoding="utf-8"))
+    envs = data["benchmark"]["envs"]
+    assert envs["KEEP_ME"] == "keep"
+    assert envs["PYTHONPATH"] == "/apex_trace/patched_files:/existing/path"
+    assert envs["APEX_TRACE_ENABLED"] == "1"
+    assert envs["APEX_TRACE_KERNEL_NAMES"] == "target"
+    assert envs["APEX_TRACE_MAX_RECORDS"] == "3"
+
+
+def test_temporary_env_restores_original_environment(monkeypatch):
+    monkeypatch.setenv("APEX_TRACE_TEST_KEEP", "old")
+    monkeypatch.delenv("APEX_TRACE_TEST_NEW", raising=False)
+
+    with _temporary_env({
+        "APEX_TRACE_TEST_KEEP": "new",
+        "APEX_TRACE_TEST_NEW": "value",
+    }):
+        assert os.environ["APEX_TRACE_TEST_KEEP"] == "new"
+        assert os.environ["APEX_TRACE_TEST_NEW"] == "value"
+
+    assert os.environ["APEX_TRACE_TEST_KEEP"] == "old"
+    assert "APEX_TRACE_TEST_NEW" not in os.environ
+
+
+def test_source_for_patch_extracts_container_source(tmp_path):
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = "/site/pkg/mod.py\n__APEX_SOURCE_BEGIN__\nVALUE = 1\n"
+
+    fallback = tmp_path / "host_mod.py"
+    config = TraceKernelConfig(
+        results_dir=tmp_path / "results",
+        kernel_name="target",
+        kernel_file=fallback,
+        benchmark_config=str(tmp_path / "bench.yaml"),
+    )
+
+    with patch("kernel_tracing.runner._detect_magpie_run_mode", return_value="docker"), \
+            patch("kernel_tracing.runner._resolve_benchmark_docker_image", return_value="image:tag"), \
+            patch("kernel_tracing.runner.shutil.which", return_value="/usr/bin/docker"), \
+            patch("kernel_tracing.runner.subprocess.run", return_value=Result()) as run:
+        source = _source_for_patch(config, "pkg.mod", "pkg/mod.py", fallback)
+
+    assert source == tmp_path / "results" / "container_sources" / "pkg" / "mod.py"
+    assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert source.with_suffix(".py.container_path").read_text(encoding="utf-8") == "/site/pkg/mod.py"
+    args = run.call_args.args[0]
+    assert args[:5] == ["docker", "run", "--rm", "--entrypoint", "python3"]
+    assert args[5] == "image:tag"
+
+
+def test_source_for_patch_uses_fallback_outside_docker(tmp_path):
+    fallback = tmp_path / "host_mod.py"
+    config = TraceKernelConfig(
+        results_dir=tmp_path / "results",
+        kernel_name="target",
+        kernel_file=tmp_path / "kernel.py",
+    )
+    assert _source_for_patch(config, "pkg.mod", "pkg/mod.py", fallback) == fallback
+
+
+def test_source_for_patch_rejects_prepatched_container_source(tmp_path):
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = "/site/pkg/mod.py\n__APEX_SOURCE_BEGIN__\napex_trace_event()\n"
+
+    config = TraceKernelConfig(
+        results_dir=tmp_path / "results",
+        kernel_name="target",
+        kernel_file=tmp_path / "kernel.py",
+        benchmark_config=str(tmp_path / "bench.yaml"),
+    )
+
+    with patch("kernel_tracing.runner._detect_magpie_run_mode", return_value="docker"), \
+            patch("kernel_tracing.runner._resolve_benchmark_docker_image", return_value="image:tag"), \
+            patch("kernel_tracing.runner.shutil.which", return_value="/usr/bin/docker"), \
+            patch("kernel_tracing.runner.subprocess.run", return_value=Result()), \
+            pytest.raises(RuntimeError, match="already contains apex_trace_event"):
+        _source_for_patch(config, "pkg.mod", "pkg/mod.py")
 
 
 def test_local_overlay_import_smoke(tmp_path):
