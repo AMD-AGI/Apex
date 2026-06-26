@@ -39,6 +39,12 @@ baseline kernel  →  prompt constructor  →  LLM agent  →  grader (Magpie)  
 6. **Benchmark (final)** — re-run E2E benchmark with patches to measure real throughput improvement
 7. **Score & Report** — compute rewards, update leaderboard, generate report
 
+## Dynamic Kernel Workload Tracing
+
+Apex also includes a standalone `trace-kernel` workflow for collecting real runtime workload metadata from E2E model benchmarks. It temporarily patches Python-visible Triton launch sites or HIP/custom-op wrapper paths, reruns the workload, and emits raw JSONL plus aggregated workload ranges for shapes, dtypes, strides, flags, and meta parameters.
+
+For detailed usage, CLI arguments, Docker overlay behavior, and runnable examples, see [`pipeline/kernel_tracing/README.md`](pipeline/kernel_tracing/README.md).
+
 ## Quick Start
 
 ### Prerequisites

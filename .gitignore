@@ -47,6 +47,7 @@ leaderboard.json
 .mcp.json
 mcp_config.json
 results
+results_*/
 results_total_*/
 tools/.cache/*
 tools/mcps/.cache/

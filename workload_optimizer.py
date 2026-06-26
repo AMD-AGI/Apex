@@ -4457,6 +4457,222 @@ def cmd_benchmark(args):
     print(f"  State saved to {state.path}")
 
 
+def _format_trace_kernel_summary(result: dict, results_dir: Path) -> str:
+    lines = [
+        "Trace result:",
+        f"  success: {result.get('success')}",
+        f"  any_event_found: {result.get('any_event_found')}",
+        f"  target_event_found: {result.get('target_event_found')}",
+    ]
+    if result.get("dry_run"):
+        lines.append("  dry_run: True")
+
+    missing = result.get("missing_kernel_names") or []
+    if missing:
+        lines.append("  missing_kernel_names:")
+        for name in missing:
+            lines.append(f"    - {name}")
+
+    ranges = result.get("workload_ranges")
+    if isinstance(ranges, dict):
+        lines.extend([
+            "",
+            "Workload ranges:",
+            f"  total_events: {ranges.get('total_events')}",
+            f"  total_calls: {ranges.get('total_calls')}",
+            f"  groups: {len(ranges.get('groups', []))}",
+            f"  summary: {results_dir / 'workload_summary.md'}",
+        ])
+    return "\n".join(lines)
+
+
+def cmd_trace_kernel(args):
+    """Trace one or more kernel/op workloads by patching Python launch/wrapper sites."""
+    from kernel_tracing.registry import find_supported_kernel
+    from kernel_tracing.runner import (
+        TraceKernelConfig,
+        TraceKernelTarget,
+        resolve_trace_docker_image,
+        run_trace_kernel,
+    )
+
+    kernel_ids: list[str] = []
+    for raw in getattr(args, "kernel_ids", None) or []:
+        kernel_ids.extend(part.strip() for part in str(raw).split(",") if part.strip())
+    if not kernel_ids:
+        raise SystemExit("trace-kernel requires at least one --kernel-id")
+    deduped_kernel_ids = []
+    seen_kernel_ids = set()
+    for kernel_id in kernel_ids:
+        if kernel_id in seen_kernel_ids:
+            continue
+        deduped_kernel_ids.append(kernel_id)
+        seen_kernel_ids.add(kernel_id)
+
+    try:
+        resolved_image = resolve_trace_docker_image(
+            benchmark_config=getattr(args, "benchmark_config", "") or "",
+            docker_image=getattr(args, "docker_image", "") or "",
+            framework=getattr(args, "framework", "") or "",
+            repo_root=REPO_ROOT,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    entries = []
+    try:
+        entries = [
+            find_supported_kernel(
+                kernel_id,
+                docker_image=resolved_image,
+                repo_root=REPO_ROOT,
+                validate_files=False,
+            )
+            for kernel_id in deduped_kernel_ids
+        ]
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    first = entries[0]
+    targets = [
+        TraceKernelTarget(
+            kernel_name=entry.kernel_name,
+            kernel_file=entry.resolved_file(REPO_ROOT),
+            kernel_id=entry.id,
+            registry_entry=entry.as_dict(),
+            trace_mode=entry.trace_mode,
+            kernel_type=entry.kernel_type,
+            patch_strategy=entry.patch_strategy,
+        )
+        for entry in entries
+    ]
+    cfg = TraceKernelConfig(
+        results_dir=Path(args.results_dir),
+        kernel_name=first.kernel_name,
+        kernel_file=first.resolved_file(REPO_ROOT),
+        kernel_id=first.id,
+        registry_entry=first.as_dict(),
+        trace_mode=first.trace_mode,
+        kernel_type=first.kernel_type,
+        patch_strategy=first.patch_strategy,
+        benchmark_config=getattr(args, "benchmark_config", "") or "",
+        run_cmd=getattr(args, "run_cmd", "") or "",
+        max_records=getattr(args, "max_records", 100000),
+        sample_rate=getattr(args, "sample_rate", 1.0),
+        small_tensor_stats=getattr(args, "small_tensor_stats", False),
+        trace_all=getattr(args, "trace_all", False),
+        agent_backend=getattr(args, "agent_backend", "claude"),
+        agent_model=getattr(args, "agent_model", None),
+        agent_max_turns=getattr(args, "agent_max_turns", 8),
+        benchmark_timeout=getattr(args, "benchmark_timeout", 5400),
+        docker_image=resolved_image,
+        framework=getattr(args, "framework", ""),
+        disable_benchmark_cuda_graph=getattr(args, "disable_benchmark_cuda_graph", False),
+        dry_run=getattr(args, "dry_run", False),
+        repo_root=REPO_ROOT,
+        targets=targets,
+    )
+    if bool(cfg.benchmark_config) == bool(cfg.run_cmd) and not cfg.dry_run:
+        raise SystemExit("trace-kernel requires exactly one of --run-cmd or -b/--benchmark-config")
+    result = run_trace_kernel(cfg)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    print(_format_trace_kernel_summary(result, cfg.results_dir), file=sys.stderr)
+
+
+def cmd_list_trace_kernels(args):
+    """List supported trace-kernel whitelist entries for one Docker image."""
+    from kernel_tracing.registry import (
+        TRACE_IMAGE_REGISTRY_PATHS,
+        load_supported_kernels,
+        registry_summary,
+        supported_trace_images,
+    )
+    from kernel_tracing.runner import resolve_trace_docker_image
+
+    if getattr(args, "supported_images", False):
+        for image in supported_trace_images():
+            path = TRACE_IMAGE_REGISTRY_PATHS[image]
+            status = "present" if path.exists() else "missing"
+            print(f"{image}\t{path}\t{status}")
+        return
+
+    try:
+        resolved_image = resolve_trace_docker_image(
+            benchmark_config=getattr(args, "benchmark_config", "") or "",
+            docker_image=getattr(args, "docker_image", "") or "",
+            framework=getattr(args, "framework", "") or "",
+            repo_root=REPO_ROOT,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    entries = load_supported_kernels(
+        docker_image=resolved_image,
+        repo_root=REPO_ROOT,
+        validate_files=False,
+    )
+    repo_filter = (getattr(args, "repo", "") or "").strip()
+    type_filter = (getattr(args, "kernel_type", "") or "").strip()
+    if repo_filter:
+        entries = [entry for entry in entries if entry.repo == repo_filter]
+    if type_filter:
+        entries = [entry for entry in entries if entry.kernel_type == type_filter]
+
+    headers = ("id", "repo", "type", "kernel_name", "kernel_file")
+    rows = [
+        (entry.id, entry.repo, entry.kernel_type, entry.kernel_name, entry.kernel_file)
+        for entry in entries
+    ]
+    widths = [
+        max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
+        for i in range(len(headers))
+    ]
+    summary = registry_summary(TRACE_IMAGE_REGISTRY_PATHS[resolved_image])
+    print(f"Docker image: {resolved_image}")
+    print(f"Registry: {summary['path']}")
+    print("")
+    print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    print("  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        print("  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+    print(f"\n{len(rows)} supported trace kernels")
+
+
+def cmd_update_trace_kernel_registry(args):
+    """Refresh fixed-image trace-kernel registries from supported Docker images."""
+    from kernel_tracing.registry_update import RegistryUpdateError, update_trace_kernel_registry
+
+    report_arg = getattr(args, "report", "") or ""
+    report_path = Path(report_arg) if report_arg else None
+    try:
+        result = update_trace_kernel_registry(
+            repo_root=REPO_ROOT,
+            report_path=report_path,
+            write=getattr(args, "write", False),
+        )
+    except RegistryUpdateError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    mode = "write" if result.wrote_registry else "dry-run"
+    print(f"Trace kernel registry update ({mode})")
+    for image, output_path in result.output_paths.items():
+        diff = result.diffs[image]
+        print(f"  image: {image}")
+        print(f"    output: {output_path}")
+        print(f"    repos: {', '.join(result.repos_by_image[image])}")
+        print(f"    kernels: {diff['old_count']} -> {diff['new_count']} ({diff['delta']:+d})")
+        print(
+            "    changes: "
+            f"added={len(diff['added'])}, "
+            f"removed={len(diff['removed'])}, "
+            f"changed={len(diff['changed'])}"
+        )
+    if result.report_path:
+        print(f"  report: {result.report_path}")
+    if not result.wrote_registry:
+        print("  registry not written; pass --write to update the YAML")
+
+
 def cmd_identify(args):
     """Step 2-4: Identify, classify, filter bottleneck kernels."""
     t0 = time.monotonic()
@@ -5895,6 +6111,60 @@ def main():
     _add_common_args(p)
     _add_benchmark_args(p)
 
+    # -- trace-kernel --
+    p = subparsers.add_parser(
+        "trace-kernel",
+        help="Trace one Triton launch or Python-visible HIP/custom op workload",
+    )
+    p.add_argument("-r", "--results-dir", required=True,
+                   help="Directory for trace outputs")
+    p.add_argument("--kernel-id", dest="kernel_ids", action="append", required=True,
+                   help="Supported trace kernel ID. Repeat or pass comma-separated IDs. "
+                        "Use list-trace-kernels to inspect IDs.")
+    p.add_argument("-b", "--benchmark-config", default="",
+                   help="Magpie benchmark YAML config")
+    p.add_argument("--run-cmd", default="",
+                   help="Local command to run for tracing")
+    p.add_argument("--max-records", type=int, default=100000)
+    p.add_argument("--sample-rate", type=float, default=1.0)
+    p.add_argument("--small-tensor-stats", action="store_true")
+    p.add_argument("--trace-all", action="store_true")
+    p.add_argument("--benchmark-timeout", type=int, default=5400)
+    p.add_argument("--docker-image", default="")
+    p.add_argument("--framework", default="")
+    p.add_argument("--disable-benchmark-cuda-graph", action="store_true",
+                   help="Patch the selected InferenceX benchmark script in Docker "
+                        "to disable SGLang/vLLM cuda graph capture while tracing")
+    p.add_argument("--dry-run", action="store_true")
+
+    # -- list-trace-kernels --
+    p = subparsers.add_parser(
+        "list-trace-kernels",
+        help="List supported trace-kernel IDs for one supported Docker image",
+    )
+    p.add_argument("-b", "--benchmark-config", default="",
+                   help="Benchmark YAML used to resolve the Docker image")
+    p.add_argument("--docker-image", default="",
+                   help="Supported Docker image whose trace registry should be listed")
+    p.add_argument("--framework", default="",
+                   help="Framework used when resolving an image from a benchmark config")
+    p.add_argument("--supported-images", action="store_true",
+                   help="List Docker images supported by trace-kernel registries")
+    p.add_argument("--repo", default="", choices=["", "aiter", "vllm", "sglang"],
+                   help="Filter by source repo")
+    p.add_argument("--kernel-type", default="", choices=["", "triton", "hip"],
+                   help="Filter by kernel type")
+
+    # -- update-trace-kernel-registry --
+    p = subparsers.add_parser(
+        "update-trace-kernel-registry",
+        help="Regenerate fixed-image trace-kernel registries from supported Docker images",
+    )
+    p.add_argument("--report", default="",
+                   help="Optional Markdown diff report path")
+    p.add_argument("--write", action="store_true",
+                   help="Write the updated registry YAML files; default is dry-run")
+
     # -- identify --
     p = subparsers.add_parser("identify",
                               help="Step 2-4: Identify & filter bottleneck kernels")
@@ -6032,6 +6302,9 @@ def main():
 
     handlers = {
         "benchmark": cmd_benchmark,
+        "trace-kernel": cmd_trace_kernel,
+        "list-trace-kernels": cmd_list_trace_kernels,
+        "update-trace-kernel-registry": cmd_update_trace_kernel_registry,
         "identify": cmd_identify,
         "list-kernels": cmd_list_kernels,
         "optimize": cmd_optimize,
