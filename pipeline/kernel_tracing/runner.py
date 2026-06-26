@@ -681,9 +681,9 @@ def _run_trace_benchmark(config: TraceKernelConfig) -> dict:
     env = _base_trace_env(config, docker=False)
     if mode == "docker":
         wrapper_dir = write_docker_wrapper(config.results_dir, extra_mounts=extra_mounts)
-        env["APEX_TRACE_HOST_RESULTS_DIR"] = str(config.results_dir)
+        env["APEX_TRACE_HOST_RESULTS_DIR"] = str(config.results_dir.resolve())
         env["APEX_TRACE_REAL_DOCKER"] = shutil.which("docker") or "/usr/bin/docker"
-        env["PATH"] = f"{wrapper_dir}:{env.get('PATH', '')}"
+        env["PATH"] = f"{wrapper_dir.resolve()}:{env.get('PATH', '')}"
     with _temporary_env(env):
         result = run_magpie_benchmark(
             framework=config.framework or "vllm",
@@ -709,7 +709,12 @@ def _trace_event_flags(
     *,
     include_details: bool = False,
 ) -> dict[str, Any]:
-    flags = {"any_event_found": False, "target_event_found": False}
+    flags = {
+        "any_event_found": False,
+        "any_target_event_found": False,
+        "partial_coverage": False,
+        "target_event_found": False,
+    }
     if isinstance(kernel_name, str):
         target_names = [kernel_name] if kernel_name else []
     else:
@@ -735,12 +740,19 @@ def _trace_event_flags(
                 )
                 if value is not None
             }
-            if not target_set or candidates & target_set:
-                flags["target_event_found"] = True
-                for name in candidates & target_set:
-                    found_by_target[name] = True
+            if not target_set:
+                flags["any_target_event_found"] = True
+                continue
+            for name in candidates & target_set:
+                found_by_target[name] = True
     if target_set:
+        flags["any_target_event_found"] = any(found_by_target.values())
         flags["target_event_found"] = all(found_by_target.values())
+        flags["partial_coverage"] = (
+            flags["any_target_event_found"] and not flags["target_event_found"]
+        )
+    else:
+        flags["target_event_found"] = flags["any_event_found"]
     if include_details:
         flags["target_events_found"] = found_by_target
         flags["missing_kernel_names"] = [
@@ -816,20 +828,26 @@ def _prepare_static_patches(
 
 
 def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
-    config.results_dir = Path(config.results_dir)
-    config.kernel_file = Path(config.kernel_file)
-    config.repo_root = Path(config.repo_root)
+    config.results_dir = Path(config.results_dir).expanduser().resolve()
+    config.kernel_file = Path(config.kernel_file).expanduser().resolve()
+    config.repo_root = Path(config.repo_root).expanduser().resolve()
+    if config.benchmark_config:
+        config.benchmark_config = str(Path(config.benchmark_config).expanduser().resolve())
     config.results_dir.mkdir(parents=True, exist_ok=True)
     trace_raw_dir = config.results_dir / "trace_raw"
     trace_raw_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        trace_raw_dir.chmod(0o777)
-    except OSError:
-        pass
+    if config.benchmark_config:
+        try:
+            # Docker benchmark workers can run as a different UID from the host
+            # user, but still need to append trace JSONL files to this bind
+            # mounted results directory.
+            trace_raw_dir.chmod(0o777)
+        except OSError:
+            pass
 
     targets = _targets_from_config(config)
     for target in targets:
-        target.kernel_file = Path(target.kernel_file)
+        target.kernel_file = Path(target.kernel_file).expanduser().resolve()
 
     target_modes: dict[str, str] = {}
     for target in targets:
@@ -934,9 +952,12 @@ def run_trace_kernel(config: TraceKernelConfig) -> dict[str, Any]:
         include_details=multi_target,
     )
     result.update(event_flags)
-    result["event_found"] = (
-        event_flags["any_event_found"] if config.trace_all else event_flags["target_event_found"]
-    )
+    if config.trace_all:
+        result["event_found"] = event_flags["any_event_found"]
+    elif multi_target:
+        result["event_found"] = event_flags["any_target_event_found"]
+    else:
+        result["event_found"] = event_flags["target_event_found"]
     result["success"] = bool(run_result.get("success", True)) and result["event_found"]
     write_target_kernel_tensor_shapes(config.results_dir, ranges, result)
     (config.results_dir / "trace_result.json").write_text(

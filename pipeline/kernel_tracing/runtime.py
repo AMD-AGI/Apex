@@ -129,8 +129,10 @@ def _apex_trace_event_impl(kind, kernel_name, source_file, line, args=None, kwar
         "kwargs": serialize_value(kwargs or {}),
         "extra": serialize_value(extra or {}),
     }
-    with _output_file().open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event, sort_keys=True) + "\n")
+    line = json.dumps(event, sort_keys=True) + "\n"
+    with _LOCK:
+        with _output_file().open("a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def apex_trace_event(kind, kernel_name, source_file, line, args=None, kwargs=None, grid=None, extra=None):

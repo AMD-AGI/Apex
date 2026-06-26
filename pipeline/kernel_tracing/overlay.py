@@ -170,6 +170,7 @@ def write_overlay_support(
     results_dir: Path,
     mappings: list[ModuleMapping],
 ) -> Path:
+    results_dir = results_dir.resolve()
     patched_files_dir = results_dir / "patched_files"
     patched_files_dir.mkdir(parents=True, exist_ok=True)
     (patched_files_dir / "apex_kernel_tracing_importer.py").write_text(
@@ -187,8 +188,8 @@ def write_overlay_support(
             {
                 "module_name": m.module_name,
                 "package_rel_path": m.package_rel_path,
-                "source_file": str(m.source_path),
-                "patched_file": str(m.patched_path),
+                "source_file": str(m.source_path.resolve()),
+                "patched_file": str(m.patched_path.resolve()),
                 "container_patched_file": f"/apex_trace/patched_files/overlay/{m.package_rel_path}",
                 "container_source_file": _container_source_file(m),
             }
@@ -214,6 +215,7 @@ def write_docker_wrapper(
     extra_mounts: list[tuple[Path | str, str]] | None = None,
 ) -> Path:
     """Create a docker wrapper that injects the tracing volume into docker run."""
+    results_dir = results_dir.resolve()
     wrapper_dir = results_dir / "docker_wrapper"
     wrapper_dir.mkdir(parents=True, exist_ok=True)
     real_docker = shutil.which("docker") or "/usr/bin/docker"

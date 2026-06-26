@@ -8,6 +8,22 @@ from pathlib import Path
 from typing import Any
 
 
+SIGNATURE_SCALAR_KEYS = {
+    "block_size",
+    "cache_dtype",
+    "causal",
+    "head_dim",
+    "kv_block_size",
+    "num_experts",
+    "num_heads",
+    "num_kv_heads",
+    "num_query_heads",
+    "page_size",
+    "sliding_window",
+    "top_k",
+}
+
+
 def _iter_events(trace_raw_dir: Path):
     for path in sorted(trace_raw_dir.glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -41,7 +57,7 @@ def _signature(event: dict) -> tuple:
     if isinstance(kwargs, dict):
         for key, value in sorted(kwargs.items()):
             if isinstance(value, (bool, int, float, str)):
-                if key.isupper() or key in {"causal", "top_k", "num_experts", "block_size"}:
+                if key.isupper() or key in SIGNATURE_SCALAR_KEYS:
                     sig.append((key, value))
     return tuple(sig)
 
@@ -158,18 +174,29 @@ def _compact_trace_result(
     if isinstance(trace_result, dict) and trace_result:
         return {
             "any_event_found": trace_result.get("any_event_found"),
+            "any_target_event_found": trace_result.get("any_target_event_found"),
             "missing_kernel_names": trace_result.get("missing_kernel_names") or [],
+            "partial_coverage": trace_result.get("partial_coverage"),
             "success": trace_result.get("success"),
             "target_event_found": trace_result.get("target_event_found"),
         }
 
     missing = [name for name in target_names if not targets.get(name, {}).get("events")]
     any_event_found = bool(result.get("total_calls"))
+    any_target_event_found = (
+        any(bool(targets.get(name, {}).get("events")) for name in target_names)
+        if target_names
+        else any_event_found
+    )
+    target_event_found = any_event_found and not missing
+    partial_coverage = any_target_event_found and not target_event_found
     return {
         "any_event_found": any_event_found,
+        "any_target_event_found": any_target_event_found,
         "missing_kernel_names": missing,
-        "success": any_event_found and not missing,
-        "target_event_found": any_event_found and not missing,
+        "partial_coverage": partial_coverage,
+        "success": any_event_found and any_target_event_found,
+        "target_event_found": target_event_found,
     }
 
 

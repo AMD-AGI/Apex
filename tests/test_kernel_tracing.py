@@ -517,6 +517,8 @@ def test_trace_event_flags_separate_any_and_target(tmp_path):
     )
     assert _trace_event_flags(tmp_path, "target") == {
         "any_event_found": True,
+        "any_target_event_found": False,
+        "partial_coverage": False,
         "target_event_found": False,
     }
 
@@ -540,6 +542,8 @@ def test_trace_event_flags_tracks_multiple_targets_and_load_names(tmp_path):
 
     assert _trace_event_flags(tmp_path, ["first", "second"]) == {
         "any_event_found": True,
+        "any_target_event_found": True,
+        "partial_coverage": False,
         "target_event_found": True,
     }
     details = _trace_event_flags(
@@ -547,6 +551,8 @@ def test_trace_event_flags_tracks_multiple_targets_and_load_names(tmp_path):
         ["first", "second", "missing"],
         include_details=True,
     )
+    assert details["any_target_event_found"] is True
+    assert details["partial_coverage"] is True
     assert details["target_event_found"] is False
     assert details["target_events_found"] == {
         "first": True,
@@ -716,6 +722,27 @@ def test_local_overlay_import_smoke(tmp_path):
     subprocess.run([sys.executable, "-c", "import mod"], env=env, check=True)
     raw = "\n".join(p.read_text() for p in (results / "trace_raw").glob("*.jsonl"))
     assert '"kind": "module_import"' in raw
+
+
+def test_overlay_manifest_uses_absolute_host_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    results = Path("relative_results")
+    patched = results / "patched_files" / "overlay" / "mod.py"
+    patched.parent.mkdir(parents=True)
+    patched.write_text("VALUE = 1\n", encoding="utf-8")
+    source = tmp_path / "source_mod.py"
+    source.write_text("VALUE = 0\n", encoding="utf-8")
+
+    manifest_path = write_overlay_support(
+        results_dir=results,
+        mappings=[ModuleMapping("mod", "mod.py", source, patched)],
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    item = manifest["patched_files"][0]
+    assert Path(manifest["mounts"]["host_results_dir"]).is_absolute()
+    assert Path(item["source_file"]).is_absolute()
+    assert Path(item["patched_file"]).is_absolute()
 
 
 def test_overlay_import_preserves_package_sibling_utils(tmp_path):
@@ -900,7 +927,89 @@ mod.wrapper(T(), T(), 64)
     assert target_shapes["targets"]["second_kernel"]["events"] == 1
 
 
-def test_run_trace_kernel_aiter_mode_patches_compile_ops_core(tmp_path):
+def test_run_trace_kernel_multiple_targets_partial_coverage(tmp_path):
+    src = tmp_path / "mod.py"
+    src.write_text("""
+class DummyKernel:
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            return "ok"
+        return launch
+
+first_kernel = DummyKernel()
+second_kernel = DummyKernel()
+
+def wrapper(q, k, block, launch_second=False):
+    first_kernel[(q.shape[0], block)](q, key=k, BLOCK_SIZE=block)
+    if launch_second:
+        second_kernel[(k.shape[0], block)](k, query=q, BLOCK_SIZE=block)
+""", encoding="utf-8")
+    script = tmp_path / "smoke.py"
+    script.write_text("""
+class T:
+    shape = (2, 3)
+    dtype = "fake"
+    device = "cpu"
+    layout = "strided"
+    requires_grad = False
+    def stride(self): return (3, 1)
+    def is_contiguous(self): return True
+    def numel(self): return 6
+    def element_size(self): return 4
+    def data_ptr(self): return 123
+
+import mod
+mod.wrapper(T(), T(), 64)
+""", encoding="utf-8")
+    cmd = f"{sys.executable} {script}"
+
+    result = run_trace_kernel(TraceKernelConfig(
+        results_dir=tmp_path / "results",
+        kernel_name="first_kernel",
+        kernel_file=src,
+        run_cmd=cmd,
+        max_records=10,
+        repo_root=tmp_path,
+        targets=[
+            TraceKernelTarget(
+                kernel_name="first_kernel",
+                kernel_file=src,
+                kernel_id="synthetic.first",
+                trace_mode="triton-launch",
+                kernel_type="triton",
+                patch_strategy="static",
+            ),
+            TraceKernelTarget(
+                kernel_name="second_kernel",
+                kernel_file=src,
+                kernel_id="synthetic.second",
+                trace_mode="triton-launch",
+                kernel_type="triton",
+                patch_strategy="static",
+            ),
+        ],
+    ))
+
+    assert result["success"] is True
+    assert result["event_found"] is True
+    assert result["any_target_event_found"] is True
+    assert result["target_event_found"] is False
+    assert result["partial_coverage"] is True
+    assert result["missing_kernel_names"] == ["second_kernel"]
+    assert result["target_events_found"] == {
+        "first_kernel": True,
+        "second_kernel": False,
+    }
+    target_shapes = json.loads(
+        (tmp_path / "results" / "target_kernel_tensor_shapes.json").read_text()
+    )
+    assert target_shapes["trace_result"]["partial_coverage"] is True
+    assert target_shapes["targets"]["first_kernel"]["events"] == 1
+    assert target_shapes["targets"]["second_kernel"]["events"] == 0
+
+
+def test_run_trace_kernel_aiter_mode_patches_compile_ops_core(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAGPIE_RUN_MODE", "local")
     core = tmp_path / "tools" / "rocm" / "aiter" / "aiter" / "jit" / "core.py"
     core.parent.mkdir(parents=True)
     core.write_text("""
@@ -920,17 +1029,22 @@ def compile_ops(_md_name, fc_name=None, ffi_type="pybind", develop=False):
     wrapper = tmp_path / "tools" / "rocm" / "aiter" / "aiter" / "ops" / "moe_op.py"
     wrapper.parent.mkdir(parents=True)
     wrapper.write_text("def fmoe(): pass\n", encoding="utf-8")
+    bench = tmp_path / "benchmark.yaml"
+    bench.write_text("benchmark: {}\n", encoding="utf-8")
     result = run_trace_kernel(TraceKernelConfig(
         results_dir=tmp_path / "results",
         kernel_name="fmoe",
         kernel_file=wrapper,
         trace_mode="aiter-compile-ops",
+        benchmark_config=str(bench),
         dry_run=True,
         repo_root=tmp_path,
     ))
     assert result["mode"] == "aiter-compile-ops"
     assert ((tmp_path / "results" / "trace_raw").stat().st_mode & 0o777) == 0o777
     assert result["patched_file"].endswith("patched_files/overlay/aiter/jit/core.py")
+    trace_config = json.loads((tmp_path / "results" / "trace_config.json").read_text())
+    assert Path(trace_config["benchmark_config"]).is_absolute()
     manifest = json.loads(
         (tmp_path / "results" / "patched_files" / "patch_manifest.json").read_text()
     )
@@ -1036,11 +1150,12 @@ python3 -m sglang.launch_server \\
     assert "--disable-cuda-graph" in text
 
 
-def test_write_docker_wrapper_includes_extra_mounts(tmp_path):
+def test_write_docker_wrapper_includes_extra_mounts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     host_script = tmp_path / "no_cudagraph.sh"
     host_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     wrapper_dir = write_docker_wrapper(
-        tmp_path,
+        Path("relative_results"),
         extra_mounts=[
             (
                 host_script,
@@ -1048,6 +1163,7 @@ def test_write_docker_wrapper_includes_extra_mounts(tmp_path):
             )
         ],
     )
+    assert wrapper_dir.is_absolute()
     extra_mounts = (wrapper_dir / "extra_mounts.tsv").read_text(encoding="utf-8")
     wrapper = (wrapper_dir / "docker").read_text(encoding="utf-8")
     assert str(host_script.resolve()) in extra_mounts
@@ -1079,6 +1195,40 @@ def test_postprocess_shape_ranges(tmp_path):
     assert target_shapes["targets"]["k"]["events"] == 2
     assert target_shapes["targets"]["k"]["group_count"] == 1
     assert target_shapes["workload_ranges"]["total_calls"] == 2
+
+
+def test_postprocess_signature_includes_attention_meta_kwargs(tmp_path):
+    raw = tmp_path / "trace_raw"
+    raw.mkdir()
+    events = [
+        {
+            "kind": "triton_launch",
+            "kernel_name": "paged_attn",
+            "kwargs": {"num_kv_heads": 8, "q": {"type": "tensor", "shape": [1, 64]}},
+            "source_file": "x.py",
+            "line": 1,
+        },
+        {
+            "kind": "triton_launch",
+            "kernel_name": "paged_attn",
+            "kwargs": {"num_kv_heads": 16, "q": {"type": "tensor", "shape": [1, 64]}},
+            "source_file": "x.py",
+            "line": 1,
+        },
+    ]
+    (raw / "trace_pid1_rank0.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in events) + "\n",
+        encoding="utf-8",
+    )
+
+    result = postprocess_trace(tmp_path)
+
+    assert result["total_calls"] == 2
+    assert len(result["groups"]) == 2
+    assert {
+        group["signature"]["num_kv_heads"]
+        for group in result["groups"]
+    } == {8, 16}
 
 
 def test_agent_fallback_uses_existing_backend(monkeypatch, tmp_path):
