@@ -19,6 +19,7 @@ from kernel_tracing.mode_detection import detect_trace_mode, normalize_trace_mod
 from kernel_tracing.overlay import ModuleMapping, write_docker_wrapper, write_overlay_support
 from kernel_tracing.patch_triton import patch_triton_launch_file
 from kernel_tracing.postprocess import postprocess_trace
+from kernel_tracing.registry import VLLM_TRACE_IMAGE
 from kernel_tracing.runner import (
     TraceKernelConfig,
     TraceKernelTarget,
@@ -598,14 +599,14 @@ def test_base_trace_env_uses_deduped_targets_and_trace_all(tmp_path, monkeypatch
     assert trace_all_env["APEX_TRACE_KERNEL_NAMES"] == ""
 
 
-def test_merge_benchmark_envs_preserves_existing_envs(tmp_path):
+def test_merge_benchmark_envs_pins_docker_image_and_preserves_existing_envs(tmp_path):
     bench = tmp_path / "bench.yaml"
     bench.write_text(
         "benchmark:\n"
         "  envs:\n"
         "    PYTHONPATH: /existing/path\n"
         "    KEEP_ME: keep\n"
-        "  docker_image: image:tag\n",
+        "  docker_image: vllm/vllm-openai-rocm:nightly\n",
         encoding="utf-8",
     )
     config = TraceKernelConfig(
@@ -613,16 +614,25 @@ def test_merge_benchmark_envs_preserves_existing_envs(tmp_path):
         kernel_name="target",
         kernel_file=tmp_path / "kernel.py",
         max_records=3,
+        docker_image=VLLM_TRACE_IMAGE,
     )
 
     out = _merge_benchmark_envs(str(bench), config, docker=True)
     data = yaml.safe_load(out.read_text(encoding="utf-8"))
+    assert data["benchmark"]["docker_image"] == VLLM_TRACE_IMAGE
     envs = data["benchmark"]["envs"]
     assert envs["KEEP_ME"] == "keep"
     assert envs["PYTHONPATH"] == "/apex_trace/patched_files:/existing/path"
     assert envs["APEX_TRACE_ENABLED"] == "1"
     assert envs["APEX_TRACE_KERNEL_NAMES"] == "target"
     assert envs["APEX_TRACE_MAX_RECORDS"] == "3"
+
+    original = yaml.safe_load(bench.read_text(encoding="utf-8"))
+    assert original["benchmark"]["docker_image"] == "vllm/vllm-openai-rocm:nightly"
+
+    local_out = _merge_benchmark_envs(str(bench), config, docker=False)
+    local_data = yaml.safe_load(local_out.read_text(encoding="utf-8"))
+    assert local_data["benchmark"]["docker_image"] == "vllm/vllm-openai-rocm:nightly"
 
 
 def test_temporary_env_restores_original_environment(monkeypatch):

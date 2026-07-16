@@ -252,6 +252,11 @@ def _base_trace_env(config: TraceKernelConfig, *, docker: bool = False) -> dict[
 def _merge_benchmark_envs(config_path: str, config: TraceKernelConfig, *, docker: bool) -> Path:
     data = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
     bench = data.setdefault("benchmark", data)
+    if docker and config.docker_image:
+        # Registry entries are tied to one exact image's Python source. Ensure
+        # Magpie runs that same image even when the input benchmark config pins
+        # an older or mutable tag such as ``nightly``.
+        bench["docker_image"] = config.docker_image
     envs = bench.setdefault("envs", {})
     trace_env = _base_trace_env(config, docker=docker)
     for key in (

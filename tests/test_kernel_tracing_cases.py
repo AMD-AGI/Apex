@@ -74,12 +74,41 @@ def test_supported_kernel_registry_schema():
         assert all(entry.trace_mode != "agent" for entry in entries)
 
     vllm_ids = {entry.id for entry in SUPPORTED_BY_IMAGE[VLLM_TRACE_IMAGE]}
+    assert len(vllm_ids) == 841
+    vllm_counts = {
+        (repo, kernel_type): sum(
+            entry.repo == repo and entry.kernel_type == kernel_type
+            for entry in SUPPORTED_BY_IMAGE[VLLM_TRACE_IMAGE]
+        )
+        for repo in ("aiter", "vllm")
+        for kernel_type in ("hip", "triton")
+    }
+    assert vllm_counts == {
+        ("aiter", "hip"): 205,
+        ("aiter", "triton"): 259,
+        ("vllm", "hip"): 174,
+        ("vllm", "triton"): 203,
+    }
+    assert REGISTRIES_RAW[VLLM_TRACE_IMAGE]["package_sources"]["aiter"][
+        "package_version"
+    ] == "0.1.13.post1"
+    assert REGISTRIES_RAW[VLLM_TRACE_IMAGE]["package_sources"]["vllm"][
+        "package_version"
+    ] == "0.23.0+rocm723"
     assert {
         "vllm.hip.reshape_and_cache_flash",
         "vllm.triton.gumbel_sample",
         "aiter.triton.unified_attention_2d",
         "aiter.hip.moe_sorting_fwd",
     } <= vllm_ids
+    pack_bitmatrix = next(
+        entry
+        for entry in SUPPORTED_BY_IMAGE[VLLM_TRACE_IMAGE]
+        if entry.id == "vllm.triton.pack_bitmatrix"
+    )
+    assert pack_bitmatrix.kernel_file.endswith(
+        "model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py"
+    )
     sglang_ids = {entry.id for entry in SUPPORTED_BY_IMAGE[SGLANG_TRACE_IMAGE]}
     assert {
         "sglang.triton.fused_append_shared_experts_kernel",
@@ -191,7 +220,7 @@ def test_registry_schema_accepts_image_metadata(tmp_path):
         "package_sources": {
             "vllm": {
                 "image": VLLM_TRACE_IMAGE,
-                "package_version": "0.19.1+rocm721",
+                "package_version": "0.23.0+rocm723",
                 "source_path": "/usr/local/lib/python3.12/dist-packages/vllm",
                 "registry_path": "tools/rocm/vllm/vllm",
             }
@@ -381,6 +410,7 @@ def test_list_trace_kernels_supported_images():
     )
     assert VLLM_TRACE_IMAGE in proc.stdout
     assert SGLANG_TRACE_IMAGE in proc.stdout
+    assert "vllm/vllm-openai-rocm:v0.19.1" not in proc.stdout
 
 
 def test_list_trace_kernels_resolves_sglang_benchmark_config():
@@ -408,14 +438,21 @@ def test_list_trace_kernels_resolves_sglang_benchmark_config():
     assert "sglang.triton.fused_append_shared_experts_kernel" in proc.stdout
 
 
-def test_list_trace_kernels_rejects_unsupported_image():
+@pytest.mark.parametrize(
+    "image",
+    [
+        "vllm/vllm-openai-rocm:v0.19.1",
+        "vllm/vllm-openai-rocm:nightly",
+    ],
+)
+def test_list_trace_kernels_rejects_unsupported_image(image):
     proc = subprocess.run(
         [
             sys.executable,
             "workload_optimizer.py",
             "list-trace-kernels",
             "--docker-image",
-            "vllm/vllm-openai-rocm:nightly",
+            image,
         ],
         cwd=REPO_ROOT,
         capture_output=True,

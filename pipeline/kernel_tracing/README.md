@@ -12,7 +12,7 @@ This feature is meant to answer one practical question:
 python3 workload_optimizer.py trace-kernel \
   -r /path/to/results_trace \
   --kernel-id aiter.triton.unified_attention_2d \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --docker-image vllm/vllm-openai-rocm:v0.23.0 \
   --max-records 200 \
   --sample-rate 1.0 \
   -b /root/Magpie/examples/benchmarks/benchmark_vllm_gptoss_20b.yaml
@@ -22,9 +22,9 @@ List supported IDs with:
 
 ```bash
 python3 workload_optimizer.py list-trace-kernels \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1
+  --docker-image vllm/vllm-openai-rocm:v0.23.0
 python3 workload_optimizer.py list-trace-kernels \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --docker-image vllm/vllm-openai-rocm:v0.23.0 \
   --repo vllm --kernel-type hip
 python3 workload_optimizer.py list-trace-kernels --supported-images
 ```
@@ -190,6 +190,12 @@ APEX_TRACE_OUTPUT_DIR=/apex_trace/trace_raw
 
 The importer records a `module_import` event whenever a patched overlay module is imported. This diagnostic event is never sampled and does not count against `--max-records`.
 
+The generated `benchmark/trace_benchmark_config.yaml` also pins
+`benchmark.docker_image` to the exact image selected for the trace registry.
+This overrides an older or mutable image tag in the input benchmark config
+without modifying the original YAML, keeping registry discovery, source
+extraction, and the executed workload on the same image.
+
 ## Interpreting Results
 
 ### Case 1: `module_import` and target events exist
@@ -232,7 +238,7 @@ Use this workflow for a new target:
 
 Kernel tracing intentionally supports only these Docker images:
 
-- `vllm/vllm-openai-rocm:v0.19.1`
+- `vllm/vllm-openai-rocm:v0.23.0`
 - `lmsysorg/sglang:v0.5.12-rocm720-mi35x`
 
 Each image has its own generated registry under
@@ -257,10 +263,11 @@ python3 workload_optimizer.py update-trace-kernel-registry --write
 The generator copies Python source from the two supported images, discovers
 traceable launch/wrapper sites, records image/package provenance, and writes:
 
-- `pipeline/kernel_tracing/registries/vllm_v0_19_1.yaml`
+- `pipeline/kernel_tracing/registries/vllm_v0_23_0.yaml`
 - `pipeline/kernel_tracing/registries/sglang_v0_5_12_rocm720_mi35x.yaml`
 
-Custom, nightly, digest-only, or other architecture images are not accepted by
+The former vLLM `v0.19.1` image, custom tags, nightly, digest-only, or other
+architecture images are not accepted by
 `trace-kernel`. During Docker tracing, Apex extracts the source file from the
 resolved supported image and fails hard if the file cannot be found, rather than
 falling back to a possibly mismatched local checkout.
@@ -284,7 +291,7 @@ This traces a known aiter Triton launch used by GPT-OSS 20B when vLLM routes att
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_unified_attention_2d \
   --kernel-id aiter.triton.unified_attention_2d \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --docker-image vllm/vllm-openai-rocm:v0.23.0 \
   --max-records 200 \
   --sample-rate 1.0 \
   --benchmark-timeout 2700 \
@@ -305,7 +312,7 @@ This traces the Python-visible vLLM cache wrapper before it calls the compiled c
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_vllm_reshape_and_cache_flash \
   --kernel-id vllm.hip.reshape_and_cache_flash \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --docker-image vllm/vllm-openai-rocm:v0.23.0 \
   --max-records 200 \
   --sample-rate 1.0 \
   --benchmark-timeout 2700 \
@@ -325,7 +332,7 @@ Use this when you know a high-level aiter path is involved, but you do not yet k
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_compile_ops_discovery \
   --kernel-id aiter.hip.fmoe \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --docker-image vllm/vllm-openai-rocm:v0.23.0 \
   --trace-all \
   --max-records 200 \
   --sample-rate 1.0 \
@@ -356,7 +363,7 @@ Then rerun with the actual supported low-level `--kernel-id`, for example:
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_gptoss20b_aiter_fmoe \
   --kernel-id aiter.hip.fmoe \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --docker-image vllm/vllm-openai-rocm:v0.23.0 \
   --max-records 10000 \
   --sample-rate 0.01 \
   --benchmark-timeout 2700 \
@@ -371,7 +378,7 @@ Use `--dry-run` to validate that the patch can be generated and compiled without
 python3 workload_optimizer.py trace-kernel \
   -r /tmp/apex_trace_dry_unified_attention \
   --kernel-id aiter.triton.unified_attention_2d \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --docker-image vllm/vllm-openai-rocm:v0.23.0 \
   --dry-run
 ```
 
@@ -387,7 +394,7 @@ select the fixed registry that defines the supported kernel ID.
 python3 workload_optimizer.py trace-kernel \
   -r /root/Apex/results_trace_local_pa_decode \
   --kernel-id aiter.triton.paged_attn_decode_v1_wo_dot \
-  --docker-image vllm/vllm-openai-rocm:v0.19.1 \
+  --docker-image vllm/vllm-openai-rocm:v0.23.0 \
   --max-records 200 \
   --sample-rate 1.0 \
   --run-cmd 'python3 -m pytest /root/Apex/tools/rocm/aiter/op_tests/triton_tests/attention/test_pa_decode.py -x'
