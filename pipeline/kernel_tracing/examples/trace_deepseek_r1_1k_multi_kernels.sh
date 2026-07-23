@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Example DeepSeek R1 multi-kernel tracing run.
+# DeepSeek R1 MXFP4 1K/1K multi-kernel tracing example.
 #
-# Override the workload without editing this file:
-#   BENCH_CONFIG=tmp/benchmark_sglang_dsr1_isl8192_osl1024.yaml \
-#   RESULTS_DIR=tmp/results_trace_deepseek_r1_isl8192_osl1024_example \
-#   bash pipeline/kernel_tracing/trace_deepseek_r1_multi_kernels_example.sh
+# Basic use:
+#   HF_CACHE_PATH=/path/to/huggingface \
+#     bash pipeline/kernel_tracing/examples/trace_deepseek_r1_1k_multi_kernels.sh
 #
 # Common knobs:
-#   MAX_RECORDS=20000 SAMPLE_RATE=1.0 BENCHMARK_TIMEOUT=7200
+#   MAX_RECORDS=300000 SAMPLE_RATE=0.01 BENCHMARK_TIMEOUT=7200
 #   TRACE_ALL=1 DRY_RUN=1 DISABLE_BENCHMARK_CUDA_GRAPH=0
 
-APEX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APEX_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$APEX_ROOT"
 
 if [[ -f "$APEX_ROOT/.venv/bin/activate" ]]; then
@@ -31,20 +31,26 @@ if [[ -z "${MAGPIE_ROOT:-}" ]]; then
   fi
 fi
 
+export HF_CACHE_PATH="${HF_CACHE_PATH:-${HF_HOME:-$HOME/.cache/huggingface}}"
 export MAGPIE_RUN_MODE="${MAGPIE_RUN_MODE:-docker}"
 
 TS="$(date -u +%Y%m%d_%H%M%S)"
-DEFAULT_RESULTS_DIR="$APEX_ROOT/tmp/results_trace_deepseek_r1_multi_kernels_${TS}"
+DEFAULT_RESULTS_DIR="$APEX_ROOT/tmp/results_trace_deepseek_r1_1k_multi_kernels_${TS}"
 RESULTS_DIR="${RESULTS_DIR:-$DEFAULT_RESULTS_DIR}"
 mkdir -p "$RESULTS_DIR"
 
-# Default tmp config is aligned with the DeepSeek R1 SGLang FP4 fixed-seq run.
-DEFAULT_TRACE_BENCH="$APEX_ROOT/tmp/benchmark_sglang_dsr1_isl1024_osl1024.yaml"
+# Keep the script and its one supported workload paired in this directory.
+DEFAULT_TRACE_BENCH="$SCRIPT_DIR/benchmark_sglang_dsr1_isl1024_osl1024.yaml"
 TRACE_BENCH="${BENCH_CONFIG:-$DEFAULT_TRACE_BENCH}"
 if [[ ! -f "$TRACE_BENCH" ]]; then
   echo "Benchmark config not found: $TRACE_BENCH" >&2
   exit 1
 fi
+
+DOCKER_IMAGE="${DOCKER_IMAGE:-lmsysorg/sglang:v0.5.12-rocm720-mi35x}"
+MAX_RECORDS="${MAX_RECORDS:-300000}"
+SAMPLE_RATE="${SAMPLE_RATE:-0.01}"
+BENCHMARK_TIMEOUT="${BENCHMARK_TIMEOUT:-7200}"
 
 # These cover the CSV analysis targets that are present in the fixed-image
 # trace registries under pipeline/kernel_tracing/registries/.
@@ -120,6 +126,8 @@ echo "Apex root:       $APEX_ROOT"
 echo "Magpie root:     $MAGPIE_ROOT"
 echo "Results dir:     $RESULTS_DIR"
 echo "Benchmark config:$TRACE_BENCH"
+echo "Docker image:    $DOCKER_IMAGE"
+echo "HF cache path:   $HF_CACHE_PATH"
 echo "Run mode:        $MAGPIE_RUN_MODE"
 echo "Framework:       ${FRAMEWORK:-sglang}"
 echo "CUDA graph:      disable overlay=${DISABLE_BENCHMARK_CUDA_GRAPH:-1}"
@@ -133,9 +141,10 @@ python3 workload_optimizer.py trace-kernel \
   "${TRACE_ALL_ARGS[@]}" \
   "${DRY_RUN_ARGS[@]}" \
   "${CUDA_GRAPH_ARGS[@]}" \
-  --max-records "${MAX_RECORDS:-20000}" \
-  --sample-rate "${SAMPLE_RATE:-1.0}" \
-  --benchmark-timeout "${BENCHMARK_TIMEOUT:-7200}" \
+  --docker-image "$DOCKER_IMAGE" \
+  --max-records "$MAX_RECORDS" \
+  --sample-rate "$SAMPLE_RATE" \
+  --benchmark-timeout "$BENCHMARK_TIMEOUT" \
   --framework "${FRAMEWORK:-sglang}" \
   -b "$TRACE_BENCH"
 

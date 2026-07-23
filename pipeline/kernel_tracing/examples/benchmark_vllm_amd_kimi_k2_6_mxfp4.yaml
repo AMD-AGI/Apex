@@ -1,0 +1,47 @@
+# vLLM Benchmark Configuration for amd/Kimi-K2.6-MXFP4
+# ====================================================
+#
+# Usage (Docker - default):
+#   HF_CACHE_PATH=/path/to/huggingface \
+#     python -m Magpie benchmark --benchmark-config \
+#     pipeline/kernel_tracing/examples/benchmark_vllm_amd_kimi_k2_6_mxfp4.yaml
+#
+# Usage (Local - run directly on host, e.g. inside a pod):
+#   HF_CACHE_PATH=/path/to/huggingface \
+#     python -m Magpie benchmark --benchmark-config \
+#     pipeline/kernel_tracing/examples/benchmark_vllm_amd_kimi_k2_6_mxfp4.yaml \
+#     --run-mode local
+
+benchmark:
+  framework: vllm
+  model: amd/Kimi-K2.6-MXFP4
+  precision: mxfp4
+
+  envs:
+    TP: 4
+    CONC: 32
+    ISL: 8192
+    OSL: 1024
+    RANDOM_RANGE_RATIO: 0.8
+    MAX_MODEL_LEN: 131072
+    VLLM_ROCM_USE_AITER: "1"
+    EXTRA_VLLM_ARGS: "--block-size 1 --enable-auto-tool-choice --tool-call-parser kimi_k2"
+
+  profiler:
+    torch_profiler:
+      enabled: false
+    system_profiler:
+      enabled: false
+    tracelens:
+      enabled: false
+
+  docker_image: "vllm/vllm-openai-rocm:v0.23.0"
+  # Magpie expands environment variables before creating the cache bind mount.
+  hf_cache_path: "${HF_CACHE_PATH}"
+  benchmark_script: "vllm_mi355x.sh"
+  timeout_seconds: 3600
+
+  gap_analysis:
+    enabled: false
+    top_k: 100
+    find_kernel_sources: false

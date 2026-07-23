@@ -42,13 +42,15 @@ python3 workload_optimizer.py trace-kernel \
   -b /root/Magpie/examples/benchmarks/benchmark_sglang_dsr1.yaml
 ```
 
-For the DeepSeek R1 SGLang multi-kernel shape-analysis workflow, use the
-checked-in example script and override the benchmark config as needed:
+Checked-in Kimi K2.6 and DeepSeek R1 examples pair each trace script with one
+benchmark workload under `pipeline/kernel_tracing/examples/`:
 
 ```bash
-BENCH_CONFIG=tmp/benchmark_sglang_dsr1_isl8192_osl1024.yaml \
-RESULTS_DIR=tmp/results_trace_deepseek_r1_isl8192_osl1024_example \
-bash pipeline/kernel_tracing/trace_deepseek_r1_multi_kernels_example.sh
+HF_CACHE_PATH=/path/to/huggingface \
+  bash pipeline/kernel_tracing/examples/trace_kimi_k2_6_mxfp4_multi_kernels.sh
+
+HF_CACHE_PATH=/path/to/huggingface \
+  bash pipeline/kernel_tracing/examples/trace_deepseek_r1_1k_multi_kernels.sh
 ```
 
 `trace-kernel` has two phases:
