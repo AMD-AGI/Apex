@@ -74,7 +74,7 @@ def test_supported_kernel_registry_schema():
         assert all(entry.trace_mode != "agent" for entry in entries)
 
     vllm_ids = {entry.id for entry in SUPPORTED_BY_IMAGE[VLLM_TRACE_IMAGE]}
-    assert len(vllm_ids) == 841
+    assert len(vllm_ids) == 844
     vllm_counts = {
         (repo, kernel_type): sum(
             entry.repo == repo and entry.kernel_type == kernel_type
@@ -86,8 +86,8 @@ def test_supported_kernel_registry_schema():
     assert vllm_counts == {
         ("aiter", "hip"): 205,
         ("aiter", "triton"): 259,
-        ("vllm", "hip"): 174,
-        ("vllm", "triton"): 203,
+        ("vllm", "hip"): 176,
+        ("vllm", "triton"): 204,
     }
     assert REGISTRIES_RAW[VLLM_TRACE_IMAGE]["package_sources"]["aiter"][
         "package_version"
@@ -97,6 +97,9 @@ def test_supported_kernel_registry_schema():
     ] == "0.23.0+rocm723"
     assert {
         "vllm.hip.reshape_and_cache_flash",
+        "vllm.hip.custom_all_reduce_callsite",
+        "vllm.hip.pynccl_all_reduce_callsite",
+        "vllm.triton.solve_tril_bt64_callsite",
         "vllm.triton.gumbel_sample",
         "aiter.triton.unified_attention_2d",
         "aiter.hip.moe_sorting_fwd",
@@ -258,6 +261,20 @@ def test_discovery_from_repo_shaped_root(tmp_path):
     entries = discover_trace_kernel_entries(tmp_path)
     assert {entry.id for entry in entries} == {"vllm.triton.sample_kernel"}
     assert entries[0].kernel_file == "tools/rocm/vllm/vllm/sample_kernel.py"
+
+
+def test_registry_generation_preserves_supplemental_callsites():
+    data = registry_update.build_registry_data(
+        docker_image=VLLM_TRACE_IMAGE,
+        image_metadata={"image": VLLM_TRACE_IMAGE},
+        package_sources={"vllm": {"image": VLLM_TRACE_IMAGE}},
+        discovered_entries=[],
+    )
+    assert {entry["id"] for entry in data["kernels"]} == {
+        "vllm.triton.solve_tril_bt64_callsite",
+        "vllm.hip.custom_all_reduce_callsite",
+        "vllm.hip.pynccl_all_reduce_callsite",
+    }
 
 
 def test_update_registry_dry_run_does_not_write_yaml(tmp_path, monkeypatch):

@@ -39,9 +39,8 @@ if [[ -z "${MAGPIE_ROOT:-}" ]]; then
   fi
 fi
 
-# The paired YAML uses this environment variable for its cache bind mount.
-# Keep the tested large-model cache location as the default while allowing
-# callers to point at a persistent HuggingFace cache.
+# The script resolves this environment variable into a run-local benchmark
+# config before invoking Magpie. Magpie v0.23 does not expand hf_cache_path.
 export HF_CACHE_PATH="${HF_CACHE_PATH:-/tmp/qwen3_next_hf_cache}"
 
 DOCKER_IMAGE="vllm/vllm-openai-rocm:v0.23.0"
@@ -52,7 +51,7 @@ MAX_RECORDS="${MAX_RECORDS:-500000}"
 SAMPLE_RATE="${SAMPLE_RATE:-0.01}"
 BENCHMARK_TIMEOUT="${BENCHMARK_TIMEOUT:-14400}"
 DRY_RUN="${DRY_RUN:-0}"
-REQUIRE_ALL="${REQUIRE_ALL:-0}"
+REQUIRE_ALL="${REQUIRE_ALL:-1}"
 DISABLE_BENCHMARK_CUDA_GRAPH="${DISABLE_BENCHMARK_CUDA_GRAPH:-1}"
 
 DEFAULT_TRACE_BENCH="$SCRIPT_DIR/benchmark_vllm_qwen3_next_80b_a3b_instruct_bf16.yaml"
@@ -81,61 +80,45 @@ if [[ -d "$RESULTS_DIR" ]] \
   exit 1
 fi
 mkdir -p "$RESULTS_DIR"
+chmod 0755 "$RESULTS_DIR"
 
-# Qwen3-Next alternates Gated DeltaNet and standard attention, followed by a
-# 512-expert BF16 MoE. These IDs cover Python-visible GDN prefill/decode,
-# attention/cache, dense GEMM, routed MoE, and normalization paths in the fixed
-# vLLM 0.23 image. Branch-dependent fallbacks may legitimately remain unhit.
+# Qwen3-Next has 36 Gated DeltaNet layers and 12 full-attention layers, followed
+# by a 512-expert/top-10 BF16 MoE in every layer. For head_dim=256, vLLM 0.23
+# selects ROCM_ATTN; Qwen3-Next's hybrid KV layout then uses the stride-aware
+# Triton attention/cache kernels below rather than ROCM_AITER_FA fallbacks.
 KERNEL_IDS=(
-  # Gated DeltaNet prefill (vLLM Triton/FLA on ROCm).
+  # Gated DeltaNet prefill and its BT=64 triangular solve.
   "vllm.triton.fused_post_conv_kernel"
   "vllm.triton.chunk_gated_delta_rule_fwd_kernel_h_blockdim64"
   "vllm.triton.chunk_fwd_kernel_o"
   "vllm.triton.chunk_scaled_dot_kkt_fwd_kernel"
   "vllm.triton.chunk_local_cumsum_scalar_kernel"
-  "vllm.triton.chunk_local_cumsum_vector_kernel"
-  "vllm.triton.l2norm_fwd_kernel"
-  "vllm.triton.l2norm_fwd_kernel1"
   "vllm.triton.fla_ops_wy_fast.recompute_w_u_fwd_kernel"
+  "vllm.triton.solve_tril_bt64_callsite"
 
-  # Gated DeltaNet decode (AITER fast path plus vLLM fallback).
+  # Gated DeltaNet decode and gated output normalization.
   "aiter.triton.reshape_causal_conv1d_update_single_token_kernel"
-  "aiter.triton.causal_conv1d_update_single_token_kernel"
   "aiter.triton.fused_rearrange_sigmoid_gated_delta_rule_update_kernel"
-  "vllm.triton.fused_recurrent_gated_delta_rule_packed_decode_kernel"
+  "vllm.triton.layer_norm_fwd_kernel"
 
-  # Standard-attention layers and KV cache.
-  "aiter.hip.get_pa_metadata_v1"
-  "aiter.hip.pa_fwd"
-  "aiter.hip.pa_ps_fwd"
-  "aiter.triton.unified_attention_2d"
-  "aiter.triton.kernel_unified_attention_3d"
-  "aiter.triton.reduce_segments"
+  # ROCM_ATTN prefill, decode, hybrid-layout KV-cache write, and RoPE.
+  "vllm.triton.attention_ops_prefix_prefill.fwd_kernel"
+  "vllm.triton.kernel_paged_attention_2d"
+  "vllm.triton.reshape_and_cache_flash"
   "vllm.hip.rotary_embedding"
-  "vllm.hip.reshape_and_cache"
 
   # BF16 dense projections.
   "vllm.hip.rocm_unquantized_gemm"
-  "aiter.hip.gemm_a16w16_asm"
-  "aiter.triton.gemm_a16_w16_kernel"
-  "aiter.triton.gemm_a16w16_reduce_kernel"
 
-  # BF16 routed MoE and routing.
-  "vllm.hip.fused_experts"
-  "aiter.hip.grouped_topk"
-  "aiter.hip.biased_grouped_topk"
+  # BF16 routed MoE: top-k router, sorting, and CK two-stage experts.
+  "aiter.hip.topk_softmax"
   "aiter.hip.moe_sorting_fwd"
-  "aiter.hip.fmoe"
-  "aiter.hip.fmoe_g1u1"
-  "aiter.hip.fmoe_g1u1_a16"
   "aiter.hip.ck_moe_stage1"
   "aiter.hip.ck_moe_stage2"
-  "aiter.triton.triton_moe_moe_op.fused_moe_kernel"
-  "aiter.triton.triton_moe_moe_op.fused_moe_persistent_kernel"
 
-  # Eager-mode normalization.
-  "vllm.hip.kernels_vllm_c.rms_norm"
-  "vllm.hip.kernels_vllm_c.fused_add_rms_norm"
+  # Runtime-confirmed TP collective dispatch.
+  "vllm.hip.custom_all_reduce_callsite"
+  "vllm.hip.pynccl_all_reduce_callsite"
 )
 
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
@@ -195,6 +178,31 @@ PY
 )"
 mkdir -p "$HF_CACHE_PATH"
 chmod 0755 "$HF_CACHE_PATH"
+
+# BenchmarkConfig.from_dict() receives hf_cache_path verbatim. Materialize a
+# run-local config so the documented HF_CACHE_PATH override actually controls
+# the Docker bind mount while preserving the checked-in workload definition.
+RESOLVED_TRACE_BENCH="$RESULTS_DIR/benchmark_config.resolved.yaml"
+python3 - "$TRACE_BENCH" "$RESOLVED_TRACE_BENCH" "$HF_CACHE_PATH" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+cache = Path(sys.argv[3]).resolve()
+data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+benchmark = data.get("benchmark")
+if not isinstance(benchmark, dict):
+    raise SystemExit(f"Missing benchmark mapping in {source}")
+benchmark["hf_cache_path"] = str(cache)
+destination.write_text(
+    yaml.safe_dump(data, sort_keys=False, width=120),
+    encoding="utf-8",
+)
+PY
+TRACE_BENCH="$RESOLVED_TRACE_BENCH"
 
 if [[ "$DRY_RUN" == "0" ]]; then
   docker run --rm \
@@ -500,7 +508,28 @@ print(
 )
 PY
 
+SHARE_ARCHIVE="$(python3 - "$APEX_ROOT" "$RESULTS_DIR" "$TRACE_BENCH" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+results = Path(sys.argv[2])
+benchmark_config = Path(sys.argv[3])
+sys.path.insert(0, str(root / "pipeline"))
+
+from kernel_tracing.postprocess import write_tensor_shape_share_archive
+
+archive = write_tensor_shape_share_archive(
+    results,
+    analysis_dir=results / "serving_only",
+    benchmark_config_path=benchmark_config,
+)
+print(archive)
+PY
+)"
+
 echo "Results folder: $RESULTS_DIR"
 echo "Serving-only shapes: $RESULTS_DIR/serving_only/target_kernel_tensor_shapes.json"
 echo "Coverage: $RESULTS_DIR/serving_only/coverage_summary.json"
 echo "Window: $RESULTS_DIR/serving_only/window.json"
+echo "Share archive: $SHARE_ARCHIVE"

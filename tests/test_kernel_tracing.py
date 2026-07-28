@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,7 +19,11 @@ from kernel_tracing.agent_harness import AgentPatchRequest, run_agent_patch_fall
 from kernel_tracing.mode_detection import detect_trace_mode, normalize_trace_mode
 from kernel_tracing.overlay import ModuleMapping, write_docker_wrapper, write_overlay_support
 from kernel_tracing.patch_triton import patch_triton_launch_file
-from kernel_tracing.postprocess import postprocess_trace
+from kernel_tracing.postprocess import (
+    TENSOR_SHAPE_SHARE_MEMBERS,
+    postprocess_trace,
+    write_tensor_shape_share_archive,
+)
 from kernel_tracing.registry import VLLM_TRACE_IMAGE
 from kernel_tracing.runner import (
     TraceKernelConfig,
@@ -1205,6 +1210,38 @@ def test_postprocess_shape_ranges(tmp_path):
     assert target_shapes["targets"]["k"]["events"] == 2
     assert target_shapes["targets"]["k"]["group_count"] == 1
     assert target_shapes["workload_ranges"]["total_calls"] == 2
+
+
+def test_write_tensor_shape_share_archive_contains_exact_review_files(tmp_path):
+    results = tmp_path / "results"
+    analysis = results / "serving_only"
+    benchmark = results / "benchmark"
+    analysis.mkdir(parents=True)
+    benchmark.mkdir()
+    benchmark_config = results / "benchmark_config.resolved.yaml"
+    sources = {
+        analysis / "workload_summary.md": "summary\n",
+        analysis / "target_kernel_tensor_shapes.json": '{"targets": {}}\n',
+        benchmark_config: "benchmark: {}\n",
+        analysis / "coverage_summary.json": '{"targets_present": 1}\n',
+        analysis / "window.json": '{"warmup_excluded": true}\n',
+        analysis / "trace_config.json": '{"sample_rate": 0.01}\n',
+        benchmark / "benchmark_result.json": '{"success": true}\n',
+        analysis / "workload_ranges.json": '{"groups": []}\n',
+    }
+    for path, text in sources.items():
+        path.write_text(text, encoding="utf-8")
+
+    archive_path = write_tensor_shape_share_archive(
+        results,
+        analysis_dir=analysis,
+        benchmark_config_path=benchmark_config,
+    )
+
+    with zipfile.ZipFile(archive_path) as archive:
+        assert tuple(archive.namelist()) == TENSOR_SHAPE_SHARE_MEMBERS
+        assert archive.read("window.json") == b'{"warmup_excluded": true}\n'
+        assert archive.testzip() is None
 
 
 def test_postprocess_signature_includes_attention_meta_kwargs(tmp_path):

@@ -4170,6 +4170,20 @@ kernels:
   kernel_file: tools/rocm/vllm/vllm/device_allocator/xpumem.py
   trace_mode: vllm-custom-op
   patch_strategy: static
+- id: vllm.hip.custom_all_reduce_callsite
+  repo: vllm
+  kernel_type: hip
+  kernel_name: custom_all_reduce
+  kernel_file: tools/rocm/vllm/vllm/distributed/device_communicators/custom_all_reduce.py
+  trace_mode: vllm-custom-op
+  patch_strategy: static
+- id: vllm.hip.pynccl_all_reduce_callsite
+  repo: vllm
+  kernel_type: hip
+  kernel_name: all_reduce
+  kernel_file: tools/rocm/vllm/vllm/distributed/device_communicators/pynccl.py
+  trace_mode: vllm-custom-op
+  patch_strategy: static
 - id: vllm.hip.kernels_aiter_ops.fused_add_rms_norm
   repo: vllm
   kernel_type: hip
@@ -4778,6 +4792,13 @@ kernels:
   kernel_name: layer_norm_fwd_kernel
   kernel_file: tools/rocm/vllm/vllm/model_executor/layers/fla/ops/layernorm_guard.py
   trace_mode: triton-launch
+  patch_strategy: static
+- id: vllm.triton.solve_tril_bt64_callsite
+  repo: vllm
+  kernel_type: triton
+  kernel_name: solve_tril
+  kernel_file: tools/rocm/vllm/vllm/model_executor/layers/fla/ops/solve_tril.py
+  trace_mode: vllm-custom-op
   patch_strategy: static
 - id: vllm.triton.fla_ops_wy_fast.recompute_w_u_fwd_kernel
   repo: vllm

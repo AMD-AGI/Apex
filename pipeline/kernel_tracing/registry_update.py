@@ -49,6 +49,48 @@ PACKAGE_NAMES = {
     "sglang": ("sglang",),
 }
 
+# These runtime-confirmed callsites are intentionally supplemental. Static AST
+# discovery cannot see the dynamically selected Triton launcher in solve_tril
+# or collective calls made from communicator class methods.
+SUPPLEMENTAL_TRACE_KERNEL_ENTRIES = {
+    VLLM_TRACE_IMAGE: (
+        TraceKernelEntry(
+            id="vllm.triton.solve_tril_bt64_callsite",
+            repo="vllm",
+            kernel_type="triton",
+            kernel_name="solve_tril",
+            kernel_file=(
+                "tools/rocm/vllm/vllm/model_executor/layers/fla/ops/solve_tril.py"
+            ),
+            trace_mode="vllm-custom-op",
+            patch_strategy="static",
+        ),
+        TraceKernelEntry(
+            id="vllm.hip.custom_all_reduce_callsite",
+            repo="vllm",
+            kernel_type="hip",
+            kernel_name="custom_all_reduce",
+            kernel_file=(
+                "tools/rocm/vllm/vllm/distributed/device_communicators/"
+                "custom_all_reduce.py"
+            ),
+            trace_mode="vllm-custom-op",
+            patch_strategy="static",
+        ),
+        TraceKernelEntry(
+            id="vllm.hip.pynccl_all_reduce_callsite",
+            repo="vllm",
+            kernel_type="hip",
+            kernel_name="all_reduce",
+            kernel_file=(
+                "tools/rocm/vllm/vllm/distributed/device_communicators/pynccl.py"
+            ),
+            trace_mode="vllm-custom-op",
+            patch_strategy="static",
+        ),
+    ),
+}
+
 
 class RegistryUpdateError(RuntimeError):
     """Raised when fixed registries cannot be generated reliably."""
@@ -255,12 +297,16 @@ def build_registry_data(
     discovered_entries: list[TraceKernelEntry],
 ) -> dict[str, Any]:
     selected_repos = set(package_sources)
+    entries_by_id = {
+        entry.id: entry
+        for entry in discovered_entries
+        if entry.repo in selected_repos
+    }
+    for entry in SUPPLEMENTAL_TRACE_KERNEL_ENTRIES.get(docker_image, ()):
+        if entry.repo in selected_repos:
+            entries_by_id.setdefault(entry.id, entry)
     kernels = sorted(
-        [
-            entry.as_dict()
-            for entry in discovered_entries
-            if entry.repo in selected_repos
-        ],
+        [entry.as_dict() for entry in entries_by_id.values()],
         key=REGISTRY_SORT_KEY,
     )
     data: dict[str, Any] = {
