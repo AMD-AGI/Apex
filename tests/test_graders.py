@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "graders"))
 from score import (
@@ -24,6 +25,7 @@ from score import (
     parse_task_config, parse_benchmark_config,
     _extract_compiled, _extract_correct, _extract_time_ms,
     _magpie_bin, extract_tps,
+    _ensure_docker_image, VLLM_ROCM_IMAGE_DEFAULT,
     PTS_COMPILED, PTS_CORRECT,
 )
 import kernel_grader
@@ -298,6 +300,23 @@ class TestParseBenchmarkResult:
 
 
 # ── score.py — config parsing ─────────────────────────────────────────────────
+
+def test_default_vllm_rocm_image_is_v023(tmp_path, monkeypatch):
+    config = tmp_path / "benchmark.yaml"
+    config.write_text(
+        "benchmark:\n"
+        "  framework: vllm\n"
+        "  model: example/model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("APEX_VLLM_ROCM_IMAGE", raising=False)
+
+    effective = _ensure_docker_image(str(config))
+
+    data = yaml.safe_load(Path(effective).read_text(encoding="utf-8"))
+    assert VLLM_ROCM_IMAGE_DEFAULT == "vllm/vllm-openai-rocm:v0.23.0"
+    assert data["benchmark"]["docker_image"] == VLLM_ROCM_IMAGE_DEFAULT
+
 
 class TestConfigParsing:
     def test_parse_task_config(self, mock_output_dir):

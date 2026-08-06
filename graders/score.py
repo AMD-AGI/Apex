@@ -320,7 +320,7 @@ def _detect_run_mode() -> str:
         return "local"
 
 
-VLLM_ROCM_IMAGE_DEFAULT = "vllm/vllm-openai-rocm:v0.19.0"
+VLLM_ROCM_IMAGE_DEFAULT = "vllm/vllm-openai-rocm:v0.23.0"
 
 
 def _ensure_docker_image(

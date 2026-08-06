@@ -1,0 +1,51 @@
+# vLLM/MI355X benchmark workload for the original BF16 Qwen3-Next model.
+#
+# This config is intended to be used as the workload for Apex kernel tensor
+# shape tracing. Magpie's built-in profilers are disabled to avoid collecting
+# a second, overlapping trace.
+#
+# Run it through the paired
+# trace_qwen3_next_80b_a3b_instruct_bf16_8k_multi_kernels.sh script.
+#
+# To run the benchmark directly:
+#   HF_CACHE_PATH=/path/to/huggingface \
+#     python -m Magpie benchmark --benchmark-config \
+#     pipeline/kernel_tracing/examples/benchmark_vllm_qwen3_next_80b_a3b_instruct_bf16.yaml
+
+benchmark:
+  framework: vllm
+  model: Qwen/Qwen3-Next-80B-A3B-Instruct
+  precision: bf16
+  run_mode: docker
+
+  envs:
+    TP: 4
+    CONC: 16
+    ISL: 8192
+    OSL: 1024
+    RANDOM_RANGE_RATIO: 0.8
+    MAX_MODEL_LEN: 32768
+    GPU_MEMORY_UTILIZATION: 0.90
+    SAFETENSORS_FAST_GPU: "1"
+    VLLM_ROCM_USE_AITER: "1"
+    EXTRA_VLLM_ARGS: "--no-enable-prefix-caching --distributed-executor-backend mp"
+
+  profiler:
+    torch_profiler:
+      enabled: false
+    system_profiler:
+      enabled: false
+      profile_args: []
+    tracelens:
+      enabled: false
+
+  gap_analysis:
+    enabled: false
+    find_kernel_sources: false
+    top_k: 100
+
+  docker_image: "vllm/vllm-openai-rocm:v0.23.0"
+  benchmark_script: "vllm_mi355x.sh"
+  # Magpie expands environment variables before creating the cache bind mount.
+  hf_cache_path: "${HF_CACHE_PATH}"
+  timeout_seconds: 7200

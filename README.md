@@ -403,13 +403,13 @@ pytest tests/test_graders.py -v     # Grader tests only
 The pipeline runs E2E benchmarks inside Docker containers. Override the vLLM image:
 
 ```bash
---docker-image vllm/vllm-openai-rocm:v0.19.0
+--docker-image vllm/vllm-openai-rocm:v0.23.0
 ```
 
 Or set the environment variable:
 
 ```bash
-export APEX_VLLM_ROCM_IMAGE=vllm/vllm-openai-rocm:v0.19.0
+export APEX_VLLM_ROCM_IMAGE=vllm/vllm-openai-rocm:v0.23.0
 ```
 
 ### Benchmark Caching

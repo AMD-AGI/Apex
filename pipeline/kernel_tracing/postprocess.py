@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+
+TENSOR_SHAPE_SHARE_ARCHIVE = "tensor_shape_distribution_share.zip"
+TENSOR_SHAPE_SHARE_MEMBERS = (
+    "workload_summary.md",
+    "target_kernel_tensor_shapes.json",
+    "benchmark_config.yaml",
+    "coverage_summary.json",
+    "window.json",
+    "trace_config.json",
+    "benchmark_result.json",
+    "workload_ranges.json",
+)
 
 SIGNATURE_SCALAR_KEYS = {
     "block_size",
@@ -22,6 +35,61 @@ SIGNATURE_SCALAR_KEYS = {
     "sliding_window",
     "top_k",
 }
+
+
+def write_tensor_shape_share_archive(
+    results_dir: Path,
+    *,
+    analysis_dir: Path,
+    benchmark_config_path: Path,
+    archive_name: str = TENSOR_SHAPE_SHARE_ARCHIVE,
+) -> Path:
+    """Package the eight review artifacts from a validated shape trace."""
+    results_dir = Path(results_dir)
+    analysis_dir = Path(analysis_dir)
+    benchmark_config_path = Path(benchmark_config_path)
+    sources = {
+        "workload_summary.md": analysis_dir / "workload_summary.md",
+        "target_kernel_tensor_shapes.json": (
+            analysis_dir / "target_kernel_tensor_shapes.json"
+        ),
+        "benchmark_config.yaml": benchmark_config_path,
+        "coverage_summary.json": analysis_dir / "coverage_summary.json",
+        "window.json": analysis_dir / "window.json",
+        "trace_config.json": analysis_dir / "trace_config.json",
+        "benchmark_result.json": (
+            results_dir / "benchmark" / "benchmark_result.json"
+        ),
+        "workload_ranges.json": analysis_dir / "workload_ranges.json",
+    }
+    missing = [
+        str(sources[name])
+        for name in TENSOR_SHAPE_SHARE_MEMBERS
+        if not sources[name].is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Cannot create tensor-shape share archive; missing artifacts: "
+            + ", ".join(missing)
+        )
+
+    archive_path = results_dir / archive_name
+    temporary_path = archive_path.with_name(f".{archive_path.name}.tmp")
+    temporary_path.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(
+            temporary_path,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as archive:
+            for member in TENSOR_SHAPE_SHARE_MEMBERS:
+                archive.write(sources[member], arcname=member)
+        temporary_path.replace(archive_path)
+        archive_path.chmod(0o644)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return archive_path
 
 
 def _iter_events(trace_raw_dir: Path):

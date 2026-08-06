@@ -11,11 +11,11 @@ import yaml
 
 
 REGISTRY_DIR = Path(__file__).with_name("registries")
-VLLM_TRACE_IMAGE = "vllm/vllm-openai-rocm:v0.19.1"
+VLLM_TRACE_IMAGE = "vllm/vllm-openai-rocm:v0.23.0"
 SGLANG_TRACE_IMAGE = "lmsysorg/sglang:v0.5.12-rocm720-mi35x"
 SUPPORTED_TRACE_IMAGES = (VLLM_TRACE_IMAGE, SGLANG_TRACE_IMAGE)
 TRACE_IMAGE_REGISTRY_PATHS = {
-    VLLM_TRACE_IMAGE: REGISTRY_DIR / "vllm_v0_19_1.yaml",
+    VLLM_TRACE_IMAGE: REGISTRY_DIR / "vllm_v0_23_0.yaml",
     SGLANG_TRACE_IMAGE: REGISTRY_DIR / "sglang_v0_5_12_rocm720_mi35x.yaml",
 }
 
