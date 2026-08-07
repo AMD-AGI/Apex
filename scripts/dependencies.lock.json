@@ -1,0 +1,48 @@
+{
+  "schema": "apex.dependencies.lock",
+  "version": 1,
+  "receipt_schema": "apex.dependencies.receipt/v1",
+  "dependencies": {
+    "magpie": {
+      "name": "Magpie",
+      "repository": "https://github.com/AMD-AGI/Magpie.git",
+      "commit": "5a7fb05c01019c2a2c6f2ecff671c45be22f82d9",
+      "sibling": "Magpie",
+      "managed_checkout": "magpie",
+      "root_env": "MAGPIE_ROOT",
+      "python": {
+        "distribution": "magpie-eval",
+        "version": "0.2.0",
+        "version_policy": "exact",
+        "import_root": "Magpie",
+        "extras": [
+          "mcp"
+        ]
+      }
+    },
+    "tracelens": {
+      "name": "TraceLens",
+      "repository": "https://github.com/AMD-AGI/TraceLens.git",
+      "commit": "4f25c1a6f03441e710a97d71a5de9cc5c2fc1555",
+      "sibling": "TraceLens",
+      "managed_checkout": "tracelens",
+      "root_env": "TRACELENS_REPO_PATH",
+      "python": {
+        "distribution": "TraceLens",
+        "version": "0.1.0",
+        "version_policy": "prefix",
+        "import_root": "TraceLens",
+        "extras": []
+      }
+    },
+    "inferencex": {
+      "name": "InferenceX",
+      "repository": "https://github.com/SemiAnalysisAI/InferenceX.git",
+      "commit": "23f04b8baca7774f9c0bbcb7a31e9ad551a3b84b",
+      "sibling": "Apex/tools/magpie/InferenceX",
+      "managed_checkout": "inferencex",
+      "root_env": "MAGPIE_INFERENCEX_PATH",
+      "repository_only": true
+    }
+  }
+}

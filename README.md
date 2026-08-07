@@ -1,660 +1,295 @@
-# Apex — GPU Kernel Optimization Pipeline
-
-> **License Notice**
->
-> Copyright © 2025 Advanced Micro Devices, Inc. All rights reserved.
->
-> This project is licensed under the **MIT License**. You are free to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the software, subject to the following conditions:
->
-> - The above copyright notice and this license notice must be included in all copies or substantial portions of the software.
-> - The software is provided **"as is"**, without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement.
->
-> **Third-party dependencies** (ROCm libraries, vLLM, Triton, Magpie, etc.) are governed by their own respective licenses. End users are responsible for reviewing and complying with the licensing terms of any dependencies used in conjunction with this software.
->
-> **AI Agent notice** — This software orchestrates third-party AI coding agents to perform kernel optimization:
->
-> | Agent | Provider | What you need |
-> |---|---|---|
-> | **Claude Code** | Anthropic | An active [Anthropic account](https://console.anthropic.com/) and acceptance of [Anthropic's usage policies](https://www.anthropic.com/legal/usage-policy) |
-> | **OpenAI Codex** | OpenAI | An active [OpenAI account](https://platform.openai.com/) and acceptance of [OpenAI's terms of service](https://openai.com/policies/terms-of-use) |
-> | **Cursor Agent** | Cursor | An active [Cursor](https://cursor.com/) subscription with agent mode enabled |
->
-> Each user must independently obtain their own credentials and comply with the respective provider's licensing and usage terms. **This project does not include, bundle, or sublicense access to any AI model or API.** Usage of these agents may incur costs billed directly by the provider.
-
----
-
-An RL training environment that tasks an LLM agent with optimizing GPU kernels for AMD ROCm hardware. The agent receives a baseline kernel, a sandbox with relevant source code and documentation, and is scored on compilation, correctness, and runtime speedup.
-
-## How It Works
-
-```
-baseline kernel  →  prompt constructor  →  LLM agent  →  grader (Magpie)  →  score + reinjection
-```
-
-1. **Benchmark** — profile the model end-to-end to identify bottleneck kernels
-2. **Identify** — rank kernels by GPU time and select candidates
-3. **Optimize** — an LLM agent writes an optimized kernel in `output/<task_id>/solution.{py,hip}`
-4. **Grade** — [Magpie](https://github.com/AMD-AGI/Magpie) checks compilation, correctness, and measures speedup
-5. **Integrate** — kernels exceeding the speedup threshold (>1.05×) are hot-patched into site-packages
-6. **Benchmark (final)** — re-run E2E benchmark with patches to measure real throughput improvement
-7. **Score & Report** — compute rewards, update leaderboard, generate report
-
-## Dynamic Kernel Workload Tracing
-
-Apex also includes a standalone `trace-kernel` workflow for collecting real runtime workload metadata from E2E model benchmarks. It temporarily patches Python-visible Triton launch sites or HIP/custom-op wrapper paths, reruns the workload, and emits raw JSONL plus aggregated workload ranges for shapes, dtypes, strides, flags, and meta parameters.
-
-For detailed usage, CLI arguments, Docker overlay behavior, and runnable examples, see [`pipeline/kernel_tracing/README.md`](pipeline/kernel_tracing/README.md).
-
-## Quick Start
-
-### Prerequisites
-
-- **OS:** Linux (Ubuntu 22.04+ recommended)
-- **Python:** 3.10+
-- **Node.js:** 18+ (for agent CLIs)
-- **System packages:** `git`, `curl`, `jq`
-- **GPU (optional):** AMD Instinct GPU with ROCm 6.x+ (required for real kernel grading; not needed for CPU-only eval)
-
-### 1. Clone the Repository
-
-```bash
-git clone <repo-url> Apex
-cd Apex
-```
-
-### 2. Install at Least One Agent CLI
-
-Install whichever agent(s) you plan to use:
-
-```bash
-# Claude Code
-npm install -g @anthropic-ai/claude-code
-claude login
-
-# OpenAI Codex
-npm install -g @openai/codex
-codex login
-
-# Cursor Agent (standalone CLI)
-npm install -g cursor-agent
-cursor-agent login
-
-# Cursor IDE (alternative — open Apex folder in Cursor; MCP servers auto-configure via .mcp.json)
-```
-
-### 3. Run Setup
-
-```bash
-bash setup.sh
-```
-
-This single command handles everything:
-
-1. **CLI selection** — choose Claude Code, Codex, Cursor Agent, or all
-2. **Python venv** — creates `.venv/` (or reuses an existing one)
-3. **Python dependencies** — installs numpy, PyYAML, pytest, MCP packages, SDKs, etc.
-4. **PyTorch for ROCm** — installs `torch` + `torchvision` from the ROCm 7.2 wheel index
-5. **Triton** — installs the Triton compiler
-6. **ROCm source repos** — clones AMD kernel source code into `tools/rocm/` (optional, for source-finder & RAG)
-7. **Documentation** — downloads AMD architecture PDFs for the RAG server (optional)
-8. **MCP servers** — installs and registers 5 MCP servers with the selected CLI(s)
-9. **Magpie** — clones and installs the kernel evaluation framework into `tools/magpie/`
-10. **Skills** — makes 13 domain-specific optimization skills discoverable by agents
-11. **`.mcp.json`** — generates workspace config so Cursor IDE auto-discovers MCP servers
-
-#### Setup Flags
-
-```bash
-bash setup.sh                     # Interactive (prompts for choices)
-bash setup.sh --non-interactive   # Auto-detect CLIs, accept all defaults
-bash setup.sh --skip-downloads    # Skip ROCm repo cloning + doc downloads
-bash setup.sh --skip-tools        # Skip MCP + Magpie installation
-bash setup.sh --venv=/path/.venv  # Use a specific venv path
-```
-
-### 4. Activate and Run
-
-```bash
-source .venv/bin/activate
-export MAGPIE_ROOT=$(pwd)/tools/magpie
-
-# Interactive agent session
-claude                # or: codex / cursor-agent
-
-# Automated pipeline
-python3 workload_optimizer.py run \
-  -r ./results \
-  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml \
-  --kernel-types triton --top-k 10 \
-  --max-iterations 3 --max-turns 25 --leaderboard
-```
-
-## Repository Structure
-
-```
-Apex/
-├── workload_optimizer.py    # Main pipeline CLI
-├── eval.py                  # Mini eval (CPU-only, no GPU required)
-├── setup.sh                 # One-shot environment setup
-├── mcp_config.json          # MCP server configuration
-├── .mcp.json                # Auto-generated by setup.sh (MCP config for Cursor IDE)
-│
-├── agents/
-│   └── backends.py          # Claude Code SDK + Codex + Cursor Agent runner
-│
-├── pipeline/
-│   ├── knowledge_base.py    # Cross-kernel/cross-run learning store
-│   ├── reflector.py         # Agent self-reflection between iterations
-│   ├── trajectory.py        # Trajectory recording (file / CouchDB / S3)
-│   ├── leaderboard.py       # Leaderboard tracking (file / CouchDB)
-│   ├── kernel_bottleneck.py # Profiling data parser, kernel classification
-│   └── export_rl_dataset.py # RL/SFT dataset export from trajectories
-│
-├── prompts/
-│   ├── models.py            # Model registry (Qwen3.5, GPT-OSS, etc.)
-│   ├── configs.py           # 17 inference configurations
-│   ├── kernel_prompt.py     # Kernel-level prompt constructor
-│   └── model_prompt.py      # Model-level prompt constructor
-│
-├── graders/
-│   ├── score.py             # Scoring formula + Magpie helpers
-│   ├── kernel_grader.py     # Grades kernel tasks via Magpie
-│   ├── model_grader.py      # Grades E2E model throughput via Magpie
-│   ├── ground_truth.py      # ROCm kernel discovery + ground truth specs
-│   ├── config_generator.py  # Magpie config.yaml generation + validation
-│   └── cache_manager.py     # Cache isolation for reproducible grading
-│
-├── tools/
-│   ├── setup_tools.sh       # Installs Magpie, MCP servers, skills
-│   ├── skills/              # 13 domain skills (SKILL.md files)
-│   ├── mcps/                # MCP server source
-│   └── jsons/               # ROCm metadata indexes
-│
-├── files/
-│   ├── setup_files.sh       # Clones ROCm repos and downloads docs
-│   ├── hip_best_practices.md
-│   └── triton_best_practices.md
-│
-├── tests/                   # pytest suite
-│
-└── output/                  # Agent solutions (git-ignored)
-    └── <task_id>/
-        ├── solution.py / solution.hip
-        ├── config.yaml
-        └── …
-```
-
-## Usage
-
-### Full Pipeline (Automated)
-
-Run the entire optimization loop end-to-end:
-
-```bash
-source .venv/bin/activate
-export MAGPIE_ROOT=$(pwd)/tools/magpie
-
-RESULTS=./results
-BENCH_CONFIG=$MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_120b.yaml
-
-python3 workload_optimizer.py run \
-  -r $RESULTS \
-  -b $BENCH_CONFIG \
-  --kernel-types triton \
-  --top-k 10 \
-  --max-iterations 3 \
-  --max-turns 25 \
-  --leaderboard
-```
-
-### Step-by-Step Pipeline
-
-```bash
-# 1. Benchmark (or --skip-benchmark <path-to-existing-report.json>)
-python3 workload_optimizer.py benchmark -r $RESULTS -b $BENCH_CONFIG
-
-# 2. Identify top bottleneck kernels
-python3 workload_optimizer.py identify -r $RESULTS --kernel-types triton --top-k 10
-
-# 3. List identified kernels
-python3 workload_optimizer.py list-kernels -r $RESULTS
-
-# 4. Optimize all identified kernels
-python3 workload_optimizer.py optimize -r $RESULTS --max-iterations 3 --max-turns 25
-
-# 5. Integrate winners (auto-filters to >5% speedup)
-python3 workload_optimizer.py integrate -r $RESULTS
-
-# 6. Final E2E benchmark with optimized kernels
-python3 workload_optimizer.py benchmark-final -r $RESULTS -b $BENCH_CONFIG
-
-# 7. Score + trajectory + leaderboard
-python3 workload_optimizer.py score -r $RESULTS --leaderboard
-
-# 8. Generate report + replication guide
-python3 workload_optimizer.py report -r $RESULTS -b $BENCH_CONFIG
-```
-
-### Standalone Kernel Optimization
-
-Optimize a single kernel without running the full pipeline:
-
-```bash
-python3 workload_optimizer.py optimize-kernel \
-  -r ./results \
-  --kernel path/to/baseline_kernel.py \
-  --kernel-name rms_norm \
-  --kernel-type triton \
-  --agent-backend cursor \
-  --max-iterations 3 --max-turns 25
-```
-
-Correctness modes for standalone optimization:
-
-```bash
-# PyTorch reference (default) — validates against a PyTorch implementation
---correctness-mode pytorch
-
-# Library test — runs the original library's unit test suite
---correctness-mode library_test
-
-# Accordo — HSA-level validation for HIP/C++ kernels
---correctness-mode accordo
-```
-
-### Interactive Agent Mode
-
-Launch the agent directly for exploratory optimization:
-
-```bash
-# Claude Code
-cd Apex && claude
-
-# OpenAI Codex
-cd Apex && codex
-
-# Cursor Agent (standalone CLI)
-cd Apex && cursor-agent
-
-# Cursor IDE (open Apex folder — MCP servers auto-configure via .mcp.json)
-cursor .
-```
-
-### Agent-Driven Kernel Optimization Examples
-
-These prompts are tested and work end-to-end. Open the Claude Code CLI from the Apex directory and paste a prompt:
-
-```
-Run the full optimization pipeline for Qwen3.5 27B with these settings:
-triton kernels only, top 3 bottleneck kernels, 3 optimization iterations,
-max 25 agent turns per iteration, claude agent backend, and leaderboard enabled.
-Set HF_HOME=/mnt/dcgpuval/sirafati/hf before running.
-Show the final score comparison and generate a report when done.
-```
-
-```
-Run the full optimization pipeline for GPT OSS 20B with these settings:
-triton kernels only, top 3 bottleneck kernels, 3 optimization iterations,
-max 25 agent turns per iteration, claude agent backend, and leaderboard enabled.
-Show the final score comparison and generate a report when done.
-```
-
-```
-Optimize the rms_norm Triton kernel on MI355X.
-Write the solution to output/ and grade it when done. Show the score breakdown.
-```
-
-The agent reads `CLAUDE.md` / `AGENTS.md`, discovers MCP tools, and translates the prompt into the correct `workload_optimizer.py` commands.
-
-**How to use:**
-
-```bash
-# Open Claude Code from the Apex directory, then paste any prompt above:
-cd Apex && claude
-```
-
-**Equivalent direct commands** (what the agent executes under the hood):
-
-```bash
-# Full pipeline for Qwen3.5 27B
-python3 workload_optimizer.py run \
-  -r ./results_qwen35_27b \
-  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_qwen35_27b.yaml \
-  --kernel-types triton --top-k 3 \
-  --max-iterations 3 --max-turns 25 \
-  --agent-backend claude --leaderboard
-
-# Full pipeline for GPT-OSS-20B
-python3 workload_optimizer.py run \
-  -r ./results_gptoss_20b \
-  -b $MAGPIE_ROOT/examples/benchmarks/benchmark_vllm_gptoss_20b.yaml \
-  --kernel-types triton --top-k 3 \
-  --max-iterations 3 --max-turns 25 \
-  --agent-backend claude --leaderboard
-
-# Standalone kernel optimization
-python3 workload_optimizer.py optimize-kernel \
-  -r ./results \
-  --kernel tools/rocm/aiter/aiter/ops/triton/normalization/rmsnorm.py \
-  --kernel-name rms_norm --kernel-type triton \
-  --correctness-mode pytorch \
-  --agent-backend claude \
-  --max-iterations 1 --max-turns 10
-```
-
-### Mini Eval (No GPU Required)
-
-Exercises the full pipeline on a CPU-only task (naive Python RMSNorm → NumPy):
-
-```bash
-pip install -r requirements-eval.txt
-
-python3 eval.py              # Uses Claude API
-python3 eval.py --dry-run    # Skip API call, grade a trivial solution
-python3 eval.py --model claude-opus-4-6 --max-turns 12
-```
-
-### Explore Prompts
-
-```bash
-python3 prompts/kernel_prompt.py --list                          # List all kernel task IDs
-python3 prompts/kernel_prompt.py --task-id llama-3-1-8b-instruct__rms_norm  # Print a single prompt
-python3 prompts/kernel_prompt.py --all > prompts.jsonl             # Dump all as JSONL
-python3 prompts/kernel_prompt.py --target gfx942 --list            # Target a specific GPU
-```
-
-### Grade Output Tasks
-
-```bash
-python3 graders/kernel_grader.py    # Grade all kernel tasks in output/
-python3 graders/model_grader.py     # Grade model-level tasks
-```
-
-### Export RL/SFT Datasets
-
-```bash
-# Export trajectory data as RL training tasks
-python3 workload_optimizer.py export-rl -r ./results --export-output-dir ./datasets
-
-# Include SFT warm-start pairs
-python3 workload_optimizer.py export-rl -r ./results --export-output-dir ./datasets --sft
-```
-
-### Run Tests
-
-```bash
-pytest tests/ -v
-pytest tests/test_prompts.py -v     # Prompt tests only
-pytest tests/test_graders.py -v     # Grader tests only
-```
-
-## Pipeline Options
-
-### Agent Backend
-
-```bash
---agent-backend claude         # Use Claude Code (default)
---agent-backend codex          # Use OpenAI Codex
---agent-backend cursor         # Use Cursor Agent
-```
-
-### Docker Image Override
-
-The pipeline runs E2E benchmarks inside Docker containers. Override the vLLM image:
-
-```bash
---docker-image vllm/vllm-openai-rocm:v0.23.0
-```
-
-Or set the environment variable:
-
-```bash
-export APEX_VLLM_ROCM_IMAGE=vllm/vllm-openai-rocm:v0.23.0
-```
-
-### Benchmark Caching
-
-Cache E2E baseline results to skip the ~30-minute benchmark on repeat runs:
-
-```bash
---benchmark-cache-hours 4
-```
-
-### Parallel Kernel Optimization
-
-When using the `run` subcommand (full pipeline), optimize up to N kernels simultaneously
-(agent reasoning is API-bound; GPU grading is serialized):
-
-```bash
-python3 workload_optimizer.py run ... --parallel-kernels 2
-```
-
-Note: the standalone `optimize` subcommand processes kernels sequentially regardless of this flag.
-
-### Agent Model Routing
-
-Assign different models based on kernel difficulty:
-
-```bash
---agent-model-simple claude-sonnet-4-20250514 \
---agent-model-complex claude-opus-4-6
-```
-
-### Anti-Tampering
-
-AST-based detection penalizes solutions that fake benchmark results (`sys.exit()`, hardcoded `PASS`, fabricated timings). Configure the speedup cap:
-
-```bash
---tampering-speedup-cap 1.0
-```
-
-## Scoring
-
-```
-score = compiled × 20  +  correct × 100  +  speedup_score(S)
-```
-
-Where `S = baseline_time / optimized_time`. Only compiled + correct solutions earn the speedup component.
-
-- **Compiled** (+20 pts): solution imports and defines the expected function
-- **Correct** (+100 pts): passes all unit tests against the baseline
-- **Speedup** (piecewise):
-  - S ≥ 1.0: `100 + (S − 1) × 200` pts (e.g. 1.2× → 140, 2× → 300, 3× → 500)
-  - S < 1.0: `max(0, 100 × S − 50)` pts (regression penalty)
-
-### Model-Level Reward
-
-```
-reward = 0.7 × normalized_kernel_score  +  0.3 × (optimized_tps / baseline_tps − 1)
-```
-
-Kernel score is normalized to [0, 1] against a reference of 420 pts (compile + correct + 2× speedup). Model-level grading requires a full AMD GPU environment.
-
-## Target Hardware
-
-Default target: **AMD Instinct MI355X (gfx950 / CDNA4)**.
-
-| `--target` | Hardware |
+# Apex
+
+Apex is an evidence-driven RL environment and optimization agent for AMD GPU
+kernels. It has two user-facing modes built on the same state, evidence, safety,
+and delivery contracts:
+
+- **Kernel optimization** accepts a trusted task descriptor plus a natural-language
+  objective (or a complete `TaskSpec`) and delivers an unapplied source bundle.
+- **End-to-end optimization** accepts a workload spec pointing at a Magpie benchmark
+  configuration, diagnoses the live workload, improves kernel source, and validates
+  the resulting workload without changing model or benchmark semantics.
+
+Codex is the default agent backend. Claude and Cursor are selectable alternatives.
+Agents propose code; evaluator-owned compile, correctness, safety, raw timing, and
+workload evidence decide whether a candidate is accepted.
+
+## Design guarantees
+
+Apex is a clean-cut, modular implementation. There is no compatibility layer for
+prior command, state, result, or dataset formats.
+
+- The append-only event journal and content-addressed artifact store are canonical;
+  snapshots and reports are rebuildable views.
+- Every agent invocation starts from a bounded deterministic `ContextPacket`.
+  Long E2E searches resume from typed state and receipts, not conversation memory.
+- E2E scope is kernel source only. Config-only winners are forbidden.
+- Apex emits bundles by default and does not modify the caller's repository.
+- Normal benchmark measurements are distinct from instrumented diagnostic traces.
+- Missing proof stays missing. Agent output, command success, or an image tag cannot
+  manufacture correctness, reward, provenance, or a higher validation level.
+
+The validation levels are intentionally explicit:
+
+| Level | Meaning |
 |---|---|
-| `gfx950` | AMD Instinct MI355X (CDNA4) — default |
-| `gfx942` | AMD Instinct MI300X (CDNA3) |
-| `gfx940` | AMD Instinct MI300A (CDNA3) |
-| `gfx90a` | AMD Instinct MI250X (CDNA2) |
+| `none` | No independently verified deployed implementation. |
+| `runtime_overlay_verified` | An immutable derived image loaded the measured overlay bytes, but no clean source rebuild was proven. |
+| `source_rebuild_verified` | Exact source locks and patches rebuilt successfully and a second fresh clean replay passed quality, latency, engagement, and objective gates. |
 
-The GPU is auto-detected via `rocm-smi` if available; otherwise falls back to gfx950.
+The default Docker E2E adapter is honest about its boundary: an overlay can reach
+`runtime_overlay_verified`; it cannot be presented as a formal source-rebuild
+delivery.
 
-## Kernel Reintegration (Hot-Patching)
+## Install
 
-When the pipeline integrates optimized kernels for the final E2E benchmark, it hot-patches installed Python modules in site-packages. All patches are restored after benchmarking.
-
-**Supported (hot-patching):**
-
-- **aiter, vllm, sglang** — Python/Triton `.py` kernels can be replaced in site-packages. Triton JIT re-compiles automatically on next invocation.
-- **aiter HIP** — Standalone `.so` files can be recompiled with `hipcc` and swapped.
-
-**Not supported (requires source rebuild):**
-
-- **System C/C++ libraries** — hipBLASLt, rocBLAS, composable_kernel (CK), MIOpen, rccl are system-level shared libraries that cannot be individually hot-patched.
-- **Monolithic `_C.so`** — vLLM, sglang, and PyTorch HIP kernels compile into a single binary and cannot be individually replaced.
-
-## MCP Servers
-
-Apex ships with 5 MCP servers that give agents access to domain-specific tools:
-
-| MCP | Key tools | Purpose |
-|-----|-----------|---------|
-| **source-finder** | `find_kernel_source`, `classify_kernel` | Search kernel implementations across ROCm repos |
-| **kernel-rag** | `search_kernel_optimization`, `get_optimization_playbook` | Optimization patterns, snippets, domain analysis |
-| **gpu-info** | `get_gpu_info`, `get_arch_optimization_hints` | MI355X / CDNA4 specs and optimization hints |
-| **fusion-advisor** | `detect_fusion_opportunities`, `generate_fused_kernel` | Kernel fusion detection and code generation |
-| **magpie** | `analyze`, `compare`, `benchmark` | Kernel correctness/performance evaluation |
-
-MCP servers are auto-configured for:
-- **Claude Code** — registered via `claude mcp add` during setup
-- **Codex** — registered via `codex mcp add` during setup
-- **Cursor IDE** — auto-discovered from `.mcp.json` in the project root (no manual registration needed)
-
-## Prompt Architecture
-
-Apex uses a two-layer prompt system when agents optimize kernels:
-
-**System prompt** (`SYSTEM_PROMPT` in `workload_optimizer.py`) defines the agent's role and constraints:
-- GPU kernel engineer persona with AMD ROCm specialization
-- MCP tool inventory and when to use each tool
-- Skill paths (13 `SKILL.md` files the agent can read for domain knowledge)
-- Mandatory compare-before-submit workflow via Magpie
-- Speedup calibration guidance and anti-tampering rules
-
-**Task prompt** (`KERNEL_PROMPT_TEMPLATE` in `prompts/kernel_prompt.py`) is built per-kernel with:
-
-| Section | Content |
-|---------|---------|
-| Target hardware | GPU arch, wavefront size, MFMA units, LDS, HBM bandwidth |
-| Task definition | Kernel type, model architecture, framework (vLLM/SGLang) |
-| Source locations | Paths to baseline implementations in `tools/rocm/` (aiter, CK, etc.) |
-| MCP tools table | Available tools for source search, RAG, GPU info, fusion, Magpie |
-| Skills table | 13 domain-specific optimization skills the agent can read |
-| Instructions | Step-by-step: locate baseline, analyze bottlenecks, write `solution.py` |
-| Optimization hints | Architecture-specific tips (e.g. MFMA usage, LDS tiling for CDNA4) |
-
-When running via the full pipeline, the prompt is further enriched with:
-- **Baseline source code** inlined as markdown
-- **Profiling data** (GPU time %, bound type, bandwidth/compute utilization)
-- **Knowledge base insights** from prior optimization runs
-- **Correctness reference** (PyTorch reference code or library test commands)
-
-Preview any task prompt:
+Prerequisites are Linux, Python 3.10 or newer, Git, Docker for container workloads,
+and a supported AMD ROCm environment for real measurements. Install and verify the
+exact reviewed Magpie, TraceLens, and InferenceX revisions plus the vLLM and AITER
+source locks used for formal E2E delivery with one command:
 
 ```bash
-python3 prompts/kernel_prompt.py --task-id llama-3-1-8b-instruct__rms_norm
+./setup.sh
+source .venv/bin/activate
+apex dependencies prepare-runtime --json
+apex dependencies verify --json
 ```
 
-## Kernels with Library Test Coverage
+`setup.sh` is a small wrapper around `scripts/bootstrap_dependencies.py`. It installs
+Apex into `.venv`, resolves clean locked sibling checkouts when possible, and falls
+back to managed exact-commit checkouts. For vLLM and AITER it publishes a separate
+managed checkout under `~/.cache/apex/source-locks` unless an explicit exact root is
+selected. Local siblings may supply Git objects offline but are never reset or
+switched; origin, commit, tree, and cleanliness are verified before use.
+`prepare-runtime` builds the hash-locked lm-eval quality evaluator once, using the
+pinned vLLM image with networking disabled during wheel build, install, and smoke
+validation; subsequent verification rehashes its read-only CAS tree.
+See [docs/dependencies.md](docs/dependencies.md) for offline and path overrides.
 
-These kernels have explicit library test commands in the ground truth registry, enabling `--correctness-mode library_test` for validation against aiter's own pytest suite:
-
-| Kernel | Test command | Type |
-|--------|-------------|------|
-| `silu_mul` | `pytest aiter/op_tests/triton_tests/test_activation.py` | memory-bound |
-| `gemm_bf16` | `pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py` | compute-bound |
-| `gemm_w8a8` | `pytest aiter/op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py` | compute-bound |
-| `act_quant_fp8` | `pytest aiter/op_tests/triton_tests/quant/test_quant.py` | memory-bound |
-| `kv_cache_ops` | `pytest aiter/op_tests/triton_tests/fusions/test_fused_kv_cache.py` | memory-bound |
-| `all_reduce` | `pytest aiter/op_tests/multigpu_tests/test_quick_all_reduce.py` | comms |
-
-## Model Registry
-
-21 models covering a range of architectures:
-
-| Family | Models | Attention | MLP |
-|---|---|---|---|
-| Llama 3 | 1B, 8B, 70B (×2) | GQA | Dense |
-| Mistral / Mixtral | 7B, 8×7B, 8×22B | GQA | Dense / MoE |
-| Qwen 2.5 | 7B, 32B, 72B, Coder-32B | GQA | Dense |
-| Gemma 2 | 9B, 27B | GQA | Dense |
-| DeepSeek | R1 (671B), V3 (671B), R1-Distill-70B | MLA / GQA | MoE / Dense |
-| Kimi | K2-Thinking | MLA | MoE |
-| GPT OSS | 120B | GQA | MoE |
-| Phi | 3.5-mini, phi-4 | GQA | Dense |
-| Falcon | 7B | MQA | Dense |
-
-## Kernel Types
-
-12 kernel types are defined, applicable to models based on their architecture:
-
-| Kernel | Framework | Notes |
-|---|---|---|
-| `flash_attn_prefill` | Triton | Flash attention for prompt (prefill) phase |
-| `paged_attn_decode` | Triton | Paged attention for autoregressive decoding |
-| `mla_attn` | Triton | Multi-Head Latent Attention (DeepSeek MLA) |
-| `fused_moe` | Triton | Fused MoE gate + routing + expert GEMM |
-| `gemm_w8a8` | HIP | FP8 × FP8 GEMM for quantized linear layers |
-| `gemm_bf16` | HIP | BF16 GEMM for QKV/up/gate/down projections |
-| `rms_norm` | Triton | Pre/post-attention and MLP normalization |
-| `rope_embedding` | Triton | Rotary position embedding (Q and K) |
-| `kv_cache_ops` | Triton | KV cache reshape, copy, and quantization |
-| `all_reduce` | HIP | Tensor-parallel all-reduce (RCCL + fused kernels) |
-| `act_quant_fp8` | Triton | Dynamic per-token FP8 activation quantization |
-| `silu_mul` | Triton | Fused SiLU × gate (SwiGLU) for MLP |
-
-### Validated Results (agent-driven, cursor backend)
-
-| Kernel | Speedup | Score | Settings | Notes |
-|--------|---------|-------|----------|-------|
-| `all_reduce` | 36.35x | 7290 | 3 iter / 25 turns | HIP, library_test; multi-GPU |
-| `rms_norm` | 1.05x | 674 | 1 iter / 10 turns | Triton, pytorch mode |
-| `fused_moe` | 1.14x | 248 | 1 iter / 10 turns | Triton, pytorch mode |
-| `gemm_bf16` | 1.00x | 220 | 3 iter / 25 turns | Triton, library_test |
-| `silu_mul` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
-| `act_quant_fp8` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
-| `kv_cache_ops` | 1.00x | 220 | 1 iter / 10 turns | Triton, library_test |
-
-**7 kernels validated** with correct optimizations. Top performers: `all_reduce` (36.35x), `fused_moe` (1.14x), `rms_norm` (1.05x).
-
-## Troubleshooting
-
-### PyTorch ROCm installation fails
+Install only Apex development dependencies when external runtime adapters are not
+needed:
 
 ```bash
-# Install manually with the correct ROCm version
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
-
-# For older ROCm:
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
 ```
 
-### Agent CLI not found
+Authenticate any agent CLI you intend to use. Apex does not bundle model access or
+credentials.
+
+## Kernel optimization CLI
+
+A natural-language request selects a checked-in trusted task descriptor. The
+descriptor—not the prose—owns editable paths and fixed-argv compile, correctness,
+performance, and optional safety/measurement contracts.
+
+V1 executes standalone Python and Triton tasks. A standalone task whose language is
+`hip` fails intake with `hip_execution_unavailable`, even if it carries a fixed HIP
+recipe: the current kernel loop does not yet bind trusted build, deploy, and loaded-byte
+engagement phases, so accepting that descriptor would overstate its evidence.
 
 ```bash
-# Verify Node.js 18+
-node --version
-
-# Claude Code
-npm install -g @anthropic-ai/claude-code && claude login
-
-# Codex
-npm install -g @openai/codex && codex login
-
-# Cursor Agent
-npm install -g cursor-agent && cursor-agent login
+apex optimize kernel \
+  "Optimize rms_norm in kernels/rms_norm.py for gfx950" \
+  --workspace /absolute/path/to/kernel-repo \
+  --results /absolute/path/to/run \
+  --agent-backend codex
 ```
 
-### MCP servers not working in Cursor IDE
-
-Cursor auto-discovers MCP servers from `.mcp.json`. If MCPs aren't loading:
-
-1. Verify `.mcp.json` exists in the Apex root (generated by `setup.sh`)
-2. Restart Cursor or reload the window
-3. Check that the Python path in `.mcp.json` matches your venv
-
-### No GPU detected
-
-The pipeline auto-detects GPUs via `rocm-smi`. For CPU-only development:
+Descriptors may be named `apex-task.yaml`, `task_spec.yaml`, or placed under
+`.apex/tasks/`. Machine callers can bypass natural-language selection with a complete
+caller-neutral JSON or YAML contract:
 
 ```bash
-# Use the mini eval (no GPU needed)
-python3 eval.py --dry-run
-
-# Use --skip-benchmark with pre-recorded profiling data
-python3 workload_optimizer.py run -r ./results --skip-benchmark report.json ...
+apex optimize kernel \
+  --task-spec /absolute/path/to/task.yaml \
+  --result-json /absolute/path/to/run/result.json
 ```
+
+Use `--agent-backend claude` or `--agent-backend cursor` to change the backend;
+omitting it selects Codex. `--dry-run` validates and receipts intake without invoking
+an agent. A successful candidate produces a source-only bundle and a stable machine
+result. Verify a kernel bundle independently with:
+
+```bash
+apex bundle verify --bundle /absolute/path/to/bundle --json
+```
+
+### Kernel grade
+
+Reward uses robust median and tail speedup:
+
+```text
+S50     = Tref,p50 / Topt,p50
+S99     = Tref,p99 / Topt,p99
+Srobust = min(S50, S99)
+
+Reward = 20 * Icompile
+       + Icorrect * (100 + 200 * clip(Srobust - 1, -0.25, 1.00))
+```
+
+The evaluator recomputes p50 and nearest-rank p99 from at least 300 valid raw kernel
+invocation samples for each implementation in every case. Missing or insufficient
+p99 yields no reward. `Icorrect` represents correctness, integrity, and
+anti-tampering—not an agent assertion. Safety is a separate promotion gate: a
+confirmed finding rejects the candidate and suppresses performance reward without
+silently changing the public formula.
+
+## End-to-end optimization CLI
+
+An E2E spec wraps an unchanged Magpie benchmark config and freezes search budgets
+and no-regression gates:
+
+```yaml
+schema_version: 1
+config_path: /absolute/path/to/Magpie/examples/benchmarks/benchmark.yaml
+results_dir: /absolute/path/to/apex-run
+agent_backend: codex
+agent_model: gpt-5.5
+agent_effort: xhigh
+scope: kernels
+gpu_arch: gfx950
+goal:
+  primary: throughput
+  direction: maximize
+  gates:
+    accuracy_regression_pct: 0
+    ttft_p99_regression_pct: 5
+    tpot_p99_regression_pct: 2
+max_iterations: 3
+max_kernels: 10
+max_turns: 25
+agent_timeout_seconds: 3600
+```
+
+Run it with:
+
+```bash
+apex optimize e2e --spec /absolute/path/to/e2e.yaml
+```
+
+The controller benchmarks a clean baseline, collects targeted Magpie/TraceLens
+evidence, ranks dynamic kernel opportunities, asks fresh bounded agent sessions for
+source candidates, freezes and checks each candidate, deploys eligible candidates,
+and measures against the current live anchor. It records `KEEP` or `REVERT`, then
+reprofiles before the next decision. The primary target is throughput; accuracy may
+not regress, TTFT p99 may regress by at most 5%, and TPOT p99 by at most 2%.
+
+The deliverable is an immutable patch bundle tied to exact source repositories and
+the baseline container identity. Formal success additionally requires a trusted
+source build, runtime loaded-byte/build-ID proof, and a second fresh clean replay.
+The benchmark config is not the deliverable and changing its non-image semantics is
+not an optimization.
+
+## RL post-training surface
+
+The exact context packet is the policy observation. Candidate source, tool results,
+raw measurements, policies, safety findings, decisions, and delivery receipts are
+stored by digest and linked through canonical events. The RL materializer produces a
+parent workload episode plus every candidate child attempt—including rejected,
+failed, and no-gain attempts. Dataset export replays measured rewards and fails
+closed on missing evidence or secret-bearing content.
+
+Reporting and RL data are projections, not alternate state writers. See
+[src/apex/rl/README.md](src/apex/rl/README.md),
+[src/apex/storage/README.md](src/apex/storage/README.md), and
+[src/apex/reporting/README.md](src/apex/reporting/README.md).
+
+Rebuild reports or export a dataset from an existing canonical run without changing
+its journal or artifact store:
+
+```bash
+apex report \
+  --run-root /absolute/path/to/run \
+  --output /absolute/path/to/report-view \
+  --json
+
+apex export-rl \
+  --run-root /absolute/path/to/run \
+  --output /absolute/path/to/dataset \
+  --split train \
+  --on-incomplete fail \
+  --json
+```
+
+Use `--run-id` when it cannot be derived from the run result or directory name.
+`export-rl` also accepts `--policy-id`, `--on-incomplete skip`, and `--no-sft`.
+Projection output is rejected if it overlaps canonical `events/` or `artifacts/`.
+
+## Architecture
+
+`main.py` and the installed `apex` command both enter the same thin CLI. The sole
+composition root is `apex.bootstrap`.
+
+```text
+main.py
+src/apex/
+├── cli/             parsing and dispatch only
+├── intake/          trusted kernel and E2E contracts
+├── optimization/    standalone and E2E use cases
+├── orchestration/   replayable state machines
+├── context/         bounded backend-neutral observations
+├── execution/       Codex, Claude, Cursor, and supervised argv adapters
+├── benchmark/       Magpie config and measurement adapters
+├── diagnostics/     targeted trace evidence and ranking
+├── evaluation/      robust kernel reward and E2E gates
+├── evaluation/safety/ sanitizer execution and policy
+├── delivery/        immutable kernel and E2E patch bundles
+├── storage/         event journal, CAS, and snapshots
+├── rl/              episode materialization and dataset export
+├── reporting/       deterministic reports and replication guides
+├── knowledge/       attributed static cards and measured experience views
+├── runtime/         pinned dependencies, provenance, repositories, GPU leases
+├── ports/           dependency-inversion protocols
+└── core/            shared immutable primitives and errors
+```
+
+Every package has its own README describing purpose, public API, invariants,
+dependencies, failure semantics, provenance, and focused tests. Architecture tests
+enforce layer direction, file/function size limits, import purity, and public surface.
+The [capability matrix](docs/capability_matrix.md) distinguishes implemented CPU
+contracts from pending live GPU qualification; the clean-cut migration is tracked in
+[`deletion_inventory.yaml`](deletion_inventory.yaml).
+
+## Test
+
+The default gate is CPU-only and hermetic:
+
+```bash
+source .venv/bin/activate
+pytest -q -p no:cacheprovider --import-mode=importlib \
+  tests/unit tests/contract tests/integration tests/architecture \
+  tests/test_bootstrap_dependencies.py
+```
+
+GPU and live agent/workload campaigns must be invoked explicitly and write to a
+caller-selected results directory. They must retain dependency, image, source,
+measurement, and GPU-lease receipts. See [tests/README.md](tests/README.md).
+
+## Knowledge and upstream provenance
+
+Apex loads inert optimization cards from `tools/perf_knowledge`; it does not execute
+copied upstream code. The estate is derived from
+[AMD-AGI/GEAK at `6fa40c3`](https://github.com/AMD-AGI/GEAK/tree/6fa40c36b68bad9d543ae551b95bd3d169865744)
+and retains per-file hashes, exclusions, license, and attribution. Obsolete mutable
+knowledge storage is not read.
+
+Benchmarking and targeted trace collection use
+[Magpie at `5a7fb05`](https://github.com/AMD-AGI/Magpie/tree/5a7fb05c01019c2a2c6f2ecff671c45be22f82d9);
+trace analysis uses
+[TraceLens at `4f25c1a`](https://github.com/AMD-AGI/TraceLens/tree/4f25c1a6f03441e710a97d71a5de9cc5c2fc1555).
+Serving benchmark execution uses
+[InferenceX at `23f04b8`](https://github.com/SemiAnalysisAI/InferenceX/tree/23f04b8baca7774f9c0bbcb7a31e9ad551a3b84b).
+Quality evaluation uses a source-built, hash-locked
+[EleutherAI lm-evaluation-harness at `b315ef3`](https://github.com/EleutherAI/lm-evaluation-harness/tree/b315ef3b05176acc9732bb7fdec116abe1ecc476).
+All are exact runtime dependencies rather than vendored copies. Review
+[UPSTREAM_SOURCES.md](UPSTREAM_SOURCES.md) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before redistributing the
+knowledge snapshot.
+
+## License and security
+
+Apex is licensed under the [MIT License](LICENSE). Third-party material retains its
+own notice and license. Report vulnerabilities through the private channels in
+[SECURITY.md](SECURITY.md); do not publish credentials, generated exploit kernels,
+or private workload data in an issue.

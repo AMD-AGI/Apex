@@ -1,0 +1,110 @@
+# Benchmark
+
+This module is Apex's only E2E benchmark execution boundary. It delegates
+execution to the exact Magpie checkout recorded by `DependencyReceipt`; it does
+not import an in-tree fallback, manipulate kernels, or implement another
+profiler.
+
+## Phase views
+
+`build_config_views` writes four immutable artifacts:
+
+- `benchmark.original.yaml` is a byte-for-byte copy of user input.
+- `benchmark.measurement.resolved.yaml` forces `run_kind=measurement`, disables
+  Torch, system, TraceLens, GPU monitoring, and gap analysis. Its metrics may be
+  used by E2E policy.
+- `benchmark.diagnostic.resolved.yaml` forces `run_kind=diagnostic`, enables
+  Torch profiling, TraceLens at the
+  receipt's exact root, deterministic TargetedKernelTrace acquisition, GPU
+  monitoring, and gap analysis. Its performance
+  numbers are observations only, never reward truth.
+- `benchmark.replay.yaml` has measurement instrumentation and may differ from
+  measurement only in `docker_image`.
+
+Every executable view binds the exact InferenceX receipt. Formal serving runs
+also freeze the same verified `benchmark.lm_eval_runtime` path, digest, and full
+identity in measurement, diagnostic, and replay views, plus the model revision,
+cache root, and physical GPU selection. The runtime is mounted read-only by
+Magpie and is never installed into or inferred from the workload image. For
+serving frameworks, every view freezes `RUN_EVAL=true` and an
+explicit `MAGPIE_EVAL_TASKS` value (default `gsm8k`). An input that explicitly
+disables evaluation is rejected before an agent or GPU starts. Workload
+semantics exclude only instrumentation and deployment image, and their digest
+must match across measurement, diagnostic, and replay.
+
+## Result contract
+
+`MagpieBenchmarkAdapter` invokes an argv array through `SubprocessSupervisor`
+with the receipt's Python interpreter and Magpie root. It uses an explicit
+environment allowlist rather than copying the host environment. GPU visibility,
+ROCm locations, and non-secret Hugging Face cache/offline fields may be inherited;
+named Docker daemon/context/config/TLS fields are inherited so Magpie can reach
+the operator-selected engine, and a Hugging Face token may be supplied only as
+an explicit request override.
+Hugging Face model/dataset offline switches are allowlisted so a prewarmed,
+revision-audited cache can be reused without network access. When
+`hf_offline=true`, the view builder requires an explicit existing cache and
+freezes `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, and
+`HF_DATASETS_OFFLINE=1` into the workload semantics shared by all three views.
+`PYTHON*`, shell startup hooks, dynamic-loader injection, unrelated API keys, and
+`DOCKER_AUTH_CONFIG` are excluded. The verified Magpie and TraceLens roots plus
+`PYTHONNOUSERSITE=1` are adapter-owned and cannot be overridden. Every run gets a
+new immutable output directory.
+
+`parse_benchmark_report` normalizes throughput plus TTFT/TPOT/ITL/E2EL
+mean/median/p99 distributions. Serving quality is read from exactly one
+lm-eval `results*.json` inside the Magpie workspace; scriptable quality comes
+from Magpie's `quality_gate`. Required quality evidence that is missing,
+ambiguous, skipped, or empty makes the run fail closed even if Magpie reports
+process success. The report must also agree with the requested evidence lane:
+measurement/replay require `run_kind=measurement`, `reward_eligible=true`, and
+profiling off; diagnostics require the inverse. Candidate-vs-baseline regression
+policy belongs to the E2E optimization module, not this adapter.
+
+## Purpose
+
+The package is Apex's Magpie boundary: it freezes phase-specific workload views
+and normalizes evaluator-owned performance and quality evidence.
+
+## Public API
+
+Use `build_config_views`, `validate_resolved_view`, `MagpieBenchmarkAdapter`, and
+the immutable result types exported by `apex.benchmark`.
+
+## Invariants
+
+Measurement views disable profiling, diagnostic views cannot supply rewards,
+quality stays enabled, replay changes only the allowed image locator, and host
+environment state cannot silently change the imported evaluator.
+
+## Dependencies
+
+Benchmark code depends downward on core contracts, benchmark ports, supervised
+execution, and pinned runtime receipts; it never imports optimization policy.
+
+## Failure semantics
+
+Malformed YAML, dependency drift, phase leakage, workspace escape, ambiguous
+quality files, or missing required quality evidence fail closed with reason codes.
+
+## Tests
+
+Run `pytest -q -p no:cacheprovider tests/unit/benchmark`; fixtures are CPU-only
+and use temporary immutable views and reports.
+
+## Provenance
+
+Resolved views record original/config semantic hashes plus exact Magpie,
+TraceLens, Python, and dependency-lock identities.
+
+Formal reports also fail closed unless Apex can independently re-read the
+workspace `model_revision_receipt.json` and
+`inferencex_runtime_receipt.json`. The latter must bind the configured clean
+InferenceX checkout, exact commit and tree, unchanged empty Git status, and the
+run-scoped private-index materialization method; a copied or dirty source tree
+cannot become reward evidence.
+The Magpie `lm_eval_runtime_receipt` report evidence is independently rehashed
+against the snapshotted runtime manifest and execution receipt, then compared
+with Apex's verified runtime identity. Both artifacts are retained in the
+normalized result and canonical E2E run record; missing, writable-mounted, or
+tampered evaluator evidence cannot become reward truth.

@@ -1,0 +1,369 @@
+{
+  "schema": "apex.lm-eval-runtime-lock/v1",
+  "source": {
+    "filename": "lm-evaluation-harness-b315ef3b05176acc9732bb7fdec116abe1ecc476.tar.gz",
+    "url": "https://github.com/EleutherAI/lm-evaluation-harness/archive/b315ef3b05176acc9732bb7fdec116abe1ecc476.tar.gz",
+    "size_bytes": 3301652,
+    "sha256": "a491d61ca6741cdd792d538c72065bdd0f4e0729a15c17f5c451d7363c0b94ae"
+  },
+  "source_repository": "https://github.com/EleutherAI/lm-evaluation-harness.git",
+  "source_date_epoch": 1764686356,
+  "wheels": [
+    {
+      "name": "absl-py",
+      "version": "2.5.0",
+      "filename": "absl_py-2.5.0-py3-none-any.whl",
+      "sha256": "0f17b89f2a4eaaedc4f28c622998aa690564b3012a396a4ffad0821007fe03ba",
+      "download": {
+        "filename": "absl_py-2.5.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/58/0a/a10b45aab35b175aded078a462dc8d0c698f5b13946e7cb0869097b78bb6/absl_py-2.5.0-py3-none-any.whl",
+        "size_bytes": 137410,
+        "sha256": "0f17b89f2a4eaaedc4f28c622998aa690564b3012a396a4ffad0821007fe03ba"
+      }
+    },
+    {
+      "name": "chardet",
+      "version": "6.0.0.post1",
+      "filename": "chardet-6.0.0.post1-py3-none-any.whl",
+      "sha256": "c894a36800549adf7bb5f2af47033281b75fdfcd2aa0f0243be0ad22a52e2dcb",
+      "download": {
+        "filename": "chardet-6.0.0.post1-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/66/42/5de54f632c2de53cd3415b3703383d5fff43a94cbc0567ef362515261a21/chardet-6.0.0.post1-py3-none-any.whl",
+        "size_bytes": 627245,
+        "sha256": "c894a36800549adf7bb5f2af47033281b75fdfcd2aa0f0243be0ad22a52e2dcb"
+      }
+    },
+    {
+      "name": "DataProperty",
+      "version": "1.1.1",
+      "filename": "dataproperty-1.1.1-py3-none-any.whl",
+      "sha256": "cf026aa002dbd6c57c619ec6741ffd61ae7bf2f20481951d8af2dff44480340e",
+      "download": {
+        "filename": "dataproperty-1.1.1-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/03/41/eab7fe313820578b341a2a1d6aeeedd2c38ec1e3f3d51e57e2735b5beac0/dataproperty-1.1.1-py3-none-any.whl",
+        "size_bytes": 27691,
+        "sha256": "cf026aa002dbd6c57c619ec6741ffd61ae7bf2f20481951d8af2dff44480340e"
+      }
+    },
+    {
+      "name": "defusedxml",
+      "version": "0.7.1",
+      "filename": "defusedxml-0.7.1-py2.py3-none-any.whl",
+      "sha256": "a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61",
+      "download": {
+        "filename": "defusedxml-0.7.1-py2.py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl",
+        "size_bytes": 25604,
+        "sha256": "a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61"
+      }
+    },
+    {
+      "name": "jsonlines",
+      "version": "4.0.0",
+      "filename": "jsonlines-4.0.0-py3-none-any.whl",
+      "sha256": "185b334ff2ca5a91362993f42e83588a360cf95ce4b71a73548502bda52a7c55",
+      "download": {
+        "filename": "jsonlines-4.0.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/f8/62/d9ba6323b9202dd2fe166beab8a86d29465c41a0288cbe229fac60c1ab8d/jsonlines-4.0.0-py3-none-any.whl",
+        "size_bytes": 8701,
+        "sha256": "185b334ff2ca5a91362993f42e83588a360cf95ce4b71a73548502bda52a7c55"
+      }
+    },
+    {
+      "name": "lm_eval",
+      "version": "0.4.9.2",
+      "filename": "lm_eval-0.4.9.2-py3-none-any.whl",
+      "sha256": "251b356c8ace594e67f71faa0ab4a72cae4c37255ab48582ba74d5a03e76176b",
+      "build_source": {
+        "filename": "lm-evaluation-harness-b315ef3b05176acc9732bb7fdec116abe1ecc476.tar.gz",
+        "url": "https://github.com/EleutherAI/lm-evaluation-harness/archive/b315ef3b05176acc9732bb7fdec116abe1ecc476.tar.gz",
+        "size_bytes": 3301652,
+        "sha256": "a491d61ca6741cdd792d538c72065bdd0f4e0729a15c17f5c451d7363c0b94ae"
+      }
+    },
+    {
+      "name": "lxml",
+      "version": "6.1.1",
+      "filename": "lxml-6.1.1-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "ebe6af670449830d6d9b752c256a983291c766a1365ba5d5460048f9e33a7818",
+      "download": {
+        "filename": "lxml-6.1.1-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/08/f6/af32e23e563971ffb0fb86be52bc5be5c2c118858ffc119bf6a9039b173d/lxml-6.1.1-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+        "size_bytes": 5240367,
+        "sha256": "ebe6af670449830d6d9b752c256a983291c766a1365ba5d5460048f9e33a7818"
+      }
+    },
+    {
+      "name": "mbstrdecoder",
+      "version": "1.1.5",
+      "filename": "mbstrdecoder-1.1.5-py3-none-any.whl",
+      "sha256": "4a50fe113d4abecfd86e8f716b2e413cce03d63af83ec3c7cdbe81dec0e519ed",
+      "download": {
+        "filename": "mbstrdecoder-1.1.5-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/4c/eb/711270faab7b7df702339a2c68b31fd3ed4fffc68b0e99e5bdf49b1e87e4/mbstrdecoder-1.1.5-py3-none-any.whl",
+        "size_bytes": 7966,
+        "sha256": "4a50fe113d4abecfd86e8f716b2e413cce03d63af83ec3c7cdbe81dec0e519ed"
+      }
+    },
+    {
+      "name": "nltk",
+      "version": "3.10.2",
+      "filename": "nltk-3.10.2-py3-none-any.whl",
+      "sha256": "2c7ccacb765c5e26b0cb60fb1b57080af522c6924d12a714a243305ba3637412",
+      "download": {
+        "filename": "nltk-3.10.2-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/1f/2b/bf677eb32ca6684b270c0d19ab133c2271e9f3375997e5a8dd2b08e3152d/nltk-3.10.2-py3-none-any.whl",
+        "size_bytes": 1725815,
+        "sha256": "2c7ccacb765c5e26b0cb60fb1b57080af522c6924d12a714a243305ba3637412"
+      }
+    },
+    {
+      "name": "pathvalidate",
+      "version": "3.3.1",
+      "filename": "pathvalidate-3.3.1-py3-none-any.whl",
+      "sha256": "5263baab691f8e1af96092fa5137ee17df5bdfbd6cff1fcac4d6ef4bc2e1735f",
+      "download": {
+        "filename": "pathvalidate-3.3.1-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/9a/70/875f4a23bfc4731703a5835487d0d2fb999031bd415e7d17c0ae615c18b7/pathvalidate-3.3.1-py3-none-any.whl",
+        "size_bytes": 24305,
+        "sha256": "5263baab691f8e1af96092fa5137ee17df5bdfbd6cff1fcac4d6ef4bc2e1735f"
+      }
+    },
+    {
+      "name": "portalocker",
+      "version": "4.1.0",
+      "filename": "portalocker-4.1.0-py3-none-any.whl",
+      "sha256": "d985a430d265adf31adf12bc0bf3501aea59efc495e9104c057e5dfb7394c226",
+      "download": {
+        "filename": "portalocker-4.1.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/61/91/288c883303be067c1648f1e63ea38e5f8eb5ab7123fd3a9a7366148e58b7/portalocker-4.1.0-py3-none-any.whl",
+        "size_bytes": 65914,
+        "sha256": "d985a430d265adf31adf12bc0bf3501aea59efc495e9104c057e5dfb7394c226"
+      }
+    },
+    {
+      "name": "pytablewriter",
+      "version": "1.2.1",
+      "filename": "pytablewriter-1.2.1-py3-none-any.whl",
+      "sha256": "e906ff7ff5151d70a5f66e0f7b75642a7f2dce8d893c265b79cc9cf6bc04ddb4",
+      "download": {
+        "filename": "pytablewriter-1.2.1-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/21/4c/c199512f01c845dfe5a7840ab3aae6c60463b5dc2a775be72502dfd9170a/pytablewriter-1.2.1-py3-none-any.whl",
+        "size_bytes": 91083,
+        "sha256": "e906ff7ff5151d70a5f66e0f7b75642a7f2dce8d893c265b79cc9cf6bc04ddb4"
+      }
+    },
+    {
+      "name": "pytz",
+      "version": "2026.3.post1",
+      "filename": "pytz-2026.3.post1-py2.py3-none-any.whl",
+      "sha256": "dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815",
+      "download": {
+        "filename": "pytz-2026.3.post1-py2.py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/0f/7b/39c34ca613b0b198cb866466651b26b045e2009864c5183c979a3b83f383/pytz-2026.3.post1-py2.py3-none-any.whl",
+        "size_bytes": 508283,
+        "sha256": "dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815"
+      }
+    },
+    {
+      "name": "rouge-score",
+      "version": "0.1.2",
+      "filename": "rouge_score-0.1.2-py3-none-any.whl",
+      "sha256": "22684233835256094abca755e893888a9c7bc6177f2792627c3d718aa29b9a73",
+      "build_source": {
+        "filename": "rouge_score-0.1.2.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/e2/c5/9136736c37022a6ad27fea38f3111eb8f02fe75d067f9a985cc358653102/rouge_score-0.1.2.tar.gz",
+        "size_bytes": 17400,
+        "sha256": "c7d4da2683e68c9abf0135ef915d63a46643666f848e558a1b9f7ead17ff0f04"
+      }
+    },
+    {
+      "name": "sacrebleu",
+      "version": "2.6.0",
+      "filename": "sacrebleu-2.6.0-py3-none-any.whl",
+      "sha256": "3edc1531575cfe4ad04ce53491a9307e234af1c3f805a1f491cbec844229a8a8",
+      "download": {
+        "filename": "sacrebleu-2.6.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/06/f2/6c90ccf3ad1d09a7d662a405b274f3c93b92df59c8d6a025d26aaf34d302/sacrebleu-2.6.0-py3-none-any.whl",
+        "size_bytes": 100785,
+        "sha256": "3edc1531575cfe4ad04ce53491a9307e234af1c3f805a1f491cbec844229a8a8"
+      }
+    },
+    {
+      "name": "scikit-learn",
+      "version": "1.9.0",
+      "filename": "scikit_learn-1.9.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "056c92bb67ad4c28463c2f2653d9701449201e7e7a9e94e321be0f71c4fef2b8",
+      "download": {
+        "filename": "scikit_learn-1.9.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/6c/c2/63fdda36c56437eeb44aaf9493c8bcd62ce230ab1598924fc626ffbfa943/scikit_learn-1.9.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "size_bytes": 9132097,
+        "sha256": "056c92bb67ad4c28463c2f2653d9701449201e7e7a9e94e321be0f71c4fef2b8"
+      }
+    },
+    {
+      "name": "sqlitedict",
+      "version": "2.1.0",
+      "filename": "sqlitedict-2.1.0-py3-none-any.whl",
+      "sha256": "7808239728d1603b1398463a897c0446899405bd2be105bf991700932bed345c",
+      "build_source": {
+        "filename": "sqlitedict-2.1.0.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/12/9a/7620d1e9dcb02839ed6d4b14064e609cdd7a8ae1e47289aa0456796dd9ca/sqlitedict-2.1.0.tar.gz",
+        "size_bytes": 21846,
+        "sha256": "03d9cfb96d602996f1d4c2db2856f1224b96a9c431bdd16e78032a72940f9e8c"
+      }
+    },
+    {
+      "name": "tabledata",
+      "version": "1.3.5",
+      "filename": "tabledata-1.3.5-py3-none-any.whl",
+      "sha256": "a1e57afc4767b51bef551114c0df31f205d712dbb75e3caf9be7834a79f23136",
+      "download": {
+        "filename": "tabledata-1.3.5-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/c7/86/37fa0e1437089f08b8b1b8c8ad93f6b57e9427753f002914299323300a9e/tabledata-1.3.5-py3-none-any.whl",
+        "size_bytes": 11919,
+        "sha256": "a1e57afc4767b51bef551114c0df31f205d712dbb75e3caf9be7834a79f23136"
+      }
+    },
+    {
+      "name": "tabulate",
+      "version": "0.10.0",
+      "filename": "tabulate-0.10.0-py3-none-any.whl",
+      "sha256": "f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3",
+      "download": {
+        "filename": "tabulate-0.10.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/99/55/db07de81b5c630da5cbf5c7df646580ca26dfaefa593667fc6f2fe016d2e/tabulate-0.10.0-py3-none-any.whl",
+        "size_bytes": 39814,
+        "sha256": "f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3"
+      }
+    },
+    {
+      "name": "tcolorpy",
+      "version": "0.1.7",
+      "filename": "tcolorpy-0.1.7-py3-none-any.whl",
+      "sha256": "26a59d52027e175a37e0aba72efc99dda43f074db71f55b316d3de37d3251378",
+      "download": {
+        "filename": "tcolorpy-0.1.7-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/05/a2/ed023f2edd1e011b4d99b6727bce8253842d66c3fbf9ed0a26fc09a92571/tcolorpy-0.1.7-py3-none-any.whl",
+        "size_bytes": 8096,
+        "sha256": "26a59d52027e175a37e0aba72efc99dda43f074db71f55b316d3de37d3251378"
+      }
+    },
+    {
+      "name": "tenacity",
+      "version": "9.1.4",
+      "filename": "tenacity-9.1.4-py3-none-any.whl",
+      "sha256": "6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55",
+      "download": {
+        "filename": "tenacity-9.1.4-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl",
+        "size_bytes": 28926,
+        "sha256": "6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55"
+      }
+    },
+    {
+      "name": "threadpoolctl",
+      "version": "3.6.0",
+      "filename": "threadpoolctl-3.6.0-py3-none-any.whl",
+      "sha256": "43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb",
+      "download": {
+        "filename": "threadpoolctl-3.6.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl",
+        "size_bytes": 18638,
+        "sha256": "43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb"
+      }
+    },
+    {
+      "name": "typepy",
+      "version": "1.3.5",
+      "filename": "typepy-1.3.5-py3-none-any.whl",
+      "sha256": "de361b59609c7503efc2edbe9d7a4e053ae71307bf90ae1678ec4d6bcd807922",
+      "download": {
+        "filename": "typepy-1.3.5-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/64/71/75cf08c49b64a9419f1f2cef9be072ac34f6b784da2851489470b7c7ba15/typepy-1.3.5-py3-none-any.whl",
+        "size_bytes": 31530,
+        "sha256": "de361b59609c7503efc2edbe9d7a4e053ae71307bf90ae1678ec4d6bcd807922"
+      }
+    },
+    {
+      "name": "word2number",
+      "version": "1.1",
+      "filename": "word2number-1.1-py3-none-any.whl",
+      "sha256": "93943dc29f7be870c69d65fda7b74df5fe916f984cd32cd127ea19b9cdc990fc",
+      "build_source": {
+        "filename": "word2number-1.1.zip",
+        "url": "https://files.pythonhosted.org/packages/4a/29/a31940c848521f0725f0df6b25dca8917f13a2025b0e8fcbe5d0457e45e6/word2number-1.1.zip",
+        "size_bytes": 9723,
+        "sha256": "70e27a5d387f67b04c71fbb7621c05930b19bfd26efd6851e6e0f9969dcde7d0"
+      }
+    }
+  ],
+  "base_distributions": {
+    "aiohappyeyeballs": "2.6.1",
+    "aiohttp": "3.13.5",
+    "aiosignal": "1.4.0",
+    "annotated-doc": "0.0.4",
+    "anyio": "4.13.0",
+    "attrs": "26.1.0",
+    "certifi": "2026.2.25",
+    "charset-normalizer": "3.4.7",
+    "click": "8.3.2",
+    "colorama": "0.4.6",
+    "datasets": "4.8.4",
+    "dill": "0.4.1",
+    "evaluate": "0.4.6",
+    "filelock": "3.28.0",
+    "frozenlist": "1.8.0",
+    "fsspec": "2026.2.0",
+    "h11": "0.16.0",
+    "hf-xet": "1.4.3",
+    "httpcore": "1.0.9",
+    "httpx": "0.28.1",
+    "huggingface-hub": "1.11.0",
+    "idna": "3.11",
+    "jinja2": "3.1.6",
+    "joblib": "1.5.3",
+    "markdown-it-py": "4.0.0",
+    "markupsafe": "3.0.3",
+    "more-itertools": "8.10.0",
+    "multidict": "6.7.1",
+    "multiprocess": "0.70.19",
+    "narwhals": "2.19.0",
+    "numpy": "2.1.3",
+    "packaging": "26.1",
+    "pandas": "3.0.1",
+    "propcache": "0.4.1",
+    "pyarrow": "23.0.1",
+    "pygments": "2.20.0",
+    "python-dateutil": "2.9.0.post0",
+    "pyyaml": "6.0.3",
+    "regex": "2026.4.4",
+    "requests": "2.33.1",
+    "rich": "15.0.0",
+    "scipy": "1.17.1",
+    "setuptools": "79.0.1",
+    "shellingham": "1.5.4",
+    "six": "1.17.0",
+    "tiktoken": "0.12.0",
+    "tqdm": "4.67.3",
+    "typer": "0.24.1",
+    "typing-extensions": "4.15.0",
+    "urllib3": "2.6.3",
+    "xxhash": "3.6.0",
+    "yarl": "1.23.0",
+    "zstandard": "0.25.0"
+  },
+  "identity": {
+    "lm_eval_commit": "b315ef3b05176acc9732bb7fdec116abe1ecc476",
+    "lm_eval_tree": "6574cdae47205fcee11b76510fd09c5ae60a34c9",
+    "lm_eval_version": "0.4.9.2",
+    "python_abi": "cpython-312",
+    "python_soabi": "cpython-312-x86_64-linux-gnu",
+    "base_image_id": "sha256:b599932816fe09f9ea2541655f5388457ac2494b87b551cefdbf2a207b0ed3a9",
+    "base_image_repo_digest": "vllm/vllm-openai-rocm@sha256:c3457ab4702a5bd665b06d7ba57e6105fe98adc4f5b3d4afcf98ec45551988e0",
+    "inferencex_commit": "23f04b8baca7774f9c0bbcb7a31e9ad551a3b84b",
+    "inferencex_tree": "a9fd841e1e3cf8062f891058d2ea2be8c2b98c4b"
+  },
+  "installed_tree_sha256": "23dc17079da4619a4cb37100f66f015dd9dd818df46e9f0ea16b541deaf27f60",
+  "runtime_sha256": "ca744a9e0ab994eba275a0fc0b01b762247f76f9cd0129b31b5dc2969b23732e"
+}

@@ -1,0 +1,139 @@
+# Execution
+
+`apex.execution` implements the `AgentBackend` port for Codex, Claude Code, and
+Cursor Agent. Codex is the registry default; callers can explicitly select the
+other two without preflighting unrelated credentials.
+
+All adapters execute argv with `shell=False` through `SubprocessSupervisor`, use
+a fresh process group, drain stdout and stderr concurrently, bound captured
+output, and kill descendants on timeout or a streaming turn-budget stop. They
+return normalized transcript events and never decide whether a candidate is
+correct or fast.
+
+Public API: `AgentRegistry`, `build_default_registry`, `SubprocessSupervisor`,
+`ProcessResult`, and `build_subprocess_environment`.
+
+## Structured transcripts
+
+Each backend requests a JSON stream and preserves its JSON objects as bounded raw
+events. The parser separately emits provider-neutral `agent_message`,
+`tool_called`, and `tool_result` entries. Token totals come only from an explicit
+structured `usage` mapping; the last top-level summary wins over intermediate
+message usage to avoid double counting. Turn and tool counts use explicit fields
+when present and otherwise count structured turn/message/tool events. Cost exists
+only when a JSON field such as `total_cost_usd`, `cost_usd`, or a typed
+`cost.amount/currency` object is present. Non-JSON stdout, malformed lines,
+assistant claims about tokens, and stderr cannot create usage or cost.
+
+`agent_transcript_document` produces the canonical
+`apex.agent-transcript/v1` projection containing the source JSON events,
+normalized semantic events, requested model/effort, usage, and cost. Raw stdout/stderr remain separate
+diagnostic artifacts.
+
+Every production result also embeds an `apex.agent-invocation/v1` receipt. It
+records the discovered and resolved CLI entrypoint, SHA-256 of those exact
+entrypoint bytes, the CLI's bounded `--version` output, actual argv, prompt
+transport, requested editable files, turn policy, and explicit isolation modes.
+The exact receipt is stored in the transcript CAS artifact and projected into
+the run's `agent_completed`/`agent_failed` event. `allowed_files_enforced_by_cli=false` is
+intentional: current CLIs only provide workspace-level isolation; Apex freezes
+and rejects undeclared changes after exit instead of claiming a path allowlist
+that the CLI cannot enforce.
+
+Codex and Claude receive their explicit effort through supported CLI options.
+Cursor has no independent effort switch in its CLI, so a non-null Cursor effort
+fails preflight with `agent_effort_unsupported`; it is never recorded as if applied.
+
+## CLI isolation and turn budget
+
+Codex runs with `workspace-write`, strict `approval_policy="never"`, ignored user
+config and exec-policy rules, and an ephemeral session. Claude runs in `--bare`
+and `--safe-mode`, disables slash commands, loads only an explicit empty strict
+MCP configuration, uses noninteractive `dontAsk` permissions, and does not
+persist the session. Cursor runs with its explicit sandbox enabled and without
+`--force` or automatic MCP approval. Cursor still needs explicit headless
+workspace trust and exposes no flag that disables every project configuration;
+the receipt therefore says `config_sources=backend_default_may_load` rather
+than asserting stronger isolation.
+
+`max_turns` is enforced while stdout JSONL is being drained under
+`structured_agent_turn_v1`. One complete structured assistant decision consumes
+one turn; a standalone structured tool request consumes a turn when the backend
+does not wrap it in an assistant message. A tool request at the limit stops the
+whole process group before another model turn. Explicit provider `num_turns`
+summaries are also checked. Human text and malformed JSON never create turns.
+The result records `observed_turns` and `budget_exceeded`; budget exhaustion is a
+typed failure even if the CLI races to exit zero. This policy is deliberately a
+portable stream policy, not a claim that providers expose identical internal
+sampling boundaries.
+
+A malformed JSON object stops execution as
+`budget_enforcement_failed`; a nominal exit-zero stream with no structured turn
+evidence is rejected after drain as `missing_structured_turn_evidence`.
+Non-JSON diagnostic lines may coexist with valid events but cannot satisfy the
+budget proof.
+
+The invocation receipt also states
+`response_token_limit=not_supported_context_advisory_only`. None of the three
+locally supported CLI surfaces provides a portable output-token limit; the
+ContextPacket's response allocation is therefore not represented as an
+execution cap.
+
+## Process environments
+
+Subprocesses never receive a copy of `os.environ`. The shared builder inherits a
+small named set for executable discovery, user/config/cache locations, locale,
+certificate/proxy routing, and explicitly selected GPU, Hugging Face, or Docker
+runtime fields. Normal caller-provided variables are accepted explicitly and
+bounded by count and size. `BASH_ENV`, `ENV`, dynamic-loader injection, language
+startup injection (including `PYTHON*`), and credential-shaped variables fail
+closed. `PYTHONNOUSERSITE=1` is adapter-owned.
+
+Agent adapters opt in to exactly one ambient credential: Codex receives only
+`OPENAI_API_KEY`, Claude only `ANTHROPIC_API_KEY`, and Cursor only
+`CURSOR_API_KEY`. Cross-backend credentials and unrelated host secrets are not
+inherited. An explicit request may override only that same backend credential.
+
+Tests: `pytest tests/unit/execution tests/contract -q`.
+
+## Purpose
+
+Execution contains stateless Codex, Claude, and Cursor adapters plus one bounded
+subprocess supervisor for trusted fixed-argv commands.
+
+## Public API
+
+Consumers use `AgentRegistry`, `build_default_registry`, `SubprocessSupervisor`,
+`ProcessResult`, the canonical transcript projection, and the fail-closed
+environment builder; vendor implementations remain adapter details.
+
+## Invariants
+
+Requests are immutable, argv is never shell text, time/output limits are explicit,
+backend output cannot directly mutate domain state, and subprocess environment
+inheritance is explicit rather than ambient.
+
+## Dependencies
+
+Execution depends only on core and agent ports. It never imports optimization,
+evaluation, storage, benchmark, or CLI packages.
+
+## Failure semantics
+
+Missing executable, timeout, streaming turn-budget exhaustion, nonzero exit,
+truncated output, or invalid candidate is returned as typed process/agent
+evidence rather than inferred success.
+
+## Tests
+
+Unit tests use fake executables to cover argv, timeout, limits, transcript
+capture, backend selection, environment injection rejection, credential
+isolation, Codex/Claude-shaped structured streams, summary de-duplication, and
+deterministic error mapping. Process tests prove both timeout and budget stops
+terminate descendants.
+
+## Provenance
+
+Results record backend/model/effort identity, entrypoint-byte/argv/isolation
+receipts, bounded structured transcripts, and source-indexed usage/cost;
+environment credentials are never copied into transcript artifacts.
