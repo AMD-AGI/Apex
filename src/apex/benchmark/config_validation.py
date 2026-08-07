@@ -32,6 +32,7 @@ def validate_view_contract(
     _validate_semantics_identity(benchmark, metadata)
     _validate_run_kind(benchmark, pass_type)
     _validate_quality_enabled(benchmark)
+    _validate_evaluator_policy(benchmark, metadata)
     _validate_lm_eval_runtime(benchmark, receipt)
     _validate_instrumentation(benchmark, pass_type, tracelens_root)
 
@@ -108,6 +109,30 @@ def _validate_quality_enabled(benchmark: Mapping[str, Any]) -> None:
         raise ConfigurationError(
             "Serving benchmark view is missing RUN_EVAL=true",
             "quality_contract_missing",
+        )
+
+
+def _validate_evaluator_policy(
+    benchmark: Mapping[str, Any], metadata: Mapping[str, Any]
+) -> None:
+    quality = metadata.get("quality_contract")
+    policy = quality.get("evaluator_policy") if isinstance(quality, Mapping) else None
+    if policy is None:
+        return
+    envs = benchmark.get("envs")
+    expected = {
+        "MAGPIE_EVAL_POLICY_ID": policy.get("policy_id"),
+        "MAGPIE_EVAL_TASKS": policy.get("tasks"),
+        "MAGPIE_EVAL_PRIMARY_METRIC": policy.get("primary_metric"),
+        "MAGPIE_EVAL_MAX_LENGTH": str(policy.get("max_length")),
+        "MAGPIE_EVAL_MAX_GEN_TOKENS": str(policy.get("max_gen_tokens")),
+    }
+    if not isinstance(envs, Mapping) or any(
+        str(envs.get(name)) != str(value) for name, value in expected.items()
+    ):
+        raise ConfigurationError(
+            "Benchmark evaluator policy differs from its resolved receipt",
+            "benchmark_evaluator_policy_mismatch",
         )
 
 

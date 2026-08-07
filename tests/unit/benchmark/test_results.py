@@ -4,6 +4,8 @@ import json
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from apex.benchmark import parse_benchmark_report
 from apex.benchmark.results import empty_result
 from apex.core import sha256_file
@@ -40,6 +42,34 @@ def _report(
         payload["quality_gate"] = quality_gate
     report.write_text(json.dumps(payload), encoding="utf-8")
     return report
+
+
+def _formal_gate(first, results: Path, samples: Path) -> dict:
+    return {
+        "primary_outcomes": {
+            "gsm8k": {
+                "metric": "exact_match,strict-match",
+                "value": first.quality.primary_metrics[0].value,
+                "source": "lm_eval/results.json",
+            }
+        },
+        "result_artifact_receipts": [
+            {
+                "path": "lm_eval/results.json",
+                "size_bytes": results.stat().st_size,
+                "sha256": sha256_file(results),
+            }
+        ],
+        "sample_artifact_receipts": [
+            {
+                "path": "lm_eval/samples_gsm8k.jsonl",
+                "size_bytes": samples.stat().st_size,
+                "sha256": sha256_file(samples),
+            }
+        ],
+        "outcome_digest": first.quality.outcome_digest,
+        "sample_set_digest": first.quality.sample_set_digest,
+    }
 
 
 def _add_lm_eval_runtime_evidence(report_path: Path) -> LmEvalRuntimeReceipt:
@@ -117,8 +147,8 @@ def _add_lm_eval_runtime_evidence(report_path: Path) -> LmEvalRuntimeReceipt:
 
 
 def test_normalizes_percentiles_and_lm_eval_quality(tmp_path: Path) -> None:
-    eval_dir = tmp_path / "lm_eval"
-    eval_dir.mkdir()
+    eval_dir = tmp_path / "lm_eval" / "model"
+    eval_dir.mkdir(parents=True)
     (eval_dir / "results_20260807.json").write_text(
         json.dumps(
             {
@@ -151,6 +181,106 @@ def test_normalizes_percentiles_and_lm_eval_quality(tmp_path: Path) -> None:
     assert result.metric_mapping()[
         "quality.gsm8k.exact_match,strict-match"
     ] == 0.91
+
+
+def test_strict_match_wins_and_raw_samples_are_bound(tmp_path: Path) -> None:
+    eval_dir = tmp_path / "lm_eval"
+    eval_dir.mkdir()
+    results = eval_dir / "results.json"
+    results.write_text(
+        json.dumps(
+            {
+                "results": {
+                    "gsm8k": {
+                        "exact_match,flexible-extract": 0.99,
+                        "exact_match,strict-match": 0.91,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    samples = eval_dir / "samples_gsm8k.jsonl"
+    samples.write_text('{"doc_id": 1, "exact_match": true}\n', encoding="utf-8")
+    first = parse_benchmark_report(
+        _report(tmp_path),
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+    )
+    report = json.loads(first.report_path.read_text(encoding="utf-8"))
+    report["quality_gate"] = _formal_gate(first, results, samples)
+    first.report_path.write_text(json.dumps(report), encoding="utf-8")
+    result = parse_benchmark_report(
+        first.report_path,
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+        expected_evaluator_policy={
+            "primary_metric": "exact_match,strict-match",
+            "tasks": "gsm8k",
+        },
+    )
+
+    assert result.succeeded
+    assert result.quality.primary_metrics[0].name == "exact_match,strict-match"
+    assert result.quality.primary_metrics[0].value == pytest.approx(0.91)
+    assert samples.resolve() in result.quality.raw_artifact_paths
+    assert samples.resolve() in result.artifacts
+    assert len(result.quality.outcome_digest or "") == 64
+    assert len(result.quality.sample_set_digest or "") == 64
+
+
+def test_formal_quality_rejects_tampered_outcome_digest(tmp_path: Path) -> None:
+    eval_dir = tmp_path / "lm_eval"
+    eval_dir.mkdir()
+    results = eval_dir / "results.json"
+    results.write_text(
+        json.dumps({"results": {"gsm8k": {"exact_match,strict-match": 0.9}}}),
+        encoding="utf-8",
+    )
+    samples = eval_dir / "samples_gsm8k.jsonl"
+    samples.write_text("{}\n", encoding="utf-8")
+    first = parse_benchmark_report(
+        _report(tmp_path),
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+    )
+    gate = _formal_gate(first, results, samples)
+    gate["outcome_digest"] = "0" * 64
+    report_data = json.loads(first.report_path.read_text(encoding="utf-8"))
+    report_data["quality_gate"] = gate
+    first.report_path.write_text(json.dumps(report_data), encoding="utf-8")
+    result = parse_benchmark_report(
+        first.report_path,
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+        expected_evaluator_policy={"primary_metric": "exact_match,strict-match"},
+    )
+
+    assert not result.succeeded
+    assert result.quality.error == "quality_outcome_digest_mismatch"
+
+
+def test_formal_quality_requires_raw_samples(tmp_path: Path) -> None:
+    eval_dir = tmp_path / "lm_eval"
+    eval_dir.mkdir()
+    (eval_dir / "results.json").write_text(
+        json.dumps({"results": {"gsm8k": {"exact_match,strict-match": 0.9}}}),
+        encoding="utf-8",
+    )
+    result = parse_benchmark_report(
+        _report(tmp_path, quality_gate={}),
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+        expected_evaluator_policy={"primary_metric": "exact_match,strict-match"},
+    )
+
+    assert not result.succeeded
+    assert result.quality.sample_set_digest is None
 
 
 def test_quality_ignores_runtime_copy_outside_evaluator_directory(

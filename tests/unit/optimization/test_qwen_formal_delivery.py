@@ -351,6 +351,8 @@ def test_qwen_oracles_are_source_relative_and_source_lock_bound(tmp_path: Path) 
         assert resolved is not None
         assert resolved.test_file == roots["vllm"] / test
         assert len(resolved.binding_sha256) == 64
+        assert resolved.execution_mode == "routing_only"
+        assert " -k " in f" {resolved.test_command} "
 
 
 class FakeProvenanceResolver:

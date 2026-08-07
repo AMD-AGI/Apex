@@ -141,6 +141,7 @@ def _harness_contract(
             "test_file": str(opportunity.test_file) if opportunity.test_file else None,
             "test_command": opportunity.test_command,
             "binding_sha256": opportunity.correctness_oracle_sha256,
+            "execution_mode": opportunity.oracle_execution_mode,
         },
         "promotion_policy": {
             "qualification_mode": qualification_mode,

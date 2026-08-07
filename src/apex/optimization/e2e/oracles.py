@@ -47,16 +47,21 @@ class CorrectnessOracleBinding:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedCorrectnessOracle:
-    """A checked test file and its policy-bound execution description."""
+    """A checked test route; V1 does not claim that it has been executed."""
 
     test_file: Path
     test_command: str
     binding_sha256: str
     policy_sha256: str
+    execution_mode: str = "routing_only"
 
 
 class CorrectnessOracleRegistry:
-    """Resolve reviewed tests by repository-relative source path, never symbol name."""
+    """Resolve reviewed test metadata by source path, never symbol name.
+
+    The registry gives planning and agent context a policy-bound route. It is not
+    an evaluator and cannot turn a deferred candidate into correctness evidence.
+    """
 
     def __init__(
         self,

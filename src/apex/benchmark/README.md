@@ -54,7 +54,15 @@ new immutable output directory.
 `parse_benchmark_report` normalizes throughput plus TTFT/TPOT/ITL/E2EL
 mean/median/p99 distributions. Serving quality is read from exactly one
 lm-eval `results*.json` inside the Magpie workspace; scriptable quality comes
-from Magpie's `quality_gate`. Required quality evidence that is missing,
+from Magpie's `quality_gate`. An immutable evaluator-only policy is activated
+when the exact reviewed Qwen config hash is selected. That policy keeps the
+server `MAX_MODEL_LEN=2248`, while binding lm-eval `max_length=2248`,
+`max_gen_tokens=480`, and `exact_match,strict-match`. Its digest is part of
+workload and accuracy semantics; the original benchmark YAML is copied
+byte-for-byte. Apex independently rehashes the results and raw sample receipts
+and requires Magpie's outcome and sample-set digests to match.
+
+Required quality evidence that is missing,
 ambiguous, skipped, or empty makes the run fail closed even if Magpie reports
 process success. The report must also agree with the requested evidence lane:
 measurement/replay require `run_kind=measurement`, `reward_eligible=true`, and

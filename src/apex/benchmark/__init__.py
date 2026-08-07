@@ -7,6 +7,12 @@ from .config_views import (
     validate_resolved_view,
 )
 from .magpie import MagpieBenchmarkAdapter
+from .evaluator_policy import (
+    EvaluatorPolicy,
+    QWEN_CONFIG_SHA256,
+    qwen_evaluator_policy,
+    resolve_evaluator_policy,
+)
 from .inferencex_runtime import (
     InferenceXRuntimeEvidence,
     parse_inferencex_runtime_evidence,
@@ -28,6 +34,7 @@ from .results import (
 
 __all__ = [
     "BenchmarkConfigViews",
+    "EvaluatorPolicy",
     "LatencyDistribution",
     "LatencyMetrics",
     "MagpieBenchmarkAdapter",
@@ -37,6 +44,7 @@ __all__ = [
     "NormalizedBenchmarkResult",
     "QualityEvidence",
     "QualityMetric",
+    "QWEN_CONFIG_SHA256",
     "ThroughputMetrics",
     "TraceLensBinding",
     "build_config_views",
@@ -44,5 +52,7 @@ __all__ = [
     "parse_inferencex_runtime_evidence",
     "parse_lm_eval_runtime_evidence",
     "parse_model_revision_evidence",
+    "resolve_evaluator_policy",
+    "qwen_evaluator_policy",
     "validate_resolved_view",
 ]

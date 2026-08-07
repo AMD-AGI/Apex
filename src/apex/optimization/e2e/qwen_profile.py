@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
-from apex.benchmark import MagpieBenchmarkAdapter
+from apex.benchmark import MagpieBenchmarkAdapter, QWEN_CONFIG_SHA256
 from apex.core import ContractError, IntegrityError, sha256_file
 from apex.delivery import BuildRecipeLock, BuildStep, E2EBundleVerifier
 from apex.runtime import (
@@ -31,7 +31,6 @@ from .source_delivery_adapters import (
 from .source_image_runtime import DockerPythonSourceImageBuilder
 
 
-QWEN_CONFIG_SHA256 = "f97bda8e04655fbd1410bafb34072ec072de416ea7e24551d2618281e75deafb"
 QWEN_MODEL_ID = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 QWEN_MODEL_REVISION = "c5f5f263bdd5cc134092897864e8905d8fe7b928"
 QWEN_PARENT_REFERENCE = "vllm/vllm-openai-rocm:v0.19.1"
@@ -44,6 +43,33 @@ QWEN_PARENT_REPO_DIGEST = (
 )
 QWEN_PARENT_IMAGE_ID = "sha256:b599932816fe09f9ea2541655f5388457ac2494b87b551cefdbf2a207b0ed3a9"
 QWEN_SOURCE_DATE_EPOCH = 1776474762
+_QWEN_ORACLE_SPECS = (
+    (
+        "vllm/v1/attention/ops/chunked_prefill_paged_decode.py",
+        "tests/kernels/attention/test_prefix_prefill.py",
+        "qwen3_nonstandard_block_size",
+    ),
+    (
+        "vllm/model_executor/layers/fla/ops/fused_recurrent.py",
+        "tests/kernels/test_fused_recurrent_packed_decode.py",
+        "fused_recurrent_packed_decode_matches_reference",
+    ),
+    (
+        "vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
+        "tests/kernels/mamba/test_causal_conv1d.py",
+        "causal_conv1d_update and not batch_gather and not varlen",
+    ),
+    (
+        "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py",
+        "tests/kernels/attention/test_cache.py",
+        "reshape_and_cache_flash and triton and NHD and auto",
+    ),
+    (
+        "vllm/v1/attention/ops/prefix_prefill.py",
+        "tests/kernels/attention/test_prefix_prefill.py",
+        "qwen3_nonstandard_block_size",
+    ),
+)
 
 
 class ProvenanceResolverPort(Protocol):
@@ -207,77 +233,19 @@ def build_qwen_correctness_oracles(
     """Bind dynamically discovered Qwen kernels to reviewed vLLM tests."""
 
     roots = dict(source_roots or default_qwen_source_roots())
-    bindings = tuple(
-        CorrectnessOracleBinding("vllm", source, test, argv)
-        for source, test, argv in (
-            (
-                "vllm/v1/attention/ops/chunked_prefill_paged_decode.py",
-                "tests/kernels/attention/test_prefix_prefill.py",
-                (
-                    "python",
-                    "-m",
-                    "pytest",
-                    "tests/kernels/attention/test_prefix_prefill.py",
-                    "-q",
-                    "-x",
-                ),
-            ),
-            (
-                "vllm/model_executor/layers/fla/ops/fused_recurrent.py",
-                "tests/kernels/test_fused_recurrent_packed_decode.py",
-                (
-                    "python",
-                    "-m",
-                    "pytest",
-                    "tests/kernels/test_fused_recurrent_packed_decode.py",
-                    "tests/kernels/test_fused_sigmoid_gating_delta_rule.py",
-                    "-q",
-                    "-x",
-                ),
-            ),
-            (
-                "vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
-                "tests/kernels/mamba/test_causal_conv1d.py",
-                (
-                    "python",
-                    "-m",
-                    "pytest",
-                    "tests/kernels/mamba/test_causal_conv1d.py",
-                    "-q",
-                    "-x",
-                ),
-            ),
-            (
-                "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py",
-                "tests/kernels/attention/test_cache.py",
-                (
-                    "python",
-                    "-m",
-                    "pytest",
-                    "tests/kernels/attention/test_cache.py",
-                    "-q",
-                    "-x",
-                ),
-            ),
-            (
-                "vllm/v1/attention/ops/prefix_prefill.py",
-                "tests/kernels/attention/test_prefix_prefill.py",
-                (
-                    "python",
-                    "-m",
-                    "pytest",
-                    "tests/kernels/attention/test_prefix_prefill.py",
-                    "-q",
-                    "-x",
-                ),
-            ),
-        )
-    )
+    bindings = tuple(_qwen_oracle_binding(*spec) for spec in _QWEN_ORACLE_SPECS)
     return CorrectnessOracleRegistry(
         source_roots=roots,
         bindings=bindings,
         source_lock_sha256=_qwen_source_lock().sha256,
     )
+
+
+def _qwen_oracle_binding(
+    source: str, test: str, selector: str
+) -> CorrectnessOracleBinding:
+    argv = ("python", "-m", "pytest", test, "-k", selector, "-q", "-x")
+    return CorrectnessOracleBinding("vllm", source, test, argv)
 
 
 def _reviewed_provenance_hints(

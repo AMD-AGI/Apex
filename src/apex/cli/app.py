@@ -74,6 +74,13 @@ def _parser() -> argparse.ArgumentParser:
     e2e.add_argument("--max-turns", type=int)
     e2e.add_argument("--timeout-seconds", type=int)
 
+    run = commands.add_parser("run", help="Recover or inspect a canonical run")
+    run_commands = run.add_subparsers(dest="run_command", required=True)
+    resume = run_commands.add_parser(
+        "resume", help="Resume an interrupted E2E run from durable state"
+    )
+    resume.add_argument("--run", type=Path, required=True, help="Existing run root")
+
     bundle = commands.add_parser("bundle", help="Inspect or verify source bundles")
     bundle_commands = bundle.add_subparsers(dest="bundle_command", required=True)
     verify = bundle_commands.add_parser("verify", help="Verify a content-digested kernel bundle")
@@ -275,6 +282,15 @@ def _e2e(args: argparse.Namespace) -> int:
     return _status_exit_code(result.status)
 
 
+def _resume(args: argparse.Namespace) -> int:
+    application = build_application(include_e2e=True)
+    if application.e2e_optimizer is None:
+        raise ApexError("E2E composition is unavailable", "e2e_not_composed")
+    result = application.e2e_optimizer.resume(args.run.expanduser().resolve(strict=True))
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    return _status_exit_code(result.status)
+
+
 def _kernel_budget_overrides(task: TaskSpec, args: argparse.Namespace) -> TaskSpec:
     values = {
         "max_iterations": args.max_iterations,
@@ -365,6 +381,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _kernel(args)
         if args.command == "optimize" and args.optimize_command == "e2e":
             return _e2e(args)
+        if args.command == "run" and args.run_command == "resume":
+            return _resume(args)
         parser.error("unknown command")
     except ApexError as error:
         print(

@@ -34,6 +34,7 @@ class KernelOpportunity:
     eligibility: str
     reason_code: str
     correctness_oracle_sha256: str | None = None
+    oracle_execution_mode: str | None = None
 
     @property
     def eligible(self) -> bool:
@@ -110,6 +111,9 @@ def build_kernel_opportunity_plan(
                 reason_code=reason,
                 correctness_oracle_sha256=(
                     oracle.binding_sha256 if oracle is not None else None
+                ),
+                oracle_execution_mode=(
+                    oracle.execution_mode if oracle is not None else None
                 ),
             )
         )

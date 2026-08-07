@@ -54,6 +54,11 @@ class E2EDeferredMicroQualifier:
                     "correctness": "unchanged_magpie_quality_gate",
                     "performance": "unchanged_magpie_e2e_measurement",
                 },
+                "correctness_oracle": {
+                    "execution_mode": request.opportunity.oracle_execution_mode,
+                    "executed": False,
+                    "reason_code": "trusted_docker_oracle_qualifier_unavailable",
+                },
                 "anchor_generation": request.anchor_generation,
             },
             qualification_mode="e2e_quality_deferred",

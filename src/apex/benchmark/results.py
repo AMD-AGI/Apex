@@ -14,6 +14,7 @@ from apex.ports import BenchmarkPass
 from .inferencex_runtime import InferenceXRuntimeEvidence
 from .lm_eval_runtime import LmEvalRuntimeEvidence
 from .model_revision import ModelRevisionEvidence
+from .quality import QualityEvidence, QualityMetric, parse_quality_evidence
 from .result_evidence import (
     Attestations,
     evidence_artifacts,
@@ -21,9 +22,6 @@ from .result_evidence import (
     result_verdict,
 )
 from apex.runtime import LmEvalRuntimeReceipt
-
-
-_SERVING_FRAMEWORKS = frozenset({"vllm", "sglang", "atom"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,24 +47,6 @@ class LatencyMetrics:
     tpot: LatencyDistribution
     itl: LatencyDistribution
     e2el: LatencyDistribution
-
-
-@dataclass(frozen=True, slots=True)
-class QualityMetric:
-    task: str
-    name: str
-    value: float
-    higher_is_better: bool
-
-
-@dataclass(frozen=True, slots=True)
-class QualityEvidence:
-    required: bool
-    kind: str
-    passed: bool
-    metrics: tuple[QualityMetric, ...]
-    source_paths: tuple[Path, ...]
-    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,125 +125,15 @@ def _distribution(value: Any) -> LatencyDistribution:
     )
 
 
-def _higher_is_better(name: str) -> bool:
-    lowered = name.lower()
-    return not any(
-        marker in lowered
-        for marker in ("loss", "perplexity", "ppl", "error", "wer", "cer")
-    )
-
-
-def _quality_files(workspace: Path) -> tuple[Path, ...]:
-    quality_root = workspace.resolve() / "lm_eval"
-    if quality_root.is_symlink() or not quality_root.is_dir():
-        return ()
-    files: list[Path] = []
-    for path in sorted(quality_root.rglob("results*.json")):
-        resolved = path.resolve()
-        try:
-            resolved.relative_to(quality_root)
-        except ValueError as error:
-            raise IntegrityError(
-                f"Quality artifact escapes benchmark workspace: {path}",
-                "unsafe_quality_artifact",
-            ) from error
-        if path.is_symlink() or not path.is_file():
-            raise IntegrityError(
-                f"Quality artifact must be a regular file: {path}",
-                "unsafe_quality_artifact",
-            )
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(data, dict) and isinstance(data.get("results"), dict):
-            files.append(resolved)
-    return tuple(files)
-
-
-def _parse_lm_eval(workspace: Path, *, required: bool) -> QualityEvidence:
-    sources = _quality_files(workspace)
-    if not sources:
-        return QualityEvidence(
-            required=required,
-            kind="lm_eval",
-            passed=not required,
-            metrics=(),
-            source_paths=(),
-            error="quality_evidence_missing" if required else None,
-        )
-    if len(sources) != 1:
-        return QualityEvidence(
-            required=required,
-            kind="lm_eval",
-            passed=False,
-            metrics=(),
-            source_paths=sources,
-            error="ambiguous_quality_evidence",
-        )
-
-    data = json.loads(sources[0].read_text(encoding="utf-8"))
-    metrics: list[QualityMetric] = []
-    for task, task_values in sorted(data["results"].items()):
-        if not isinstance(task, str) or not isinstance(task_values, dict):
-            continue
-        for name, raw_value in sorted(task_values.items()):
-            if not isinstance(name, str):
-                continue
-            metric_name = name.split(",", 1)[0]
-            if "stderr" in metric_name.lower():
-                continue
-            value = _finite_number(raw_value, nonnegative=False)
-            if value is None:
-                continue
-            metrics.append(
-                QualityMetric(
-                    task=task,
-                    name=name,
-                    value=value,
-                    higher_is_better=_higher_is_better(metric_name),
-                )
-            )
-    return QualityEvidence(
-        required=required,
-        kind="lm_eval",
-        passed=bool(metrics),
-        metrics=tuple(metrics),
-        source_paths=sources,
-        error=None if metrics else "quality_metrics_missing",
-    )
-
-
-def _parse_quality_gate(
-    gate: Mapping[str, Any], report_path: Path, *, required: bool
-) -> QualityEvidence:
-    metrics = tuple(
-        QualityMetric(
-            task="framework_quality_gate",
-            name=name,
-            value=value,
-            higher_is_better=_higher_is_better(name),
-        )
-        for name, raw in sorted(gate.items())
-        if name not in {"passed", "skipped"}
-        and (value := _finite_number(raw, nonnegative=False)) is not None
-    )
-    passed = gate.get("passed") is True and gate.get("skipped") is not True
-    return QualityEvidence(
-        required=required,
-        kind="framework_quality_gate",
-        passed=passed,
-        metrics=metrics,
-        source_paths=(report_path,),
-        error=None if passed else "quality_gate_not_passed",
-    )
-
-
 def _artifact_paths(
     report: Mapping[str, Any], report_path: Path, quality: QualityEvidence
 ) -> tuple[Path, ...]:
     workspace = report_path.parent.resolve()
-    paths = {report_path.resolve(), *quality.source_paths}
+    paths = {
+        report_path.resolve(),
+        *quality.source_paths,
+        *quality.raw_artifact_paths,
+    }
     tracelens = report.get("tracelens_analysis")
     if isinstance(tracelens, dict):
         output_files = tracelens.get("output_files", [])
@@ -331,9 +201,7 @@ def _normalized_result(
 
 
 def parse_benchmark_report(
-    report_path: Path,
-    *,
-    run_id: str,
+    report_path: Path, *, run_id: str,
     pass_type: BenchmarkPass,
     quality_required: bool,
     command_exit_code: int | None = 0,
@@ -345,6 +213,7 @@ def parse_benchmark_report(
     expected_inferencex_tree: str | None = None,
     expected_lm_eval_runtime: LmEvalRuntimeReceipt | None = None,
     expected_lm_eval_execution_mode: str | None = None,
+    expected_evaluator_policy: Mapping[str, Any] | None = None,
 ) -> NormalizedBenchmarkResult:
     """Parse one Magpie report plus its protected quality side artifacts."""
 
@@ -353,8 +222,13 @@ def parse_benchmark_report(
     throughput = _throughput_metrics(report.get("throughput"))
     latency = _latency_metrics(report.get("latency"))
     framework = str(report.get("framework", "")).strip().lower()
-    quality = _quality_evidence(
-        report, workspace, report_path.resolve(), framework, quality_required
+    quality = parse_quality_evidence(
+        report,
+        workspace,
+        report_path.resolve(),
+        framework,
+        quality_required,
+        expected_evaluator_policy,
     )
     run_kind = str(report.get("run_kind", "")).strip().lower()
     reward_eligible = report.get("reward_eligible") is True
@@ -463,19 +337,6 @@ def _latency_metrics(value: Any) -> LatencyMetrics:
         itl=_distribution(data.get("itl")),
         e2el=_distribution(data.get("e2el")),
     )
-
-
-def _quality_evidence(
-    report: Mapping[str, Any],
-    workspace: Path,
-    report_path: Path,
-    framework: str,
-    required: bool,
-) -> QualityEvidence:
-    gate = report.get("quality_gate")
-    if framework in _SERVING_FRAMEWORKS or not isinstance(gate, Mapping):
-        return _parse_lm_eval(workspace, required=required)
-    return _parse_quality_gate(gate, report_path, required=required)
 
 
 def _result_errors(

@@ -95,6 +95,20 @@ class MagpieBenchmarkAdapter:
             return None, "unsafe_benchmark_report"
         return report.resolve(), None
 
+    def _benchmark_argv(
+        self, request: BenchmarkRequest, run_root: Path
+    ) -> tuple[str, ...]:
+        return (
+            str(self._receipt.python),
+            "-m",
+            "Magpie",
+            "benchmark",
+            "--benchmark-config",
+            str(request.config_path.resolve()),
+            "--output-dir",
+            str(run_root),
+        )
+
     def run_normalized(self, request: BenchmarkRequest) -> NormalizedBenchmarkResult:
         """Run Magpie and return the typed result used by E2E policy."""
         document = validate_resolved_view(
@@ -114,18 +128,8 @@ class MagpieBenchmarkAdapter:
             and envs.get("MODEL_REVISION") else None
         )
         run_root = self._run_root(request)
-        argv = (
-            str(self._receipt.python),
-            "-m",
-            "Magpie",
-            "benchmark",
-            "--benchmark-config",
-            str(request.config_path.resolve()),
-            "--output-dir",
-            str(run_root),
-        )
         process = self._supervisor.run(
-            argv,
+            self._benchmark_argv(request, run_root),
             cwd=self._magpie_root,
             environment=self._environment(request.environment),
             timeout_seconds=request.timeout_seconds,
@@ -163,6 +167,11 @@ class MagpieBenchmarkAdapter:
                 expected_inferencex_tree=runtime_identity.get("inferencex_tree"),
                 expected_lm_eval_runtime=expected_lm_eval,
                 expected_lm_eval_execution_mode=expected_lm_eval_mode,
+                expected_evaluator_policy=(
+                    quality_metadata.get("evaluator_policy")
+                    if isinstance(quality_metadata.get("evaluator_policy"), Mapping)
+                    else None
+                ),
             )
         except Exception as error:
             return empty_result(

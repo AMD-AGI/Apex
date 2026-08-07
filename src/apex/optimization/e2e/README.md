@@ -67,25 +67,41 @@ Internal responsibilities are intentionally narrow:
 - `search.py` consumes the bounded queue and performs KEEP/REVERT decisions.
 - `finalization.py` requires source delivery and a second clean replay.
 - `run_record.py` is the only E2E evidence/journal facade.
+- `recovery.py` binds persisted requests and checkpoints to journal/CAS evidence.
 - `result.py` owns the terminal result schema and atomic write.
 
 ## Invariants
 
 Only regular Python/Triton source inside a resolved root and backed by an
 independent correctness oracle enters the candidate lane. Config-only proposals
-cannot be constructed. Each agent process is stateless and sees only one bounded
+cannot be constructed. The run root contains a CAS-bound `run.request.json`,
+per-action completion
+receipts, and a CAS-bound full opportunity plan. `apex run resume --run ...`
+replays the journal and resumes only a proven baseline/diagnostic boundary; the
+oracle policy digest and every dynamically ranked opportunity remain part of
+the recovery lineage. Each agent process is stateless and sees only one bounded
 packet; durable decisions, receipts, dead ends, and the current anchor replace
 conversation memory.
 
 Correctness-oracle routing never preselects profiler symbols. The diagnostic rank
 remains dynamic; after a source has been resolved into an exact source-lock root,
 `CorrectnessOracleRegistry` matches only its repository-relative source path to a
-reviewed in-tree test. The policy and individual binding SHA-256 values are bound
+reviewed, target-filtered in-tree test. The policy and individual binding SHA-256 values are bound
 into the run accuracy contract and protected harness context. A root mismatch,
 missing test, symlink, hard link, path escape, or conflicting Magpie test mapping
 fails closed. For the reviewed Qwen profile this makes paged attention, recurrent
 GDN decode, causal-conv update, prefix-prefill, and reshape/cache sources eligible
 without hardcoding their dynamic rank or runtime symbol.
+
+In V1 that registry is routing metadata, not executed correctness evidence.
+Production still composes `E2EDeferredMicroQualifier`; its receipt explicitly
+records `executed=false`, and unchanged Magpie quality remains the correctness
+authority. A future evaluator-owned Docker qualifier must import the installed
+candidate vLLM, mount only the locked `tests/` tree at `/oracle/tests`, run from
+`/oracle`, install dependencies such as `tblib` from a locked wheel set, and prove
+candidate loaded bytes. Mounting the whole source checkout would shadow the
+installed candidate and is prohibited. Until that qualifier exists, Apex must
+not claim that the routed pytest command ran.
 
 After every candidate worker exits, `run_record.py` writes one canonical
 `apex.agent-transcript/v2` CAS artifact and projects its normalized actions into
@@ -174,6 +190,9 @@ are not retroactively rewritten when later loaded-byte checks succeed. The
 separate `formal_delivery_verified` field becomes true only for
 `succeeded/source_rebuild_verified`, so a truthful partial intake cannot be
 mistaken for an unverified final delivery.
+Terminal result bytes are written to CAS and linked from a `delivery_result`
+journal event before the run transitions to a terminal phase. `result.json` is
+only a byte-checked projection; resume never trusts modified metrics or details.
 
 Safe in-root symlinks retain their identity. Escaping symlinks, hard links,
 unmerged Git paths, edits outside the declared source, materialized gitlink

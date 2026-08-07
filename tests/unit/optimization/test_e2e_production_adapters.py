@@ -262,6 +262,7 @@ def test_deferred_qualification_makes_no_micro_truth_or_reward_claim(tmp_path: P
     assert result.s50 is None and result.s99 is None and result.srobust is None
     assert result.kernel_reward_available is False
     assert result.evidence["promotion_authority"]["correctness"] == "unchanged_magpie_quality_gate"
+    assert result.evidence["correctness_oracle"]["executed"] is False
 
 
 def test_production_composition_injects_reviewed_qwen_source_delivery(

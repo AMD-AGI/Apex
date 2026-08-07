@@ -17,6 +17,7 @@ from apex.ports import BenchmarkPass
 from apex.runtime import DependencyReceipt
 
 from .config_validation import validate_view_contract
+from .evaluator_policy import EvaluatorPolicy, resolve_evaluator_policy
 from .runtime_inputs import pin_runtime_inputs
 
 
@@ -68,6 +69,7 @@ class BenchmarkConfigViews:
     original_sha256: str
     workload_semantics_sha256: str
     quality_tasks: str
+    evaluator_policy_sha256: str | None = None
 
 
 def _load_yaml(content: bytes, *, source: Path) -> dict[str, Any]:
@@ -94,7 +96,9 @@ def _enabled(value: Any) -> bool:
     return False
 
 
-def _freeze_quality_contract(benchmark: dict[str, Any]) -> str:
+def _freeze_quality_contract(
+    benchmark: dict[str, Any], policy: EvaluatorPolicy | None
+) -> str:
     framework = str(benchmark.get("framework", "")).strip().lower()
     envs = benchmark.setdefault("envs", {})
     if not isinstance(envs, dict):
@@ -125,6 +129,16 @@ def _freeze_quality_contract(benchmark: dict[str, Any]) -> str:
     envs["RUN_EVAL"] = "true"
     envs["MAGPIE_EVAL_TASKS"] = tasks
     envs.setdefault("MAGPIE_EVAL_BATCH_SIZE", "auto")
+    if policy is not None:
+        for name, expected in policy.env().items():
+            observed = envs.get(name)
+            if observed is not None and str(observed) != expected:
+                raise ConfigurationError(
+                    f"Evaluator policy field {name} was overridden",
+                    "evaluator_policy_override",
+                )
+            envs[name] = expected
+        tasks = policy.tasks
     return tasks
 
 
@@ -215,6 +229,7 @@ def _metadata(
     binding: TraceLensBinding,
     receipt: DependencyReceipt,
     quality_tasks: str,
+    evaluator_policy: EvaluatorPolicy | None,
 ) -> dict[str, Any]:
     return {
         "benchmark_view": {
@@ -243,6 +258,9 @@ def _metadata(
                 "required": True,
                 "kind": "lm_eval" if quality_tasks else "framework_quality_gate",
                 "tasks": quality_tasks,
+                "evaluator_policy": (
+                    evaluator_policy.to_dict() if evaluator_policy else None
+                ),
             },
         }
     }
@@ -317,10 +335,11 @@ def _measurement_document(
     original_sha256: str,
     binding: TraceLensBinding,
     receipt: DependencyReceipt,
+    evaluator_policy: EvaluatorPolicy | None,
 ) -> tuple[dict[str, Any], str, str]:
     result = copy.deepcopy(dict(document))
     benchmark = result["benchmark"]
-    quality_tasks = _freeze_quality_contract(benchmark)
+    quality_tasks = _freeze_quality_contract(benchmark, evaluator_policy)
     _disable_instrumentation(benchmark)
     benchmark["run_kind"] = "measurement"
     semantics_sha256 = sha256_json(_workload_projection(benchmark))
@@ -333,6 +352,7 @@ def _measurement_document(
             binding=binding,
             receipt=receipt,
             quality_tasks=quality_tasks,
+            evaluator_policy=evaluator_policy,
         ),
     )
     return result, quality_tasks, semantics_sha256
@@ -346,9 +366,10 @@ def _diagnostic_document(
     binding: TraceLensBinding,
     receipt: DependencyReceipt,
     source_repository_roots: Sequence[Path],
+    evaluator_policy: EvaluatorPolicy | None,
 ) -> dict[str, Any]:
     result = copy.deepcopy(dict(document))
-    _freeze_quality_contract(result["benchmark"])
+    _freeze_quality_contract(result["benchmark"], evaluator_policy)
     _enable_diagnostics(result["benchmark"], binding, source_repository_roots)
     result["benchmark"]["run_kind"] = "diagnostic"
     _attach_metadata(
@@ -360,6 +381,7 @@ def _diagnostic_document(
             binding=binding,
             receipt=receipt,
             quality_tasks=quality_tasks,
+            evaluator_policy=evaluator_policy,
         ),
     )
     return result
@@ -373,6 +395,7 @@ def _replay_document(
     quality_tasks: str,
     binding: TraceLensBinding,
     receipt: DependencyReceipt,
+    evaluator_policy: EvaluatorPolicy | None,
 ) -> dict[str, Any]:
     result = copy.deepcopy(dict(measurement))
     if replay_image is not None:
@@ -388,6 +411,7 @@ def _replay_document(
         binding=binding,
         receipt=receipt,
         quality_tasks=quality_tasks,
+        evaluator_policy=evaluator_policy,
     )
     result["apex"]["benchmark_view"] = metadata["benchmark_view"]
     return result
@@ -415,6 +439,7 @@ def _view_paths(
     original_sha256: str,
     semantics_sha256: str,
     quality_tasks: str,
+    evaluator_policy: EvaluatorPolicy | None,
 ) -> BenchmarkConfigViews:
     return BenchmarkConfigViews(
         original=destination / "benchmark.original.yaml",
@@ -424,6 +449,7 @@ def _view_paths(
         original_sha256=original_sha256,
         workload_semantics_sha256=semantics_sha256,
         quality_tasks=quality_tasks,
+        evaluator_policy_sha256=(evaluator_policy.digest if evaluator_policy else None),
     )
 
 
@@ -466,6 +492,9 @@ def build_config_views(
     original_bytes = source.read_bytes()
     original_sha256 = sha256_bytes(original_bytes)
     document = _load_yaml(original_bytes, source=source)
+    evaluator_policy = resolve_evaluator_policy(
+        original_sha256, document["benchmark"]
+    )
     pin_runtime_inputs(
         document["benchmark"],
         dependency_receipt,
@@ -475,7 +504,7 @@ def build_config_views(
         hf_offline=hf_offline,
     )
     measurement, quality_tasks, semantics_sha256 = _measurement_document(
-        document, original_sha256, binding, dependency_receipt
+        document, original_sha256, binding, dependency_receipt, evaluator_policy
     )
     diagnostic = _diagnostic_document(
         document,
@@ -485,6 +514,7 @@ def build_config_views(
         binding,
         dependency_receipt,
         source_roots,
+        evaluator_policy,
     )
     replay = _replay_document(
         measurement,
@@ -494,10 +524,15 @@ def build_config_views(
         quality_tasks,
         binding,
         dependency_receipt,
+        evaluator_policy,
     )
     _assert_view_semantics(diagnostic, replay, semantics_sha256, quality_tasks)
     paths = _view_paths(
-        destination, original_sha256, semantics_sha256, quality_tasks
+        destination,
+        original_sha256,
+        semantics_sha256,
+        quality_tasks,
+        evaluator_policy,
     )
     _write_views(paths, original_bytes, measurement, diagnostic, replay)
     return paths

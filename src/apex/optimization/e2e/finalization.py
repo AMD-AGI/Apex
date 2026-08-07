@@ -12,7 +12,12 @@ from apex.runtime import GpuLeaseReceipt, RunProvenance
 
 from ..projections import publish_terminal_projections
 from .benchmarking import Diagnosis, E2EBenchmarkSession, measurement_metrics
-from .result import E2EOptimizationResult, build_e2e_result, write_e2e_result
+from .result import (
+    E2EOptimizationResult,
+    bind_terminal_result,
+    build_e2e_result,
+    write_e2e_result,
+)
 from .run_record import E2ERunRecord
 from .search import SearchOutcome
 from .services import AcceptedCandidate, FinalDeliveryPort, FinalDeliveryRequest
@@ -91,7 +96,6 @@ class E2EFinalizer:
         if self.record.controller.state.phase is RunPhase.RUNNING:
             if self.record.controller.state.pending_action is not None:
                 self.record.controller.abort_pending(reason)
-            self.record.controller.finish(RunPhase.FAILED, reason=reason)
         return self._write(
             initial=initial,
             status=status,
@@ -101,6 +105,8 @@ class E2EFinalizer:
             final=None,
             no_regression=None,
             details={"gpu_lease": self.gpu_lease.to_dict()},
+            terminal_phase=RunPhase.FAILED,
+            stop_reason=reason,
         )
 
     def _without_winner(
@@ -122,11 +128,10 @@ class E2EFinalizer:
             unsupported = reason in _UNSUPPORTED_REASONS
             status = TaskStatus.UNSUPPORTED if unsupported else TaskStatus.NO_GAIN
             phase = RunPhase.FAILED if unsupported else RunPhase.SUCCEEDED
-            self.record.controller.finish(phase, reason=status.value)
         else:
             status = TaskStatus.VERIFICATION_FAILED
             reason = verdict.reason_code
-            self.record.controller.finish(RunPhase.FAILED, reason=reason)
+            phase = RunPhase.FAILED
         return self._write(
             initial=initial,
             status=status,
@@ -141,6 +146,8 @@ class E2EFinalizer:
                 "accepted_candidates": [],
                 "gpu_lease": self.gpu_lease.to_dict(),
             },
+            terminal_phase=phase,
+            stop_reason=status.value if phase is RunPhase.SUCCEEDED else reason,
         )
 
     def _cumulative_regression(
@@ -162,9 +169,6 @@ class E2EFinalizer:
         self.record.controller.commit_e2e_final(
             receipt=lineage.digest, clean_replay_verified=False
         )
-        self.record.controller.finish(
-            RunPhase.FAILED, reason="final_cumulative_replay_regression"
-        )
         return self._write(
             initial=initial,
             status=TaskStatus.VERIFICATION_FAILED,
@@ -174,6 +178,8 @@ class E2EFinalizer:
             final=final,
             no_regression=False,
             details=self._search_details(search, "cumulative_verdict", verdict),
+            terminal_phase=RunPhase.FAILED,
+            stop_reason="final_cumulative_replay_regression",
         )
 
     def _deliver(
@@ -219,13 +225,11 @@ class E2EFinalizer:
             receipt=lineage.digest,
             clean_replay_verified=result.verified and result.clean_replay_verified,
         )
-        self.record.controller.finish(
-            RunPhase.SUCCEEDED if result.verified else RunPhase.FAILED,
-            reason=(
-                "source_rebuild_and_second_clean_replay_verified"
-                if result.verified
-                else result.reason_code
-            ),
+        phase = RunPhase.SUCCEEDED if result.verified else RunPhase.FAILED
+        stop_reason = (
+            "source_rebuild_and_second_clean_replay_verified"
+            if result.verified
+            else result.reason_code
         )
         details = self._search_details(search, "cumulative_verdict", cumulative)
         details["final_delivery"] = result.to_dict()
@@ -238,6 +242,8 @@ class E2EFinalizer:
             final=final,
             no_regression=True,
             details=details,
+            terminal_phase=phase,
+            stop_reason=stop_reason,
         )
 
     def _search_details(
@@ -264,6 +270,8 @@ class E2EFinalizer:
         final: E2EMeasurement | None,
         no_regression: bool | None,
         details: dict[str, Any],
+        terminal_phase: RunPhase,
+        stop_reason: str,
     ) -> E2EOptimizationResult:
         result = build_e2e_result(
             record=self.record,
@@ -279,6 +287,13 @@ class E2EFinalizer:
             no_regression=no_regression,
             details=details,
         )
+        bind_terminal_result(
+            self.record,
+            result,
+            phase=terminal_phase,
+            stop_reason=stop_reason,
+        )
+        self.record.controller.finish(terminal_phase, reason=stop_reason)
         write_e2e_result(result, self.record.root / "result.json")
         _write_projections(self.record)
         return result

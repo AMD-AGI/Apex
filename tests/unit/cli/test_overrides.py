@@ -67,3 +67,11 @@ def test_e2e_cli_agent_and_budget_overrides_are_explicit(tmp_path: Path) -> None
     assert updated.agent_effort == "high"
     assert (updated.max_iterations, updated.max_kernels) == (4, 6)
     assert (updated.max_turns, updated.agent_timeout_seconds) == (19, 902)
+
+
+def test_resume_parser_requires_explicit_run_root() -> None:
+    args = app._parser().parse_args(["run", "resume", "--run", "/tmp/apex-run"])
+
+    assert args.command == "run"
+    assert args.run_command == "resume"
+    assert args.run == Path("/tmp/apex-run")

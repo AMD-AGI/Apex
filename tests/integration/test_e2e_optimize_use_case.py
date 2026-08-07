@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from apex.benchmark import (
     InferenceXRuntimeEvidence,
     LatencyDistribution,
@@ -13,7 +15,7 @@ from apex.benchmark import (
     QualityMetric,
     ThroughputMetrics,
 )
-from apex.core import TaskStatus
+from apex.core import IntegrityError, TaskStatus
 from apex.diagnostics import (
     AcquisitionCoverage,
     EvidenceArtifacts,
@@ -133,6 +135,11 @@ class FakeDiagnostics:
         )
 
 
+class CrashDiagnostics:
+    def analyze(self, request):
+        raise RuntimeError("simulated process loss after diagnostic benchmark")
+
+
 class FakeProvenance:
     def resolve(self, config_path, *, gpu_arch, hints=None):
         return RunProvenance(
@@ -227,6 +234,106 @@ def test_e2e_vertical_slice_records_trace_and_no_regression(tmp_path: Path) -> N
     assert recovered.state.stop_reason == "no_gain"
     assert recovered.state.e2e is not None
     assert recovered.state.e2e.stage.value == "completed"
+    terminal = EventJournal(results / "events" / "run.db").get_by_idempotency_key(
+        result.run_id, "e2e.terminal_result"
+    )
+    assert terminal is not None
+    assert terminal.payload["artifacts"][0]["role"] == "e2e_terminal_result"
+    assert use_case.resume(results).to_dict() == result.to_dict()
+
+
+def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Path) -> None:
+    results = tmp_path / "resume-run"
+    benchmark = FakeBenchmark()
+    receipt = _receipt(tmp_path)
+    interrupted = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=benchmark,
+        diagnostics=CrashDiagnostics(),
+        provenance=FakeProvenance(),
+    )
+    with pytest.raises(RuntimeError, match="simulated process loss"):
+        interrupted.run(_spec(tmp_path, results))
+
+    request = json.loads((results / "run.request.json").read_text(encoding="utf-8"))
+    assert request["schema"] == "apex.e2e-run-request/v1"
+    assert request["spec"]["results_dir"] == str(results)
+    assert (results / "action_receipts/baseline-measurement.json").is_file()
+    assert (results / "action_receipts/diagnostic-0.json").is_file()
+
+    resumed = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=benchmark,
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+    ).resume(results)
+
+    assert resumed.status is TaskStatus.NO_GAIN
+    assert resumed.no_regression is True
+    assert resumed.opportunity_count == 1
+    assert (results / "result.json").is_file()
+    state = RunController.recover(
+        resumed.run_id,
+        EventJournal(results / "events/run.db"),
+        SnapshotStore(results / "state.snapshot.json"),
+    ).state
+    assert state.e2e is not None
+    assert state.e2e.stage.value == "completed"
+    events = EventJournal(results / "events/run.db").iter_events(resumed.run_id)
+    plan = next(
+        event for event in events
+        if event.event_type == "tool_result"
+        and event.payload.get("tool") == "kernel_opportunity_planner"
+    )
+    assert plan.payload["opportunity_count"] == 1
+
+
+def test_resume_rejects_mutated_run_request_projection(tmp_path: Path) -> None:
+    results = tmp_path / "tampered-resume-run"
+    receipt = _receipt(tmp_path)
+    interrupted = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=FakeBenchmark(),
+        diagnostics=CrashDiagnostics(),
+        provenance=FakeProvenance(),
+    )
+    with pytest.raises(RuntimeError, match="simulated process loss"):
+        interrupted.run(_spec(tmp_path, results))
+
+    request_path = results / "run.request.json"
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    request["spec"]["max_iterations"] = 999
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(IntegrityError) as failure:
+        E2EOptimizeUseCase(
+            dependency_receipt=receipt,
+            benchmark=FakeBenchmark(),
+            diagnostics=FakeDiagnostics(),
+            provenance=FakeProvenance(),
+        ).resume(results)
+    assert failure.value.reason_code == "run_request_projection_mismatch"
+
+
+def test_terminal_resume_rejects_unbound_result_projection(tmp_path: Path) -> None:
+    results = tmp_path / "tampered-terminal-run"
+    receipt = _receipt(tmp_path)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=FakeBenchmark(),
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+    )
+    use_case.run(_spec(tmp_path, results))
+    result_path = results / "result.json"
+    value = json.loads(result_path.read_text(encoding="utf-8"))
+    value["final_metrics"]["total_tokens_per_second"] = 999999.0
+    value["details"]["tampered"] = True
+    result_path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(IntegrityError) as failure:
+        use_case.resume(results)
+    assert failure.value.reason_code == "e2e_result_projection_mismatch"
 
 
 def test_e2e_final_replay_regression_fails_verification(tmp_path: Path) -> None:

@@ -4,7 +4,7 @@
 agent execution, or benchmark logic. Both the installed `apex` console script
 and repository `main.py` call the same `apex.cli:main` function.
 
-Current public command groups are `optimize`, `bundle`, `dependencies`,
+Current public command groups are `optimize`, `run`, `bundle`, `dependencies`,
 `report`, and `export-rl`.
 Codex is the task default; `--agent-backend` can explicitly select Claude or
 Cursor. Machine callers use `--task-spec` and `--result-json`.
@@ -60,6 +60,17 @@ composition root; it contains no optimization or grading policy.
 
 Codex is the default backend, Claude and Cursor require an explicit selection,
 and commands never recover state or measurements from agent stdout.
+
+`apex run resume --run /absolute/run/root` verifies the persisted resolved
+request, dependency/source/oracle policy identities, benchmark views, event
+journal, CAS receipts, and current GPU lease before continuing. V1 resumes
+baseline and diagnostic boundaries (including an interrupted `diagnostic-0`)
+and fails closed for a partially executed candidate without a frozen candidate
+checkpoint. Re-running resume on a terminal run reads the journal-bound CAS
+result receipt and requires `result.json` to match those canonical bytes. The
+terminal value also binds its run ID, provenance, benchmark views, root-bound
+journal/artifact paths, and CAS-verified diagnostic evidence; any drift is
+rejected.
 
 ## Dependencies
 

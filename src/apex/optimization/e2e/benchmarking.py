@@ -17,6 +17,7 @@ from apex.storage import ArtifactReceipt
 
 from .kernel_lane import KernelOpportunityPlan, build_kernel_opportunity_plan
 from .oracles import CorrectnessOracleRegistry
+from .recovery import persist_diagnosis, write_action_completion
 from .run_record import E2ERunRecord
 
 
@@ -33,6 +34,7 @@ class Diagnosis:
     plan: KernelOpportunityPlan
     evidence_path: Path
     evidence_receipt: ArtifactReceipt
+    state_receipt: ArtifactReceipt
 
 
 class E2EBenchmarkSession:
@@ -73,7 +75,15 @@ class E2EBenchmarkSession:
                 timeout_seconds=7200,
             )
         )
-        return result, self.record.record_benchmark(action_id, result)
+        receipt = self.record.record_benchmark(action_id, result)
+        write_action_completion(
+            self.record,
+            action_id=action_id,
+            normalized=receipt,
+            succeeded=result.succeeded,
+            errors=result.errors,
+        )
+        return result, receipt
 
     def measure(
         self,
@@ -113,7 +123,15 @@ class E2EBenchmarkSession:
             raise ContractError(
                 "Trace evidence was not stored in CAS", "trace_evidence_not_recorded"
             )
-        return Diagnosis(plan, path, receipt)
+        state_receipt = persist_diagnosis(
+            self.record, evidence=receipt, plan=plan
+        )
+        return Diagnosis(
+            plan,
+            self.record.artifacts.root / receipt.relative_path,
+            receipt,
+            state_receipt,
+        )
 
 
 def measurement_from_result(
@@ -146,9 +164,18 @@ def measurement_from_result(
 
 def primary_quality(metrics: tuple[QualityMetric, ...]) -> QualityMetric | None:
     eligible = tuple(item for item in metrics if item.higher_is_better)
-    for name in ("exact_match", "acc_norm", "acc"):
+    for name in (
+        "exact_match,strict-match",
+        "exact_match,flexible-extract",
+        "exact_match,none",
+        "exact_match",
+        "acc_norm,none",
+        "acc,none",
+        "acc_norm",
+        "acc",
+    ):
         match = next(
-            (item for item in eligible if item.name.split(",", 1)[0] == name),
+            (item for item in eligible if item.name == name),
             None,
         )
         if match:

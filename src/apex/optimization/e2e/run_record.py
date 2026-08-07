@@ -476,6 +476,9 @@ def _benchmark_dict(result: NormalizedBenchmarkResult) -> dict[str, Any]:
         "quality": {
             **asdict(result.quality),
             "source_paths": [str(path) for path in result.quality.source_paths],
+            "raw_artifact_paths": [
+                str(path) for path in result.quality.raw_artifact_paths
+            ],
         },
         "profiling_enabled": result.profiling_enabled,
         "run_kind": result.run_kind,

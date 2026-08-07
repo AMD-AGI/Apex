@@ -275,6 +275,19 @@ def test_actual_qwen_config_generates_protected_views(tmp_path: Path) -> None:
         tmp_path / "views",
         dependency_receipt=_receipt(tmp_path),
     )
+    assert views.original.read_bytes() == source.read_bytes()
+    assert views.original_sha256 == (
+        "f97bda8e04655fbd1410bafb34072ec072de416ea7e24551d2618281e75deafb"
+    )
+    measurement = _load(views.measurement)
+    envs = measurement["benchmark"]["envs"]
+    assert envs["MAX_MODEL_LEN"] == 2248
+    assert envs["MAGPIE_EVAL_MAX_LENGTH"] == "2248"
+    assert envs["MAGPIE_EVAL_MAX_GEN_TOKENS"] == "480"
+    assert envs["MAGPIE_EVAL_PRIMARY_METRIC"] == "exact_match,strict-match"
+    assert views.evaluator_policy_sha256 == measurement["apex"]["benchmark_view"][
+        "quality_contract"
+    ]["evaluator_policy"]["sha256"]
 
     measurement = _load(views.measurement)["benchmark"]
     diagnostic = _load(views.diagnostic)["benchmark"]
