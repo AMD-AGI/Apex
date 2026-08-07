@@ -46,6 +46,22 @@ def _report(
 
 def _formal_gate(first, results: Path, samples: Path) -> dict:
     return {
+        "requested": True,
+        "status": "passed",
+        "passed": True,
+        "evidence_present": True,
+        "primary_metric_policy": [
+            "exact_match,strict-match",
+            "exact_match,flexible-extract",
+            "exact_match,none",
+            "exact_match",
+            "acc_norm,none",
+            "acc,none",
+            "acc_norm",
+            "acc",
+            "pass@1,none",
+            "pass@1",
+        ],
         "primary_outcomes": {
             "gsm8k": {
                 "metric": "exact_match,strict-match",
@@ -69,6 +85,13 @@ def _formal_gate(first, results: Path, samples: Path) -> dict:
         ],
         "outcome_digest": first.quality.outcome_digest,
         "sample_set_digest": first.quality.sample_set_digest,
+        "task_count": 1,
+        "tasks_truncated": False,
+        "result_artifact_count": 1,
+        "result_artifacts_truncated": False,
+        "errors": [],
+        "error_count": 0,
+        "errors_truncated": False,
     }
 
 
@@ -262,6 +285,75 @@ def test_formal_quality_rejects_tampered_outcome_digest(tmp_path: Path) -> None:
 
     assert not result.succeeded
     assert result.quality.error == "quality_outcome_digest_mismatch"
+
+
+def test_formal_quality_rejects_failed_magpie_gate_with_matching_digests(
+    tmp_path: Path,
+) -> None:
+    eval_dir = tmp_path / "lm_eval"
+    eval_dir.mkdir()
+    results = eval_dir / "results.json"
+    results.write_text(
+        json.dumps({"results": {"gsm8k": {"exact_match,strict-match": 0.9}}}),
+        encoding="utf-8",
+    )
+    samples = eval_dir / "samples_gsm8k.jsonl"
+    samples.write_text("{}\n", encoding="utf-8")
+    first = parse_benchmark_report(
+        _report(tmp_path),
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+    )
+    gate = _formal_gate(first, results, samples)
+    gate.update({"status": "invalid", "passed": False})
+    report_data = json.loads(first.report_path.read_text(encoding="utf-8"))
+    report_data["quality_gate"] = gate
+    first.report_path.write_text(json.dumps(report_data), encoding="utf-8")
+
+    result = parse_benchmark_report(
+        first.report_path,
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+        expected_evaluator_policy={"primary_metric": "exact_match,strict-match"},
+    )
+
+    assert not result.succeeded
+    assert result.quality.error == "quality_gate_not_passed"
+
+
+def test_formal_quality_rejects_empty_sample_artifact(tmp_path: Path) -> None:
+    eval_dir = tmp_path / "lm_eval"
+    eval_dir.mkdir()
+    results = eval_dir / "results.json"
+    results.write_text(
+        json.dumps({"results": {"gsm8k": {"exact_match,strict-match": 0.9}}}),
+        encoding="utf-8",
+    )
+    samples = eval_dir / "samples_gsm8k.jsonl"
+    samples.write_bytes(b"")
+    first = parse_benchmark_report(
+        _report(tmp_path),
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+    )
+    gate = _formal_gate(first, results, samples)
+    report_data = json.loads(first.report_path.read_text(encoding="utf-8"))
+    report_data["quality_gate"] = gate
+    first.report_path.write_text(json.dumps(report_data), encoding="utf-8")
+
+    result = parse_benchmark_report(
+        first.report_path,
+        run_id="baseline",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+        expected_evaluator_policy={"primary_metric": "exact_match,strict-match"},
+    )
+
+    assert not result.succeeded
+    assert result.quality.error == "quality_sample_artifact_empty"
 
 
 def test_formal_quality_requires_raw_samples(tmp_path: Path) -> None:

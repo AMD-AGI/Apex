@@ -156,6 +156,23 @@ def _binding_error(
         return None
     if not isinstance(gate, Mapping):
         return "quality_receipt_missing"
+    if (
+        gate.get("requested") is not True
+        or gate.get("status") != "passed"
+        or gate.get("passed") is not True
+        or gate.get("evidence_present") is not True
+    ):
+        return "quality_gate_not_passed"
+    if gate.get("primary_metric_policy") != list(PRIMARY_METRICS):
+        return "quality_primary_metric_policy_mismatch"
+    if (
+        gate.get("errors") != []
+        or gate.get("error_count") != 0
+        or gate.get("errors_truncated") is not False
+        or gate.get("tasks_truncated") is not False
+        or gate.get("result_artifacts_truncated") is not False
+    ):
+        return "quality_gate_incomplete"
     expected_name = expected_policy.get("primary_metric")
     raw_tasks = expected_policy.get("tasks", ())
     expected_tasks = (
@@ -167,6 +184,14 @@ def _binding_error(
         return "quality_primary_metric_mismatch"
     if expected_tasks and tuple(item.task for item in primary) != expected_tasks:
         return "quality_task_set_mismatch"
+    if gate.get("task_count") != len(primary):
+        return "quality_task_count_mismatch"
+    if gate.get("result_artifact_count") != len(result_receipts):
+        return "quality_result_count_mismatch"
+    if any(receipt.get("size_bytes", 0) <= 0 for receipt in result_receipts):
+        return "quality_result_artifact_empty"
+    if any(receipt.get("size_bytes", 0) <= 0 for receipt in sample_receipts):
+        return "quality_sample_artifact_empty"
     checks = (
         ("primary_outcomes", primary_outcomes, "quality_primary_outcome_mismatch"),
         (
