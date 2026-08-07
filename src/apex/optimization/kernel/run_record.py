@@ -111,7 +111,9 @@ class KernelRunRecord:
             canonical_json_bytes(transcript_document(result)),
             media_type="application/json",
         )
-        event_type = "agent_completed" if result.succeeded else "agent_failed"
+        event_type = (
+            "agent_completed" if result.candidate_capture_allowed else "agent_failed"
+        )
         self.controller.record_domain_event(
             event_type,
             {
@@ -121,9 +123,21 @@ class KernelRunRecord:
                 "model": result.model,
                 "exit_code": result.exit_code,
                 "timed_out": result.timed_out,
-                "budget_exceeded": result.budget_exceeded,
-                "budget_enforcement_failed": result.budget_enforcement_failed,
-                "budget_reason": result.budget_reason,
+                "termination_kind": result.termination_kind.value,
+                "termination_reason": result.termination_reason,
+                "capture_status": result.capture_status.value,
+                "candidate_capture_allowed": result.candidate_capture_allowed,
+                "observer_stop_sent": result.observer_stop_sent,
+                "observer_suspend_sent": result.observer_suspend_sent,
+                "suspension_verified": result.suspension_verified,
+                "boundary_quiescence_policy_id": (
+                    result.invocation.boundary_quiescence_policy_id
+                    if result.invocation
+                    else None
+                ),
+                "discarded_stdout_lines": result.discarded_stdout_lines,
+                "discarded_stdout_bytes": result.discarded_stdout_bytes,
+                "discarded_stdout_sha256": result.discarded_stdout_sha256,
                 "observed_turns": result.observed_turns,
                 "duration_seconds": result.duration_seconds,
                 "artifacts": [

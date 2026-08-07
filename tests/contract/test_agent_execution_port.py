@@ -3,7 +3,17 @@ from __future__ import annotations
 import pytest
 
 from apex.core import AgentBackendName, ContractError
-from apex.ports import AgentCost, AgentResult, AgentSemanticEvent, AgentUsage
+from apex.ports import (
+    AgentCaptureStatus,
+    AgentCost,
+    AgentInvocationReceipt,
+    AgentResult,
+    AgentSemanticEvent,
+    AgentTerminationKind,
+    AgentUsage,
+    BOUNDARY_QUIESCENCE_POLICY,
+    STRUCTURED_TURN_CHECKPOINT_POLICY,
+)
 
 
 def test_agent_result_defaults_preserve_minimal_fake_backends() -> None:
@@ -41,7 +51,26 @@ def test_normalized_agent_evidence_validates_lineage_and_numeric_domain() -> Non
         AgentSemanticEvent(0, 0, "assistant", "unknown")
 
 
-def test_budget_failure_is_typed_and_cannot_report_success() -> None:
+def _invocation(max_turns: int = 2) -> AgentInvocationReceipt:
+    return AgentInvocationReceipt(
+        cli_name="codex",
+        cli_version="test",
+        executable_path="/usr/bin/codex",
+        resolved_executable_path="/usr/bin/codex",
+        entrypoint_sha256="a" * 64,
+        argv=("codex", "exec"),
+        workspace="/tmp/workspace",
+        prompt_transport="stdin",
+        requested_allowed_files=("kernel.py",),
+        allowed_files_enforced_by_cli=False,
+        max_turns=max_turns,
+        turn_policy=STRUCTURED_TURN_CHECKPOINT_POLICY,
+        boundary_quiescence_policy_id=BOUNDARY_QUIESCENCE_POLICY,
+        isolation=(("sandbox", "workspace-write"),),
+    )
+
+
+def test_exact_boundary_is_typed_and_candidate_capture_is_fail_closed() -> None:
     result = AgentResult(
         AgentBackendName.CODEX,
         None,
@@ -51,12 +80,18 @@ def test_budget_failure_is_typed_and_cannot_report_success() -> None:
         "",
         "",
         0.1,
-        budget_exceeded=True,
-        budget_reason="max_turns_exceeded",
+        invocation=_invocation(),
+        termination_kind=AgentTerminationKind.EXACT_TURN_BOUNDARY,
+        termination_reason="max_turns_exact_boundary",
         observed_turns=2,
+        observer_stop_sent=True,
+        observer_suspend_sent=True,
+        suspension_verified=True,
     )
 
     assert not result.succeeded
+    assert result.candidate_capture_allowed
+    assert result.candidate_rejection_reason is None
     with pytest.raises(ContractError):
         AgentResult(
             AgentBackendName.CODEX,
@@ -67,5 +102,48 @@ def test_budget_failure_is_typed_and_cannot_report_success() -> None:
             "",
             "",
             0.1,
-            budget_exceeded=True,
+            invocation=_invocation(),
+            termination_kind=AgentTerminationKind.EXACT_TURN_BOUNDARY,
+            termination_reason="max_turns_exact_boundary",
+            observed_turns=1,
         )
+    unsuspended = AgentResult(
+        AgentBackendName.CODEX,
+        None,
+        0,
+        False,
+        (),
+        "",
+        "",
+        0.1,
+        invocation=_invocation(),
+        termination_kind=AgentTerminationKind.EXACT_TURN_BOUNDARY,
+        termination_reason="max_turns_exact_boundary",
+        observed_turns=2,
+    )
+    assert not unsuspended.candidate_capture_allowed
+    assert (
+        unsuspended.candidate_rejection_reason
+        == "agent_boundary_suspension_unverified"
+    )
+
+    truncated = AgentResult(
+        AgentBackendName.CODEX,
+        None,
+        -15,
+        False,
+        (),
+        "",
+        "",
+        0.1,
+        invocation=_invocation(),
+        termination_kind=AgentTerminationKind.EXACT_TURN_BOUNDARY,
+        capture_status=AgentCaptureStatus.OUTPUT_TRUNCATED,
+        termination_reason="max_turns_exact_boundary",
+        observed_turns=2,
+        observer_stop_sent=True,
+        observer_suspend_sent=True,
+        suspension_verified=True,
+    )
+    assert not truncated.candidate_capture_allowed
+    assert truncated.candidate_rejection_reason == "agent_output_truncated"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import py_compile
 import sys
 from pathlib import Path
 
@@ -29,12 +30,17 @@ from apex.execution import AgentRegistry
 from apex.intake import TaskSpec
 from apex.optimization.kernel import KernelOptimizeRequest, KernelOptimizeUseCase
 from apex.ports import (
+    AgentCaptureStatus,
     AgentCost,
+    AgentInvocationReceipt,
     AgentRequest,
     AgentResult,
     AgentSemanticEvent,
     AgentTranscriptEvent,
+    AgentTerminationKind,
     AgentUsage,
+    BOUNDARY_QUIESCENCE_POLICY,
+    STRUCTURED_TURN_CHECKPOINT_POLICY,
 )
 from apex.rl import DatasetExportConfig, DatasetExporter, EpisodeGraphMaterializer
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal
@@ -48,11 +54,15 @@ class EditingAgent:
         *,
         edit_harness: bool = False,
         make_change: bool = True,
-        budget_exceeded: bool = False,
+        termination_kind: AgentTerminationKind = AgentTerminationKind.COMPLETED,
+        capture_status: AgentCaptureStatus = AgentCaptureStatus.COMPLETE,
+        ignored_artifact_marker: Path | None = None,
     ) -> None:
         self.edit_harness = edit_harness
         self.make_change = make_change
-        self.budget_exceeded = budget_exceeded
+        self.termination_kind = termination_kind
+        self.capture_status = capture_status
+        self.ignored_artifact_marker = ignored_artifact_marker
 
     def run(self, request: AgentRequest) -> AgentResult:
         if self.make_change:
@@ -61,19 +71,64 @@ class EditingAgent:
             )
         if self.edit_harness:
             (request.workspace / "harness.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+        if self.ignored_artifact_marker is not None:
+            poison = request.workspace / "sitecustomize.py"
+            poison.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(self.ignored_artifact_marker)!r}).write_text('executed')\n",
+                encoding="utf-8",
+            )
+            py_compile.compile(
+                str(poison),
+                cfile=str(request.workspace / "sitecustomize.pyc"),
+                doraise=True,
+            )
+            poison.unlink()
+        boundary = self.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY
+        overrun = self.termination_kind is AgentTerminationKind.TURN_OVERRUN
         return AgentResult(
             backend=self.name,
             model=request.model,
-            exit_code=0,
+            exit_code=-15 if boundary or overrun else 0,
             timed_out=False,
             events=(),
             stdout='{"type":"turn.completed"}\n',
             stderr="",
             duration_seconds=0.1,
-            budget_exceeded=self.budget_exceeded,
-            budget_reason=("max_turns_exceeded" if self.budget_exceeded else None),
-            observed_turns=26 if self.budget_exceeded else 1,
+            invocation=_agent_invocation(request) if boundary or overrun else None,
+            termination_kind=self.termination_kind,
+            capture_status=self.capture_status,
+            termination_reason=(
+                "max_turns_exact_boundary"
+                if boundary
+                else "max_turns_overrun" if overrun else None
+            ),
+            observed_turns=(
+                request.max_turns if boundary else request.max_turns + 1 if overrun else 1
+            ),
+            observer_stop_sent=boundary or overrun,
+            observer_suspend_sent=boundary or overrun,
+            suspension_verified=boundary or overrun,
         )
+
+
+def _agent_invocation(request: AgentRequest) -> AgentInvocationReceipt:
+    return AgentInvocationReceipt(
+        cli_name="codex",
+        cli_version="test",
+        executable_path="/usr/bin/codex",
+        resolved_executable_path="/usr/bin/codex",
+        entrypoint_sha256="a" * 64,
+        argv=("codex", "exec"),
+        workspace=str(request.workspace),
+        prompt_transport="stdin",
+        requested_allowed_files=request.allowed_files,
+        allowed_files_enforced_by_cli=False,
+        max_turns=request.max_turns,
+        turn_policy=STRUCTURED_TURN_CHECKPOINT_POLICY,
+        boundary_quiescence_policy_id=BOUNDARY_QUIESCENCE_POLICY,
+        isolation=(("sandbox", "workspace-write"),),
+    )
 
 
 class SequencedEditingAgent:
@@ -431,17 +486,101 @@ def test_use_case_reports_no_gain_for_unchanged_candidate(tmp_path: Path) -> Non
     assert result.bundle_path is None
 
 
-def test_use_case_reports_streaming_agent_turn_budget_exhaustion(tmp_path: Path) -> None:
-    task, result, _ = _run(tmp_path, EditingAgent(budget_exceeded=True))
+def test_use_case_rejects_agent_turn_overrun(tmp_path: Path) -> None:
+    task, result, _ = _run(
+        tmp_path,
+        EditingAgent(termination_kind=AgentTerminationKind.TURN_OVERRUN),
+    )
 
     assert result.status is TaskStatus.BUDGET_EXHAUSTED
-    assert result.reason_code == "agent_turn_budget_exceeded"
+    assert result.reason_code == "agent_turn_budget_overrun"
     assert result.bundle_path is None
     run_root = next((task.results_dir / "runs").iterdir())
     events = EventJournal(run_root / "events" / "run.db").iter_events(run_root.name)
     failed = next(event for event in events if event.event_type == "agent_failed")
-    assert failed.payload["budget_exceeded"] is True
+    assert failed.payload["termination_kind"] == "turn_overrun"
+    assert failed.payload["candidate_capture_allowed"] is False
     assert failed.payload["observed_turns"] == 26
+
+
+def test_exact_turn_boundary_candidate_runs_all_trusted_gates(tmp_path: Path) -> None:
+    task, result, _ = _run(
+        tmp_path,
+        EditingAgent(termination_kind=AgentTerminationKind.EXACT_TURN_BOUNDARY),
+    )
+
+    assert result.status is TaskStatus.CANDIDATE_READY
+    assert result.bundle_path is not None
+    run_root = next((task.results_dir / "runs").iterdir())
+    events = EventJournal(run_root / "events" / "run.db").iter_events(run_root.name)
+    event_types = [event.event_type for event in events]
+    completed = next(event for event in events if event.event_type == "agent_completed")
+    assert completed.payload["termination_kind"] == "exact_turn_boundary"
+    assert completed.payload["capture_status"] == "complete"
+    assert completed.payload["candidate_capture_allowed"] is True
+    assert completed.payload["observed_turns"] == 25
+    binding = next(
+        item
+        for item in completed.payload["artifacts"]
+        if item["role"] == "agent_transcript"
+    )
+    receipt = ArtifactReceipt.from_dict(binding["receipt"])
+    transcript = json.loads(ArtifactStore(run_root / "artifacts").read_bytes(receipt))
+    assert transcript["schema"] == "apex.agent-transcript/v2"
+    assert transcript["termination"] == {
+        "kind": "exact_turn_boundary",
+        "reason": "max_turns_exact_boundary",
+        "capture_status": "complete",
+        "candidate_capture_allowed": True,
+        "observer_stop_sent": True,
+        "suspension": {
+            "policy_id": BOUNDARY_QUIESCENCE_POLICY,
+            "sent": True,
+            "verified": True,
+        },
+        "discarded_stdout_tail": {"lines": 0, "bytes": 0, "sha256": None},
+        "observed_turns": 25,
+        "max_turns": 25,
+        "turn_policy": STRUCTURED_TURN_CHECKPOINT_POLICY,
+    }
+    assert event_types.index("agent_completed") < event_types.index("candidate_frozen")
+    assert event_types.index("candidate_frozen") < event_types.index("compile_result")
+    assert event_types.index("compile_result") < event_types.index("correctness_result")
+    assert event_types.index("correctness_result") < event_types.index("safety_result")
+    assert event_types.index("safety_result") < event_types.index(
+        "performance_command_result"
+    )
+
+
+def test_exact_turn_boundary_without_source_change_is_not_delivered(tmp_path: Path) -> None:
+    _, result, _ = _run(
+        tmp_path,
+        EditingAgent(
+            make_change=False,
+            termination_kind=AgentTerminationKind.EXACT_TURN_BOUNDARY,
+        ),
+    )
+
+    assert result.status is TaskStatus.NO_GAIN
+    assert result.reason_code == "agent_made_no_source_change"
+    assert result.bundle_path is None
+
+
+def test_evaluator_never_executes_agent_generated_ignored_bytecode(tmp_path: Path) -> None:
+    marker = tmp_path / "poison-executed"
+    task, result, _ = _run(
+        tmp_path,
+        EditingAgent(
+            termination_kind=AgentTerminationKind.EXACT_TURN_BOUNDARY,
+            ignored_artifact_marker=marker,
+        ),
+    )
+
+    assert result.status is TaskStatus.CANDIDATE_READY
+    assert not marker.exists()
+    run_root = next((task.results_dir / "runs").iterdir())
+    projection = next((run_root / "projections").iterdir())
+    assert not (projection / "sitecustomize.pyc").exists()
 
 
 class _SafetyOutcomePort:
@@ -823,7 +962,7 @@ def test_max_iterations_one_emits_canonical_agent_transcript(tmp_path: Path) -> 
     receipt = ArtifactReceipt.from_dict(binding["receipt"])
     raw = ArtifactStore(run_root / "artifacts").read_bytes(receipt)
     transcript = json.loads(raw)
-    assert transcript["schema"] == "apex.agent-transcript/v1"
+    assert transcript["schema"] == "apex.agent-transcript/v2"
     assert transcript["events"] == [
         {
             "kind": "turn.completed",

@@ -635,7 +635,7 @@ def test_agent_transcript_usage_and_cost_are_attempt_scoped(tmp_path: Path) -> N
     transcript = json.loads(
         ArtifactStore(tmp_path / "results" / "artifacts").read_bytes(receipt)
     )
-    assert transcript["schema"] == "apex.agent-transcript/v1"
+    assert transcript["schema"] == "apex.agent-transcript/v2"
     assert [event["kind"] for event in transcript["semantic_events"]] == [
         "agent_message",
         "tool_called",

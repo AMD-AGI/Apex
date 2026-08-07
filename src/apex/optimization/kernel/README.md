@@ -42,6 +42,25 @@ agent exits
   -> one source-only bundle
 ```
 
+“Agent exits” includes a controlled exact-turn-boundary checkpoint. Apex stops
+the structured stream exactly at `max_turns`; if the invocation receipt names
+`structured_agent_turn_checkpoint_v2`, the observed count equals the requested
+count, `sigstop_process_group_snapshot_v1` proves group quiescence, output is
+complete, and process-group cleanup is verified, changed source may proceed to
+the same freeze and evaluator-owned gates as a natural exit-zero
+completion. This is not a grading shortcut: unchanged source is `no_gain`, and
+turn overrun, invalid stream, timeout, truncation, or cleanup failure is rejected
+before freeze. The canonical `agent_completed` event and v2 transcript retain
+the exact termination/capture evidence.
+
+The agent-mutated workspace is never used as an evaluator cwd. After suspension
+and allowlist validation, `CandidateWorkspace` rechecks the pristine anchor,
+copies it into a new evaluator-owned projection, and overlays only content whose
+editable-file digest was frozen. Interpreter/test caches, `.pyc`/`.pyo`, and all
+other ignored agent artifacts are absent. Compile, correctness, safety, normal
+performance, and delivery use this projection; source is rehashed while copied
+to reject a freeze race.
+
 - Attempts never inherit mutable source, build output, timing reports, backend
   process state, or evaluator workspaces from an earlier attempt. Later agents
   see only bounded typed outcomes rebuilt from the append-only event journal.

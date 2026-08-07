@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence
 
@@ -14,6 +15,27 @@ from apex.core import AgentBackendName, ContractError
 _SEMANTIC_EVENT_KINDS = {"agent_message", "tool_called", "tool_result"}
 _CURRENCY = re.compile(r"[A-Z]{3,8}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+STRUCTURED_TURN_CHECKPOINT_POLICY = "structured_agent_turn_checkpoint_v2"
+BOUNDARY_QUIESCENCE_POLICY = "sigstop_process_group_snapshot_v1"
+
+
+class AgentTerminationKind(str, Enum):
+    """Evaluator-visible reason an agent process stopped producing candidates."""
+
+    COMPLETED = "completed"
+    EXACT_TURN_BOUNDARY = "exact_turn_boundary"
+    TIMEOUT = "timeout"
+    INVALID_STREAM = "invalid_stream"
+    TURN_OVERRUN = "turn_overrun"
+    PROCESS_FAILED = "process_failed"
+
+
+class AgentCaptureStatus(str, Enum):
+    """Completeness of the stream and process-group capture after agent exit."""
+
+    COMPLETE = "complete"
+    OUTPUT_TRUNCATED = "output_truncated"
+    CLEANUP_FAILED = "cleanup_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +228,7 @@ class AgentInvocationReceipt:
     allowed_files_enforced_by_cli: bool
     max_turns: int
     turn_policy: str
+    boundary_quiescence_policy_id: str
     isolation: tuple[tuple[str, str], ...]
 
     def __post_init__(self) -> None:
@@ -217,6 +240,7 @@ class AgentInvocationReceipt:
             self.workspace,
             self.prompt_transport,
             self.turn_policy,
+            self.boundary_quiescence_policy_id,
         )
         if any(not isinstance(value, str) or not value for value in strings):
             raise ContractError("Agent invocation identity is invalid", "invalid_agent_invocation")
@@ -252,7 +276,7 @@ class AgentInvocationReceipt:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema": "apex.agent-invocation/v1",
+            "schema": "apex.agent-invocation/v2",
             "cli_name": self.cli_name,
             "cli_version": self.cli_version,
             "executable_path": self.executable_path,
@@ -265,6 +289,7 @@ class AgentInvocationReceipt:
             "allowed_files_enforced_by_cli": self.allowed_files_enforced_by_cli,
             "max_turns": self.max_turns,
             "turn_policy": self.turn_policy,
+            "boundary_quiescence_policy_id": self.boundary_quiescence_policy_id,
             "isolation": dict(self.isolation),
         }
 
@@ -286,37 +311,121 @@ class AgentResult:
     cost: AgentCost | None = None
     effort: str | None = None
     invocation: AgentInvocationReceipt | None = None
-    budget_exceeded: bool = False
-    budget_enforcement_failed: bool = False
-    budget_reason: str | None = None
+    termination_kind: AgentTerminationKind = AgentTerminationKind.COMPLETED
+    capture_status: AgentCaptureStatus = AgentCaptureStatus.COMPLETE
+    termination_reason: str | None = None
     observed_turns: int = 0
+    observer_stop_sent: bool = False
+    observer_suspend_sent: bool = False
+    suspension_verified: bool = False
+    discarded_stdout_lines: int = 0
+    discarded_stdout_bytes: int = 0
+    discarded_stdout_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.budget_exceeded, bool):
-            raise ContractError("Agent budget outcome is invalid", "invalid_agent_result")
-        if not isinstance(self.budget_enforcement_failed, bool):
-            raise ContractError("Agent budget enforcement is invalid", "invalid_agent_result")
-        if self.budget_reason is not None and (
-            not isinstance(self.budget_reason, str) or not self.budget_reason
+        if not isinstance(self.termination_kind, AgentTerminationKind):
+            raise ContractError("Agent termination kind is invalid", "invalid_agent_result")
+        if not isinstance(self.capture_status, AgentCaptureStatus):
+            raise ContractError("Agent capture status is invalid", "invalid_agent_result")
+        if self.termination_reason is not None and (
+            not isinstance(self.termination_reason, str) or not self.termination_reason
         ):
-            raise ContractError("Agent budget reason is invalid", "invalid_agent_result")
-        if (self.budget_exceeded or self.budget_enforcement_failed) != (
-            self.budget_reason is not None
+            raise ContractError("Agent termination reason is invalid", "invalid_agent_result")
+        if (self.termination_kind is AgentTerminationKind.COMPLETED) != (
+            self.termination_reason is None
         ):
-            raise ContractError("Agent budget reason is inconsistent", "invalid_agent_result")
+            raise ContractError("Agent termination reason is inconsistent", "invalid_agent_result")
         if (
             isinstance(self.observed_turns, bool)
             or not isinstance(self.observed_turns, int)
             or self.observed_turns < 0
         ):
             raise ContractError("Agent observed turn count is invalid", "invalid_agent_result")
+        if self.timed_out != (self.termination_kind is AgentTerminationKind.TIMEOUT):
+            raise ContractError("Agent timeout evidence is inconsistent", "invalid_agent_result")
+        suspension_flags = (self.observer_stop_sent, self.observer_suspend_sent, self.suspension_verified)
+        if any(not isinstance(value, bool) for value in suspension_flags) or (
+            self.suspension_verified and not self.observer_suspend_sent
+        ):
+            raise ContractError("Agent suspension evidence is invalid", "invalid_agent_result")
+        discarded_counts = (self.discarded_stdout_lines, self.discarded_stdout_bytes)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in discarded_counts
+        ):
+            raise ContractError("Agent discarded-tail counts are invalid", "invalid_agent_result")
+        has_tail = self.discarded_stdout_lines > 0 or self.discarded_stdout_bytes > 0
+        if (
+            has_tail
+            and (
+                self.discarded_stdout_lines == 0
+                or self.discarded_stdout_bytes == 0
+                or self.discarded_stdout_sha256 is None
+                or not _SHA256.fullmatch(self.discarded_stdout_sha256)
+            )
+        ) or (not has_tail and self.discarded_stdout_sha256 is not None):
+            raise ContractError("Agent discarded-tail digest is invalid", "invalid_agent_result")
+        if self.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY:
+            self._validate_exact_boundary()
+
+    def _validate_exact_boundary(self) -> None:
+        invocation = self.invocation
+        if (
+            invocation is None
+            or invocation.turn_policy != STRUCTURED_TURN_CHECKPOINT_POLICY
+            or invocation.boundary_quiescence_policy_id != BOUNDARY_QUIESCENCE_POLICY
+            or self.observed_turns != invocation.max_turns
+            or self.termination_reason != "max_turns_exact_boundary"
+        ):
+            raise ContractError("Exact-boundary evidence is incomplete", "invalid_agent_result")
+
+    @property
+    def candidate_capture_allowed(self) -> bool:
+        """Whether trusted code may freeze source bytes from this process."""
+
+        exact_boundary = (
+            self.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY
+            and self.observer_suspend_sent
+            and self.suspension_verified
+            and (self.exit_code == 0 or self.observer_stop_sent)
+        )
+        return self.capture_status is AgentCaptureStatus.COMPLETE and (
+            self.succeeded or exact_boundary
+        )
+
+    @property
+    def candidate_rejection_reason(self) -> str | None:
+        """Stable reason a workspace may not cross the source-freeze boundary."""
+
+        if self.capture_status is AgentCaptureStatus.CLEANUP_FAILED:
+            return "agent_process_cleanup_failed"
+        if self.capture_status is AgentCaptureStatus.OUTPUT_TRUNCATED:
+            return "agent_output_truncated"
+        if self.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY and (
+            not self.observer_suspend_sent or not self.suspension_verified
+        ):
+            return "agent_boundary_suspension_unverified"
+        if (
+            self.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY
+            and self.exit_code != 0
+            and not self.observer_stop_sent
+        ):
+            return "agent_boundary_stop_unverified"
+        return {
+            AgentTerminationKind.COMPLETED: None if self.succeeded else "agent_failed",
+            AgentTerminationKind.EXACT_TURN_BOUNDARY: None,
+            AgentTerminationKind.TIMEOUT: "agent_timeout",
+            AgentTerminationKind.INVALID_STREAM: "agent_turn_stream_invalid",
+            AgentTerminationKind.TURN_OVERRUN: "agent_turn_budget_overrun",
+            AgentTerminationKind.PROCESS_FAILED: "agent_failed",
+        }[self.termination_kind]
 
     @property
     def succeeded(self) -> bool:
         return (
             not self.timed_out
-            and not self.budget_exceeded
-            and not self.budget_enforcement_failed
+            and self.termination_kind is AgentTerminationKind.COMPLETED
+            and self.capture_status is AgentCaptureStatus.COMPLETE
             and self.exit_code == 0
         )
 

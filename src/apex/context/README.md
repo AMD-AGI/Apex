@@ -28,7 +28,7 @@ It is a context-compilation allocation shown to the agent, and every packet
 records `response_token_enforcement=context_advisory_not_backend_enforced`.
 The supported Codex, Claude, and Cursor CLIs expose no portable per-invocation
 output-token cap, so Apex does not claim to enforce one. Wall time and
-`structured_agent_turn_v1` are the execution-side response bounds.
+`structured_agent_turn_checkpoint_v2` is the execution-side response bound.
 
 Large source files, traces, patches, tool output, and transcripts are represented
 only by `artifact://sha256/...` references. The artifact reader must validate

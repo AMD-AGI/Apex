@@ -26,14 +26,16 @@ only when a JSON field such as `total_cost_usd`, `cost_usd`, or a typed
 assistant claims about tokens, and stderr cannot create usage or cost.
 
 `agent_transcript_document` produces the canonical
-`apex.agent-transcript/v1` projection containing the source JSON events,
+`apex.agent-transcript/v2` projection containing the source JSON events,
 normalized semantic events, requested model/effort, usage, and cost. Raw stdout/stderr remain separate
 diagnostic artifacts.
 
-Every production result also embeds an `apex.agent-invocation/v1` receipt. It
+Every production result also embeds an `apex.agent-invocation/v2` receipt. It
 records the discovered and resolved CLI entrypoint, SHA-256 of those exact
 entrypoint bytes, the CLI's bounded `--version` output, actual argv, prompt
 transport, requested editable files, turn policy, and explicit isolation modes.
+It also binds `sigstop_process_group_snapshot_v1` as the non-configurable
+boundary-quiescence policy.
 The exact receipt is stored in the transcript CAS artifact and projected into
 the run's `agent_completed`/`agent_failed` event. `allowed_files_enforced_by_cli=false` is
 intentional: current CLIs only provide workspace-level isolation; Apex freezes
@@ -56,22 +58,46 @@ workspace trust and exposes no flag that disables every project configuration;
 the receipt therefore says `config_sources=backend_default_may_load` rather
 than asserting stronger isolation.
 
-`max_turns` is enforced while stdout JSONL is being drained under
-`structured_agent_turn_v1`. One complete structured assistant decision consumes
-one turn; a standalone structured tool request consumes a turn when the backend
-does not wrap it in an assistant message. A tool request at the limit stops the
-whole process group before another model turn. Explicit provider `num_turns`
-summaries are also checked. Human text and malformed JSON never create turns.
-The result records `observed_turns` and `budget_exceeded`; budget exhaustion is a
-typed failure even if the CLI races to exit zero. This policy is deliberately a
-portable stream policy, not a claim that providers expose identical internal
-sampling boundaries.
+`max_turns` is enforced while stdout JSONL is drained under
+`structured_agent_turn_checkpoint_v2`. One complete structured assistant
+decision consumes one turn; a standalone structured tool request consumes one
+when the backend does not wrap it in an assistant message. The observer stops
+the process group as soon as turn `max_turns` is observed, including a final
+assistant message, so a valid run never starts turn `max_turns + 1`. Explicit
+provider summaries above the limit are typed `turn_overrun` and rejected.
 
-A malformed JSON object stops execution as
-`budget_enforcement_failed`; a nominal exit-zero stream with no structured turn
-evidence is rejected after drain as `missing_structured_turn_evidence`.
-Non-JSON diagnostic lines may coexist with valid events but cannot satisfy the
-budget proof.
+`AgentResult` separates termination from capture. Termination is one of
+`completed`, `exact_turn_boundary`, `timeout`, `invalid_stream`,
+`turn_overrun`, or `process_failed`; capture is `complete`,
+`output_truncated`, or `cleanup_failed`. The supervisor drains both pipes,
+terminates the complete process group, and verifies that no same-group child
+survives. Only a normal exit-zero completion or an exact-boundary result whose
+invocation uses the v2 policy, whose observed count equals the requested count,
+and whose capture is complete may cross the source-freeze boundary. A malformed
+JSON object, missing structured evidence, timeout, overrun, truncated output,
+or unverified cleanup fails closed. Non-JSON diagnostic lines may coexist with
+valid events but cannot satisfy the turn proof.
+
+The boundary line itself is included in formal stdout. Any stdout already
+buffered after that line is still drained so the child cannot block, but it is
+excluded from parsing and the formal transcript. Apex records the discarded
+tail's line count, byte count, and SHA-256 in termination evidence; later
+buffered events therefore cannot appear as a hidden turn 51 in an exact-50
+transcript.
+
+Before notifying the waiting supervisor of a terminal stream event, the stdout
+reader sends `SIGSTOP` to the complete process group and verifies through
+`/proc` that every live same-group member is stopped. The supervisor then kills
+and reaps that suspended group. Exact-boundary source capture requires both
+`observer_suspend_sent=true` and `suspension_verified=true`; signal delivery
+without verified quiescence is not checkpoint evidence.
+
+The v2 transcript records the typed termination kind/reason, capture status,
+derived `candidate_capture_allowed` decision, exact observed/requested turns,
+and policy identity. A controlled exact-boundary capture is recorded as
+`agent_completed` with its nonzero process exit and boundary reason still
+visible; this means the candidate-production phase completed with freezeable
+bytes, not that agent text became trusted evidence.
 
 The invocation receipt also states
 `response_token_limit=not_supported_context_advisory_only`. None of the three
@@ -120,9 +146,9 @@ evaluation, storage, benchmark, or CLI packages.
 
 ## Failure semantics
 
-Missing executable, timeout, streaming turn-budget exhaustion, nonzero exit,
-truncated output, or invalid candidate is returned as typed process/agent
-evidence rather than inferred success.
+Missing executable, timeout, invalid stream, exact-boundary stop, turn overrun,
+nonzero exit, truncated output, cleanup failure, or invalid candidate is
+returned as typed process/agent evidence rather than inferred success.
 
 ## Tests
 

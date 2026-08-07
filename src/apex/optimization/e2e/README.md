@@ -88,12 +88,24 @@ GDN decode, causal-conv update, prefix-prefill, and reshape/cache sources eligib
 without hardcoding their dynamic rank or runtime symbol.
 
 After every candidate worker exits, `run_record.py` writes one canonical
-`apex.agent-transcript/v1` CAS artifact and projects its normalized actions into
+`apex.agent-transcript/v2` CAS artifact and projects its normalized actions into
 attempt-scoped `agent_message`, `tool_called`, and `tool_result` journal events.
 Structured usage and explicit provider cost become separate `usage_recorded` and
 `cost_recorded` events before `agent_completed`/`agent_failed`; all are marked
 `self_reported` and carry source-event indexes plus the transcript receipt. They
 are training/cost provenance, never evaluator correctness or performance proof.
+
+Candidate production uses `structured_agent_turn_checkpoint_v2`. A source-changing
+candidate stopped exactly at the requested turn count may be frozen only when the
+typed capture is complete, `sigstop_process_group_snapshot_v1` verifies group
+quiescence, and same-process-group cleanup is verified. Its
+`agent_completed` event still records `termination_kind=exact_turn_boundary` and
+the controlled process exit. A count below the limit is valid only as a natural
+completed process; a count above it, timeout, invalid stream, truncated output,
+or cleanup failure is rejected. Every admitted checkpoint then follows the same
+micro/deferred qualification, safety, deployment, and E2E acceptance path.
+The E2E workspace purge removes interpreter and test caches before source
+fingerprinting; ignored artifacts are neither candidate bytes nor evaluator input.
 
 Strict micro qualification accepts one canonical `KernelGrade`; it has no second
 statistics or threshold implementation. KEEP therefore requires compile,

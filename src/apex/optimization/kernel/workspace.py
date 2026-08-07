@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from apex.core import ContractError, IntegrityError, sha256_file
+from apex.core import ContractError, IntegrityError, sha256_bytes, sha256_file
 from apex.intake import ResolvedTaskSpec
 
 
@@ -58,10 +58,12 @@ class CandidateWorkspace:
         self,
         *,
         root: Path,
+        anchor: Path,
         baseline: Mapping[str, FileFingerprint],
         allowed_files: tuple[str, ...],
     ) -> None:
         self.root = root
+        self._anchor = anchor
         self._baseline = dict(baseline)
         self._allowed = frozenset(allowed_files)
 
@@ -82,10 +84,16 @@ class CandidateWorkspace:
         copied = _fingerprint_tree(destination)
         if copied != baseline:
             raise IntegrityError("candidate copy does not match anchor", "candidate_copy_mismatch")
-        return cls(root=destination, baseline=baseline, allowed_files=resolved.task.editable_files)
+        return cls(
+            root=destination,
+            anchor=source,
+            baseline=baseline,
+            allowed_files=resolved.task.editable_files,
+        )
 
-    def freeze(self) -> CandidateFreeze:
-        candidate = _fingerprint_tree(self.root)
+    def freeze(self, *, destination: Path | None = None) -> CandidateFreeze:
+        agent_root = self.root
+        candidate = _fingerprint_tree(agent_root)
         paths = set(self._baseline) | set(candidate)
         changed = tuple(sorted(path for path in paths if self._baseline.get(path) != candidate.get(path)))
         forbidden = sorted(set(changed).difference(self._allowed))
@@ -113,9 +121,48 @@ class CandidateWorkspace:
                 f"Agent deleted editable files: {', '.join(deleted)}",
                 "editable_source_deleted",
             )
+        projection = destination or agent_root.with_name(f"{agent_root.name}.frozen")
+        projected = self._materialize_projection(
+            agent_root,
+            projection,
+            changed,
+            candidate,
+        )
+        self.root = projection
         return CandidateFreeze(
-            root=self.root,
+            root=projection,
             changed_files=changed,
             baseline=self._baseline,
-            candidate=candidate,
+            candidate=projected,
         )
+
+    def _materialize_projection(
+        self,
+        agent_root: Path,
+        destination: Path,
+        changed: tuple[str, ...],
+        candidate: Mapping[str, FileFingerprint],
+    ) -> dict[str, FileFingerprint]:
+        if destination.exists():
+            raise ContractError("candidate projection already exists", "candidate_projection_exists")
+        if _fingerprint_tree(self._anchor) != self._baseline:
+            raise IntegrityError("candidate anchor changed before freeze", "candidate_anchor_drift")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(self._anchor, destination, symlinks=False, ignore=_ignore)
+        if _fingerprint_tree(destination) != self._baseline:
+            raise IntegrityError("candidate projection baseline mismatch", "candidate_projection_mismatch")
+        expected = dict(self._baseline)
+        for relative in changed:
+            fingerprint = candidate[relative]
+            content = (agent_root / relative).read_bytes()
+            if sha256_bytes(content) != fingerprint.sha256:
+                raise IntegrityError("candidate source changed during freeze", "candidate_freeze_race")
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            os.chmod(target, fingerprint.mode)
+            expected[relative] = fingerprint
+        projected = _fingerprint_tree(destination)
+        if projected != expected:
+            raise IntegrityError("candidate projection differs from frozen source", "candidate_projection_mismatch")
+        return projected

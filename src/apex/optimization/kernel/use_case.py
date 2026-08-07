@@ -25,6 +25,7 @@ from apex.execution import AgentRegistry
 from apex.intake import TaskResolver
 from apex.ports import (
     AgentRequest,
+    AgentTerminationKind,
     SafetyToolRunRequest,
     SafetyToolRunResult,
     SafetyVerificationPort,
@@ -214,46 +215,24 @@ class KernelOptimizeUseCase:
         )
         receipts = run.record.record_agent(attempt.attempt_id, result=result)
         evidence = (attempt.context.packet_receipt, *receipts)
-        if result.timed_out:
-            return close_attempt(
-                attempt,
+        if result.candidate_capture_allowed:
+            return evidence
+        status = _agent_failure_status(result.termination_kind)
+        reason = result.candidate_rejection_reason or "agent_failed"
+        return close_attempt(
+            attempt,
+            status,
+            reason,
+            strategy=attempt.context.packet_receipt.digest,
+            evidence=evidence,
+            closure="reject",
+            stop_search=status in {
                 TaskStatus.TIMEOUT,
-                "agent_timeout",
-                strategy=attempt.context.packet_receipt.digest,
-                evidence=evidence,
-                closure="reject",
-                stop_search=True,
-            )
-        if result.budget_enforcement_failed:
-            return close_attempt(
-                attempt,
-                TaskStatus.INFRASTRUCTURE_ERROR,
-                "agent_turn_budget_unverifiable",
-                strategy=attempt.context.packet_receipt.digest,
-                evidence=evidence,
-                closure="reject",
-                stop_search=True,
-            )
-        if result.budget_exceeded:
-            return close_attempt(
-                attempt,
                 TaskStatus.BUDGET_EXHAUSTED,
-                "agent_turn_budget_exceeded",
-                strategy=attempt.context.packet_receipt.digest,
-                evidence=evidence,
-                closure="reject",
-                stop_search=True,
-            )
-        if not result.succeeded:
-            return close_attempt(
-                attempt,
                 TaskStatus.INFRASTRUCTURE_ERROR,
-                "agent_failed",
-                strategy=attempt.context.packet_receipt.digest,
-                evidence=evidence,
-                closure="reject",
-            )
-        return evidence
+            }
+            and result.termination_kind is not AgentTerminationKind.PROCESS_FAILED,
+        )
 
     def _prepare_candidate(
         self,
@@ -261,7 +240,9 @@ class KernelOptimizeUseCase:
         evidence: tuple[ArtifactReceipt, ...],
     ) -> PreparedCandidate | KernelAttemptOutcome:
         run = attempt.run
-        frozen = attempt.candidate.freeze()
+        frozen = attempt.candidate.freeze(
+            destination=run.run_root / "projections" / attempt.attempt_id
+        )
         if not frozen.changed_files:
             return close_attempt(
                 attempt,
@@ -542,5 +523,14 @@ class KernelOptimizeUseCase:
             max_turns=task.budget.max_turns,
             timeout_seconds=task.budget.timeout_seconds,
         )
+
+
+def _agent_failure_status(kind: AgentTerminationKind) -> TaskStatus:
+    if kind is AgentTerminationKind.TIMEOUT:
+        return TaskStatus.TIMEOUT
+    if kind is AgentTerminationKind.TURN_OVERRUN:
+        return TaskStatus.BUDGET_EXHAUSTED
+    return TaskStatus.INFRASTRUCTURE_ERROR
+
 
 __all__ = ["KernelOptimizeRequest", "KernelOptimizeUseCase"]

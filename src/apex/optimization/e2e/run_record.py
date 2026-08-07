@@ -280,7 +280,9 @@ class E2ERunRecord:
                 },
                 idempotency_key=f"attempt.{candidate.attempt_id}.cost",
             )
-        agent_type = "agent_completed" if result.succeeded else "agent_failed"
+        agent_type = (
+            "agent_completed" if result.candidate_capture_allowed else "agent_failed"
+        )
         self.controller.record_domain_event(
             agent_type,
             {
@@ -566,9 +568,21 @@ def _semantic_agent_payload(event: AgentSemanticEvent) -> dict[str, object]:
 
 def _agent_execution_payload(result: AgentResult) -> dict[str, object]:
     return {
-        "budget_exceeded": result.budget_exceeded,
-        "budget_enforcement_failed": result.budget_enforcement_failed,
-        "budget_reason": result.budget_reason,
+        "termination_kind": result.termination_kind.value,
+        "termination_reason": result.termination_reason,
+        "capture_status": result.capture_status.value,
+        "candidate_capture_allowed": result.candidate_capture_allowed,
+        "observer_stop_sent": result.observer_stop_sent,
+        "observer_suspend_sent": result.observer_suspend_sent,
+        "suspension_verified": result.suspension_verified,
+        "boundary_quiescence_policy_id": (
+            result.invocation.boundary_quiescence_policy_id
+            if result.invocation
+            else None
+        ),
+        "discarded_stdout_lines": result.discarded_stdout_lines,
+        "discarded_stdout_bytes": result.discarded_stdout_bytes,
+        "discarded_stdout_sha256": result.discarded_stdout_sha256,
         "observed_turns": result.observed_turns,
         "invocation": result.invocation.to_dict() if result.invocation else None,
     }

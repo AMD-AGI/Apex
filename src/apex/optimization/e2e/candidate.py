@@ -224,13 +224,9 @@ class AgentCandidateWorker:
 
 
 def _agent_failure_reason(result: AgentResult) -> str | None:
-    if result.timed_out:
-        return "agent_timeout"
-    if result.budget_enforcement_failed:
-        return "agent_turn_budget_unverifiable"
-    if result.budget_exceeded:
-        return "agent_turn_budget_exceeded"
-    return None if result.succeeded else "agent_failed"
+    if result.candidate_capture_allowed:
+        return None
+    return result.candidate_rejection_reason or "agent_failed"
 
 
 def candidate_file_paths(candidate: E2ECandidate) -> tuple[Path, ...]:

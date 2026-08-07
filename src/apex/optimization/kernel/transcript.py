@@ -9,15 +9,31 @@ def transcript_document(result: AgentResult) -> dict[str, object]:
     """Return every normalized event without reconstructing data from human text."""
 
     return {
-        "schema": "apex.agent-transcript/v1",
+        "schema": "apex.agent-transcript/v2",
         "backend": result.backend.value,
         "model": result.model,
         "effort": result.effort,
         "invocation": result.invocation.to_dict() if result.invocation else None,
-        "budget": {
-            "exceeded": result.budget_exceeded,
-            "enforcement_failed": result.budget_enforcement_failed,
-            "reason": result.budget_reason,
+        "termination": {
+            "kind": result.termination_kind.value,
+            "reason": result.termination_reason,
+            "capture_status": result.capture_status.value,
+            "candidate_capture_allowed": result.candidate_capture_allowed,
+            "observer_stop_sent": result.observer_stop_sent,
+            "suspension": {
+                "policy_id": (
+                    result.invocation.boundary_quiescence_policy_id
+                    if result.invocation
+                    else None
+                ),
+                "sent": result.observer_suspend_sent,
+                "verified": result.suspension_verified,
+            },
+            "discarded_stdout_tail": {
+                "lines": result.discarded_stdout_lines,
+                "bytes": result.discarded_stdout_bytes,
+                "sha256": result.discarded_stdout_sha256,
+            },
             "observed_turns": result.observed_turns,
             "max_turns": result.invocation.max_turns if result.invocation else None,
             "turn_policy": result.invocation.turn_policy if result.invocation else None,
@@ -43,9 +59,19 @@ def transcript_metadata(result: AgentResult) -> dict[str, object]:
     usage = result.usage
     payload: dict[str, object] = {
         "effort": result.effort,
-        "budget_exceeded": result.budget_exceeded,
-        "budget_enforcement_failed": result.budget_enforcement_failed,
-        "budget_reason": result.budget_reason,
+        "termination_kind": result.termination_kind.value,
+        "termination_reason": result.termination_reason,
+        "capture_status": result.capture_status.value,
+        "candidate_capture_allowed": result.candidate_capture_allowed,
+        "observer_stop_sent": result.observer_stop_sent,
+        "observer_suspend_sent": result.observer_suspend_sent,
+        "suspension_verified": result.suspension_verified,
+        "boundary_quiescence_policy_id": (
+            result.invocation.boundary_quiescence_policy_id if result.invocation else None
+        ),
+        "discarded_stdout_lines": result.discarded_stdout_lines,
+        "discarded_stdout_bytes": result.discarded_stdout_bytes,
+        "discarded_stdout_sha256": result.discarded_stdout_sha256,
         "observed_turns": result.observed_turns,
         "invocation": result.invocation.to_dict() if result.invocation else None,
         "transcript_event_count": len(result.events),

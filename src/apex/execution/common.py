@@ -8,7 +8,14 @@ import shutil
 from typing import Mapping
 
 from apex.core import AgentBackendName, DependencyError, sha256_file
-from apex.ports import AgentInvocationReceipt, AgentRequest, AgentResult
+from apex.ports import (
+    AgentCaptureStatus,
+    AgentInvocationReceipt,
+    AgentRequest,
+    AgentResult,
+    AgentTerminationKind,
+    BOUNDARY_QUIESCENCE_POLICY,
+)
 
 from .environment import (
     AGENT_CONFIG_ENVIRONMENT_KEYS,
@@ -16,7 +23,7 @@ from .environment import (
     HF_RUNTIME_ENVIRONMENT_KEYS,
     build_subprocess_environment,
 )
-from .supervisor import SubprocessSupervisor
+from .supervisor import ProcessResult, SubprocessSupervisor
 from .transcript import parse_agent_output
 from .turn_budget import AgentTurnBudget, TURN_POLICY
 
@@ -79,6 +86,7 @@ def invocation_receipt(
         allowed_files_enforced_by_cli=False,
         max_turns=request.max_turns,
         turn_policy=turn_policy,
+        boundary_quiescence_policy_id=BOUNDARY_QUIESCENCE_POLICY,
         isolation=tuple(sorted(isolation.items())),
     )
 
@@ -166,9 +174,11 @@ def execute_agent_cli(
     )
     budget.finalize(
         process_succeeded=process.exit_code == 0 and not process.timed_out,
-        observer_stopped=process.budget_exceeded,
+        observer_stopped=process.observer_stopped,
     )
     parsed = parse_agent_output(process.stdout)
+    capture_status = _capture_status(process)
+    termination_kind, termination_reason = _termination(process, budget)
     return AgentResult(
         backend=backend,
         model=request.model,
@@ -183,8 +193,35 @@ def execute_agent_cli(
         cost=parsed.cost,
         effort=effort,
         invocation=invocation,
-        budget_exceeded=budget.budget_exceeded,
-        budget_enforcement_failed=budget.enforcement_failed,
-        budget_reason=budget.stop_reason,
+        termination_kind=termination_kind,
+        capture_status=capture_status,
+        termination_reason=termination_reason,
         observed_turns=budget.observed_turns,
+        observer_stop_sent=process.observer_termination_started,
+        observer_suspend_sent=process.observer_suspend_sent,
+        suspension_verified=process.suspension_verified,
+        discarded_stdout_lines=process.discarded_stdout_lines,
+        discarded_stdout_bytes=process.discarded_stdout_bytes,
+        discarded_stdout_sha256=process.discarded_stdout_sha256,
     )
+
+
+def _capture_status(process: ProcessResult) -> AgentCaptureStatus:
+    if not process.cleanup_succeeded:
+        return AgentCaptureStatus.CLEANUP_FAILED
+    if process.stdout_truncated or process.stderr_truncated:
+        return AgentCaptureStatus.OUTPUT_TRUNCATED
+    return AgentCaptureStatus.COMPLETE
+
+
+def _termination(
+    process: ProcessResult, budget: AgentTurnBudget
+) -> tuple[AgentTerminationKind, str | None]:
+    if process.timed_out:
+        return AgentTerminationKind.TIMEOUT, "agent_process_timeout"
+    if budget.termination_kind is not None:
+        assert budget.termination_reason is not None
+        return budget.termination_kind, budget.termination_reason
+    if process.exit_code != 0:
+        return AgentTerminationKind.PROCESS_FAILED, "agent_process_failed"
+    return AgentTerminationKind.COMPLETED, None

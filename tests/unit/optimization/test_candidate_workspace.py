@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import py_compile
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,32 @@ def test_freeze_accepts_only_editable_content_change(tmp_path: Path) -> None:
     frozen = candidate.freeze()
 
     assert frozen.changed_files == ("source/kernel.py",)
+    assert frozen.root == candidate.root
+    assert frozen.root.name == "candidate.frozen"
+
+
+def test_freeze_rebuilds_clean_projection_without_agent_bytecode(tmp_path: Path) -> None:
+    resolved = _resolved(tmp_path)
+    candidate = CandidateWorkspace.create(resolved, destination=tmp_path / "candidate")
+    (candidate.root / "source" / "kernel.py").write_text("value = 2\n", encoding="utf-8")
+    poison = candidate.root / "sitecustomize.py"
+    poison.write_text("raise RuntimeError('agent bytecode executed')\n", encoding="utf-8")
+    py_compile.compile(
+        str(poison),
+        cfile=str(candidate.root / "sitecustomize.pyc"),
+        doraise=True,
+    )
+    poison.unlink()
+    cache = candidate.root / "source" / "__pycache__"
+    cache.mkdir()
+    (cache / "kernel.pyc").write_bytes(b"untrusted-bytecode")
+
+    frozen = candidate.freeze()
+
+    assert frozen.changed_files == ("source/kernel.py",)
+    assert not (frozen.root / "sitecustomize.pyc").exists()
+    assert not (frozen.root / "source" / "__pycache__").exists()
+    assert (frozen.root / "source" / "kernel.py").read_text() == "value = 2\n"
 
 
 def test_freeze_rejects_harness_edit(tmp_path: Path) -> None:

@@ -11,17 +11,30 @@ from apex.execution import AgentRegistry, ProcessResult, build_default_registry
 from apex.execution.claude import ClaudeBackend
 from apex.execution.codex import CodexBackend
 from apex.execution.cursor import CursorBackend
-from apex.ports import AgentRequest
+from apex.ports import (
+    AgentCaptureStatus,
+    AgentRequest,
+    AgentTerminationKind,
+    STRUCTURED_TURN_CHECKPOINT_POLICY,
+)
 
 
 class FakeSupervisor:
-    def __init__(self, stdout: str | None = None) -> None:
+    def __init__(
+        self,
+        stdout: str | None = None,
+        *,
+        stdout_truncated: bool = False,
+        cleanup_succeeded: bool = True,
+    ) -> None:
         self.call: dict[str, object] | None = None
         self.stdout = (
             '{"type":"turn.completed","usage":{"input_tokens":1}}\n'
             if stdout is None
             else stdout
         )
+        self.stdout_truncated = stdout_truncated
+        self.cleanup_succeeded = cleanup_succeeded
 
     def run(
         self,
@@ -52,23 +65,27 @@ class FakeSupervisor:
                 stderr_truncated=False,
                 duration_seconds=0.01,
             )
-        budget_exceeded = False
+        observer_stopped = False
         emitted: list[str] = []
         for line in self.stdout.splitlines(keepends=True):
             emitted.append(line)
             if stdout_budget is not None and stdout_budget(line):
-                budget_exceeded = True
+                observer_stopped = True
                 break
         return ProcessResult(
             argv=tuple(argv),
-            exit_code=-15 if budget_exceeded else 0,
+            exit_code=-15 if observer_stopped else 0,
             timed_out=False,
             stdout="".join(emitted),
             stderr="",
-            stdout_truncated=False,
+            stdout_truncated=self.stdout_truncated,
             stderr_truncated=False,
             duration_seconds=0.1,
-            budget_exceeded=budget_exceeded,
+            observer_stopped=observer_stopped,
+            observer_termination_started=observer_stopped,
+            observer_suspend_sent=observer_stopped,
+            suspension_verified=observer_stopped,
+            cleanup_succeeded=self.cleanup_succeeded,
         )
 
 
@@ -247,7 +264,7 @@ def test_non_codex_backends_use_fail_closed_cli_isolation(
     assert result.invocation.argv == argv
 
 
-def test_backend_stream_budget_exhaustion_is_typed_failure(
+def test_backend_exact_boundary_is_a_complete_candidate_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("apex.execution.claude.require_executable", lambda _: sys.executable)
@@ -261,12 +278,15 @@ def test_backend_stream_budget_exhaustion_is_typed_failure(
         replace(_request(tmp_path), backend=AgentBackendName.CLAUDE, max_turns=1)
     )
 
-    assert result.budget_exceeded
-    assert not result.budget_enforcement_failed
-    assert result.budget_reason == "max_turns_exceeded"
-    assert result.observed_turns == 2
+    assert result.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY
+    assert result.capture_status is AgentCaptureStatus.COMPLETE
+    assert result.termination_reason == "max_turns_exact_boundary"
+    assert result.observed_turns == 1
+    assert result.candidate_capture_allowed
     assert not result.succeeded
     assert result.exit_code == -15
+    assert result.invocation is not None
+    assert result.invocation.turn_policy == STRUCTURED_TURN_CHECKPOINT_POLICY
 
 
 def test_backend_success_without_structured_turn_evidence_fails_closed(
@@ -276,7 +296,54 @@ def test_backend_success_without_structured_turn_evidence_fails_closed(
 
     result = CodexBackend(FakeSupervisor("diagnostic only\n")).run(_request(tmp_path))
 
-    assert result.budget_enforcement_failed
-    assert result.budget_reason == "missing_structured_turn_evidence"
-    assert not result.budget_exceeded
+    assert result.termination_kind is AgentTerminationKind.INVALID_STREAM
+    assert result.termination_reason == "missing_structured_turn_evidence"
+    assert not result.candidate_capture_allowed
     assert not result.succeeded
+
+
+def test_backend_rejects_provider_summary_above_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("apex.execution.codex.require_executable", lambda _: sys.executable)
+    supervisor = FakeSupervisor('{"type":"result","num_turns":2}\n')
+
+    result = CodexBackend(supervisor).run(replace(_request(tmp_path), max_turns=1))
+
+    assert result.termination_kind is AgentTerminationKind.TURN_OVERRUN
+    assert result.termination_reason == "max_turns_overrun"
+    assert result.observed_turns == 2
+    assert not result.candidate_capture_allowed
+    assert result.candidate_rejection_reason == "agent_turn_budget_overrun"
+
+
+@pytest.mark.parametrize(
+    ("supervisor", "capture", "reason"),
+    (
+        (
+            FakeSupervisor(stdout_truncated=True),
+            AgentCaptureStatus.OUTPUT_TRUNCATED,
+            "agent_output_truncated",
+        ),
+        (
+            FakeSupervisor(cleanup_succeeded=False),
+            AgentCaptureStatus.CLEANUP_FAILED,
+            "agent_process_cleanup_failed",
+        ),
+    ),
+)
+def test_backend_rejects_incomplete_exact_boundary_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supervisor: FakeSupervisor,
+    capture: AgentCaptureStatus,
+    reason: str,
+) -> None:
+    monkeypatch.setattr("apex.execution.codex.require_executable", lambda _: sys.executable)
+
+    result = CodexBackend(supervisor).run(replace(_request(tmp_path), max_turns=1))
+
+    assert result.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY
+    assert result.capture_status is capture
+    assert not result.candidate_capture_allowed
+    assert result.candidate_rejection_reason == reason
