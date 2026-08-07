@@ -13,6 +13,7 @@ from apex.core import sha256_file, sha256_json
 from apex.optimization.e2e.candidate import E2ECandidate
 from apex.optimization.e2e.candidate import AgentCandidateWorker
 from apex.optimization.e2e.deferred import E2EDeferredMicroQualifier
+from apex.optimization.e2e.oracle_preflight import DockerOracleMicroQualifier
 from apex.optimization.e2e.docker_overlay import (
     DockerOverlayDeployment,
     OverlayOnlyFinalDelivery,
@@ -252,7 +253,14 @@ def _views(tmp_path: Path):
 def test_deferred_qualification_makes_no_micro_truth_or_reward_claim(tmp_path: Path):
     opportunity, candidate, request, _ = _fixture(tmp_path)
     result = E2EDeferredMicroQualifier().verify(
-        MicroQualificationRequest("run-1", candidate, opportunity, tmp_path / "micro", 0)
+        MicroQualificationRequest(
+            "run-1",
+            candidate,
+            opportunity,
+            tmp_path / "micro",
+            0,
+            "amd-gpu-set=0",
+        )
     )
 
     assert result.qualified is True
@@ -289,6 +297,11 @@ def test_production_composition_injects_reviewed_qwen_source_delivery(
         "tests/kernels/test_fused_sigmoid_gating_delta_rule.py",
         "tests/kernels/mamba/test_causal_conv1d.py",
         "tests/kernels/attention/test_cache.py",
+        "tests/__init__.py",
+        "tests/kernels/__init__.py",
+        "tests/kernels/utils.py",
+        "tests/kernels/quant_utils.py",
+        "tests/kernels/attention/conftest.py",
     }
     for relative in oracle_files:
         path = vllm / relative
@@ -328,7 +341,7 @@ def test_production_composition_injects_reviewed_qwen_source_delivery(
 
     assert application.e2e_optimizer is not None
     assert isinstance(application.e2e_optimizer._candidate_worker, AgentCandidateWorker)
-    assert isinstance(application.e2e_optimizer._micro, E2EDeferredMicroQualifier)
+    assert isinstance(application.e2e_optimizer._micro, DockerOracleMicroQualifier)
     assert isinstance(application.e2e_optimizer._deployments, DockerOverlayDeployment)
     assert isinstance(application.e2e_optimizer._final_delivery, SourceRebuildFinalDelivery)
     for binding in application.e2e_optimizer._final_delivery._bindings:

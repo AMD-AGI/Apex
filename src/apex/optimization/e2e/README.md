@@ -19,6 +19,11 @@ Concrete adapters implement the typed ports in `services.py` and the
 Production composition uses `AgentCandidateWorker` with the default Codex-first
 registry, `E2EDeferredMicroQualifier` when no trusted raw-sample micro harness is
 available, and `DockerOverlayDeployment` for runtime-only vLLM/AITER experiments.
+The reviewed Qwen profile strengthens that deferred boundary with
+`DockerOracleMicroQualifier`: it executes a small source-relative subset of the
+exact locked vLLM tests in an immutable candidate-overlay image before full E2E.
+This is a fail-closed preflight, not a canonical kernel grade; compile,
+correctness, timing, and reward remain explicitly unmeasured.
 The latter builds from the inspected parent image ID, changes one installed
 Python file, proves the loaded bytes in a clean container, and derives Magpie
 configs whose sole workload change is `benchmark.docker_image`.
@@ -51,6 +56,8 @@ Internal responsibilities are intentionally narrow:
 - `benchmarking.py` binds measurements and TraceLens diagnostics to journal/CAS.
 - `kernel_lane.py` turns measured evidence into source-only opportunities.
 - `oracles.py` resolves version-locked source paths to reviewed correctness tests.
+- `oracle_preflight.py` owns Qwen tests-only policy, source locks, and qualification.
+- `oracle_container.py` owns the immutable overlay and same-process test runner.
 - `context.py` compiles a fresh bounded `ContextPacket` from durable state.
 - `candidate.py` materializes and freezes an isolated source checkout.
 - `deferred.py` represents the no-micro-harness truth boundary without reward.
@@ -135,6 +142,30 @@ authoritative. Its exact order is freeze/integrity, evaluator safety policy,
 isolated immutable deployment with loaded-byte proof, and unchanged Magpie
 quality plus normal performance. This is deliberately not presented as strict
 micro ordering or as a kernel-level correctness/reward result.
+
+The reviewed Qwen preflight adds a candidate-rejection check between freeze and
+safety. Passing means only that the exact pinned pytest node IDs executed with
+the expected JUnit case count; it does not upgrade the deferred claim. The
+preflight starts from the exact parent digest, verifies the image ID, builds a
+one-file overlay, and proves the imported candidate bytes in the test process. It
+copies only reviewed tests, explicit helpers, and an evaluator-owned runner into a
+read-only `/opt/apex-oracle` mount, so the host `vllm/` checkout cannot shadow the
+installed candidate module. Before calling `pytest.main`, that same Python process
+imports the exact module and verifies its resolved `__file__` and SHA-256; after
+pytest it verifies the same module object, path, and bytes again. The runner then
+atomically publishes a read-only receipt which the host revalidates. Exact node
+IDs avoid collecting the 388-, 164-, and 1850-case source files wholesale.
+
+The receipt binds source commit/tree, parent and derived image IDs, baseline and
+candidate bytes, same-process before/after loaded-byte proof, evaluator-runner and
+test/helper hashes, exact argv, dependency
+versions, GPU scope, bounded stdout/stderr, exit status, and JUnit digest/counts.
+The pinned parent lacks `tblib`; `--confcutdir=/opt/apex-oracle/tests/kernels`
+keeps the repository-wide `tests/conftest.py` that imports it outside collection.
+The dependencies actually used by selected tests (`pytest==9.0.2` and
+`einops==0.8.2`) are checked in-image first. Missing/drifted dependencies,
+skips, truncation, timeout, nonzero exit, source/test/image drift, or a loaded-byte
+mismatch reject the preflight.
 
 KEEP is evaluated against the current live anchor, never the original baseline.
 REVERT rolls back the candidate deployment. A KEEP forces a fresh diagnostic pass

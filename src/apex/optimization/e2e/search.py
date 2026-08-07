@@ -74,6 +74,7 @@ class E2ESearchLoop:
         micro: MicroQualificationPort,
         safety: CandidateSafetyPort,
         deployments: CandidateDeploymentPort,
+        gpu_device_scope: str,
     ) -> None:
         self.spec = spec
         self.record = record
@@ -85,6 +86,7 @@ class E2ESearchLoop:
         self.micro = micro
         self.safety = safety
         self.deployments = deployments
+        self.gpu_device_scope = gpu_device_scope
 
     def run(self, initial: Diagnosis, baseline: E2EMeasurement) -> SearchOutcome:
         opportunities = _opportunity_map(initial)
@@ -264,6 +266,7 @@ class E2ESearchLoop:
                 opportunity,
                 self.record.root / "verification" / attempt_id / "micro",
                 self.record.controller.state.anchor_generation,
+                self.gpu_device_scope,
             )
         )
         receipt = self.record.record_micro(attempt_id, result)

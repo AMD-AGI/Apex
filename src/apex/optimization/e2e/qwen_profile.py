@@ -19,6 +19,12 @@ from apex.runtime import (
 )
 
 from .oracles import CorrectnessOracleBinding, CorrectnessOracleRegistry
+from .oracle_preflight import (
+    DockerOracleMicroQualifier,
+    DockerOraclePolicy,
+    OracleDependencyLock,
+    OracleSourceLock,
+)
 from .source_delivery import FormalDeliveryBinding, SourceRebuildFinalDelivery
 from .source_delivery_models import FormalRepositoryProfile, FormalSourceDeliveryProfile
 from .source_delivery_provenance import ExactRequestProvenance
@@ -43,33 +49,6 @@ QWEN_PARENT_REPO_DIGEST = (
 )
 QWEN_PARENT_IMAGE_ID = "sha256:b599932816fe09f9ea2541655f5388457ac2494b87b551cefdbf2a207b0ed3a9"
 QWEN_SOURCE_DATE_EPOCH = 1776474762
-_QWEN_ORACLE_SPECS = (
-    (
-        "vllm/v1/attention/ops/chunked_prefill_paged_decode.py",
-        "tests/kernels/attention/test_prefix_prefill.py",
-        "qwen3_nonstandard_block_size",
-    ),
-    (
-        "vllm/model_executor/layers/fla/ops/fused_recurrent.py",
-        "tests/kernels/test_fused_recurrent_packed_decode.py",
-        "fused_recurrent_packed_decode_matches_reference",
-    ),
-    (
-        "vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
-        "tests/kernels/mamba/test_causal_conv1d.py",
-        "causal_conv1d_update and not batch_gather and not varlen",
-    ),
-    (
-        "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py",
-        "tests/kernels/attention/test_cache.py",
-        "reshape_and_cache_flash and triton and NHD and auto",
-    ),
-    (
-        "vllm/v1/attention/ops/prefix_prefill.py",
-        "tests/kernels/attention/test_prefix_prefill.py",
-        "qwen3_nonstandard_block_size",
-    ),
-)
 
 
 class ProvenanceResolverPort(Protocol):
@@ -233,19 +212,126 @@ def build_qwen_correctness_oracles(
     """Bind dynamically discovered Qwen kernels to reviewed vLLM tests."""
 
     roots = dict(source_roots or default_qwen_source_roots())
-    bindings = tuple(_qwen_oracle_binding(*spec) for spec in _QWEN_ORACLE_SPECS)
     return CorrectnessOracleRegistry(
         source_roots=roots,
-        bindings=bindings,
+        bindings=_qwen_oracle_bindings(),
         source_lock_sha256=_qwen_source_lock().sha256,
     )
 
 
-def _qwen_oracle_binding(
-    source: str, test: str, selector: str
-) -> CorrectnessOracleBinding:
-    argv = ("python", "-m", "pytest", test, "-k", selector, "-q", "-x")
-    return CorrectnessOracleBinding("vllm", source, test, argv)
+def _qwen_oracle_bindings() -> tuple[CorrectnessOracleBinding, ...]:
+    prefix_test = "tests/kernels/attention/test_prefix_prefill.py"
+    recurrent_test = "tests/kernels/test_fused_recurrent_packed_decode.py"
+    causal_test = "tests/kernels/mamba/test_causal_conv1d.py"
+    cache_test = "tests/kernels/attention/test_cache.py"
+    return (
+        CorrectnessOracleBinding(
+            "vllm",
+            "vllm/v1/attention/ops/chunked_prefill_paged_decode.py",
+            prefix_test,
+            _oracle_argv(
+                f"{prefix_test}::test_qwen3_nonstandard_block_size"
+                "[chunked_prefill_paged_decode-cuda:0-dtype0-128]"
+            ),
+        ),
+        CorrectnessOracleBinding(
+            "vllm",
+            "vllm/model_executor/layers/fla/ops/fused_recurrent.py",
+            recurrent_test,
+            _oracle_argv(
+                f"{recurrent_test}::test_fused_recurrent_packed_decode_matches_reference"
+                "[False-dtype1]",
+                f"{recurrent_test}::test_fused_recurrent_packed_decode_matches_reference"
+                "[True-dtype1]",
+                "tests/kernels/test_fused_sigmoid_gating_delta_rule.py::"
+                "test_fused_sigmoid_gating_delta_rule_update_non_spec"
+                "[dtype1-128-128-32-16-1-1]",
+            ),
+            ("tests/kernels/test_fused_sigmoid_gating_delta_rule.py",),
+            3,
+        ),
+        CorrectnessOracleBinding(
+            "vllm",
+            "vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
+            causal_test,
+            _oracle_argv(
+                f"{causal_test}::test_causal_conv1d_update"
+                "[4096-4-1-True-True-itype0]",
+                f"{causal_test}::test_causal_conv1d_update"
+                "[2064-4-1-False-False-itype0]",
+            ),
+            expected_test_count=2,
+        ),
+        CorrectnessOracleBinding(
+            "vllm",
+            "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py",
+            cache_test,
+            _oracle_argv(
+                f"{cache_test}::test_reshape_and_cache_flash"
+                "[triton-tensor-NHD-auto-cuda:0-0-dtype0-1024-16-256-8-42]",
+                f"{cache_test}::test_reshape_and_cache_flash"
+                "[triton-tensor-NHD-fp8-cuda:0-0-dtype0-1024-32-256-8-42]",
+            ),
+            (
+                "tests/__init__.py",
+                "tests/kernels/__init__.py",
+                "tests/kernels/utils.py",
+                "tests/kernels/quant_utils.py",
+                "tests/kernels/attention/conftest.py",
+            ),
+            2,
+        ),
+        CorrectnessOracleBinding(
+            "vllm",
+            "vllm/v1/attention/ops/prefix_prefill.py",
+            prefix_test,
+            _oracle_argv(
+                f"{prefix_test}::test_qwen3_nonstandard_block_size"
+                "[context_attention_fwd-cuda:0-dtype0-128]"
+            ),
+        ),
+    )
+
+
+def build_qwen_oracle_micro_qualifier(
+    oracles: CorrectnessOracleRegistry,
+) -> DockerOracleMicroQualifier:
+    """Bind the reviewed tests-only preflight to the immutable Qwen parent."""
+
+    identities = _source_identities()
+    return DockerOracleMicroQualifier(
+        oracles=oracles,
+        policy=DockerOraclePolicy(
+            QWEN_PARENT_LOCATOR,
+            QWEN_PARENT_IMAGE_ID,
+            tuple(
+                OracleSourceLock(name, identity["commit"], identity["tree"])
+                for name, identity in sorted(identities.items())
+            ),
+            (
+                OracleDependencyLock("pytest", "9.0.2"),
+                OracleDependencyLock("einops", "0.8.2"),
+            ),
+        ),
+    )
+
+
+def _oracle_argv(*node_ids: str) -> tuple[str, ...]:
+    """Return a reviewed tests-only argv; parent ``tests/conftest.py`` is excluded."""
+
+    return (
+        "python3",
+        "-m",
+        "pytest",
+        "-p",
+        "no:cacheprovider",
+        "--rootdir=/opt/apex-oracle",
+        "--confcutdir=/opt/apex-oracle/tests/kernels",
+        "--junitxml=/opt/apex-result/junit.xml",
+        "-q",
+        "-x",
+        *node_ids,
+    )
 
 
 def _reviewed_provenance_hints(
@@ -388,5 +474,6 @@ __all__ = [
     "build_qwen_acceptance_delivery",
     "build_qwen_acceptance_provenance_resolver",
     "build_qwen_correctness_oracles",
+    "build_qwen_oracle_micro_qualifier",
     "default_qwen_source_roots",
 ]

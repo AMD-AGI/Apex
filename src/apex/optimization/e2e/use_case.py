@@ -87,6 +87,7 @@ class _PreparedRun:
     views: BenchmarkConfigViews
     provenance: RunProvenance
     session: E2EBenchmarkSession
+    gpu_device_scope: str
 
 
 class E2EOptimizeUseCase:
@@ -272,7 +273,9 @@ class E2EOptimizeUseCase:
             max_kernels=spec.max_kernels,
             correctness_oracles=self._correctness_oracles,
         )
-        return _PreparedRun(spec, record, views, provenance, session)
+        return _PreparedRun(
+            spec, record, views, provenance, session, gpu_lease.device_scope
+        )
 
     def _resume_leased(
         self,
@@ -433,6 +436,7 @@ class E2EOptimizeUseCase:
             micro=self._micro,
             safety=self._safety,
             deployments=self._deployments,
+            gpu_device_scope=prepared.gpu_device_scope,
         )
 
     def _finalizer(

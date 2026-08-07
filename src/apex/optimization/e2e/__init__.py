@@ -10,6 +10,12 @@ from .oracles import (
     CorrectnessOracleRegistry,
     ResolvedCorrectnessOracle,
 )
+from .oracle_preflight import (
+    DockerOracleMicroQualifier,
+    DockerOraclePolicy,
+    OracleDependencyLock,
+    OracleSourceLock,
+)
 from .result import E2EOptimizationResult, build_e2e_result, write_e2e_result
 from .services import (
     AcceptedCandidate,
@@ -40,6 +46,7 @@ from .qwen_profile import (
     build_qwen_acceptance_delivery,
     build_qwen_acceptance_provenance_resolver,
     build_qwen_correctness_oracles,
+    build_qwen_oracle_micro_qualifier,
     default_qwen_source_roots,
 )
 from .use_case import BenchmarkAdapter, E2EOptimizeUseCase, ProvenancePort
@@ -56,6 +63,8 @@ __all__ = [
     "CorrectnessOracleBinding",
     "CorrectnessOracleRegistry",
     "DockerOverlayDeployment",
+    "DockerOracleMicroQualifier",
+    "DockerOraclePolicy",
     "E2ECandidate",
     "E2ECandidateRequest",
     "E2EContextBuilder",
@@ -74,6 +83,8 @@ __all__ = [
     "MicroQualificationPort",
     "MicroQualificationRequest",
     "OverlayOnlyFinalDelivery",
+    "OracleDependencyLock",
+    "OracleSourceLock",
     "PrimarySourceBuildOutput",
     "PrimarySourceBuildPort",
     "PrimarySourceBuildRequest",
@@ -89,6 +100,7 @@ __all__ = [
     "build_qwen_acceptance_delivery",
     "build_qwen_acceptance_provenance_resolver",
     "build_qwen_correctness_oracles",
+    "build_qwen_oracle_micro_qualifier",
     "default_qwen_source_roots",
     "write_e2e_result",
 ]

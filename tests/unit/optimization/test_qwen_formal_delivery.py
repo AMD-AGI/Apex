@@ -333,7 +333,14 @@ def test_qwen_oracles_are_source_relative_and_source_lock_bound(tmp_path: Path) 
             "tests/kernels/attention/test_prefix_prefill.py"
         ),
     }
-    extra_tests = {"tests/kernels/test_fused_sigmoid_gating_delta_rule.py"}
+    extra_tests = {
+        "tests/kernels/test_fused_sigmoid_gating_delta_rule.py",
+        "tests/__init__.py",
+        "tests/kernels/__init__.py",
+        "tests/kernels/utils.py",
+        "tests/kernels/quant_utils.py",
+        "tests/kernels/attention/conftest.py",
+    }
     for relative in set(sources).union(sources.values()).union(extra_tests):
         path = roots["vllm"] / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -352,7 +359,9 @@ def test_qwen_oracles_are_source_relative_and_source_lock_bound(tmp_path: Path) 
         assert resolved.test_file == roots["vllm"] / test
         assert len(resolved.binding_sha256) == 64
         assert resolved.execution_mode == "routing_only"
-        assert " -k " in f" {resolved.test_command} "
+        assert resolved.test_argv[:3] == ("python3", "-m", "pytest")
+        assert "-k" not in resolved.test_argv
+        assert any(item.startswith(f"{test}::") for item in resolved.test_argv)
 
 
 class FakeProvenanceResolver:

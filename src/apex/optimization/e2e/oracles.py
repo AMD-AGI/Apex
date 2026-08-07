@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from apex.core import ContractError, IntegrityError, sha256_json
+from apex.core import ContractError, IntegrityError, sha256_file, sha256_json
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -21,6 +21,8 @@ class CorrectnessOracleBinding:
     source_relative_path: str
     test_relative_path: str
     test_argv: tuple[str, ...]
+    support_relative_paths: tuple[str, ...] = ()
+    expected_test_count: int = 1
 
     def __post_init__(self) -> None:
         if not self.repository_id:
@@ -30,11 +32,23 @@ class CorrectnessOracleBinding:
         if not self.test_argv or any(not item for item in self.test_argv):
             raise ContractError("Oracle argv is empty", "invalid_oracle_binding")
         expected = self.test_relative_path
-        if expected not in self.test_argv:
+        if not any(
+            item == expected or item.startswith(f"{expected}::")
+            for item in self.test_argv
+        ):
             raise ContractError(
                 "Oracle argv does not name its reviewed test",
                 "invalid_oracle_binding",
             )
+        for relative in self.support_relative_paths:
+            _safe_relative(relative, "support_relative_path")
+        if self.test_relative_path in self.support_relative_paths:
+            raise ContractError(
+                "Oracle support files duplicate the primary test",
+                "invalid_oracle_binding",
+            )
+        if self.expected_test_count < 1:
+            raise ContractError("Oracle test count is invalid", "invalid_oracle_binding")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -42,6 +56,8 @@ class CorrectnessOracleBinding:
             "source_relative_path": self.source_relative_path,
             "test_relative_path": self.test_relative_path,
             "test_argv": list(self.test_argv),
+            "support_relative_paths": list(self.support_relative_paths),
+            "expected_test_count": self.expected_test_count,
         }
 
 
@@ -51,6 +67,11 @@ class ResolvedCorrectnessOracle:
 
     test_file: Path
     test_command: str
+    test_argv: tuple[str, ...]
+    support_files: tuple[Path, ...]
+    source_sha256: str
+    test_files_sha256: Mapping[str, str]
+    expected_test_count: int
     binding_sha256: str
     policy_sha256: str
     execution_mode: str = "routing_only"
@@ -143,6 +164,22 @@ class CorrectnessOracleRegistry:
         return ResolvedCorrectnessOracle(
             test_file=test_file,
             test_command=" ".join(binding.test_argv),
+            test_argv=binding.test_argv,
+            support_files=tuple(
+                observed_root.joinpath(*Path(relative).parts)
+                for relative in binding.support_relative_paths
+            ),
+            source_sha256=sha256_file(
+                observed_root.joinpath(*Path(binding.source_relative_path).parts)
+            ),
+            test_files_sha256={
+                relative: sha256_file(observed_root.joinpath(*Path(relative).parts))
+                for relative in (
+                    binding.test_relative_path,
+                    *binding.support_relative_paths,
+                )
+            },
+            expected_test_count=binding.expected_test_count,
             binding_sha256=binding_sha256,
             policy_sha256=self.policy_sha256,
         )
@@ -151,6 +188,8 @@ class CorrectnessOracleRegistry:
         root = self._roots[binding.repository_id]
         _regular_file(root, binding.source_relative_path, "oracle_source_missing")
         _regular_file(root, binding.test_relative_path, "oracle_test_missing")
+        for relative in binding.support_relative_paths:
+            _regular_file(root, relative, "oracle_support_file_missing")
 
 
 def _safe_relative(value: str, field: str) -> Path:

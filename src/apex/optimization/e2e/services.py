@@ -35,6 +35,7 @@ class MicroQualificationRequest:
     opportunity: KernelOpportunity
     artifact_root: Path
     anchor_generation: int
+    gpu_device_scope: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +105,9 @@ class MicroQualification:
     def reason_code(self) -> str:
         if self.grade is not None:
             return self.grade.promotion_reason_code
+        observed = self.evidence.get("reason_code")
+        if isinstance(observed, str) and observed:
+            return observed
         return "e2e_quality_deferred" if self.deferred_candidate_valid else "invalid_frozen_candidate"
 
     @property
