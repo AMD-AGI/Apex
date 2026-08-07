@@ -284,7 +284,9 @@ class E2EOptimizeUseCase:
         gpu_lease: GpuLeaseReceipt,
     ) -> E2EOptimizationResult:
         self._record_resume_lease(record, gpu_lease)
-        prepared = self._recover_prepared(request, record)
+        prepared = self._recover_prepared(
+            request, record, gpu_device_scope=gpu_lease.device_scope
+        )
         if record.controller.state.pending_action is not None:
             record.controller.abort_pending("interrupted_before_completion_receipt")
         search_state = record.controller.state.e2e
@@ -348,7 +350,11 @@ class E2EOptimizeUseCase:
         )
 
     def _recover_prepared(
-        self, request: RecoveredRunRequest, record: E2ERunRecord
+        self,
+        request: RecoveredRunRequest,
+        record: E2ERunRecord,
+        *,
+        gpu_device_scope: str,
     ) -> _PreparedRun:
         spec = request.spec
         provenance = self._provenance.resolve(
@@ -376,7 +382,9 @@ class E2EOptimizeUseCase:
             max_kernels=spec.max_kernels,
             correctness_oracles=self._correctness_oracles,
         )
-        return _PreparedRun(spec, record, request.views, provenance, session)
+        return _PreparedRun(
+            spec, record, request.views, provenance, session, gpu_device_scope
+        )
 
     @staticmethod
     def _record_run_identity(
