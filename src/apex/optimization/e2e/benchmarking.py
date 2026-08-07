@@ -16,6 +16,7 @@ from apex.runtime import RunProvenance
 from apex.storage import ArtifactReceipt
 
 from .kernel_lane import KernelOpportunityPlan, build_kernel_opportunity_plan
+from .oracles import CorrectnessOracleRegistry
 from .run_record import E2ERunRecord
 
 
@@ -46,6 +47,7 @@ class E2EBenchmarkSession:
         provenance: RunProvenance,
         protocol_hash: str,
         max_kernels: int,
+        correctness_oracles: CorrectnessOracleRegistry | None = None,
     ) -> None:
         self._benchmark = benchmark
         self._diagnostics = diagnostics
@@ -53,6 +55,7 @@ class E2EBenchmarkSession:
         self.provenance = provenance
         self.protocol_hash = protocol_hash
         self.max_kernels = max_kernels
+        self.correctness_oracles = correctness_oracles
 
     def action(
         self,
@@ -100,7 +103,9 @@ class E2EBenchmarkSession:
         receipts = self.record.record_diagnostics(diagnostic)
         path = _evidence_path(diagnostic)
         plan = build_kernel_opportunity_plan(
-            load_evidence(path), max_kernels=self.max_kernels
+            load_evidence(path),
+            max_kernels=self.max_kernels,
+            correctness_oracles=self.correctness_oracles,
         )
         digest = sha256_file(path)
         receipt = next((item for item in receipts if item.digest == digest), None)

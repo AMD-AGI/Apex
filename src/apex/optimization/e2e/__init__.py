@@ -5,6 +5,11 @@ from .context import E2EContextBuilder
 from .deferred import E2EDeferredMicroQualifier
 from .docker_overlay import DockerOverlayDeployment, OverlayOnlyFinalDelivery
 from .kernel_lane import KernelOpportunity, KernelOpportunityPlan, build_kernel_opportunity_plan
+from .oracles import (
+    CorrectnessOracleBinding,
+    CorrectnessOracleRegistry,
+    ResolvedCorrectnessOracle,
+)
 from .result import E2EOptimizationResult, build_e2e_result, write_e2e_result
 from .services import (
     AcceptedCandidate,
@@ -34,6 +39,7 @@ from .source_delivery_provenance import ExactRequestProvenance
 from .qwen_profile import (
     build_qwen_acceptance_delivery,
     build_qwen_acceptance_provenance_resolver,
+    build_qwen_correctness_oracles,
     default_qwen_source_roots,
 )
 from .use_case import BenchmarkAdapter, E2EOptimizeUseCase, ProvenancePort
@@ -47,6 +53,8 @@ __all__ = [
     "CandidateDeploymentRequest",
     "CandidateSafetyPort",
     "CandidateWorker",
+    "CorrectnessOracleBinding",
+    "CorrectnessOracleRegistry",
     "DockerOverlayDeployment",
     "E2ECandidate",
     "E2ECandidateRequest",
@@ -70,6 +78,7 @@ __all__ = [
     "PrimarySourceBuildPort",
     "PrimarySourceBuildRequest",
     "ProvenancePort",
+    "ResolvedCorrectnessOracle",
     "DeliveryProvenancePort",
     "SafetyQualification",
     "SafetyQualificationRequest",
@@ -79,6 +88,7 @@ __all__ = [
     "build_kernel_opportunity_plan",
     "build_qwen_acceptance_delivery",
     "build_qwen_acceptance_provenance_resolver",
+    "build_qwen_correctness_oracles",
     "default_qwen_source_roots",
     "write_e2e_result",
 ]

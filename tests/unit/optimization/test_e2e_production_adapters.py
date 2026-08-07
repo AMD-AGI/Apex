@@ -277,6 +277,22 @@ def test_production_composition_injects_reviewed_qwen_source_delivery(
     aiter = tmp_path / "verified-aiter"
     vllm.mkdir()
     aiter.mkdir()
+    oracle_files = {
+        "vllm/v1/attention/ops/chunked_prefill_paged_decode.py",
+        "vllm/model_executor/layers/fla/ops/fused_recurrent.py",
+        "vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
+        "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py",
+        "vllm/v1/attention/ops/prefix_prefill.py",
+        "tests/kernels/attention/test_prefix_prefill.py",
+        "tests/kernels/test_fused_recurrent_packed_decode.py",
+        "tests/kernels/test_fused_sigmoid_gating_delta_rule.py",
+        "tests/kernels/mamba/test_causal_conv1d.py",
+        "tests/kernels/attention/test_cache.py",
+    }
+    for relative in oracle_files:
+        path = vllm / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("pass\n", encoding="utf-8")
     source_receipt = SourceLockReceipt(
         "apex.e2e-source-locks.receipt/v1",
         tmp_path / "source-lock.json",

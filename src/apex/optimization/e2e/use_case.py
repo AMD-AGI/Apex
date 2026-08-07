@@ -31,6 +31,7 @@ from .benchmarking import (
 from .candidate import CandidateWorker
 from .context import E2EContextBuilder
 from .finalization import E2EFinalizer
+from .oracles import CorrectnessOracleRegistry
 from .result import E2EOptimizationResult
 from .run_record import E2ERunRecord
 from .search import E2ESearchLoop
@@ -82,6 +83,7 @@ class E2EOptimizeUseCase:
         deployments: CandidateDeploymentPort | None = None,
         final_delivery: FinalDeliveryPort | None = None,
         gpu_leases: GpuLeaseManager | None = None,
+        correctness_oracles: CorrectnessOracleRegistry | None = None,
     ) -> None:
         self._receipt = dependency_receipt
         self._benchmark = benchmark or MagpieBenchmarkAdapter(dependency_receipt)
@@ -94,6 +96,7 @@ class E2EOptimizeUseCase:
         self._deployments = deployments or UnavailableDeployment()
         self._final_delivery = final_delivery or UnavailableFinalDelivery()
         self._gpu_leases = gpu_leases or LocalGpuLeaseManager()
+        self._correctness_oracles = correctness_oracles
 
     def run(self, spec: E2EOptimizeSpec) -> E2EOptimizationResult:
         run_id = new_identifier("e2e")
@@ -185,7 +188,9 @@ class E2EOptimizeUseCase:
             workload_id=f"workload-{provenance.benchmark_config_sha256[:16]}",
             provenance_hash=provenance.digest,
             objective_policy_hash=_objective_hash(spec),
-            accuracy_contract_hash=_accuracy_hash(views, spec),
+            accuracy_contract_hash=_accuracy_hash(
+                views, spec, self._correctness_oracles
+            ),
             measurement_protocol_hash=views.workload_semantics_sha256,
             candidate_limit=spec.max_kernels * spec.max_iterations,
             cycle_limit=spec.max_iterations,
@@ -197,6 +202,7 @@ class E2EOptimizeUseCase:
             provenance=provenance,
             protocol_hash=views.workload_semantics_sha256,
             max_kernels=spec.max_kernels,
+            correctness_oracles=self._correctness_oracles,
         )
         return _PreparedRun(spec, record, views, provenance, session)
 
@@ -298,14 +304,21 @@ def _hf_offline(spec: E2EOptimizeSpec) -> bool:
     return raw
 
 
-def _accuracy_hash(views: BenchmarkConfigViews, spec: E2EOptimizeSpec) -> str:
-    return sha256_json(
-        {
-            "schema": "apex.e2e-quality-policy-binding.v1",
-            "quality_tasks": views.quality_tasks,
-            "regression_gates": asdict(spec.goal.gates),
-        }
-    )
+def _accuracy_hash(
+    views: BenchmarkConfigViews,
+    spec: E2EOptimizeSpec,
+    correctness_oracles: CorrectnessOracleRegistry | None = None,
+) -> str:
+    policy = {
+        "schema": "apex.e2e-quality-policy-binding.v1",
+        "quality_tasks": views.quality_tasks,
+        "regression_gates": asdict(spec.goal.gates),
+    }
+    if correctness_oracles is not None:
+        policy["correctness_oracle_policy_sha256"] = (
+            correctness_oracles.policy_sha256
+        )
+    return sha256_json(policy)
 
 
 def _binding(role: str, receipt: ArtifactReceipt) -> dict[str, object]:

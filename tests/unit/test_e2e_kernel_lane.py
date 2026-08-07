@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from apex.diagnostics import (
     AcquisitionCoverage,
     EvidenceArtifactReceipt,
@@ -15,7 +17,12 @@ from apex.diagnostics import (
     TraceEvidence,
     derive_candidate_id,
 )
-from apex.optimization.e2e import build_kernel_opportunity_plan
+from apex.core import IntegrityError
+from apex.optimization.e2e import (
+    CorrectnessOracleBinding,
+    CorrectnessOracleRegistry,
+    build_kernel_opportunity_plan,
+)
 
 
 def _evidence(tmp_path: Path, name: str, share: float, *, resolved: bool) -> TraceEvidence:
@@ -101,3 +108,70 @@ def test_config_or_non_source_candidates_cannot_enter_lane(tmp_path: Path) -> No
     plan = build_kernel_opportunity_plan((evidence,), max_kernels=1)
     assert plan.eligible == ()
     assert plan.opportunities[0].reason_code == "unsupported_kernel_language"
+
+
+def test_source_locked_oracle_makes_dynamically_ranked_source_eligible(
+    tmp_path: Path,
+) -> None:
+    evidence = _evidence(tmp_path, "runtime_symbol_can_change", 20, resolved=True)
+    kernel = replace(evidence.kernel, test_file=None, test_command=None)
+    candidate = derive_candidate_id(
+        provenance_hash=evidence.provenance_hash,
+        phase=evidence.phase,
+        rank=evidence.rank,
+        kernel=kernel,
+        shape=evidence.shape,
+    )
+    evidence = replace(evidence, kernel=kernel, candidate_id=candidate)
+    root = Path(kernel.source_root or "")
+    registry = CorrectnessOracleRegistry(
+        source_roots={"aiter": root},
+        source_lock_sha256="e" * 64,
+        bindings=(
+            CorrectnessOracleBinding(
+                "aiter",
+                "kernel.py",
+                "test_kernel.py",
+                ("python", "-m", "pytest", "test_kernel.py", "-q"),
+            ),
+        ),
+    )
+
+    plan = build_kernel_opportunity_plan(
+        (evidence,), max_kernels=1, correctness_oracles=registry
+    )
+
+    assert [item.runtime_name for item in plan.eligible] == [
+        "runtime_symbol_can_change"
+    ]
+    assert plan.eligible[0].test_file == root / "test_kernel.py"
+    assert plan.eligible[0].test_command == "python -m pytest test_kernel.py -q"
+    assert len(plan.eligible[0].correctness_oracle_sha256 or "") == 64
+    assert plan.correctness_oracle_policy_sha256 == registry.policy_sha256
+
+
+def test_oracle_rejects_a_different_source_root(tmp_path: Path) -> None:
+    evidence = _evidence(tmp_path, "kernel", 20, resolved=True)
+    root = Path(evidence.kernel.source_root or "")
+    registry = CorrectnessOracleRegistry(
+        source_roots={"aiter": root},
+        source_lock_sha256="e" * 64,
+        bindings=(
+            CorrectnessOracleBinding(
+                "aiter",
+                "kernel.py",
+                "test_kernel.py",
+                ("python", "-m", "pytest", "test_kernel.py"),
+            ),
+        ),
+    )
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "kernel.py").write_text("pass\n", encoding="utf-8")
+
+    with pytest.raises(IntegrityError, match="differs"):
+        registry.resolve(
+            repository_id="aiter",
+            source_root=other,
+            source_path=other / "kernel.py",
+        )

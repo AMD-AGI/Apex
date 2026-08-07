@@ -18,6 +18,7 @@ from apex.runtime import (
     load_source_lock,
 )
 
+from .oracles import CorrectnessOracleBinding, CorrectnessOracleRegistry
 from .source_delivery import FormalDeliveryBinding, SourceRebuildFinalDelivery
 from .source_delivery_models import FormalRepositoryProfile, FormalSourceDeliveryProfile
 from .source_delivery_provenance import ExactRequestProvenance
@@ -200,6 +201,85 @@ def build_qwen_acceptance_provenance_resolver(
     )
 
 
+def build_qwen_correctness_oracles(
+    *, source_roots: Mapping[str, Path] | None = None
+) -> CorrectnessOracleRegistry:
+    """Bind dynamically discovered Qwen kernels to reviewed vLLM tests."""
+
+    roots = dict(source_roots or default_qwen_source_roots())
+    bindings = tuple(
+        CorrectnessOracleBinding("vllm", source, test, argv)
+        for source, test, argv in (
+            (
+                "vllm/v1/attention/ops/chunked_prefill_paged_decode.py",
+                "tests/kernels/attention/test_prefix_prefill.py",
+                (
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/kernels/attention/test_prefix_prefill.py",
+                    "-q",
+                    "-x",
+                ),
+            ),
+            (
+                "vllm/model_executor/layers/fla/ops/fused_recurrent.py",
+                "tests/kernels/test_fused_recurrent_packed_decode.py",
+                (
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/kernels/test_fused_recurrent_packed_decode.py",
+                    "tests/kernels/test_fused_sigmoid_gating_delta_rule.py",
+                    "-q",
+                    "-x",
+                ),
+            ),
+            (
+                "vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
+                "tests/kernels/mamba/test_causal_conv1d.py",
+                (
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/kernels/mamba/test_causal_conv1d.py",
+                    "-q",
+                    "-x",
+                ),
+            ),
+            (
+                "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py",
+                "tests/kernels/attention/test_cache.py",
+                (
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/kernels/attention/test_cache.py",
+                    "-q",
+                    "-x",
+                ),
+            ),
+            (
+                "vllm/v1/attention/ops/prefix_prefill.py",
+                "tests/kernels/attention/test_prefix_prefill.py",
+                (
+                    "python",
+                    "-m",
+                    "pytest",
+                    "tests/kernels/attention/test_prefix_prefill.py",
+                    "-q",
+                    "-x",
+                ),
+            ),
+        )
+    )
+    return CorrectnessOracleRegistry(
+        source_roots=roots,
+        bindings=bindings,
+        source_lock_sha256=_qwen_source_lock().sha256,
+    )
+
+
 def _reviewed_provenance_hints(
     roots: Mapping[str, Path],
 ) -> dict[str, Any]:
@@ -339,5 +419,6 @@ __all__ = [
     "QwenAcceptanceProvenanceResolver",
     "build_qwen_acceptance_delivery",
     "build_qwen_acceptance_provenance_resolver",
+    "build_qwen_correctness_oracles",
     "default_qwen_source_roots",
 ]

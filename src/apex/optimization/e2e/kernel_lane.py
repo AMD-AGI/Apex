@@ -8,6 +8,8 @@ from pathlib import Path
 from apex.core import ContractError
 from apex.diagnostics import OpportunityRankings, TraceEvidence, rank_evidence
 
+from .oracles import CorrectnessOracleRegistry, ResolvedCorrectnessOracle
+
 
 @dataclass(frozen=True, slots=True)
 class KernelOpportunity:
@@ -31,6 +33,7 @@ class KernelOpportunity:
     test_command: str | None
     eligibility: str
     reason_code: str
+    correctness_oracle_sha256: str | None = None
 
     @property
     def eligible(self) -> bool:
@@ -42,6 +45,7 @@ class KernelOpportunityPlan:
     opportunities: tuple[KernelOpportunity, ...]
     measured_order: tuple[str, ...]
     recoverable_order: tuple[str, ...]
+    correctness_oracle_policy_sha256: str | None = None
 
     @property
     def eligible(self) -> tuple[KernelOpportunity, ...]:
@@ -53,6 +57,7 @@ def build_kernel_opportunity_plan(
     *,
     max_kernels: int,
     min_gpu_pct: float = 0.1,
+    correctness_oracles: CorrectnessOracleRegistry | None = None,
 ) -> KernelOpportunityPlan:
     """Keep unresolved kernels visible while selecting only source candidates."""
 
@@ -68,7 +73,19 @@ def build_kernel_opportunity_plan(
         source = Path(record.kernel.source_path) if record.kernel.source_path else None
         root = Path(record.kernel.source_root) if record.kernel.source_root else None
         test = Path(record.kernel.test_file) if record.kernel.test_file else None
-        reason = _eligibility_reason(record, source, root)
+        command = record.kernel.test_command
+        oracle = _resolve_oracle(
+            correctness_oracles,
+            record=record,
+            source=source,
+            root=root,
+            observed_test=test,
+            observed_command=command,
+        )
+        if oracle is not None:
+            test = oracle.test_file
+            command = oracle.test_command
+        reason = _eligibility_reason(record, source, root, test, command)
         planned.append(
             KernelOpportunity(
                 opportunity_id=f"kernel-{record.candidate_id[:24]}",
@@ -88,9 +105,12 @@ def build_kernel_opportunity_plan(
                 source_path=source,
                 source_root=root,
                 test_file=test,
-                test_command=record.kernel.test_command,
+                test_command=command,
                 eligibility="eligible" if reason == "eligible" else "unresolved",
                 reason_code=reason,
+                correctness_oracle_sha256=(
+                    oracle.binding_sha256 if oracle is not None else None
+                ),
             )
         )
         if reason == "eligible":
@@ -105,10 +125,19 @@ def build_kernel_opportunity_plan(
             for item in rankings.recoverable
             if item.candidate_id in {planned_item.evidence_id for planned_item in planned}
         ),
+        correctness_oracle_policy_sha256=(
+            correctness_oracles.policy_sha256 if correctness_oracles is not None else None
+        ),
     )
 
 
-def _eligibility_reason(record: TraceEvidence, source: Path | None, root: Path | None) -> str:
+def _eligibility_reason(
+    record: TraceEvidence,
+    source: Path | None,
+    root: Path | None,
+    test: Path | None,
+    command: str | None,
+) -> str:
     if record.kernel.language not in {"python", "triton"}:
         return "unsupported_kernel_language"
     if not record.kernel.patchable or source is None:
@@ -121,9 +150,43 @@ def _eligibility_reason(record: TraceEvidence, source: Path | None, root: Path |
         source.resolve().relative_to(root.resolve())
     except ValueError:
         return "source_outside_root"
-    if not record.kernel.test_command and not (record.kernel.test_file and Path(record.kernel.test_file).is_file()):
+    if not command and not (test and test.is_file()):
         return "correctness_oracle_unresolved"
     return "eligible"
+
+
+def _resolve_oracle(
+    registry: CorrectnessOracleRegistry | None,
+    *,
+    record: TraceEvidence,
+    source: Path | None,
+    root: Path | None,
+    observed_test: Path | None,
+    observed_command: str | None,
+) -> ResolvedCorrectnessOracle | None:
+    if registry is None or source is None or root is None:
+        return None
+    resolved = registry.resolve(
+        repository_id=record.kernel.origin_library,
+        source_root=root,
+        source_path=source,
+    )
+    if resolved is None:
+        return None
+    if (
+        observed_test is not None
+        and observed_test.resolve() != resolved.test_file.resolve()
+    ):
+        raise ContractError(
+            "Observed correctness test conflicts with reviewed oracle",
+            "correctness_oracle_conflict",
+        )
+    if observed_command is not None and observed_command != resolved.test_command:
+        raise ContractError(
+            "Observed correctness command conflicts with reviewed oracle",
+            "correctness_oracle_conflict",
+        )
+    return resolved
 
 
 __all__ = [

@@ -16,6 +16,7 @@ from apex.optimization.e2e import (
     FinalDeliveryPort,
     build_qwen_acceptance_delivery,
     build_qwen_acceptance_provenance_resolver,
+    build_qwen_correctness_oracles,
 )
 from apex.optimization.kernel import KernelContextBuilder, KernelOptimizeUseCase
 from apex.runtime import verify_runtime_dependencies
@@ -47,10 +48,12 @@ def build_application(
     receipt = verify_runtime_dependencies()
     final_delivery = e2e_final_delivery
     provenance = None
+    correctness_oracles = None
     if final_delivery is None:
         roots = {name: receipt.source_root(name) for name in ("vllm", "aiter")}
         final_delivery = build_qwen_acceptance_delivery(receipt, source_roots=roots)
         provenance = build_qwen_acceptance_provenance_resolver(source_roots=roots)
+        correctness_oracles = build_qwen_correctness_oracles(source_roots=roots)
     e2e = E2EOptimizeUseCase(
         dependency_receipt=receipt,
         provenance=provenance,
@@ -59,6 +62,7 @@ def build_application(
         micro=E2EDeferredMicroQualifier(),
         deployments=DockerOverlayDeployment(),
         final_delivery=final_delivery,
+        correctness_oracles=correctness_oracles,
     )
     return Application(kernel_optimizer=kernel, e2e_optimizer=e2e)
 

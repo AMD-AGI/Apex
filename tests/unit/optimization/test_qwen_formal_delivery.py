@@ -48,6 +48,7 @@ from apex.optimization.e2e.qwen_profile import (
     QwenAcceptanceProvenance,
     QwenAcceptanceProvenanceResolver,
     _profiles,
+    build_qwen_correctness_oracles,
 )
 from apex.optimization.e2e.source_delivery_adapters import (
     QwenIndependentReplay,
@@ -310,6 +311,46 @@ def test_qwen_profile_accepts_only_the_reviewed_identity(tmp_path: Path) -> None
         for profile in profiles
         for step in profile.recipe.steps
     )
+
+
+def test_qwen_oracles_are_source_relative_and_source_lock_bound(tmp_path: Path) -> None:
+    roots = {"vllm": tmp_path / "vllm", "aiter": tmp_path / "aiter"}
+    roots["aiter"].mkdir()
+    sources = {
+        "vllm/v1/attention/ops/chunked_prefill_paged_decode.py": (
+            "tests/kernels/attention/test_prefix_prefill.py"
+        ),
+        "vllm/model_executor/layers/fla/ops/fused_recurrent.py": (
+            "tests/kernels/test_fused_recurrent_packed_decode.py"
+        ),
+        "vllm/model_executor/layers/mamba/ops/causal_conv1d.py": (
+            "tests/kernels/mamba/test_causal_conv1d.py"
+        ),
+        "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py": (
+            "tests/kernels/attention/test_cache.py"
+        ),
+        "vllm/v1/attention/ops/prefix_prefill.py": (
+            "tests/kernels/attention/test_prefix_prefill.py"
+        ),
+    }
+    extra_tests = {"tests/kernels/test_fused_sigmoid_gating_delta_rule.py"}
+    for relative in set(sources).union(sources.values()).union(extra_tests):
+        path = roots["vllm"] / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("pass\n", encoding="utf-8")
+
+    registry = build_qwen_correctness_oracles(source_roots=roots)
+
+    assert len(registry.policy_sha256) == 64
+    for source, test in sources.items():
+        resolved = registry.resolve(
+            repository_id="vllm",
+            source_root=roots["vllm"],
+            source_path=roots["vllm"] / source,
+        )
+        assert resolved is not None
+        assert resolved.test_file == roots["vllm"] / test
+        assert len(resolved.binding_sha256) == 64
 
 
 class FakeProvenanceResolver:

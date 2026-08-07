@@ -50,6 +50,7 @@ Internal responsibilities are intentionally narrow:
 
 - `benchmarking.py` binds measurements and TraceLens diagnostics to journal/CAS.
 - `kernel_lane.py` turns measured evidence into source-only opportunities.
+- `oracles.py` resolves version-locked source paths to reviewed correctness tests.
 - `context.py` compiles a fresh bounded `ContextPacket` from durable state.
 - `candidate.py` materializes and freezes an isolated source checkout.
 - `deferred.py` represents the no-micro-harness truth boundary without reward.
@@ -75,6 +76,16 @@ independent correctness oracle enters the candidate lane. Config-only proposals
 cannot be constructed. Each agent process is stateless and sees only one bounded
 packet; durable decisions, receipts, dead ends, and the current anchor replace
 conversation memory.
+
+Correctness-oracle routing never preselects profiler symbols. The diagnostic rank
+remains dynamic; after a source has been resolved into an exact source-lock root,
+`CorrectnessOracleRegistry` matches only its repository-relative source path to a
+reviewed in-tree test. The policy and individual binding SHA-256 values are bound
+into the run accuracy contract and protected harness context. A root mismatch,
+missing test, symlink, hard link, path escape, or conflicting Magpie test mapping
+fails closed. For the reviewed Qwen profile this makes paged attention, recurrent
+GDN decode, causal-conv update, prefix-prefill, and reshape/cache sources eligible
+without hardcoding their dynamic rank or runtime symbol.
 
 After every candidate worker exits, `run_record.py` writes one canonical
 `apex.agent-transcript/v1` CAS artifact and projects its normalized actions into
