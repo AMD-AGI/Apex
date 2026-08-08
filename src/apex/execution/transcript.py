@@ -42,7 +42,7 @@ def agent_transcript_document(result: AgentResult) -> dict[str, object]:
     """Return a deterministic, provider-neutral transcript document."""
 
     return {
-        "schema": "apex.agent-transcript/v2",
+        "schema": "apex.agent-transcript/v3",
         "backend": result.backend.value,
         "model": result.model,
         "effort": result.effort,
@@ -53,15 +53,11 @@ def agent_transcript_document(result: AgentResult) -> dict[str, object]:
             "capture_status": result.capture_status.value,
             "candidate_capture_allowed": result.candidate_capture_allowed,
             "observer_stop_sent": result.observer_stop_sent,
-            "suspension": {
-                "policy_id": (
-                    result.invocation.boundary_quiescence_policy_id
-                    if result.invocation
-                    else None
-                ),
-                "sent": result.observer_suspend_sent,
-                "verified": result.suspension_verified,
-            },
+            "process_containment": (
+                result.process_containment.to_dict()
+                if result.process_containment is not None
+                else None
+            ),
             "discarded_stdout_tail": {
                 "lines": result.discarded_stdout_lines,
                 "bytes": result.discarded_stdout_bytes,

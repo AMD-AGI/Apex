@@ -45,15 +45,15 @@ agent exits
 “Agent exits” includes a controlled exact-turn-boundary checkpoint. Apex stops
 the structured stream exactly at `max_turns`; if the invocation receipt names
 `structured_agent_turn_checkpoint_v2`, the observed count equals the requested
-count, `sigstop_process_group_snapshot_v1` proves group quiescence, output is
-complete, and process-group cleanup is verified, changed source may proceed to
+count, `private_pid_namespace_init_pidfd_v1` proves the agent namespace empty,
+output is complete, and containment cleanup is verified, changed source may proceed to
 the same freeze and evaluator-owned gates as a natural exit-zero
 completion. This is not a grading shortcut: unchanged source is `no_gain`, and
 turn overrun, invalid stream, timeout, truncation, or cleanup failure is rejected
-before freeze. The canonical `agent_completed` event and v2 transcript retain
+before freeze. The canonical `agent_completed` event and v3 transcript retain
 the exact termination/capture evidence.
 
-The agent-mutated workspace is never used as an evaluator cwd. After suspension
+The agent-mutated workspace is never used as an evaluator cwd. After containment
 and allowlist validation, `CandidateWorkspace` rechecks the pristine anchor,
 copies it into a new evaluator-owned projection, and overlays only content whose
 editable-file digest was frozen. Interpreter/test caches, `.pyc`/`.pyo`, and all

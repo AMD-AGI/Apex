@@ -11,8 +11,11 @@ from .agent import (
     AgentTranscriptEvent,
     AgentTerminationKind,
     AgentUsage,
-    BOUNDARY_QUIESCENCE_POLICY,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
+)
+from .agent_containment import (
+    AGENT_PROCESS_CONTAINMENT_POLICY,
+    AgentProcessContainmentReceipt,
 )
 from .benchmark import BenchmarkPass, BenchmarkPort, BenchmarkRequest, BenchmarkResult
 from .diagnostics import DiagnosticsPort, DiagnosticsRequest, DiagnosticsResult
@@ -25,17 +28,18 @@ from .safety import (
 )
 
 __all__ = [
+    "AGENT_PROCESS_CONTAINMENT_POLICY",
     "AgentBackend",
     "AgentCaptureStatus",
     "AgentCost",
     "AgentInvocationReceipt",
+    "AgentProcessContainmentReceipt",
     "AgentRequest",
     "AgentResult",
     "AgentSemanticEvent",
     "AgentTranscriptEvent",
     "AgentTerminationKind",
     "AgentUsage",
-    "BOUNDARY_QUIESCENCE_POLICY",
     "BenchmarkPass",
     "BenchmarkPort",
     "BenchmarkRequest",

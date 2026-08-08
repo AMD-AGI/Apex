@@ -30,18 +30,47 @@ from apex.execution import AgentRegistry
 from apex.intake import TaskSpec
 from apex.optimization.kernel import KernelOptimizeRequest, KernelOptimizeUseCase
 from apex.ports import (
+    AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
     AgentCost,
     AgentInvocationReceipt,
+    AgentProcessContainmentReceipt,
     AgentRequest,
     AgentResult,
     AgentSemanticEvent,
     AgentTranscriptEvent,
     AgentTerminationKind,
     AgentUsage,
-    BOUNDARY_QUIESCENCE_POLICY,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
 )
+
+
+def _agent_containment(*, stopped: bool = False) -> AgentProcessContainmentReceipt:
+    return AgentProcessContainmentReceipt(
+        policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
+        launcher_path="/usr/bin/bwrap",
+        launcher_sha256="b" * 64,
+        namespace_init_host_pid=100,
+        namespace_init_starttime=200,
+        namespace_init_inner_pid=1,
+        pid_namespace_inode=300,
+        mount_namespace_inode=301,
+        ipc_namespace_inode=302,
+        user_namespace_inode=303,
+        private_procfs_verified=True,
+        pidfd_opened=True,
+        termination_reason="stdout_budget_boundary" if stopped else "natural_exit",
+        teardown_mode="pidfd_sigkill" if stopped else "natural_exit",
+        pidfd_sigkill_sent=stopped,
+        namespace_init_exit_verified=True,
+        wrapper_exit_verified=True,
+        wrapper_force_killed=False,
+        terminal_status_verified=True,
+        terminal_status_absent_after_sigkill=False,
+        status_eof_verified=True,
+        namespace_membership_scan_complete=True,
+        live_namespace_members_after=(),
+    )
 from apex.rl import DatasetExportConfig, DatasetExporter, EpisodeGraphMaterializer
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal
 
@@ -89,13 +118,13 @@ class EditingAgent:
         return AgentResult(
             backend=self.name,
             model=request.model,
-            exit_code=-15 if boundary or overrun else 0,
+            exit_code=137 if boundary or overrun else 0,
             timed_out=False,
             events=(),
             stdout='{"type":"turn.completed"}\n',
             stderr="",
             duration_seconds=0.1,
-            invocation=_agent_invocation(request) if boundary or overrun else None,
+            invocation=_agent_invocation(request),
             termination_kind=self.termination_kind,
             capture_status=self.capture_status,
             termination_reason=(
@@ -107,8 +136,7 @@ class EditingAgent:
                 request.max_turns if boundary else request.max_turns + 1 if overrun else 1
             ),
             observer_stop_sent=boundary or overrun,
-            observer_suspend_sent=boundary or overrun,
-            suspension_verified=boundary or overrun,
+            process_containment=_agent_containment(stopped=boundary or overrun),
         )
 
 
@@ -126,7 +154,7 @@ def _agent_invocation(request: AgentRequest) -> AgentInvocationReceipt:
         allowed_files_enforced_by_cli=False,
         max_turns=request.max_turns,
         turn_policy=STRUCTURED_TURN_CHECKPOINT_POLICY,
-        boundary_quiescence_policy_id=BOUNDARY_QUIESCENCE_POLICY,
+        process_containment_policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
         isolation=(("sandbox", "workspace-write"),),
     )
 
@@ -197,6 +225,8 @@ class SequencedEditingAgent:
                 source_event_index=0,
                 source_key="total_cost_usd",
             ),
+            invocation=_agent_invocation(request),
+            process_containment=_agent_containment(),
         )
 
 
@@ -526,23 +556,24 @@ def test_exact_turn_boundary_candidate_runs_all_trusted_gates(tmp_path: Path) ->
     )
     receipt = ArtifactReceipt.from_dict(binding["receipt"])
     transcript = json.loads(ArtifactStore(run_root / "artifacts").read_bytes(receipt))
-    assert transcript["schema"] == "apex.agent-transcript/v2"
-    assert transcript["termination"] == {
-        "kind": "exact_turn_boundary",
-        "reason": "max_turns_exact_boundary",
-        "capture_status": "complete",
-        "candidate_capture_allowed": True,
-        "observer_stop_sent": True,
-        "suspension": {
-            "policy_id": BOUNDARY_QUIESCENCE_POLICY,
-            "sent": True,
-            "verified": True,
-        },
-        "discarded_stdout_tail": {"lines": 0, "bytes": 0, "sha256": None},
-        "observed_turns": 25,
-        "max_turns": 25,
-        "turn_policy": STRUCTURED_TURN_CHECKPOINT_POLICY,
+    assert transcript["schema"] == "apex.agent-transcript/v3"
+    termination = transcript["termination"]
+    assert termination["kind"] == "exact_turn_boundary"
+    assert termination["reason"] == "max_turns_exact_boundary"
+    assert termination["candidate_capture_allowed"] is True
+    assert termination["observer_stop_sent"] is True
+    assert termination["process_containment"]["policy_id"] == (
+        AGENT_PROCESS_CONTAINMENT_POLICY
+    )
+    assert termination["process_containment"]["namespace_empty_verified"] is True
+    assert termination["discarded_stdout_tail"] == {
+        "lines": 0,
+        "bytes": 0,
+        "sha256": None,
     }
+    assert termination["observed_turns"] == 25
+    assert termination["max_turns"] == 25
+    assert termination["turn_policy"] == STRUCTURED_TURN_CHECKPOINT_POLICY
     assert event_types.index("agent_completed") < event_types.index("candidate_frozen")
     assert event_types.index("candidate_frozen") < event_types.index("compile_result")
     assert event_types.index("compile_result") < event_types.index("correctness_result")
@@ -962,7 +993,7 @@ def test_max_iterations_one_emits_canonical_agent_transcript(tmp_path: Path) -> 
     receipt = ArtifactReceipt.from_dict(binding["receipt"])
     raw = ArtifactStore(run_root / "artifacts").read_bytes(receipt)
     transcript = json.loads(raw)
-    assert transcript["schema"] == "apex.agent-transcript/v2"
+    assert transcript["schema"] == "apex.agent-transcript/v3"
     assert transcript["events"] == [
         {
             "kind": "turn.completed",

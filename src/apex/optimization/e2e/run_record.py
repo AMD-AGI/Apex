@@ -576,11 +576,14 @@ def _agent_execution_payload(result: AgentResult) -> dict[str, object]:
         "capture_status": result.capture_status.value,
         "candidate_capture_allowed": result.candidate_capture_allowed,
         "observer_stop_sent": result.observer_stop_sent,
-        "observer_suspend_sent": result.observer_suspend_sent,
-        "suspension_verified": result.suspension_verified,
-        "boundary_quiescence_policy_id": (
-            result.invocation.boundary_quiescence_policy_id
+        "process_containment_policy_id": (
+            result.invocation.process_containment_policy_id
             if result.invocation
+            else None
+        ),
+        "process_containment": (
+            result.process_containment.to_dict()
+            if result.process_containment is not None
             else None
         ),
         "discarded_stdout_lines": result.discarded_stdout_lines,

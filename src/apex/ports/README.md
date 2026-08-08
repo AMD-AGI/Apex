@@ -18,6 +18,11 @@ Agent execution returns raw structured `AgentTranscriptEvent` objects alongside
 provider-neutral `AgentSemanticEvent`, `AgentUsage`, and `AgentCost` values.
 `AgentResult` also retains the controller-requested model and effort; unsupported
 effort is rejected instead of being silently ignored.
+`AgentInvocationReceipt` declares `private_pid_namespace_init_pidfd_v1`, while
+`AgentProcessContainmentReceipt` separately records the live namespace-init,
+pidfd, private-procfs, wrapper/status-FD, and zero-member teardown proof. A
+candidate cannot cross source freeze without a complete runtime receipt, whether
+the CLI ended naturally or at an exact-turn boundary.
 Usage distinguishes input, cached input, cache creation, output, reasoning, total
 tokens, turns, and tool calls, with exact source-event indexes. Cost keeps an
 explicit provider amount as a canonical decimal string plus currency and source

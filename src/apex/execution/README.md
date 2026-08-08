@@ -4,11 +4,11 @@
 Cursor Agent. Codex is the registry default; callers can explicitly select the
 other two without preflighting unrelated credentials.
 
-All adapters execute argv with `shell=False` through `SubprocessSupervisor`, use
-a fresh process group, drain stdout and stderr concurrently, bound captured
-output, and kill descendants on timeout or a streaming turn-budget stop. They
-return normalized transcript events and never decide whether a candidate is
-correct or fast.
+All adapters execute argv with `shell=False` through `SubprocessSupervisor`,
+drain stdout and stderr concurrently, bound captured output, and run both CLI
+identity discovery and candidate production inside an authoritative Linux PID
+namespace. They return normalized transcript events and never decide whether a
+candidate is correct or fast.
 
 Public API: `AgentRegistry`, `build_default_registry`, `SubprocessSupervisor`,
 `ProcessResult`, and `build_subprocess_environment`.
@@ -26,16 +26,17 @@ only when a JSON field such as `total_cost_usd`, `cost_usd`, or a typed
 assistant claims about tokens, and stderr cannot create usage or cost.
 
 `agent_transcript_document` produces the canonical
-`apex.agent-transcript/v2` projection containing the source JSON events,
+`apex.agent-transcript/v3` projection containing the source JSON events,
 normalized semantic events, requested model/effort, usage, and cost. Raw stdout/stderr remain separate
 diagnostic artifacts.
 
-Every production result also embeds an `apex.agent-invocation/v2` receipt. It
+Every production result also embeds an `apex.agent-invocation/v3` receipt. It
 records the discovered and resolved CLI entrypoint, SHA-256 of those exact
 entrypoint bytes, the CLI's bounded `--version` output, actual argv, prompt
 transport, requested editable files, turn policy, and explicit isolation modes.
-It also binds `sigstop_process_group_snapshot_v1` as the non-configurable
-boundary-quiescence policy.
+It also binds `private_pid_namespace_init_pidfd_v1` as the non-configurable
+process-containment policy. Runtime proof is separate from invocation intent and
+uses `apex.agent-process-containment/v1`.
 The exact receipt is stored in the transcript CAS artifact and projected into
 the run's `agent_completed`/`agent_failed` event. `allowed_files_enforced_by_cli=false` is
 intentional: current CLIs only provide workspace-level isolation; Apex freezes
@@ -61,19 +62,20 @@ than asserting stronger isolation.
 `max_turns` is enforced while stdout JSONL is drained under
 `structured_agent_turn_checkpoint_v2`. One complete structured assistant
 decision consumes one turn; a standalone structured tool request consumes one
-when the backend does not wrap it in an assistant message. The observer stops
-the process group as soon as turn `max_turns` is observed, including a final
-assistant message, so a valid run never starts turn `max_turns + 1`. Explicit
+when the backend does not wrap it in an assistant message. The observer kills
+the PID namespace init through its pidfd as soon as turn `max_turns` is observed,
+including a final assistant message, so a valid run never starts turn
+`max_turns + 1`. Explicit
 provider summaries above the limit are typed `turn_overrun` and rejected.
 
 `AgentResult` separates termination from capture. Termination is one of
 `completed`, `exact_turn_boundary`, `timeout`, `invalid_stream`,
 `turn_overrun`, or `process_failed`; capture is `complete`,
-`output_truncated`, or `cleanup_failed`. The supervisor drains both pipes,
-terminates the complete process group, and verifies that no same-group child
-survives. Only a normal exit-zero completion or an exact-boundary result whose
-invocation uses the v2 policy, whose observed count equals the requested count,
-and whose capture is complete may cross the source-freeze boundary. A malformed
+`output_truncated`, or `cleanup_failed`. The supervisor drains both pipes and
+requires a verified empty PID namespace before it returns agent results. Only a
+normal exit-zero completion or an exact-boundary result whose invocation uses
+the containment policy, whose observed count equals the requested count, and
+whose capture is complete may cross the source-freeze boundary. A malformed
 JSON object, missing structured evidence, timeout, overrun, truncated output,
 or unverified cleanup fails closed. Non-JSON diagnostic lines may coexist with
 valid events but cannot satisfy the turn proof.
@@ -85,14 +87,24 @@ tail's line count, byte count, and SHA-256 in termination evidence; later
 buffered events therefore cannot appear as a hidden turn 51 in an exact-50
 transcript.
 
-Before notifying the waiting supervisor of a terminal stream event, the stdout
-reader sends `SIGSTOP` to the complete process group and verifies through
-`/proc` that every live same-group member is stopped. The supervisor then kills
-and reaps that suspended group. Exact-boundary source capture requires both
-`observer_suspend_sent=true` and `suspension_verified=true`; signal delivery
-without verified quiescence is not checkpoint evidence.
+Before the agent command is released, bubblewrap reports its namespace PID 1
+and namespace inodes, and the supervisor binds that identity to a start time and
+pidfd. Exact-turn and timeout paths send `SIGKILL` to that exact pidfd; Linux
+then kills every namespace member, including `setsid`, double-forked, and
+environment-cleared descendants. Natural exit uses the same kernel semantics.
+Both paths require pidfd readiness, wrapper/status-FD completion, a complete
+namespace-membership scan, and zero live members before source capture. A
+process-group scan is not accepted as formal proof.
 
-The v2 transcript records the typed termination kind/reason, capture status,
+The containment mount creates a private `/proc`, unshares user and IPC
+namespaces, and rebuilds Docker's masked/read-only system paths. Therefore an
+AgentKernelArena outer wrapper for the Apex arm must not pre-install `/proc`
+submount masks: Apex owns the immediate private procfs and masks, after which a
+backend managed sandbox may safely fall back to that procfs. Missing bubblewrap,
+pidfd support, private procfs, or identity evidence fails closed before candidate
+execution.
+
+The v3 transcript records the typed termination kind/reason, capture status,
 derived `candidate_capture_allowed` decision, exact observed/requested turns,
 and policy identity. A controlled exact-boundary capture is recorded as
 `agent_completed` with its nonzero process exit and boundary reason still
@@ -155,8 +167,8 @@ returned as typed process/agent evidence rather than inferred success.
 Unit tests use fake executables to cover argv, timeout, limits, transcript
 capture, backend selection, environment injection rejection, credential
 isolation, Codex/Claude-shaped structured streams, summary de-duplication, and
-deterministic error mapping. Process tests prove both timeout and budget stops
-terminate descendants.
+deterministic error mapping. CPU process tests prove exact-turn and natural-exit
+teardown defeat a `setsid` + double-fork + `clearenv` delayed writer.
 
 ## Provenance
 

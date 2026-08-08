@@ -9,12 +9,12 @@ from typing import Mapping
 
 from apex.core import AgentBackendName, DependencyError, sha256_file
 from apex.ports import (
+    AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
     AgentInvocationReceipt,
     AgentRequest,
     AgentResult,
     AgentTerminationKind,
-    BOUNDARY_QUIESCENCE_POLICY,
 )
 
 from .environment import (
@@ -86,7 +86,7 @@ def invocation_receipt(
         allowed_files_enforced_by_cli=False,
         max_turns=request.max_turns,
         turn_policy=turn_policy,
-        boundary_quiescence_policy_id=BOUNDARY_QUIESCENCE_POLICY,
+        process_containment_policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
         isolation=tuple(sorted(isolation.items())),
     )
 
@@ -112,6 +112,7 @@ def resolve_cli_version(
         cwd=workspace,
         environment=environment,
         timeout_seconds=min(timeout_seconds, 30),
+        require_pid_namespace=True,
     )
     output = result.stdout.strip() or result.stderr.strip()
     if (
@@ -119,6 +120,7 @@ def resolve_cli_version(
         or result.timed_out
         or result.stdout_truncated
         or result.stderr_truncated
+        or not result.cleanup_succeeded
         or not output
         or len(output) > 512
     ):
@@ -171,6 +173,7 @@ def execute_agent_cli(
         timeout_seconds=request.timeout_seconds,
         stdin_text=stdin_text,
         stdout_budget=budget.observe,
+        require_pid_namespace=True,
     )
     budget.finalize(
         process_succeeded=process.exit_code == 0 and not process.timed_out,
@@ -197,9 +200,8 @@ def execute_agent_cli(
         capture_status=capture_status,
         termination_reason=termination_reason,
         observed_turns=budget.observed_turns,
-        observer_stop_sent=process.observer_termination_started,
-        observer_suspend_sent=process.observer_suspend_sent,
-        suspension_verified=process.suspension_verified,
+        observer_stop_sent=process.observer_stopped,
+        process_containment=process.process_containment,
         discarded_stdout_lines=process.discarded_stdout_lines,
         discarded_stdout_bytes=process.discarded_stdout_bytes,
         discarded_stdout_sha256=process.discarded_stdout_sha256,

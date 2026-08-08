@@ -9,7 +9,7 @@ def transcript_document(result: AgentResult) -> dict[str, object]:
     """Return every normalized event without reconstructing data from human text."""
 
     return {
-        "schema": "apex.agent-transcript/v2",
+        "schema": "apex.agent-transcript/v3",
         "backend": result.backend.value,
         "model": result.model,
         "effort": result.effort,
@@ -20,15 +20,11 @@ def transcript_document(result: AgentResult) -> dict[str, object]:
             "capture_status": result.capture_status.value,
             "candidate_capture_allowed": result.candidate_capture_allowed,
             "observer_stop_sent": result.observer_stop_sent,
-            "suspension": {
-                "policy_id": (
-                    result.invocation.boundary_quiescence_policy_id
-                    if result.invocation
-                    else None
-                ),
-                "sent": result.observer_suspend_sent,
-                "verified": result.suspension_verified,
-            },
+            "process_containment": (
+                result.process_containment.to_dict()
+                if result.process_containment is not None
+                else None
+            ),
             "discarded_stdout_tail": {
                 "lines": result.discarded_stdout_lines,
                 "bytes": result.discarded_stdout_bytes,
@@ -64,10 +60,15 @@ def transcript_metadata(result: AgentResult) -> dict[str, object]:
         "capture_status": result.capture_status.value,
         "candidate_capture_allowed": result.candidate_capture_allowed,
         "observer_stop_sent": result.observer_stop_sent,
-        "observer_suspend_sent": result.observer_suspend_sent,
-        "suspension_verified": result.suspension_verified,
-        "boundary_quiescence_policy_id": (
-            result.invocation.boundary_quiescence_policy_id if result.invocation else None
+        "process_containment_policy_id": (
+            result.invocation.process_containment_policy_id
+            if result.invocation
+            else None
+        ),
+        "process_containment": (
+            result.process_containment.to_dict()
+            if result.process_containment is not None
+            else None
         ),
         "discarded_stdout_lines": result.discarded_stdout_lines,
         "discarded_stdout_bytes": result.discarded_stdout_bytes,

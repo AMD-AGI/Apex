@@ -49,7 +49,9 @@ from apex.optimization.e2e.services import (
 from apex.optimization.e2e.use_case import E2EOptimizeUseCase
 from apex.orchestration import RunController
 from apex.ports import (
+    AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCost,
+    AgentProcessContainmentReceipt,
     AgentResult,
     AgentSemanticEvent,
     AgentTranscriptEvent,
@@ -57,6 +59,34 @@ from apex.ports import (
     BenchmarkPass,
     DiagnosticsResult,
 )
+
+
+def _agent_containment() -> AgentProcessContainmentReceipt:
+    return AgentProcessContainmentReceipt(
+        policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
+        launcher_path="/usr/bin/bwrap",
+        launcher_sha256="b" * 64,
+        namespace_init_host_pid=100,
+        namespace_init_starttime=200,
+        namespace_init_inner_pid=1,
+        pid_namespace_inode=300,
+        mount_namespace_inode=301,
+        ipc_namespace_inode=302,
+        user_namespace_inode=303,
+        private_procfs_verified=True,
+        pidfd_opened=True,
+        termination_reason="natural_exit",
+        teardown_mode="natural_exit",
+        pidfd_sigkill_sent=False,
+        namespace_init_exit_verified=True,
+        wrapper_exit_verified=True,
+        wrapper_force_killed=False,
+        terminal_status_verified=True,
+        terminal_status_absent_after_sigkill=False,
+        status_eof_verified=True,
+        namespace_membership_scan_complete=True,
+        live_namespace_members_after=(),
+    )
 from apex.runtime import (
     ContainerIdentity,
     DependencyReceipt,
@@ -257,6 +287,7 @@ class _Worker:
             semantic_events=semantic,
             usage=AgentUsage(10, None, None, 5, None, 15, 1, 1, (0, 1, 2, 3)),
             cost=AgentCost("0.01", "USD", 3, "total_cost_usd"),
+            process_containment=_agent_containment(),
         )
         return E2ECandidate(
             request.attempt_id,
@@ -635,7 +666,7 @@ def test_agent_transcript_usage_and_cost_are_attempt_scoped(tmp_path: Path) -> N
     transcript = json.loads(
         ArtifactStore(tmp_path / "results" / "artifacts").read_bytes(receipt)
     )
-    assert transcript["schema"] == "apex.agent-transcript/v2"
+    assert transcript["schema"] == "apex.agent-transcript/v3"
     assert [event["kind"] for event in transcript["semantic_events"]] == [
         "agent_message",
         "tool_called",

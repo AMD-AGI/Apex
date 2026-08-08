@@ -12,11 +12,41 @@ from apex.execution.claude import ClaudeBackend
 from apex.execution.codex import CodexBackend
 from apex.execution.cursor import CursorBackend
 from apex.ports import (
+    AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
+    AgentProcessContainmentReceipt,
     AgentRequest,
     AgentTerminationKind,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
 )
+
+
+def _containment(*, stopped: bool = False) -> AgentProcessContainmentReceipt:
+    return AgentProcessContainmentReceipt(
+        policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
+        launcher_path="/usr/bin/bwrap",
+        launcher_sha256="b" * 64,
+        namespace_init_host_pid=1234,
+        namespace_init_starttime=5678,
+        namespace_init_inner_pid=1,
+        pid_namespace_inode=9012,
+        mount_namespace_inode=9013,
+        ipc_namespace_inode=9014,
+        user_namespace_inode=9015,
+        private_procfs_verified=True,
+        pidfd_opened=True,
+        termination_reason="stdout_budget_boundary" if stopped else "natural_exit",
+        teardown_mode="pidfd_sigkill" if stopped else "natural_exit",
+        pidfd_sigkill_sent=stopped,
+        namespace_init_exit_verified=True,
+        wrapper_exit_verified=True,
+        wrapper_force_killed=False,
+        terminal_status_verified=True,
+        terminal_status_absent_after_sigkill=False,
+        status_eof_verified=True,
+        namespace_membership_scan_complete=True,
+        live_namespace_members_after=(),
+    )
 
 
 class FakeSupervisor:
@@ -35,6 +65,7 @@ class FakeSupervisor:
         )
         self.stdout_truncated = stdout_truncated
         self.cleanup_succeeded = cleanup_succeeded
+        self.pid_namespace_requests: list[bool] = []
 
     def run(
         self,
@@ -45,7 +76,9 @@ class FakeSupervisor:
         timeout_seconds,
         stdin_text=None,
         stdout_budget=None,
+        require_pid_namespace=False,
     ):
+        self.pid_namespace_requests.append(require_pid_namespace)
         self.call = {
             "argv": tuple(argv),
             "cwd": cwd,
@@ -53,6 +86,7 @@ class FakeSupervisor:
             "timeout_seconds": timeout_seconds,
             "stdin_text": stdin_text,
             "stdout_budget": stdout_budget,
+            "require_pid_namespace": require_pid_namespace,
         }
         if tuple(argv)[-1] == "--version":
             return ProcessResult(
@@ -74,7 +108,7 @@ class FakeSupervisor:
                 break
         return ProcessResult(
             argv=tuple(argv),
-            exit_code=-15 if observer_stopped else 0,
+            exit_code=137 if observer_stopped else 0,
             timed_out=False,
             stdout="".join(emitted),
             stderr="",
@@ -83,8 +117,7 @@ class FakeSupervisor:
             duration_seconds=0.1,
             observer_stopped=observer_stopped,
             observer_termination_started=observer_stopped,
-            observer_suspend_sent=observer_stopped,
-            suspension_verified=observer_stopped,
+            process_containment=_containment(stopped=observer_stopped),
             cleanup_succeeded=self.cleanup_succeeded,
         )
 
@@ -141,6 +174,7 @@ def test_codex_uses_stdin_ephemeral_process_and_hides_other_backend_secrets(
     assert result.invocation.argv == supervisor.call["argv"]
     assert result.invocation.entrypoint_sha256
     assert result.invocation.allowed_files_enforced_by_cli is False
+    assert supervisor.pid_namespace_requests == [True, True]
     assert dict(result.invocation.isolation)["sandbox"] == "workspace-write"
     assert supervisor.call is not None
     argv = supervisor.call["argv"]
@@ -284,7 +318,7 @@ def test_backend_exact_boundary_is_a_complete_candidate_checkpoint(
     assert result.observed_turns == 1
     assert result.candidate_capture_allowed
     assert not result.succeeded
-    assert result.exit_code == -15
+    assert result.exit_code == 137
     assert result.invocation is not None
     assert result.invocation.turn_policy == STRUCTURED_TURN_CHECKPOINT_POLICY
 

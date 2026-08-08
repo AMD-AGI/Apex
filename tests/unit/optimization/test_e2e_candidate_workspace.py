@@ -15,14 +15,43 @@ from apex.optimization.e2e.candidate import (
 )
 from apex.optimization.e2e.kernel_lane import KernelOpportunity
 from apex.ports import (
+    AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
     AgentInvocationReceipt,
+    AgentProcessContainmentReceipt,
     AgentRequest,
     AgentResult,
     AgentTerminationKind,
-    BOUNDARY_QUIESCENCE_POLICY,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
 )
+
+
+def _containment() -> AgentProcessContainmentReceipt:
+    return AgentProcessContainmentReceipt(
+        policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
+        launcher_path="/usr/bin/bwrap",
+        launcher_sha256="b" * 64,
+        namespace_init_host_pid=100,
+        namespace_init_starttime=200,
+        namespace_init_inner_pid=1,
+        pid_namespace_inode=300,
+        mount_namespace_inode=301,
+        ipc_namespace_inode=302,
+        user_namespace_inode=303,
+        private_procfs_verified=True,
+        pidfd_opened=True,
+        termination_reason="stdout_budget_boundary",
+        teardown_mode="pidfd_sigkill",
+        pidfd_sigkill_sent=True,
+        namespace_init_exit_verified=True,
+        wrapper_exit_verified=True,
+        wrapper_force_killed=False,
+        terminal_status_verified=True,
+        terminal_status_absent_after_sigkill=False,
+        status_eof_verified=True,
+        namespace_membership_scan_complete=True,
+        live_namespace_members_after=(),
+    )
 
 
 def _git(root: Path, *args: str) -> str:
@@ -109,7 +138,7 @@ class _BoundaryAgent:
         return AgentResult(
             backend=self.name,
             model=request.model,
-            exit_code=-15,
+            exit_code=137,
             timed_out=self.kind is AgentTerminationKind.TIMEOUT,
             events=(),
             stdout='{"type":"assistant_message","content":"done"}\n',
@@ -131,16 +160,7 @@ class _BoundaryAgent:
                 AgentTerminationKind.TURN_OVERRUN,
                 AgentTerminationKind.INVALID_STREAM,
             },
-            observer_suspend_sent=self.kind in {
-                AgentTerminationKind.EXACT_TURN_BOUNDARY,
-                AgentTerminationKind.TURN_OVERRUN,
-                AgentTerminationKind.INVALID_STREAM,
-            },
-            suspension_verified=self.kind in {
-                AgentTerminationKind.EXACT_TURN_BOUNDARY,
-                AgentTerminationKind.TURN_OVERRUN,
-                AgentTerminationKind.INVALID_STREAM,
-            },
+            process_containment=_containment(),
         )
 
 
@@ -158,7 +178,7 @@ def _invocation(request: AgentRequest) -> AgentInvocationReceipt:
         allowed_files_enforced_by_cli=False,
         max_turns=request.max_turns,
         turn_policy=STRUCTURED_TURN_CHECKPOINT_POLICY,
-        boundary_quiescence_policy_id=BOUNDARY_QUIESCENCE_POLICY,
+        process_containment_policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
         isolation=(("sandbox", "workspace-write"),),
     )
 

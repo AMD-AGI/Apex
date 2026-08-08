@@ -21,7 +21,10 @@ artifacts or domain events instead of parsing presentation text.
 
 Run tests in the project virtual environment. Magpie and TraceLens behavior is
 represented through ports in deterministic tests; live dependency checkouts are
-reserved for explicit integration or GPU campaigns.
+reserved for explicit integration or GPU campaigns. Linux CPU tests require
+`bwrap`, PID namespaces, private procfs, and `pidfd_open`/`pidfd_send_signal`;
+these are product prerequisites, so containment tests fail rather than skip when
+the kernel boundary is unavailable.
 
 ## Failure semantics
 

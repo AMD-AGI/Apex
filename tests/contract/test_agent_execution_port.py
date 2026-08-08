@@ -1,19 +1,50 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from apex.core import AgentBackendName, ContractError
 from apex.ports import (
+    AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
     AgentCost,
     AgentInvocationReceipt,
+    AgentProcessContainmentReceipt,
     AgentResult,
     AgentSemanticEvent,
     AgentTerminationKind,
     AgentUsage,
-    BOUNDARY_QUIESCENCE_POLICY,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
 )
+
+
+def _containment() -> AgentProcessContainmentReceipt:
+    return AgentProcessContainmentReceipt(
+        policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
+        launcher_path="/usr/bin/bwrap",
+        launcher_sha256="b" * 64,
+        namespace_init_host_pid=100,
+        namespace_init_starttime=200,
+        namespace_init_inner_pid=1,
+        pid_namespace_inode=300,
+        mount_namespace_inode=301,
+        ipc_namespace_inode=302,
+        user_namespace_inode=303,
+        private_procfs_verified=True,
+        pidfd_opened=True,
+        termination_reason="stdout_budget_boundary",
+        teardown_mode="pidfd_sigkill",
+        pidfd_sigkill_sent=True,
+        namespace_init_exit_verified=True,
+        wrapper_exit_verified=True,
+        wrapper_force_killed=False,
+        terminal_status_verified=False,
+        terminal_status_absent_after_sigkill=True,
+        status_eof_verified=True,
+        namespace_membership_scan_complete=True,
+        live_namespace_members_after=(),
+    )
 
 
 def test_agent_result_defaults_preserve_minimal_fake_backends() -> None:
@@ -65,7 +96,7 @@ def _invocation(max_turns: int = 2) -> AgentInvocationReceipt:
         allowed_files_enforced_by_cli=False,
         max_turns=max_turns,
         turn_policy=STRUCTURED_TURN_CHECKPOINT_POLICY,
-        boundary_quiescence_policy_id=BOUNDARY_QUIESCENCE_POLICY,
+        process_containment_policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
         isolation=(("sandbox", "workspace-write"),),
     )
 
@@ -85,8 +116,7 @@ def test_exact_boundary_is_typed_and_candidate_capture_is_fail_closed() -> None:
         termination_reason="max_turns_exact_boundary",
         observed_turns=2,
         observer_stop_sent=True,
-        observer_suspend_sent=True,
-        suspension_verified=True,
+        process_containment=_containment(),
     )
 
     assert not result.succeeded
@@ -107,7 +137,7 @@ def test_exact_boundary_is_typed_and_candidate_capture_is_fail_closed() -> None:
             termination_reason="max_turns_exact_boundary",
             observed_turns=1,
         )
-    unsuspended = AgentResult(
+    uncontained = AgentResult(
         AgentBackendName.CODEX,
         None,
         0,
@@ -121,10 +151,10 @@ def test_exact_boundary_is_typed_and_candidate_capture_is_fail_closed() -> None:
         termination_reason="max_turns_exact_boundary",
         observed_turns=2,
     )
-    assert not unsuspended.candidate_capture_allowed
+    assert not uncontained.candidate_capture_allowed
     assert (
-        unsuspended.candidate_rejection_reason
-        == "agent_boundary_suspension_unverified"
+        uncontained.candidate_rejection_reason
+        == "agent_process_containment_unverified"
     )
 
     truncated = AgentResult(
@@ -142,8 +172,73 @@ def test_exact_boundary_is_typed_and_candidate_capture_is_fail_closed() -> None:
         termination_reason="max_turns_exact_boundary",
         observed_turns=2,
         observer_stop_sent=True,
-        observer_suspend_sent=True,
-        suspension_verified=True,
+        process_containment=_containment(),
     )
     assert not truncated.candidate_capture_allowed
     assert truncated.candidate_rejection_reason == "agent_output_truncated"
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    (
+        replace(_containment(), pidfd_opened=False),
+        replace(_containment(), private_procfs_verified=False),
+        replace(_containment(), namespace_init_exit_verified=False),
+        replace(_containment(), wrapper_exit_verified=False),
+        replace(_containment(), wrapper_force_killed=True),
+        replace(_containment(), status_eof_verified=False),
+        replace(_containment(), namespace_membership_scan_complete=False),
+        replace(_containment(), live_namespace_members_after=(321,)),
+        replace(
+            _containment(),
+            terminal_status_absent_after_sigkill=False,
+        ),
+    ),
+)
+def test_incomplete_process_containment_blocks_candidate_capture(
+    receipt: AgentProcessContainmentReceipt,
+) -> None:
+    result = AgentResult(
+        AgentBackendName.CODEX,
+        None,
+        137,
+        False,
+        (),
+        "",
+        "",
+        0.1,
+        invocation=_invocation(),
+        termination_kind=AgentTerminationKind.EXACT_TURN_BOUNDARY,
+        termination_reason="max_turns_exact_boundary",
+        observed_turns=2,
+        observer_stop_sent=True,
+        process_containment=receipt,
+    )
+
+    assert not result.candidate_capture_allowed
+    assert result.candidate_rejection_reason == "agent_process_containment_unverified"
+
+
+def test_normal_completion_requires_verified_process_containment() -> None:
+    contained = AgentResult(
+        AgentBackendName.CODEX,
+        None,
+        0,
+        False,
+        (),
+        "",
+        "",
+        0.1,
+        process_containment=replace(
+            _containment(),
+            termination_reason="natural_exit",
+            teardown_mode="natural_exit",
+            pidfd_sigkill_sent=False,
+            terminal_status_verified=True,
+            terminal_status_absent_after_sigkill=False,
+        ),
+    )
+    uncontained = replace(contained, process_containment=None)
+
+    assert contained.succeeded and contained.candidate_capture_allowed
+    assert not uncontained.succeeded and not uncontained.candidate_capture_allowed
