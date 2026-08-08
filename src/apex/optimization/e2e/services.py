@@ -293,6 +293,7 @@ class CandidateDeployment:
     validation_level: ValidationLevel
     engagement_verified: bool
     evidence: Mapping[str, Any]
+    infrastructure_failure: bool = False
 
     @property
     def qualified(self) -> bool:

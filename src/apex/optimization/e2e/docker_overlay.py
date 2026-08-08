@@ -108,12 +108,19 @@ class DockerOverlayDeployment:
         try:
             return self._deploy(request)
         except ApexError as error:
-            return _failed_deployment(request, error.reason_code, error.details or {})
+            return _failed_deployment(
+                request,
+                error.reason_code,
+                error.details or {},
+                infrastructure_failure=error.reason_code
+                not in _CANDIDATE_DEPLOYMENT_FAILURES,
+            )
         except (OSError, ValueError, yaml.YAMLError) as error:
             return _failed_deployment(
                 request,
                 "overlay_deployment_failed",
                 {"error_type": type(error).__name__},
+                infrastructure_failure=True,
             )
 
     def _deploy(self, request: CandidateDeploymentRequest) -> CandidateDeployment:
@@ -160,8 +167,8 @@ class DockerOverlayDeployment:
         artifact_root: Path,
     ) -> tuple[ContainerImage, InstalledPythonTarget]:
         parent_reference = _config_image(request.benchmark_measurement)
-        parent = self._engine.inspect_image(parent_reference, cwd=artifact_root)
-        _validate_parent(parent_reference, parent.image_id, request.provenance)
+        inspected = self._engine.inspect_image(parent_reference, cwd=artifact_root)
+        parent = _validate_parent(parent_reference, inspected, request.provenance)
         target = self._engine.resolve_python_target(
             parent.image_id,
             library=request.opportunity.origin_library,
@@ -181,7 +188,7 @@ class DockerOverlayDeployment:
         artifact_root: Path,
     ) -> tuple[BuiltOverlay, LoadedFileReceipt]:
         built = self._engine.build_overlay(
-            parent_image_id=parent.image_id,
+            parent=parent,
             candidate_source=candidate_path,
             target=target,
             build_root=artifact_root,
@@ -350,7 +357,7 @@ def _validate_target_mapping(
     ):
         raise IntegrityError(
             "Container package probe returned a different source mapping",
-            "source_mapping_mismatch",
+            "container_source_mapping_mismatch",
         )
 
 
@@ -362,8 +369,16 @@ def _candidate_paths(
     relative = opportunity.source_path.resolve(strict=True).relative_to(
         opportunity.source_root.resolve(strict=True)
     ).as_posix()
-    if candidate.changed_files != (relative,) or _safe_package_relative(opportunity) is None:
-        raise ContractError("Candidate source mapping is not exact", "source_mapping_mismatch")
+    if candidate.changed_files != (relative,):
+        raise ContractError(
+            "Candidate changed files do not match the selected source",
+            "candidate_source_mapping_mismatch",
+        )
+    if _safe_package_relative(opportunity) is None:
+        raise ContractError(
+            "Selected source does not map to an overlay package",
+            "source_mapping_mismatch",
+        )
     candidate_path = candidate.workspace.joinpath(*PurePosixPath(relative).parts)
     if (
         not candidate_path.is_file()
@@ -433,24 +448,65 @@ def _config_image(path: Path) -> str:
     return image.strip()
 
 
-def _validate_parent(reference: str, image_id: str, provenance: RunProvenance) -> None:
-    if not _IMAGE_ID.fullmatch(image_id):
+def _validate_parent(
+    reference: str, parent: ContainerImage, provenance: RunProvenance
+) -> ContainerImage:
+    if not _IMAGE_ID.fullmatch(parent.image_id):
         raise IntegrityError("Parent image is not immutable", "invalid_image_id")
+    if parent.image_id != provenance.container.image_id:
+        raise IntegrityError("Parent differs from provenance", "image_identity_mismatch")
     if _IMAGE_ID.fullmatch(reference):
-        if reference != image_id:
+        if reference != parent.image_id:
             raise IntegrityError("Exact parent image changed identity", "image_identity_mismatch")
-        return
-    if (
-        reference != provenance.container.requested_image
-        or image_id != provenance.container.image_id
-    ):
+    elif reference != provenance.container.requested_image:
         raise IntegrityError("Mutable parent differs from provenance", "image_identity_mismatch")
+    allowed = set(provenance.container.repo_digests)
+    if parent.verified_repo_digest is not None:
+        observed = {parent.verified_repo_digest}
+        matching = (
+            (parent.verified_repo_digest,)
+            if not allowed or parent.verified_repo_digest in allowed
+            else ()
+        )
+    else:
+        observed = set(parent.repo_digests)
+        if not _IMAGE_ID.fullmatch(reference):
+            repository = _repository_name(reference)
+            observed = {
+                item for item in observed if _repository_name(item) == repository
+            }
+        matching = tuple(sorted(observed & allowed))
+    if len(matching) != 1:
+        raise IntegrityError(
+            "Parent image has no unique provenance-approved repo digest",
+            "immutable_parent_locator_unresolved",
+            {
+                "parent_image_id": parent.image_id,
+                "observed_repo_digests": sorted(observed),
+                "allowed_repo_digests": sorted(allowed),
+            },
+        )
+    return ContainerImage(
+        parent.reference,
+        parent.image_id,
+        parent.repo_digests,
+        matching[0],
+    )
+
+
+def _repository_name(reference: str) -> str:
+    name = reference.split("@", 1)[0]
+    slash = name.rfind("/")
+    colon = name.rfind(":")
+    return name[:colon] if colon > slash else name
 
 
 def _failed_deployment(
     request: CandidateDeploymentRequest,
     reason: str,
     details: Mapping[str, Any],
+    *,
+    infrastructure_failure: bool,
 ) -> CandidateDeployment:
     candidate = request.candidate
     return CandidateDeployment(
@@ -465,7 +521,17 @@ def _failed_deployment(
         ValidationLevel.NONE,
         False,
         {"schema_version": 1, "failure": reason, "details": dict(details)},
+        infrastructure_failure,
     )
+
+
+_CANDIDATE_DEPLOYMENT_FAILURES = {
+    "agent_made_no_source_change",
+    "candidate_lineage_mismatch",
+    "candidate_source_mapping_mismatch",
+    "invalid_frozen_candidate",
+    "safety_gate_failed",
+}
 
 
 __all__ = [

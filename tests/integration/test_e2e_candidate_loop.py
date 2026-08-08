@@ -365,9 +365,16 @@ class _Safety:
 
 
 class _Deployments:
-    def __init__(self, state: _LeaseState, *, succeed: bool = True) -> None:
+    def __init__(
+        self,
+        state: _LeaseState,
+        *,
+        succeed: bool = True,
+        infrastructure_failure: bool = False,
+    ) -> None:
         self.state = state
         self.succeed = succeed
+        self.infrastructure_failure = infrastructure_failure
         self.requests = []
         self.results = []
         self.rollbacks = []
@@ -392,7 +399,15 @@ class _Deployments:
         result = CandidateDeployment(
             candidate_id=str(request.candidate.candidate_id),
             deployed=self.succeed,
-            reason_code="deployed" if self.succeed else "source_build_failed",
+            reason_code=(
+                "deployed"
+                if self.succeed
+                else (
+                    "container_command_failed"
+                    if self.infrastructure_failure
+                    else "invalid_frozen_candidate"
+                )
+            ),
             measurement_config=configs[0],
             diagnostic_config=configs[1],
             replay_config=configs[2],
@@ -405,6 +420,7 @@ class _Deployments:
             ),
             engagement_verified=self.succeed,
             evidence={"loaded_bytes": self.succeed},
+            infrastructure_failure=not self.succeed and self.infrastructure_failure,
         )
         self.results.append(result)
         return result
@@ -553,6 +569,7 @@ def _system(
     *,
     safety_finding: bool = False,
     deployment_succeeds: bool = True,
+    deployment_infrastructure_failure: bool = False,
     final_succeeds: bool = True,
     deferred_micro: bool = False,
 ):
@@ -564,7 +581,11 @@ def _system(
     worker = _Worker(state)
     micro = E2EDeferredMicroQualifier() if deferred_micro else _Micro(state, micro_outcomes)
     safety = _Safety(state, finding=safety_finding)
-    deployments = _Deployments(state, succeed=deployment_succeeds)
+    deployments = _Deployments(
+        state,
+        succeed=deployment_succeeds,
+        infrastructure_failure=deployment_infrastructure_failure,
+    )
     final = _FinalDelivery(state, succeed=final_succeeds)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=_receipt(tmp_path),
@@ -755,6 +776,38 @@ def test_deployment_failure_never_runs_candidate_e2e(tmp_path: Path) -> None:
     assert result.status is TaskStatus.NO_GAIN
     assert len(system[3].calls) == 3  # baseline, diagnostic, unchanged final
     assert system[8].rollbacks == ["candidate-attempt-1"]
+
+
+def test_deployment_infrastructure_failure_is_not_candidate_no_gain(
+    tmp_path: Path,
+) -> None:
+    system = _system(
+        tmp_path,
+        [100.0],
+        [True],
+        deployment_succeeds=False,
+        deployment_infrastructure_failure=True,
+    )
+
+    result = system[0].run(_spec(tmp_path, iterations=1))
+
+    assert result.status is TaskStatus.INFRASTRUCTURE_ERROR
+    assert result.reason_code == "deployment_infrastructure_failed"
+    assert len(system[3].calls) == 2  # baseline and diagnostic; no final replay
+    assert len(system[5].requests) == 1
+    assert len(system[8].requests) == 1
+    assert system[9].requests == []
+    assert result.details["failure"]["evidence"]["deployment_reason_code"] == (
+        "container_command_failed"
+    )
+    recovered = RunController.recover(
+        result.run_id,
+        EventJournal(tmp_path / "results" / "events" / "run.db"),
+        SnapshotStore(tmp_path / "results" / "state.snapshot.json"),
+    )
+    assert recovered.state.phase.value == "failed"
+    assert recovered.state.e2e is not None
+    assert recovered.state.e2e.decisions == ()
 
 
 def test_formal_success_is_denied_when_second_delivery_is_unresolved(tmp_path: Path) -> None:

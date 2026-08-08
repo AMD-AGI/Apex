@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from apex.benchmark import BenchmarkConfigViews
 from apex.core import ContractError, TaskStatus, ValidationLevel
@@ -92,6 +92,7 @@ class E2EFinalizer:
         baseline: E2EMeasurement | None,
         status: TaskStatus,
         reason: str,
+        details: Mapping[str, Any] | None = None,
     ) -> E2EOptimizationResult:
         if self.record.controller.state.phase is RunPhase.RUNNING:
             if self.record.controller.state.pending_action is not None:
@@ -104,7 +105,10 @@ class E2EFinalizer:
             baseline=baseline,
             final=None,
             no_regression=None,
-            details={"gpu_lease": self.gpu_lease.to_dict()},
+            details={
+                "gpu_lease": self.gpu_lease.to_dict(),
+                **({"failure": dict(details)} if details else {}),
+            },
             terminal_phase=RunPhase.FAILED,
             stop_reason=reason,
         )

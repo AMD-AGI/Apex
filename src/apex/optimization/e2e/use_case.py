@@ -213,6 +213,10 @@ class E2EOptimizeUseCase:
                 baseline=baseline,
                 status=TaskStatus.INFRASTRUCTURE_ERROR,
                 reason=error.reason_code,
+                details={
+                    "reason_code": error.reason_code,
+                    "evidence": dict(error.details or {}),
+                },
             )
 
     def _prepare(

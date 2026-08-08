@@ -24,9 +24,17 @@ The reviewed Qwen profile strengthens that deferred boundary with
 exact locked vLLM tests in an immutable candidate-overlay image before full E2E.
 This is a fail-closed preflight, not a canonical kernel grade; compile,
 correctness, timing, and reward remain explicitly unmeasured.
-The latter builds from the inspected parent image ID, changes one installed
-Python file, proves the loaded bytes in a clean container, and derives Magpie
-configs whose sole workload change is `benchmark.docker_image`.
+The latter binds the inspected parent image ID to the unique
+provenance-approved immutable `repo@sha256` locator from the same inspection,
+re-inspects that locator immediately before build, changes one installed Python
+file, proves the loaded bytes in a clean container, and derives Magpie configs
+whose sole workload change is `benchmark.docker_image`. A bare local image ID
+remains valid for `docker run` and byte probes but is never written in
+Dockerfile `FROM`, where BuildKit interprets it as a registry reference. Missing
+or ambiguous repo-digest provenance for a tag or bare image ID fails closed. An
+explicit `repo@sha256` requested image is instead bound directly to its inspected
+image ID and may be used when the provenance digest list is absent; Apex never
+falls back to a mutable tag.
 
 Formal delivery is an explicit reviewed capability, never an inference from a
 runtime overlay. `SourceRebuildFinalDelivery` accepts only a
@@ -197,15 +205,25 @@ Safety and final delivery remain evaluator-owned boundaries.
 Docker overlays require one exact clean vLLM/AITER source lock whose repository
 bytes match the installed parent image. They do not mount or modify host
 site-packages, and rollback merely selects the previous immutable config/image.
+The overlay adapter retries one transient Docker build failure once against the
+same immutable candidate context. The agent process has already terminated and
+the safety boundary has made the frozen candidate read-only; Apex additionally
+makes both context files read-only and rechecks their SHA-256 values before each
+attempt. Every failed command receipt retains stage, redacted argv, cwd,
+exit/timeout/cleanup state, and bounded redacted stdout/stderr with hashes;
+environment variables and credential values are not serialized.
 
 ## Failure semantics
 
 Baseline or quality failure terminates as `baseline_invalid`. Missing source,
-micro, or deployment capability is reported as unsupported; compile, correctness,
-safety, build, engagement, or E2E failures reject/revert only the active candidate
-until its bounded retry budget is exhausted. Infrastructure exceptions fail the
-run without promoting an anchor. Missing source provenance or second-clean-replay
-proof can retain primary evidence but cannot produce formal success.
+micro, or deployment capability is reported as unsupported. Candidate-caused
+compile, correctness, safety, or E2E failures reject/revert only the active
+candidate until its bounded search budget is exhausted. Docker, image identity,
+provenance, and adapter infrastructure failures instead persist the delivery
+failure receipt and terminate as `infrastructure_error`; they do not commit a
+candidate reject, rotate to another opportunity, or run a final baseline replay.
+Missing source provenance or second-clean-replay proof can retain primary
+evidence but cannot produce formal success.
 
 Missing exact source/model/image identity is `provenance_unresolved`. An exact
 source stack without a matching trusted fixed recipe, attestor, engagement
@@ -234,9 +252,11 @@ closed.
 
 CPU-only tests cover dynamic eligibility, config exclusion, safe symlink/gitlink
 handling, 300-sample enforcement, retry and fresh-context history, safety blocking,
-deployment failure, current-overlay chaining, KEEP/REVERT rollback, GPU lease
-scope/contention, attempt-scoped message/tool/usage/cost lineage, final provenance
-failure, crash recovery, and the mandatory second clean replay.
+immutable parent binding for tag, image-ID, and repo-digest inputs, bounded Docker
+retry/failure evidence, candidate-versus-infrastructure deployment failure,
+current-overlay chaining, KEEP/REVERT rollback, GPU lease scope/contention,
+attempt-scoped message/tool/usage/cost lineage, final provenance failure, crash
+recovery, and the mandatory second clean replay.
 
 Run the focused suite with:
 

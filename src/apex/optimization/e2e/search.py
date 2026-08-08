@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Mapping
 
 from apex.benchmark import BenchmarkConfigViews
-from apex.core import ApexError, ContractError
+from apex.core import ApexError, ContractError, IntegrityError
 from apex.evaluation import E2EAcceptancePolicy, E2EMeasurement, evaluate_current_anchor
 from apex.intake import E2EOptimizeSpec
 from apex.orchestration import SearchStage
@@ -341,14 +341,32 @@ class E2ESearchLoop:
         _validate_deployment(result, candidate, self.views)
         receipt = self.record.record_delivery(attempt_id, result)
         assert candidate.candidate_id is not None
-        self.record.controller.commit_e2e_delivery_verification(
-            candidate_id=candidate.candidate_id,
-            receipt=receipt.digest,
-            verified=result.qualified,
-            reason=result.reason_code,
-        )
-        if not result.qualified:
+        if result.qualified:
+            self.record.controller.commit_e2e_delivery_verification(
+                candidate_id=candidate.candidate_id,
+                receipt=receipt.digest,
+                verified=True,
+                reason=result.reason_code,
+            )
+        else:
             self.deployments.rollback(result)
+            if result.infrastructure_failure:
+                raise IntegrityError(
+                    "Candidate deployment infrastructure failed",
+                    "deployment_infrastructure_failed",
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "deployment_reason_code": result.reason_code,
+                        "delivery_receipt": receipt.digest,
+                        "deployment_evidence": dict(result.evidence),
+                    },
+                )
+            self.record.controller.commit_e2e_delivery_verification(
+                candidate_id=candidate.candidate_id,
+                receipt=receipt.digest,
+                verified=False,
+                reason=result.reason_code,
+            )
             self.record.controller.complete_e2e_update(stop=False, reason=result.reason_code)
             return None
         micro, micro_receipt = micro_pair
