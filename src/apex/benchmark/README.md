@@ -46,8 +46,11 @@ with the receipt's Python interpreter and Magpie root. It uses an explicit
 environment allowlist rather than copying the host environment. GPU visibility,
 ROCm locations, and non-secret Hugging Face cache/offline fields may be inherited;
 named Docker daemon/context/config/TLS fields are inherited so Magpie can reach
-the operator-selected engine, and a Hugging Face token may be supplied only as
-an explicit request override.
+the operator-selected engine. The single Magpie-owned host control
+`MAGPIE_PROTECT_BENCHMARK_CONTAINER` is also inherited exactly: operators may
+opt into shared-host stop protection without broadening the environment
+boundary. A Hugging Face token may be supplied only as an explicit request
+override.
 Hugging Face model/dataset offline switches are allowlisted so a prewarmed,
 revision-audited cache can be reused without network access. When
 `hf_offline=true`, the view builder requires an explicit existing cache and
