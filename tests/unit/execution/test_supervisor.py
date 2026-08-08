@@ -4,6 +4,7 @@ import hashlib
 import os
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -170,8 +171,48 @@ def test_stream_budget_destroys_pid_namespace_before_timeout(tmp_path: Path) -> 
     assert result.process_containment is not None
     assert result.process_containment.namespace_empty_verified
     assert result.process_containment.pidfd_sigkill_sent
+    assert result.process_containment.termination_reason == "stdout_budget_boundary"
+    assert result.process_containment.teardown_mode == "pidfd_sigkill"
     assert not result.timed_out
     assert result.duration_seconds < 5
+
+
+def test_wait_contained_preserves_observer_boundary_after_wrapper_exit() -> None:
+    class ExitedProcess:
+        @staticmethod
+        def poll() -> int:
+            return -9
+
+    observer_stop = threading.Event()
+    observer_stop.set()
+
+    assert SubprocessSupervisor._wait_contained(
+        ExitedProcess(),  # type: ignore[arg-type]
+        observer_stop=observer_stop,
+        timeout_seconds=1,
+    ) == (False, True)
+
+
+def test_natural_exit_waits_for_slow_stdout_boundary_decision(tmp_path: Path) -> None:
+    def slow_boundary(_line: str) -> bool:
+        time.sleep(0.15)
+        return True
+
+    result = SubprocessSupervisor(kill_grace_seconds=0.2).run(
+        [sys.executable, "-c", "print('{}', flush=True)"],
+        cwd=tmp_path,
+        environment=os.environ,
+        timeout_seconds=5,
+        stdout_budget=slow_boundary,
+        require_pid_namespace=True,
+    )
+
+    assert result.observer_stopped
+    assert result.observer_termination_started
+    assert result.cleanup_succeeded
+    assert result.process_containment is not None
+    assert result.process_containment.termination_reason == "stdout_budget_boundary"
+    assert result.process_containment.namespace_empty_verified
 
 
 def test_stream_boundary_excludes_and_digests_prebuffered_tail(tmp_path: Path) -> None:

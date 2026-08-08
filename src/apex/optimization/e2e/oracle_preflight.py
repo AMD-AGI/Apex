@@ -23,7 +23,11 @@ from apex.execution import (
     build_subprocess_environment,
 )
 
-from .candidate import candidate_file_paths, make_candidate_read_only
+from .candidate import (
+    frozen_candidate_source,
+    materialize_frozen_sources,
+    validate_frozen_sources,
+)
 from .kernel_lane import KernelOpportunity
 from .oracle_container import (
     DockerOracleOverlayBuilder,
@@ -154,14 +158,15 @@ class DockerOracleMicroQualifier:
         try:
             evidence = self._verify(request)
         except ApexError as error:
+            if error.reason_code not in _ORACLE_CANDIDATE_FAILURES:
+                raise
             return _qualification(request, False, error.reason_code, error.details or {})
         except (OSError, ValueError) as error:
-            return _qualification(
-                request,
-                False,
-                "oracle_preflight_failed",
+            raise IntegrityError(
+                "Oracle preflight infrastructure failed",
+                "oracle_preflight_infrastructure_failed",
                 {"error_type": type(error).__name__},
-            )
+            ) from error
         return _qualification(request, True, "oracle_preflight_passed", evidence)
 
     def _verify(self, request: MicroQualificationRequest) -> Mapping[str, Any]:
@@ -171,16 +176,19 @@ class DockerOracleMicroQualifier:
             raise IntegrityError(
                 "Oracle preflight requires frozen source", "invalid_frozen_candidate"
             )
-        make_candidate_read_only(candidate)
+        validate_frozen_sources(candidate)
         oracle = self._resolve(opportunity)
         if oracle is None:
             raise ContractError("No reviewed oracle is bound", "oracle_preflight_unsupported")
         source_receipt = self._verify_source_lock(opportunity)
         root, tests, results = _prepare_artifacts(request.artifact_root)
+        snapshot_root = materialize_frozen_sources(
+            candidate, root / "frozen-candidate"
+        )
         parent = self._engine.inspect_image(self._policy.parent_locator, cwd=root)
         if parent.image_id != self._policy.parent_image_id:
             raise IntegrityError("Oracle parent image drifted", "image_identity_mismatch")
-        relative, candidate_path = _candidate_path(request)
+        relative, candidate_path = _candidate_path(request, snapshot_root)
         target = self._engine.resolve_python_target(
             parent.image_id,
             library=opportunity.origin_library,
@@ -368,18 +376,22 @@ def _candidate_integrity(request: MicroQualificationRequest) -> bool:
     )
 
 
-def _candidate_path(request: MicroQualificationRequest) -> tuple[str, Path]:
+def _candidate_path(
+    request: MicroQualificationRequest, snapshot_root: Path
+) -> tuple[str, Path]:
     opportunity = request.opportunity
     assert opportunity.source_root is not None and opportunity.source_path is not None
     relative = opportunity.source_path.resolve(strict=True).relative_to(
         opportunity.source_root.resolve(strict=True)
     ).as_posix()
-    paths = candidate_file_paths(request.candidate)
-    if len(paths) != 1 or request.candidate.editable_files != (relative,):
+    if request.candidate.editable_files != (relative,):
         raise IntegrityError("Oracle candidate path drifted", "candidate_lineage_mismatch")
-    path = paths[0]
+    source = frozen_candidate_source(request.candidate, relative)
+    path = snapshot_root.joinpath(*PurePosixPath(relative).parts)
     if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
         raise IntegrityError("Oracle candidate is not regular", "invalid_frozen_candidate")
+    if sha256_file(path) != source.sha256:
+        raise IntegrityError("Oracle candidate snapshot drifted", "candidate_lineage_mismatch")
     return relative, path
 
 
@@ -540,6 +552,12 @@ def _qualification(
         qualification_mode="e2e_quality_deferred",
         deferred_candidate_valid=passed,
     )
+
+
+_ORACLE_CANDIDATE_FAILURES = {
+    "loaded_byte_probe_failed",
+    "oracle_test_failed",
+}
 
 
 __all__ = [

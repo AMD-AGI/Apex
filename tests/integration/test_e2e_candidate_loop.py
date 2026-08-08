@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import apex.optimization.e2e.candidate_snapshot as candidate_snapshot
 from apex.benchmark import (
     InferenceXRuntimeEvidence,
     LatencyDistribution,
@@ -17,7 +18,14 @@ from apex.benchmark import (
     QualityMetric,
     ThroughputMetrics,
 )
-from apex.core import AgentBackendName, TaskStatus, ValidationLevel, sha256_json
+from apex.core import (
+    AgentBackendName,
+    DependencyError,
+    TaskStatus,
+    ValidationLevel,
+    sha256_bytes,
+    sha256_json,
+)
 from apex.diagnostics import (
     AcquisitionCoverage,
     EvidenceArtifactReceipt,
@@ -38,18 +46,20 @@ from apex.evaluation import (
     grade_kernel,
 )
 from apex.intake import E2EOptimizeSpec, MetricGoal, RegressionGates
-from apex.optimization.e2e.candidate import E2ECandidate
+from apex.optimization.e2e.candidate import E2ECandidate, FrozenCandidateSource
 from apex.optimization.e2e.deferred import E2EDeferredMicroQualifier
 from apex.optimization.e2e.services import (
     CandidateDeployment,
     FinalDeliveryResult,
     MicroQualification,
+    NoToolSafetyVerifier,
     SafetyQualification,
 )
 from apex.optimization.e2e.use_case import E2EOptimizeUseCase
 from apex.orchestration import RunController
 from apex.ports import (
     AGENT_PROCESS_CONTAINMENT_POLICY,
+    AgentCaptureStatus,
     AgentCost,
     AgentProcessContainmentReceipt,
     AgentResult,
@@ -234,20 +244,44 @@ class _Provenance:
 
 
 class _Worker:
-    def __init__(self, state: _LeaseState) -> None:
+    def __init__(
+        self,
+        state: _LeaseState,
+        *,
+        infrastructure_error: Exception | None = None,
+        returned_failure: str | None = None,
+    ) -> None:
         self.state = state
         self.requests = []
+        self.infrastructure_error = infrastructure_error
+        self.returned_failure = returned_failure
 
     def generate(self, request):
         assert self.state.active
         self.requests.append(request)
+        if self.infrastructure_error is not None:
+            raise self.infrastructure_error
         relative = request.opportunity.source_path.relative_to(
             request.opportunity.source_root
         )
         source = request.destination / relative
         source.parent.mkdir(parents=True)
         source.write_text(f"value = {len(self.requests) + 1}\n", encoding="utf-8")
-        digest = sha256_json({"attempt": request.attempt_id, "value": source.read_text()})
+        content = source.read_bytes()
+        source_sha256 = sha256_bytes(content)
+        source_mode = source.stat().st_mode & 0o777
+        digest = sha256_json(
+            {
+                "schema_version": 1,
+                "files": [
+                    {
+                        "path": relative.as_posix(),
+                        "sha256": source_sha256,
+                        "mode": source_mode,
+                    }
+                ],
+            }
+        )
         events = (
             AgentTranscriptEvent(
                 "assistant",
@@ -289,7 +323,11 @@ class _Worker:
             cost=AgentCost("0.01", "USD", 3, "total_cost_usd"),
             process_containment=_agent_containment(),
         )
-        return E2ECandidate(
+        if self.returned_failure == "agent_process_cleanup_failed":
+            result = replace(result, capture_status=AgentCaptureStatus.CLEANUP_FAILED)
+        elif self.returned_failure == "agent_process_containment_unverified":
+            result = replace(result, process_containment=None)
+        candidate = E2ECandidate(
             request.attempt_id,
             f"candidate-{request.attempt_id}",
             True,
@@ -300,6 +338,22 @@ class _Worker:
             "b" * 64,
             digest,
             result,
+            (
+                FrozenCandidateSource(
+                    relative.as_posix(), source_sha256, source_mode, content
+                ),
+            ),
+        )
+        if self.returned_failure is None:
+            return candidate
+        return replace(
+            candidate,
+            candidate_id=None,
+            succeeded=False,
+            reason_code=self.returned_failure,
+            changed_files=(),
+            candidate_source_sha256=None,
+            frozen_sources=(),
         )
 
 
@@ -572,15 +626,22 @@ def _system(
     deployment_infrastructure_failure: bool = False,
     final_succeeds: bool = True,
     deferred_micro: bool = False,
+    worker_infrastructure_error: Exception | None = None,
+    worker_returned_failure: str | None = None,
+    safety_override=None,
 ):
     state = _LeaseState()
     source = _source(tmp_path)
     lease = _LeaseManager(state)
     benchmark = _Benchmark(state, measurements)
     diagnostics = _Diagnostics(state, source)
-    worker = _Worker(state)
+    worker = _Worker(
+        state,
+        infrastructure_error=worker_infrastructure_error,
+        returned_failure=worker_returned_failure,
+    )
     micro = E2EDeferredMicroQualifier() if deferred_micro else _Micro(state, micro_outcomes)
-    safety = _Safety(state, finding=safety_finding)
+    safety = safety_override or _Safety(state, finding=safety_finding)
     deployments = _Deployments(
         state,
         succeed=deployment_succeeds,
@@ -778,6 +839,168 @@ def test_deployment_failure_never_runs_candidate_e2e(tmp_path: Path) -> None:
     assert system[8].rollbacks == ["candidate-attempt-1"]
 
 
+def test_candidate_worker_infrastructure_failure_terminates_without_rejection(
+    tmp_path: Path,
+) -> None:
+    system = _system(
+        tmp_path,
+        [100.0],
+        [],
+        worker_infrastructure_error=DependencyError(
+            "PID namespace setup failed",
+            "agent_process_containment_failed",
+            {"stage": "candidate_generation"},
+        ),
+    )
+
+    result = system[0].run(_spec(tmp_path, iterations=2))
+
+    assert result.status is TaskStatus.INFRASTRUCTURE_ERROR
+    assert result.reason_code == "agent_process_containment_failed"
+    assert len(system[3].calls) == 2  # baseline and diagnostic; no final replay
+    assert len(system[5].requests) == 1
+    assert system[6].calls == 0
+    assert system[8].requests == []
+    assert system[9].requests == []
+    events = EventJournal(tmp_path / "results" / "events" / "run.db").iter_events(
+        result.run_id
+    )
+    assert not any(event.event_type == "e2e.execution_rejected" for event in events)
+    assert not any(event.event_type == "decision" for event in events)
+    recovered = RunController.recover(
+        result.run_id,
+        EventJournal(tmp_path / "results" / "events" / "run.db"),
+        SnapshotStore(tmp_path / "results" / "state.snapshot.json"),
+    )
+    assert recovered.state.e2e is not None
+    assert recovered.state.e2e.decisions == ()
+
+
+def test_untyped_candidate_worker_exception_is_normalized_as_infrastructure(
+    tmp_path: Path,
+) -> None:
+    system = _system(
+        tmp_path,
+        [100.0],
+        [],
+        worker_infrastructure_error=OSError("simulated exec failure"),
+    )
+
+    result = system[0].run(_spec(tmp_path, iterations=1))
+
+    assert result.status is TaskStatus.INFRASTRUCTURE_ERROR
+    assert result.reason_code == "candidate_generation_infrastructure_failed"
+    assert result.details["failure"]["evidence"] == {"error_type": "OSError"}
+    assert len(system[3].calls) == 2  # baseline and diagnostic; no final replay
+    events = EventJournal(tmp_path / "results" / "events" / "run.db").iter_events(
+        result.run_id
+    )
+    assert not any(event.event_type == "e2e.execution_rejected" for event in events)
+    assert not any(event.event_type == "decision" for event in events)
+
+
+@pytest.mark.parametrize(
+    ("reason", "capture_status", "has_containment"),
+    (
+        ("agent_process_cleanup_failed", "cleanup_failed", True),
+        ("agent_process_containment_unverified", "complete", False),
+    ),
+)
+def test_unverified_agent_teardown_is_recorded_then_terminates_infrastructure(
+    tmp_path: Path,
+    reason: str,
+    capture_status: str,
+    has_containment: bool,
+) -> None:
+    system = _system(
+        tmp_path,
+        [100.0],
+        [],
+        worker_returned_failure=reason,
+    )
+
+    result = system[0].run(_spec(tmp_path, iterations=2))
+
+    assert result.status is TaskStatus.INFRASTRUCTURE_ERROR
+    assert result.reason_code == reason
+    assert len(system[3].calls) == 2  # baseline and diagnostic; no final replay
+    evidence = result.details["failure"]["evidence"]
+    assert evidence["capture_status"] == capture_status
+    assert (evidence["process_containment"] is not None) is has_containment
+    digest = evidence["candidate_manifest_receipt"]
+    manifest_path = tmp_path / "results" / "artifacts" / "sha256" / digest[:2] / digest
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source_receipts"] == []
+    assert manifest["frozen_sources"] == []
+    events = EventJournal(tmp_path / "results" / "events" / "run.db").iter_events(
+        result.run_id
+    )
+    event_types = [event.event_type for event in events]
+    assert "agent_failed" in event_types
+    assert "candidate_frozen" in event_types
+    assert "e2e.execution_rejected" not in event_types
+    assert "decision" not in event_types
+
+
+def test_safety_snapshot_io_failure_returns_terminal_infrastructure_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fail_write(_destination, _source):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(candidate_snapshot, "_write_frozen_source", fail_write)
+    system = _system(
+        tmp_path,
+        [100.0],
+        [True],
+        safety_override=NoToolSafetyVerifier(),
+    )
+
+    result = system[0].run(_spec(tmp_path, iterations=1))
+
+    assert result.status is TaskStatus.INFRASTRUCTURE_ERROR
+    assert result.reason_code == "candidate_snapshot_materialization_failed"
+    assert result.details["failure"]["evidence"] == {"error_type": "OSError"}
+    assert len(system[3].calls) == 2  # baseline and diagnostic; no final replay
+    assert system[8].requests == []
+    assert system[9].requests == []
+    events = EventJournal(tmp_path / "results" / "events" / "run.db").iter_events(
+        result.run_id
+    )
+    assert not any(event.event_type == "e2e.execution_rejected" for event in events)
+    assert not any(event.event_type == "decision" for event in events)
+
+
+def test_returned_candidate_failure_remains_a_search_rejection(tmp_path: Path) -> None:
+    system = _system(
+        tmp_path,
+        [100.0, 100.0],
+        [],
+        worker_returned_failure="undeclared_agent_edit",
+    )
+
+    result = system[0].run(_spec(tmp_path, iterations=1))
+
+    assert result.status is TaskStatus.NO_GAIN
+    assert len(system[3].calls) == 3  # baseline, diagnostic, unchanged final
+    assert system[6].calls == 0
+    assert system[8].requests == []
+    events = EventJournal(tmp_path / "results" / "events" / "run.db").iter_events(
+        result.run_id
+    )
+    rejected = [event for event in events if event.event_type == "e2e.execution_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].payload["reason"] == "undeclared_agent_edit"
+    recovered = RunController.recover(
+        result.run_id,
+        EventJournal(tmp_path / "results" / "events" / "run.db"),
+        SnapshotStore(tmp_path / "results" / "state.snapshot.json"),
+    )
+    assert recovered.state.e2e is not None
+    assert len(recovered.state.e2e.decisions) == 1
+    assert recovered.state.e2e.decisions[0].verdict == "reject"
+
+
 def test_deployment_infrastructure_failure_is_not_candidate_no_gain(
     tmp_path: Path,
 ) -> None:
@@ -808,6 +1031,16 @@ def test_deployment_infrastructure_failure_is_not_candidate_no_gain(
     assert recovered.state.phase.value == "failed"
     assert recovered.state.e2e is not None
     assert recovered.state.e2e.decisions == ()
+    delivery_events = [
+        event
+        for event in EventJournal(
+            tmp_path / "results" / "events" / "run.db"
+        ).iter_events(result.run_id)
+        if event.event_type == "delivery_result"
+        and event.payload.get("attempt_id") == "attempt-1"
+    ]
+    assert len(delivery_events) == 1
+    assert delivery_events[0].payload["infrastructure_failure"] is True
 
 
 def test_formal_success_is_denied_when_second_delivery_is_unresolved(tmp_path: Path) -> None:

@@ -19,8 +19,17 @@ from apex.ports import (
     AgentProcessContainmentReceipt,
 )
 
+from .procfs import (
+    ProcfsMountIdentity,
+    live_namespace_members,
+    open_verified_private_procfs,
+    private_procfs_verified,
+    procfs_mount_identity,
+)
+
 
 _STATUS_LIMIT = 4096
+_READINESS_POLL_SECONDS = 0.005
 _MASKED_DIRECTORIES = (
     "/proc/acpi",
     "/proc/asound",
@@ -78,6 +87,7 @@ class ActivePidNamespace:
     """A pidfd-pinned namespace init held until teardown evidence is complete."""
 
     init_pidfd: int
+    private_procfs_fd: int
     status_fd: int
     init_host_pid: int
     init_starttime: int
@@ -105,7 +115,19 @@ class ActivePidNamespace:
 
     def close(self) -> None:
         self.init_pidfd = _close_fd(self.init_pidfd)
+        self.private_procfs_fd = _close_fd(self.private_procfs_fd)
         self.status_fd = _close_fd(self.status_fd)
+
+
+@dataclass(frozen=True, slots=True)
+class _LaunchIdentity:
+    starttime: int
+    parent_pid: int
+    inner_pid: int
+    pid_namespace_inode: int
+    mount_namespace_inode: int
+    ipc_namespace_inode: int
+    user_namespace_inode: int
 
 
 def prepare_pid_namespace(command: Sequence[str]) -> PreparedPidNamespace:
@@ -171,46 +193,52 @@ def establish_pid_namespace(
 
     boundary: ActivePidNamespace | None = None
     established = False
+    pidfd = -1
+    private_procfs_fd = -1
+    deadline = time.monotonic() + timeout_seconds
     try:
-        status = _read_launch_status(prepared.status_read_fd, timeout_seconds)
+        status = _read_launch_status(
+            prepared.status_read_fd,
+            max(0.0, deadline - time.monotonic()),
+        )
         init_pid = status["child-pid"]
         pidfd = os.pidfd_open(init_pid, 0)
-        starttime = _process_starttime(init_pid)
-        parent_pid, inner_pid = _process_namespace_identity(init_pid)
-        inode = _namespace_inode(init_pid, "pid")
-        mount_inode = _namespace_inode(init_pid, "mnt")
-        ipc_inode = _namespace_inode(init_pid, "ipc")
-        user_inode = _namespace_inode(init_pid, "user")
-        private_procfs = _private_procfs_verified(init_pid)
+        supervisor_procfs = procfs_mount_identity(Path("/proc"))
+        identity = _await_verified_launch_identity(
+            init_pid,
+            wrapper_pid=process.pid,
+            pidfd=pidfd,
+            status=status,
+            supervisor_procfs=supervisor_procfs,
+            deadline=deadline,
+        )
+        private_procfs_fd = open_verified_private_procfs(
+            init_pid, supervisor_procfs
+        )
+        final_identity = _launch_identity(init_pid)
+        _validate_launch_identity(final_identity, identity, process.pid, status)
+        if _pidfd_ready(pidfd, 0):
+            raise ContractError(
+                "Agent PID namespace exited before release",
+                "agent_process_containment_failed",
+            )
         boundary = ActivePidNamespace(
             init_pidfd=pidfd,
+            private_procfs_fd=private_procfs_fd,
             status_fd=prepared.status_read_fd,
             init_host_pid=init_pid,
-            init_starttime=starttime,
-            pid_namespace_inode=inode,
-            mount_namespace_inode=mount_inode,
-            ipc_namespace_inode=ipc_inode,
-            user_namespace_inode=user_inode,
-            private_procfs_verified=private_procfs,
+            init_starttime=identity.starttime,
+            pid_namespace_inode=identity.pid_namespace_inode,
+            mount_namespace_inode=identity.mount_namespace_inode,
+            ipc_namespace_inode=identity.ipc_namespace_inode,
+            user_namespace_inode=identity.user_namespace_inode,
+            private_procfs_verified=True,
             launcher_path=prepared.launcher_path,
             launcher_sha256=prepared.launcher_sha256,
         )
+        pidfd = -1
+        private_procfs_fd = -1
         prepared.status_read_fd = -1
-        if (
-            parent_pid != process.pid
-            or inner_pid != 1
-            or inode != status["pid-namespace"]
-            or mount_inode != status["mnt-namespace"]
-            or ipc_inode != status["ipc-namespace"]
-            or user_inode == _namespace_inode(os.getpid(), "user")
-            or not private_procfs
-            or _process_starttime(init_pid) != starttime
-            or _pidfd_ready(pidfd, 0)
-        ):
-            raise ContractError(
-                "Agent PID namespace identity changed before release",
-                "agent_process_containment_failed",
-            )
         os.write(prepared.gate_write_fd, b"1")
         established = True
         return boundary
@@ -220,6 +248,8 @@ def establish_pid_namespace(
             "agent_process_containment_failed",
         ) from error
     finally:
+        _close_fd(pidfd)
+        _close_fd(private_procfs_fd)
         prepared.gate_write_fd = _close_fd(prepared.gate_write_fd)
         prepared.close()
         if boundary is not None and not established:
@@ -252,7 +282,7 @@ def finalize_pid_namespace(
         init_exited = _pidfd_ready(boundary.init_pidfd, timeout_seconds)
         payload, eof = _read_terminal_status(boundary.status_fd, timeout_seconds)
         terminal_verified = _terminal_status_matches(payload, process.poll())
-        members = _live_namespace_members(boundary.pid_namespace_inode)
+        members = live_namespace_members(boundary.private_procfs_fd)
         return AgentProcessContainmentReceipt(
             policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
             launcher_path=boundary.launcher_path,
@@ -338,13 +368,29 @@ def _append_system_path_masks(command: list[str]) -> None:
 
 
 def _read_launch_status(descriptor: int, timeout_seconds: float) -> dict[str, int]:
-    ready, _, _ = select.select([descriptor], [], [], timeout_seconds)
-    if not ready:
-        raise ContractError(
-            "Agent PID namespace status timed out",
-            "agent_process_containment_failed",
-        )
-    payload = os.read(descriptor, _STATUS_LIMIT + 1)
+    deadline = time.monotonic() + timeout_seconds
+    chunks: list[bytes] = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ContractError(
+                "Agent PID namespace status timed out",
+                "agent_process_containment_failed",
+            )
+        ready, _, _ = select.select([descriptor], [], [], remaining)
+        if not ready:
+            raise ContractError(
+                "Agent PID namespace status timed out",
+                "agent_process_containment_failed",
+            )
+        chunk = os.read(descriptor, _STATUS_LIMIT + 1)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > _STATUS_LIMIT or b"\n" in payload:
+            break
+    payload = b"".join(chunks)
     try:
         value = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -356,6 +402,7 @@ def _read_launch_status(descriptor: int, timeout_seconds: float) -> dict[str, in
     if (
         len(payload) > _STATUS_LIMIT
         or not payload.endswith(b"\n")
+        or payload.count(b"\n") != 1
         or not isinstance(value, dict)
         or set(value) != expected
         or any(type(value.get(key)) is not int or value[key] <= 0 for key in expected)
@@ -423,54 +470,76 @@ def _namespace_inode(pid: int, kind: str) -> int:
     return (Path(f"/proc/{pid}/ns") / kind).stat().st_ino
 
 
-def _private_procfs_verified(pid: int) -> bool:
-    try:
-        lines = Path(f"/proc/{pid}/mountinfo").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return False
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 10 or fields[4] != "/proc" or "-" not in fields:
-            continue
-        separator = fields.index("-")
-        return (
-            fields[3] == "/"
-            and fields[separator + 1] == "proc"
-            and fields[separator + 2] == "proc"
+def _launch_identity(pid: int) -> _LaunchIdentity:
+    parent_pid, inner_pid = _process_namespace_identity(pid)
+    return _LaunchIdentity(
+        starttime=_process_starttime(pid),
+        parent_pid=parent_pid,
+        inner_pid=inner_pid,
+        pid_namespace_inode=_namespace_inode(pid, "pid"),
+        mount_namespace_inode=_namespace_inode(pid, "mnt"),
+        ipc_namespace_inode=_namespace_inode(pid, "ipc"),
+        user_namespace_inode=_namespace_inode(pid, "user"),
+    )
+
+
+def _await_verified_launch_identity(
+    pid: int,
+    *,
+    wrapper_pid: int,
+    pidfd: int,
+    status: dict[str, int],
+    supervisor_procfs: ProcfsMountIdentity,
+    deadline: float,
+) -> _LaunchIdentity:
+    expected: _LaunchIdentity | None = None
+    supervisor_user_namespace = _namespace_inode(os.getpid(), "user")
+    while time.monotonic() < deadline:
+        if _pidfd_ready(pidfd, 0):
+            break
+        try:
+            before = _launch_identity(pid)
+            expected = expected or before
+            _validate_launch_identity(before, expected, wrapper_pid, status)
+            private_procfs = private_procfs_verified(pid, supervisor_procfs)
+            after = _launch_identity(pid)
+            _validate_launch_identity(after, expected, wrapper_pid, status)
+            if (
+                private_procfs
+                and before == after
+                and after.user_namespace_inode != supervisor_user_namespace
+                and not _pidfd_ready(pidfd, 0)
+            ):
+                return after
+        except (OSError, ValueError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(_READINESS_POLL_SECONDS, remaining))
+    raise ContractError(
+        "Agent PID namespace did not reach verified private-proc readiness",
+        "agent_process_containment_failed",
+    )
+
+
+def _validate_launch_identity(
+    current: _LaunchIdentity,
+    expected: _LaunchIdentity,
+    wrapper_pid: int,
+    status: dict[str, int],
+) -> None:
+    if (
+        current != expected
+        or current.parent_pid != wrapper_pid
+        or current.inner_pid != 1
+        or current.pid_namespace_inode != status["pid-namespace"]
+        or current.mount_namespace_inode != status["mnt-namespace"]
+        or current.ipc_namespace_inode != status["ipc-namespace"]
+    ):
+        raise ContractError(
+            "Agent PID namespace identity changed before release",
+            "agent_process_containment_failed",
         )
-    return False
-
-
-def _live_namespace_members(namespace_inode: int) -> list[int] | None:
-    try:
-        entries = list(Path("/proc").iterdir())
-    except OSError:
-        return None
-    members: list[int] = []
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            if (entry / "ns/pid").stat().st_ino != namespace_inode:
-                continue
-        except FileNotFoundError:
-            continue
-        except PermissionError:
-            # hidepid and sibling user namespaces may conceal unrelated tasks.
-            # Namespace-init pidfd exit is the authority; this scan corroborates
-            # every namespace identity visible to the supervisor.
-            continue
-        except OSError:
-            return None
-        try:
-            fields = (entry / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
-            if fields[0] != "Z":
-                members.append(int(entry.name))
-        except FileNotFoundError:
-            continue
-        except (OSError, IndexError, ValueError):
-            return None
-    return sorted(members)
 
 
 def _pidfd_ready(descriptor: int, timeout_seconds: float) -> bool:

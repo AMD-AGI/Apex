@@ -67,7 +67,13 @@ Internal responsibilities are intentionally narrow:
 - `oracle_preflight.py` owns Qwen tests-only policy, source locks, and qualification.
 - `oracle_container.py` owns the immutable overlay and same-process test runner.
 - `context.py` compiles a fresh bounded `ContextPacket` from durable state.
-- `candidate.py` materializes and freezes an isolated source checkout.
+- `candidate.py` materializes the isolated checkout and owns agent outcome routing.
+- `candidate_fingerprint.py` owns bounded tree/Git traversal, source fingerprints,
+  and pre-hash entry, depth, file-size, and changed-byte budgets.
+- `candidate_snapshot.py` owns bounded source identity, immutable byte capture,
+  validation, and evaluator-only read-only materialization without reopening the
+  agent workspace.
+- `candidate_record.py` persists frozen candidate bytes and their CAS manifest.
 - `deferred.py` represents the no-micro-harness truth boundary without reward.
 - `overlay_runtime.py` owns fixed-argv Docker inspection, build, and byte probes.
 - `overlay_config.py` derives immutable image-only benchmark views.
@@ -108,15 +114,16 @@ fails closed. For the reviewed Qwen profile this makes paged attention, recurren
 GDN decode, causal-conv update, prefix-prefill, and reshape/cache sources eligible
 without hardcoding their dynamic rank or runtime symbol.
 
-In V1 that registry is routing metadata, not executed correctness evidence.
-Production still composes `E2EDeferredMicroQualifier`; its receipt explicitly
-records `executed=false`, and unchanged Magpie quality remains the correctness
-authority. A future evaluator-owned Docker qualifier must import the installed
-candidate vLLM, mount only the locked `tests/` tree at `/oracle/tests`, run from
-`/oracle`, install dependencies such as `tblib` from a locked wheel set, and prove
-candidate loaded bytes. Mounting the whole source checkout would shadow the
-installed candidate and is prohibited. Until that qualifier exists, Apex must
-not claim that the routed pytest command ran.
+For generic or unbound workloads, that registry is routing metadata rather than
+executed correctness evidence. Those workloads compose
+`E2EDeferredMicroQualifier`; its receipt records `executed=false`, and unchanged
+Magpie quality remains the correctness authority. The reviewed Qwen profile is
+the explicit exception: `DockerOracleMicroQualifier` imports the installed
+candidate vLLM, mounts only the locked evaluator test subset, executes the exact
+pinned pytest node IDs, and proves candidate loaded bytes in the same process.
+That preflight remains a candidate-rejection boundary, not a canonical kernel
+grade or reward. Mounting the whole source checkout would shadow the installed
+candidate and is prohibited.
 
 After every candidate worker exits, `run_record.py` writes one canonical
 `apex.agent-transcript/v3` CAS artifact and projects its normalized actions into
@@ -133,10 +140,17 @@ agent PID namespace is empty, and authoritative containment cleanup is verified.
 `agent_completed` event still records `termination_kind=exact_turn_boundary` and
 the controlled process exit. A count below the limit is valid only as a natural
 completed process; a count above it, timeout, invalid stream, truncated output,
-or cleanup failure is rejected. Every admitted checkpoint then follows the same
+or cleanup failure is rejected. Unverified containment or cleanup is an
+infrastructure failure, and no post-agent workspace traversal is permitted;
+the source-empty failure first persists its transcript, termination, capture,
+and containment receipts, then terminates without an execution rejection or
+decision. Other rejected captures likewise return without freezing or reading agent paths.
+Every admitted checkpoint then follows the same
 micro/deferred qualification, safety, deployment, and E2E acceptance path.
-The E2E workspace purge removes interpreter and test caches before source
-fingerprinting; ignored artifacts are neither candidate bytes nor evaluator input.
+The bounded workspace walker counts entries incrementally, prunes interpreter,
+test, and Git-control directories without enumerating their children, and excludes
+ignored artifacts from source fingerprints. They remain untrusted workspace bytes
+and are never candidate snapshot bytes or evaluator input.
 
 Strict micro qualification accepts one canonical `KernelGrade`; it has no second
 statistics or threshold implementation. KEEP therefore requires compile,
@@ -218,8 +232,10 @@ environment variables and credential values are not serialized.
 Baseline or quality failure terminates as `baseline_invalid`. Missing source,
 micro, or deployment capability is reported as unsupported. Candidate-caused
 compile, correctness, safety, or E2E failures reject/revert only the active
-candidate until its bounded search budget is exhausted. Docker, image identity,
-provenance, and adapter infrastructure failures instead persist the delivery
+candidate until its bounded search budget is exhausted. After those evaluator
+verdict boundaries pass, every immutable-overlay deployment failure is
+infrastructure: frozen-source, source-mapping, safety-state, Docker, image
+identity, provenance, and adapter failures all persist the delivery
 failure receipt and terminate as `infrastructure_error`; they do not commit a
 candidate reject, rotate to another opportunity, or run a final baseline replay.
 Missing source provenance or second-clean-replay proof can retain primary

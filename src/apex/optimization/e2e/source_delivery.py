@@ -25,6 +25,7 @@ from apex.delivery import (
 )
 from apex.execution import SubprocessSupervisor
 
+from .candidate import validate_frozen_sources
 from .services import FinalDeliveryRequest, FinalDeliveryResult
 from .source_delivery_models import (
     DeliveryProvenancePort,
@@ -220,6 +221,7 @@ def _validate_accepted_stack(request: FinalDeliveryRequest) -> frozenset[str]:
             or not candidate.changed_files
         ):
             raise ContractError("Accepted source stack is not deliverable", "unsupported_delivery")
+        validate_frozen_sources(candidate)
         changed.add(item.opportunity.origin_library)
     return frozenset(changed)
 

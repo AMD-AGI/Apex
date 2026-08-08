@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 
 import yaml
 
-from apex.core import AgentBackendName, TaskStatus, ValidationLevel, sha256_file, sha256_json
+from apex.core import (
+    AgentBackendName,
+    TaskStatus,
+    ValidationLevel,
+    sha256_bytes,
+    sha256_file,
+    sha256_json,
+)
 from apex.delivery import (
     BuildRecipeLock,
     BuildStep,
@@ -23,7 +31,7 @@ from apex.delivery import (
     load_and_verify_e2e_bundle,
 )
 from apex.evaluation import E2EMeasurement
-from apex.optimization.e2e.candidate import E2ECandidate
+from apex.optimization.e2e.candidate import E2ECandidate, FrozenCandidateSource
 from apex.optimization.e2e.kernel_lane import KernelOpportunity
 from apex.optimization.e2e.services import (
     AcceptedCandidate,
@@ -133,6 +141,13 @@ def _candidate(
     path.write_text(f"VALUE = '{value}'\n", encoding="utf-8")
     baseline_digest = _source_digest(root, relative)
     candidate_digest = _source_digest(workspace, relative)
+    content = path.read_bytes()
+    frozen = FrozenCandidateSource(
+        relative,
+        sha256_bytes(content),
+        path.stat().st_mode & 0o777,
+        content,
+    )
     candidate = E2ECandidate(
         f"attempt-{index}",
         f"candidate-{index}",
@@ -153,6 +168,7 @@ def _candidate(
             "",
             1.0,
         ),
+        (frozen,),
     )
     path.chmod(0o444)
     opportunity = KernelOpportunity(
@@ -227,12 +243,14 @@ class PrimaryBuilder:
         self.parity = parity
         self.calls = 0
         self.observed: dict[str, str] = {}
+        self.observed_modes: dict[str, int] = {}
 
     def build_and_validate(self, request):
         self.calls += 1
         for root in request.repository_roots.values():
             for path in sorted(root.glob("vllm/kernels/*.py")):
                 self.observed[path.name] = path.read_text(encoding="utf-8")
+                self.observed_modes[path.name] = path.stat().st_mode & 0o777
         output = request.artifact_root
         output.mkdir(parents=True)
         sbom = output / "sbom.json"
@@ -490,11 +508,78 @@ def test_formal_delivery_accumulates_source_and_requires_second_clean_replay(
     }
     assert "optimized-a" in builder.observed["op_a.py"]
     assert "optimized-b" in builder.observed["op_b.py"]
+    assert builder.observed_modes["op_a.py"] == (
+        (root / "vllm/kernels/op_a.py").stat().st_mode & 0o777
+    )
     assert ":base" in (root / "vllm/kernels/op_a.py").read_text(encoding="utf-8")
     assert (
         request.artifact_root
         / "independent-verification/worktrees/vllm/vllm/kernels/op_a.py"
     ).is_file()
+
+
+def test_formal_delivery_uses_frozen_bytes_after_workspace_mutation(
+    tmp_path: Path,
+) -> None:
+    _, _, binding, builder, request = _fixture(tmp_path)
+    candidate = request.accepted[0].candidate
+    mutable_path = candidate.workspace / candidate.editable_files[0]
+    mutable_path.chmod(0o644)
+    mutable_path.write_text("VALUE = 'late-workspace-mutation'\n", encoding="utf-8")
+
+    result = SourceRebuildFinalDelivery((binding,)).finalize(request)
+
+    assert result.verified is True
+    assert "optimized-a" in builder.observed["op_a.py"]
+    assert "late-workspace-mutation" not in builder.observed["op_a.py"]
+
+
+def test_formal_delivery_never_follows_agent_workspace_symlink(
+    tmp_path: Path,
+) -> None:
+    _, _, binding, builder, request = _fixture(tmp_path)
+    candidate = request.accepted[0].candidate
+    workspace = candidate.workspace
+    hidden_workspace = tmp_path / "discarded-agent-workspace"
+    workspace.rename(hidden_workspace)
+    secret_root = tmp_path / "outside-agent-workspace"
+    secret_path = secret_root / candidate.editable_files[0]
+    secret_path.parent.mkdir(parents=True)
+    secret_path.write_text("VALUE = 'must-not-leak'\n", encoding="utf-8")
+    workspace.symlink_to(secret_root, target_is_directory=True)
+
+    result = SourceRebuildFinalDelivery((binding,)).finalize(request)
+
+    assert result.verified is True
+    assert "optimized-a" in builder.observed["op_a.py"]
+    assert "must-not-leak" not in builder.observed["op_a.py"]
+    assert not any(
+        b"must-not-leak" in path.read_bytes()
+        for path in request.artifact_root.rglob("*")
+        if path.is_file()
+    )
+    assert workspace.is_symlink()
+    shutil.rmtree(hidden_workspace)
+
+
+def test_formal_delivery_recomputes_digest_from_frozen_content(
+    tmp_path: Path,
+) -> None:
+    _, _, binding, builder, request = _fixture(tmp_path)
+    accepted = request.accepted[0]
+    candidate = accepted.candidate
+    frozen = candidate.frozen_sources[0]
+    tampered = replace(frozen, content=b"VALUE = 'tampered-snapshot'\n")
+    candidate = replace(candidate, frozen_sources=(tampered,))
+    accepted = replace(accepted, candidate=candidate)
+    request = replace(request, accepted=(accepted, *request.accepted[1:]))
+
+    result = SourceRebuildFinalDelivery((binding,)).finalize(request)
+
+    assert result.status is TaskStatus.VERIFICATION_FAILED
+    assert result.reason_code == "candidate_source_capture_drift"
+    assert builder.calls == 0
+    assert not request.artifact_root.exists()
 
 
 def test_missing_actual_agent_model_is_provenance_unresolved_before_build(

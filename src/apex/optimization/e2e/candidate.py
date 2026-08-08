@@ -12,24 +12,32 @@ from apex.core import (
     AgentBackendName,
     ContractError,
     IntegrityError,
-    sha256_bytes,
-    sha256_file,
     sha256_json,
 )
 from apex.execution import AgentRegistry, SubprocessSupervisor
 from apex.ports import AgentRequest, AgentResult
 
+from .candidate_fingerprint import (
+    IGNORED_DIRECTORIES as _IGNORED_DIRECTORIES,
+    IGNORED_SUFFIXES as _IGNORED_SUFFIXES,
+    SourceFingerprint as _Fingerprint,
+    fingerprint_git_tree as _fingerprint_git_tree,
+    fingerprint_materialized_git_tree as _fingerprint_materialized_git_tree,
+    fingerprint_tree as _fingerprint_tree,
+    git_environment as _git_environment,
+    git_output as _git_output,
+    iter_bounded_tree as _iter_bounded_tree,
+    preflight_materialized_tree as _preflight_materialized_tree,
+)
+from .candidate_snapshot import (
+    FrozenCandidateSource,
+    capture_frozen_sources as _capture_frozen_sources,
+    frozen_candidate_source,
+    materialize_frozen_sources,
+    source_set_digest as _source_set_digest,
+    validate_frozen_sources,
+)
 from .kernel_lane import KernelOpportunity
-
-
-_IGNORED_DIRECTORIES = {
-    ".git",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    "__pycache__",
-}
-_IGNORED_SUFFIXES = {".pyc", ".pyo"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,17 +70,11 @@ class E2ECandidate:
     baseline_source_sha256: str
     candidate_source_sha256: str | None
     agent_result: AgentResult
+    frozen_sources: tuple[FrozenCandidateSource, ...] = ()
 
 
 class CandidateWorker(Protocol):
     def generate(self, request: E2ECandidateRequest) -> E2ECandidate: ...
-
-
-@dataclass(frozen=True, slots=True)
-class _Fingerprint:
-    sha256: str
-    mode: int
-    kind: str = "regular"
 
 
 class SourceCandidateWorkspace:
@@ -117,21 +119,23 @@ class SourceCandidateWorkspace:
 
     def freeze(self) -> tuple[tuple[str, ...], str, str | None]:
         git_checkout = bool(getattr(self, "_git_checkout", False))
-        _purge_generated_artifacts(self.root)
+        _preflight_materialized_tree(self.root, self._baseline)
         if git_checkout:
             _validate_git_control_directory(self.root)
-        candidate = _fingerprint_git_tree(self.root) if git_checkout else _fingerprint_tree(self.root)
+        candidate = (
+            _fingerprint_materialized_git_tree(self.root, self._baseline)
+            if git_checkout
+            else _fingerprint_tree(self.root)
+        )
         all_paths = set(self._baseline) | set(candidate)
         changed = tuple(
             sorted(path for path in all_paths if self._baseline.get(path) != candidate.get(path))
         )
         forbidden = tuple(sorted(set(changed).difference(self.editable_files)))
         if git_checkout:
-            observed_changes = _git_changed_paths(self.root)
             forbidden = tuple(
                 sorted(
                     set(forbidden)
-                    .union(observed_changes.difference(self.editable_files))
                     .union(_materialized_gitlinks(self.root, self._baseline))
                     .union(_unexpected_worktree_files(self.root, self._baseline))
                 )
@@ -154,6 +158,12 @@ class SourceCandidateWorkspace:
         candidate_digest = _source_set_digest(candidate, self.editable_files) if changed else None
         return changed, baseline_digest, candidate_digest
 
+    @property
+    def baseline_source_sha256(self) -> str:
+        """Return the immutable editable-source digest captured before the agent ran."""
+
+        return _source_set_digest(self._baseline, self.editable_files)
+
 
 class AgentCandidateWorker:
     """Run Codex, Claude, or Cursor once; freeze bytes after the process exits."""
@@ -166,61 +176,102 @@ class AgentCandidateWorker:
             request.opportunity,
             destination=request.destination,
         )
-        result = self._agents.get(request.backend).run(
-            AgentRequest(
-                run_id=request.run_id,
-                attempt_id=request.attempt_id,
-                backend=request.backend,
-                prompt=request.prompt,
-                workspace=workspace.root,
-                allowed_files=workspace.editable_files,
-                model=request.model,
-                effort=request.effort,
-                max_turns=request.max_turns,
-                timeout_seconds=request.timeout_seconds,
-            )
-        )
-        changed, baseline_digest, candidate_digest = workspace.freeze()
+        baseline_digest = workspace.baseline_source_sha256
+        result = self._agents.get(request.backend).run(_agent_request(request, workspace))
         failure = _agent_failure_reason(result)
         if failure is not None:
-            return E2ECandidate(
-                request.attempt_id,
-                None,
-                False,
-                failure,
-                workspace.root,
-                workspace.editable_files,
-                changed,
-                baseline_digest,
-                candidate_digest,
-                result,
-            )
-        if not changed or candidate_digest is None:
-            return E2ECandidate(
-                request.attempt_id,
-                None,
-                False,
-                "agent_made_no_source_change",
-                workspace.root,
-                workspace.editable_files,
-                (),
-                baseline_digest,
-                None,
-                result,
-            )
-        candidate_id = f"candidate-{sha256_json({'attempt': request.attempt_id, 'source': candidate_digest})[:24]}"
+            return _agent_rejection(request, workspace, result, baseline_digest, failure)
+        return _candidate_after_agent(
+            request,
+            workspace,
+            result,
+            baseline_digest,
+        )
+
+
+def _agent_request(
+    request: E2ECandidateRequest, workspace: SourceCandidateWorkspace
+) -> AgentRequest:
+    return AgentRequest(
+        run_id=request.run_id,
+        attempt_id=request.attempt_id,
+        backend=request.backend,
+        prompt=request.prompt,
+        workspace=workspace.root,
+        allowed_files=workspace.editable_files,
+        model=request.model,
+        effort=request.effort,
+        max_turns=request.max_turns,
+        timeout_seconds=request.timeout_seconds,
+    )
+
+
+def _candidate_after_agent(
+    request: E2ECandidateRequest,
+    workspace: SourceCandidateWorkspace,
+    result: AgentResult,
+    baseline_digest: str,
+) -> E2ECandidate:
+    try:
+        changed, observed_baseline_digest, candidate_digest = workspace.freeze()
+    except IntegrityError as error:
+        # The checkout and agent result now exist, so freeze integrity is a
+        # candidate outcome. Pre-agent infrastructure failures still raise.
+        return _freeze_rejection(request, workspace, result, baseline_digest, error)
+    if observed_baseline_digest != baseline_digest:
+        raise IntegrityError(
+            "Candidate baseline identity changed during execution",
+            "candidate_baseline_drift",
+        )
+    if not changed or candidate_digest is None:
         return E2ECandidate(
             request.attempt_id,
-            candidate_id,
-            True,
-            "candidate_frozen",
+            None,
+            False,
+            "agent_made_no_source_change",
             workspace.root,
             workspace.editable_files,
-            changed,
+            (),
             baseline_digest,
-            candidate_digest,
+            None,
             result,
         )
+    return _capture_successful_candidate(
+        request, workspace, result, changed, baseline_digest, candidate_digest
+    )
+
+
+def _capture_successful_candidate(
+    request: E2ECandidateRequest,
+    workspace: SourceCandidateWorkspace,
+    result: AgentResult,
+    changed: tuple[str, ...],
+    baseline_digest: str,
+    candidate_digest: str,
+) -> E2ECandidate:
+    try:
+        frozen_sources = _capture_frozen_sources(
+            workspace,
+            expected_source_sha256=candidate_digest,
+        )
+    except IntegrityError as error:
+        if error.reason_code != "candidate_source_too_large":
+            raise
+        return _freeze_rejection(request, workspace, result, baseline_digest, error)
+    candidate_id = f"candidate-{sha256_json({'attempt': request.attempt_id, 'source': candidate_digest})[:24]}"
+    return E2ECandidate(
+        request.attempt_id,
+        candidate_id,
+        True,
+        "candidate_frozen",
+        workspace.root,
+        workspace.editable_files,
+        changed,
+        baseline_digest,
+        candidate_digest,
+        result,
+        frozen_sources,
+    )
 
 
 def _agent_failure_reason(result: AgentResult) -> str | None:
@@ -229,117 +280,58 @@ def _agent_failure_reason(result: AgentResult) -> str | None:
     return result.candidate_rejection_reason or "agent_failed"
 
 
-def candidate_file_paths(candidate: E2ECandidate) -> tuple[Path, ...]:
-    return tuple(
-        candidate.workspace.joinpath(*relative.split("/"))
-        for relative in candidate.editable_files
+def _agent_rejection(
+    request: E2ECandidateRequest,
+    workspace: SourceCandidateWorkspace,
+    result: AgentResult,
+    baseline_digest: str,
+    reason: str,
+) -> E2ECandidate:
+    return E2ECandidate(
+        request.attempt_id,
+        None,
+        False,
+        reason,
+        workspace.root,
+        workspace.editable_files,
+        (),
+        baseline_digest,
+        None,
+        result,
     )
 
 
-def make_candidate_read_only(candidate: E2ECandidate) -> None:
-    """Seal declared source bytes before evaluator-only phases."""
-
-    for path in candidate_file_paths(candidate):
-        mode = path.stat().st_mode & 0o777
-        path.chmod(mode & ~0o222)
-
-
-def _source_set_digest(
-    values: Mapping[str, _Fingerprint], editable_files: tuple[str, ...]
-) -> str:
-    try:
-        payload = [
-            {"path": path, "sha256": values[path].sha256, "mode": values[path].mode}
-            for path in editable_files
-        ]
-    except KeyError as error:
-        raise IntegrityError("Declared kernel source is missing", "missing_candidate_source") from error
-    return sha256_json({"schema_version": 1, "files": payload})
-
-
-def _fingerprint_tree(root: Path) -> dict[str, _Fingerprint]:
-    result: dict[str, _Fingerprint] = {}
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root)
-        if any(part in _IGNORED_DIRECTORIES for part in relative.parts):
-            continue
-        if path.is_symlink():
-            target = path.resolve(strict=True)
-            try:
-                target.relative_to(root.resolve(strict=True))
-            except ValueError as error:
-                raise IntegrityError(
-                    f"Source symlink escapes checkout: {relative}", "workspace_symlink_escape"
-                ) from error
-            metadata = path.lstat()
-            result[relative.as_posix()] = _Fingerprint(
-                sha256_bytes(os.readlink(path).encode()),
-                metadata.st_mode & 0o777,
-                "symlink",
-            )
-            continue
-        if not path.is_file() or path.suffix in _IGNORED_SUFFIXES:
-            continue
-        metadata = os.lstat(path)
-        if metadata.st_nlink != 1:
-            raise IntegrityError(
-                f"Source checkout contains hard link: {relative}",
-                "workspace_hardlink",
-            )
-        result[relative.as_posix()] = _Fingerprint(sha256_file(path), metadata.st_mode & 0o777)
-    return result
+def _freeze_rejection(
+    request: E2ECandidateRequest,
+    workspace: SourceCandidateWorkspace,
+    result: AgentResult,
+    baseline_digest: str,
+    error: IntegrityError,
+) -> E2ECandidate:
+    return E2ECandidate(
+        request.attempt_id,
+        None,
+        False,
+        error.reason_code,
+        workspace.root,
+        workspace.editable_files,
+        _rejected_changed_files(error, workspace.editable_files),
+        baseline_digest,
+        None,
+        result,
+    )
 
 
-def _fingerprint_git_tree(root: Path) -> dict[str, _Fingerprint]:
-    """Fingerprint tracked blobs, safe symlinks, and gitlinks without traversing submodules."""
-
-    output = _git_output(root, ("git", "ls-files", "--stage", "-z"), timeout=60)
-    result: dict[str, _Fingerprint] = {}
-    for raw in output.split("\0"):
-        if not raw:
-            continue
-        metadata, relative = raw.split("\t", 1)
-        mode, object_id, stage = metadata.split(" ", 2)
-        if stage != "0":
-            raise IntegrityError("Source checkout contains an unmerged path", "dirty_source_base")
-        path = root.joinpath(*relative.split("/"))
-        if mode == "160000":
-            result[relative] = _Fingerprint(
-                sha256_json({"gitlink": object_id}), int(mode, 8), "gitlink"
-            )
-            continue
-        if mode == "120000":
-            if not path.is_symlink():
-                raise IntegrityError("Tracked symlink is not materialized", "candidate_copy_mismatch")
-            target = path.resolve(strict=True)
-            try:
-                target.relative_to(root.resolve(strict=True))
-            except ValueError as error:
-                raise IntegrityError(
-                    f"Tracked symlink escapes checkout: {relative}",
-                    "workspace_symlink_escape",
-                ) from error
-            result[relative] = _Fingerprint(
-                sha256_bytes(os.readlink(path).encode()), int(mode, 8), "symlink"
-            )
-            continue
-        if path.is_symlink() or not path.is_file():
-            raise IntegrityError("Tracked source is not a regular file", "candidate_copy_mismatch")
-        if path.stat().st_nlink != 1:
-            raise IntegrityError("Tracked source is hard linked", "workspace_hardlink")
-        result[relative] = _Fingerprint(sha256_file(path), int(mode, 8), "regular")
-    return result
-
-
-def _git_changed_paths(root: Path) -> set[str]:
-    changed: set[str] = set()
-    for argv in (
-        ("git", "diff", "--name-only", "-z"),
-        ("git", "diff", "--cached", "--name-only", "-z"),
-        ("git", "ls-files", "--others", "--exclude-standard", "-z"),
-    ):
-        changed.update(item for item in _git_output(root, argv, timeout=60).split("\0") if item)
-    return changed
+def _rejected_changed_files(
+    error: IntegrityError, editable_files: tuple[str, ...]
+) -> tuple[str, ...]:
+    details = dict(error.details or {})
+    paths = details.get("paths")
+    if isinstance(paths, list) and all(isinstance(path, str) and path for path in paths):
+        return tuple(sorted(set(paths)))
+    if error.reason_code in {"editable_source_deleted", "source_mode_change_forbidden"}:
+        return editable_files
+    return ()
 
 
 def _materialized_gitlinks(
@@ -369,13 +361,7 @@ def _unexpected_worktree_files(
         path for path, fingerprint in baseline.items() if fingerprint.kind == "gitlink"
     )
     unexpected: set[str] = set()
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if relative.parts and relative.parts[0] == ".git":
-            continue
-        if any(part in _IGNORED_DIRECTORIES for part in relative.parts):
-            continue
-        value = relative.as_posix()
+    for value, path, _metadata in _iter_bounded_tree(root):
         if path.is_symlink() or path.is_file():
             if value not in expected:
                 unexpected.add(_gitlink_owner(value, gitlinks) or value)
@@ -387,33 +373,6 @@ def _gitlink_owner(path: str, gitlinks: tuple[str, ...]) -> str | None:
         (gitlink for gitlink in gitlinks if path.startswith(f"{gitlink}/")),
         None,
     )
-
-
-def _purge_generated_artifacts(root: Path) -> None:
-    """Remove interpreter/test caches from the isolated checkout before freezing."""
-
-    directories = sorted(
-        (
-            path
-            for path in root.rglob("*")
-            if path.name in _IGNORED_DIRECTORIES and path.name != ".git"
-            and ".git" not in path.relative_to(root).parts
-        ),
-        key=lambda path: len(path.parts),
-        reverse=True,
-    )
-    for path in directories:
-        if path.is_symlink():
-            path.unlink()
-        elif path.is_dir():
-            shutil.rmtree(path)
-    for path in root.rglob("*"):
-        if (
-            ".git" not in path.relative_to(root).parts
-            and path.is_file()
-            and path.suffix in _IGNORED_SUFFIXES
-        ):
-            path.unlink()
 
 
 def _validate_git_control_directory(root: Path) -> None:
@@ -481,31 +440,14 @@ def _clone_git_checkout(source: Path, destination: Path) -> None:
     run(("git", "remote", "set-url", "origin", origin), destination)
 
 
-def _git_output(root: Path, argv: tuple[str, ...], *, timeout: int) -> str:
-    result = SubprocessSupervisor(max_output_bytes=16 * 1024 * 1024).run(
-        argv,
-        cwd=root,
-        environment=_git_environment(),
-        timeout_seconds=timeout,
-    )
-    if result.exit_code != 0 or result.timed_out or result.stdout_truncated:
-        raise IntegrityError("Git source inspection failed", "repository_inspection_failed")
-    return result.stdout
-
-
-def _git_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
-    environment["GIT_CONFIG_NOSYSTEM"] = "1"
-    return environment
-
-
 __all__ = [
     "AgentCandidateWorker",
     "CandidateWorker",
     "E2ECandidate",
     "E2ECandidateRequest",
+    "FrozenCandidateSource",
     "SourceCandidateWorkspace",
-    "candidate_file_paths",
-    "make_candidate_read_only",
+    "frozen_candidate_source",
+    "materialize_frozen_sources",
+    "validate_frozen_sources",
 ]

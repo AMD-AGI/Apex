@@ -15,7 +15,12 @@ from apex.core import sha256_file
 from apex.execution import SubprocessSupervisor
 from apex.runtime import RepositoryLock, RunProvenance
 
-from .candidate import E2ECandidate
+from .candidate import (
+    E2ECandidate,
+    frozen_candidate_source,
+    materialize_frozen_sources,
+    validate_frozen_sources,
+)
 from .kernel_lane import KernelOpportunity
 from .overlay_config import OverlayConfigSet, derive_overlay_configs
 from .overlay_runtime import (
@@ -112,8 +117,7 @@ class DockerOverlayDeployment:
                 request,
                 error.reason_code,
                 error.details or {},
-                infrastructure_failure=error.reason_code
-                not in _CANDIDATE_DEPLOYMENT_FAILURES,
+                infrastructure_failure=True,
             )
         except (OSError, ValueError, yaml.YAMLError) as error:
             return _failed_deployment(
@@ -127,12 +131,16 @@ class DockerOverlayDeployment:
         candidate = request.candidate
         opportunity = request.opportunity
         _validate_request(request)
-        relative, candidate_path, baseline_path = _candidate_paths(candidate, opportunity)
+        relative, baseline_path = _candidate_paths(candidate, opportunity)
         lock = _matching_lock(opportunity, request.provenance)
         if lock is None:
             raise ContractError("No exact source lock for candidate", "source_lock_unresolved")
         lock_receipt = self._source_locks.verify(lock, expected_root=opportunity.source_root)
         artifact_root = _prepare_artifact_root(request.artifact_root)
+        snapshot_root = materialize_frozen_sources(
+            candidate, artifact_root / "frozen-candidate"
+        )
+        candidate_path = snapshot_root.joinpath(*PurePosixPath(relative).parts)
         parent, target = self._resolve_target(
             request, relative=relative, artifact_root=artifact_root
         )
@@ -339,6 +347,7 @@ def _validate_request(request: CandidateDeploymentRequest) -> None:
         or candidate.changed_files != candidate.editable_files
     ):
         raise ContractError("Overlay requires one frozen source edit", "invalid_frozen_candidate")
+    validate_frozen_sources(candidate)
 
 
 def _validate_target_mapping(
@@ -363,7 +372,7 @@ def _validate_target_mapping(
 
 def _candidate_paths(
     candidate: E2ECandidate, opportunity: KernelOpportunity
-) -> tuple[str, Path, Path]:
+) -> tuple[str, Path]:
     if opportunity.source_root is None or opportunity.source_path is None:
         raise ContractError("Kernel source is unresolved", "source_unresolved")
     relative = opportunity.source_path.resolve(strict=True).relative_to(
@@ -379,14 +388,8 @@ def _candidate_paths(
             "Selected source does not map to an overlay package",
             "source_mapping_mismatch",
         )
-    candidate_path = candidate.workspace.joinpath(*PurePosixPath(relative).parts)
-    if (
-        not candidate_path.is_file()
-        or candidate_path.is_symlink()
-        or candidate_path.stat().st_nlink != 1
-    ):
-        raise IntegrityError("Frozen candidate path is unsafe", "invalid_frozen_candidate")
-    return relative, candidate_path, opportunity.source_path
+    frozen_candidate_source(candidate, relative)
+    return relative, opportunity.source_path
 
 
 def _matching_lock(
@@ -523,15 +526,6 @@ def _failed_deployment(
         {"schema_version": 1, "failure": reason, "details": dict(details)},
         infrastructure_failure,
     )
-
-
-_CANDIDATE_DEPLOYMENT_FAILURES = {
-    "agent_made_no_source_change",
-    "candidate_lineage_mismatch",
-    "candidate_source_mapping_mismatch",
-    "invalid_frozen_candidate",
-    "safety_gate_failed",
-}
 
 
 __all__ = [

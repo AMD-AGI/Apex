@@ -15,7 +15,8 @@ from apex.ports import AgentSemanticEvent
 from apex.ports import DiagnosticsResult
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal, SnapshotStore
 
-from .candidate import E2ECandidate, candidate_file_paths
+from .candidate import E2ECandidate
+from .candidate_record import candidate_manifest, store_candidate_sources
 from .services import (
     CandidateDeployment,
     FinalDeliveryResult,
@@ -187,26 +188,8 @@ class E2ERunRecord:
 
     def record_candidate(self, candidate: E2ECandidate) -> ArtifactReceipt:
         self._record_agent_result(candidate)
-        sources = tuple(
-            self.artifacts.put_file(path, media_type="text/x-python")
-            for path in candidate_file_paths(candidate)
-            if path.is_file()
-        )
-        manifest = self.put_json(
-            {
-                "schema_version": 1,
-                "attempt_id": candidate.attempt_id,
-                "candidate_id": candidate.candidate_id,
-                "succeeded": candidate.succeeded,
-                "reason_code": candidate.reason_code,
-                "workspace": str(candidate.workspace),
-                "editable_files": list(candidate.editable_files),
-                "changed_files": list(candidate.changed_files),
-                "baseline_source_sha256": candidate.baseline_source_sha256,
-                "candidate_source_sha256": candidate.candidate_source_sha256,
-                "source_receipts": [item.to_dict() for item in sources],
-            }
-        )
+        sources = store_candidate_sources(self.artifacts, candidate)
+        manifest = self.put_json(candidate_manifest(candidate, sources))
         self.controller.record_domain_event(
             "candidate_frozen",
             {
@@ -404,6 +387,7 @@ class E2ERunRecord:
                 "engagement_verified": result.engagement_verified,
                 "validation_level": result.validation_level.value,
                 "reason_code": result.reason_code,
+                "infrastructure_failure": result.infrastructure_failure,
                 "artifacts": [_artifact_binding("primary_delivery", receipt)],
             },
             idempotency_key=f"attempt.{attempt_id}.delivery",

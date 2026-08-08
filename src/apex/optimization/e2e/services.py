@@ -24,7 +24,7 @@ from apex.evaluation.safety import (
 )
 from apex.runtime import RunProvenance
 
-from .candidate import E2ECandidate, make_candidate_read_only
+from .candidate import E2ECandidate, materialize_frozen_sources, validate_frozen_sources
 from .kernel_lane import KernelOpportunity
 
 
@@ -198,7 +198,12 @@ class NoToolSafetyVerifier:
         candidate = request.candidate
         if candidate.candidate_id is None or candidate.candidate_source_sha256 is None:
             raise ContractError("Safety requires a frozen candidate", "invalid_frozen_candidate")
-        make_candidate_read_only(candidate)
+        validate_frozen_sources(candidate)
+        artifact_root = _prepare_safety_artifact_root(request.artifact_root)
+        snapshot_root = materialize_frozen_sources(
+            candidate, artifact_root / "frozen-candidate"
+        )
+        evidence_root = artifact_root / "evidence"
         language = {
             "python": KernelLanguage.PYTHON,
             "triton": KernelLanguage.TRITON,
@@ -214,7 +219,7 @@ class NoToolSafetyVerifier:
             submission_paths=tuple(sorted(candidate.editable_files)),
             target_symbols=(request.opportunity.runtime_name,),
         )
-        frozen = FrozenCandidate.capture(candidate.workspace, profile)
+        frozen = FrozenCandidate.capture(snapshot_root, profile)
         policy = VerificationPolicy.no_tools()
         plan = VerificationPlan.create(
             run_id=request.run_id,
@@ -231,8 +236,8 @@ class NoToolSafetyVerifier:
             plan_fingerprint=plan.fingerprint,
             anchor_generation=request.anchor_generation,
             candidate_digest=frozen.candidate_digest,
-            frozen_root=str(candidate.workspace),
-            evaluator_artifact_root=str(request.artifact_root.resolve()),
+            frozen_root=str(snapshot_root),
+            evaluator_artifact_root=str(evidence_root),
             agent_process_tree_terminated=True,
             credentials_revoked=True,
             tool_channels_revoked=True,
@@ -245,7 +250,7 @@ class NoToolSafetyVerifier:
                 policy=policy,
                 frozen_candidate=frozen,
                 isolation_receipt=isolation,
-                artifact_root=request.artifact_root.resolve(),
+                artifact_root=evidence_root,
                 current_run_id=request.run_id,
                 current_candidate_id=candidate.candidate_id,
                 current_anchor_generation=request.anchor_generation,
@@ -261,6 +266,15 @@ class NoToolSafetyVerifier:
             reason_codes=result.decision.reason_codes,
             evidence=result.to_dict(),
         )
+
+
+def _prepare_safety_artifact_root(path: Path) -> Path:
+    if not path.is_absolute() or path.is_symlink():
+        raise ContractError("Safety artifact root is unsafe", "invalid_safety_artifact_root")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not path.is_dir():
+        raise ContractError("Safety artifact root is unsafe", "invalid_safety_artifact_root")
+    return path.resolve()
 
 
 @dataclass(frozen=True, slots=True)

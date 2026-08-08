@@ -33,6 +33,12 @@ from .services import (
 )
 
 
+_AGENT_TEARDOWN_INFRASTRUCTURE_FAILURES = {
+    "agent_process_cleanup_failed",
+    "agent_process_containment_unverified",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class SearchOutcome:
     """Durable search output consumed by finalization."""
@@ -202,12 +208,20 @@ class E2ESearchLoop:
             context_packet_id=context.compiled.packet.context_packet_id,
         )
         try:
-            candidate = self.worker.generate(self._candidate_request(attempt_id, opportunity, context.prompt))
-            receipt = self.record.record_candidate(candidate)
-        except ApexError as error:
-            self._reject_generation(attempt_id, error.reason_code)
-            return None
+            candidate = self.worker.generate(
+                self._candidate_request(attempt_id, opportunity, context.prompt)
+            )
+        except ApexError:
+            raise
+        except Exception as error:
+            raise ContractError(
+                "Candidate generation infrastructure failed",
+                "candidate_generation_infrastructure_failed",
+                {"error_type": type(error).__name__},
+            ) from error
+        receipt = self.record.record_candidate(candidate)
         if not candidate.succeeded or candidate.candidate_id is None:
+            _raise_agent_teardown_infrastructure(candidate, receipt)
             self.record.controller.reject_e2e_execution(
                 candidate_id=attempt_id,
                 receipt=receipt.digest,
@@ -236,23 +250,6 @@ class E2ESearchLoop:
             max_turns=self.spec.max_turns,
             timeout_seconds=self.spec.agent_timeout_seconds,
         )
-
-    def _reject_generation(self, attempt_id: str, reason: str) -> None:
-        receipt = self.record.put_json(
-            {
-                "schema_version": 1,
-                "attempt_id": attempt_id,
-                "reason_code": reason,
-                "stage": "candidate_generation",
-            }
-        )
-        self.record.controller.reject_e2e_execution(
-            candidate_id=attempt_id,
-            receipt=receipt.digest,
-            reason=reason,
-        )
-        self.record.controller.complete_e2e_update(stop=False, reason=reason)
-
     def _micro_gate(
         self,
         attempt_id: str,
@@ -481,6 +478,30 @@ class E2ESearchLoop:
             reason="no_reprofiled_opportunities" if not eligible else "continue",
         )
         return diagnosis
+
+
+def _raise_agent_teardown_infrastructure(
+    candidate: E2ECandidate, receipt: ArtifactReceipt
+) -> None:
+    if candidate.reason_code not in _AGENT_TEARDOWN_INFRASTRUCTURE_FAILURES:
+        return
+    result = candidate.agent_result
+    raise IntegrityError(
+        "Agent process teardown could not be verified",
+        candidate.reason_code,
+        {
+            "attempt_id": candidate.attempt_id,
+            "candidate_manifest_receipt": receipt.digest,
+            "capture_status": result.capture_status.value,
+            "termination_kind": result.termination_kind.value,
+            "termination_reason": result.termination_reason,
+            "process_containment": (
+                result.process_containment.to_dict()
+                if result.process_containment is not None
+                else None
+            ),
+        },
+    )
 
 
 def _opportunity_map(diagnosis: Diagnosis) -> dict[str, KernelOpportunity]:

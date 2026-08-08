@@ -89,12 +89,29 @@ transcript.
 
 Before the agent command is released, bubblewrap reports its namespace PID 1
 and namespace inodes, and the supervisor binds that identity to a start time and
-pidfd. Exact-turn and timeout paths send `SIGKILL` to that exact pidfd; Linux
+pidfd. The JSON status can precede bubblewrap's mount setup, so it is not itself
+a readiness signal. Within one bounded launch deadline Apex repeatedly checks
+the pidfd, start time, parent/inner PID mapping, and PID/mount/IPC/user namespace
+identity. It opens the target's actually visible `/proc` and uses that file
+descriptor's `mnt_id` to select the topmost mountinfo record; inherited or shared
+host procfs, propagation-enabled mounts, and proc superblocks matching the
+supervisor's `/proc` are rejected. The gate is released only after a second
+unchanged identity snapshot and a private `/proc/1` view.
+
+Exact-turn and timeout paths send `SIGKILL` to that exact pidfd; Linux
 then kills every namespace member, including `setsid`, double-forked, and
 environment-cleared descendants. Natural exit uses the same kernel semantics.
 Both paths require pidfd readiness, wrapper/status-FD completion, a complete
 namespace-membership scan, and zero live members before source capture. A
-process-group scan is not accepted as formal proof.
+process-group scan is not accepted as formal proof. Apex retains a read-only
+directory descriptor for the verified private procfs while the namespace is
+alive and enumerates that same procfs after teardown. A permission or I/O error
+makes `namespace_membership_scan_complete=false`; it can never be reported as a
+successful empty scan. If the stdout observer reaches its exact boundary while
+the wrapper is exiting, Apex drains the stdout decision before freezing the
+termination reason. The reason remains `stdout_budget_boundary`, while
+`teardown_mode` independently records whether pidfd `SIGKILL` was sent or the
+namespace had already exited naturally.
 
 The containment mount creates a private `/proc`, unshares user and IPC
 namespaces, and rebuilds Docker's masked/read-only system paths. Therefore an
@@ -168,7 +185,10 @@ Unit tests use fake executables to cover argv, timeout, limits, transcript
 capture, backend selection, environment injection rejection, credential
 isolation, Codex/Claude-shaped structured streams, summary de-duplication, and
 deterministic error mapping. CPU process tests prove exact-turn and natural-exit
-teardown defeat a `setsid` + double-fork + `clearenv` delayed writer.
+teardown defeat a `setsid` + double-fork + `clearenv` delayed writer. Deterministic
+containment tests cover the status/mount readiness race, visible topmost procfs
+selection, identity changes, incomplete membership scans, and the observer/wrapper
+exit race.
 
 ## Provenance
 

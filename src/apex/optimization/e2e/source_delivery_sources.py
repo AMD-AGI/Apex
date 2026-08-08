@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import os
-import shutil
+import stat
 from pathlib import Path, PurePosixPath
 from typing import Mapping, Sequence
 
-from apex.core import ContractError, IntegrityError, sha256_file, sha256_json
+from apex.core import (
+    ContractError,
+    IntegrityError,
+    sha256_bytes,
+    sha256_file,
+    sha256_json,
+)
 from apex.delivery import CapturedRepositoryPatch, capture_repository_patch
 from apex.execution import SubprocessSupervisor
 from apex.runtime import RepositoryLock, canonical_repository
 
+from .candidate import (
+    E2ECandidate,
+    FrozenCandidateSource,
+    frozen_candidate_source,
+    validate_frozen_sources,
+)
 from .services import AcceptedCandidate, FinalDeliveryRequest
 from .source_delivery_models import FormalRepositoryProfile, FormalSourceDeliveryProfile
 
@@ -146,7 +158,9 @@ class CumulativeSourceMaterializer:
             )
         _verify_candidate_digests(candidate, Path(lock.path))
         for relative in candidate.changed_files:
-            _copy_candidate_file(candidate.workspace, relative, target_root)
+            _write_frozen_candidate_file(
+                frozen_candidate_source(candidate, relative), target_root
+            )
 
     def _git(self, cwd: Path, *args: str, timeout: int = 60) -> str:
         environment = os.environ.copy()
@@ -166,45 +180,136 @@ class CumulativeSourceMaterializer:
         return result.stdout.strip()
 
 
-def _copy_candidate_file(workspace: Path, relative: str, target_root: Path) -> None:
-    path = PurePosixPath(relative)
-    if path.is_absolute() or ".." in path.parts or path.suffix != ".py":
+def _write_frozen_candidate_file(
+    source: FrozenCandidateSource, target_root: Path
+) -> None:
+    path = PurePosixPath(source.relative_path)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or not path.parts
+        or path.as_posix() != source.relative_path
+        or path.suffix != ".py"
+    ):
         raise ContractError(
             "Only safe Python/Triton source is deliverable", "unsupported_delivery"
         )
-    source = workspace.joinpath(*path.parts)
-    destination = target_root.joinpath(*path.parts)
-    if (
-        source.is_symlink()
-        or not source.is_file()
-        or destination.is_symlink()
-        or not destination.is_file()
-    ):
-        raise IntegrityError(
-            "Accepted source file is unsafe", "invalid_frozen_candidate"
+    root_descriptor = _open_directory(target_root)
+    parent_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        parent_descriptor = _open_relative_directory(
+            root_descriptor, path.parts[:-1]
         )
-    destination_mode = destination.stat().st_mode & 0o777
-    shutil.copyfile(source, destination)
-    destination.chmod(destination_mode)
+        descriptor = os.open(
+            path.name,
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent_descriptor,
+        )
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise IntegrityError(
+                "Accepted destination is not a unique regular file",
+                "invalid_frozen_candidate",
+            )
+        destination_mode = before.st_mode & 0o777
+        if source.mode != destination_mode:
+            raise IntegrityError(
+                "Frozen source mode differs from the exact baseline",
+                "candidate_lineage_mismatch",
+            )
+        os.ftruncate(descriptor, 0)
+        _write_all(descriptor, source.content)
+        os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        observed = _read_all(descriptor)
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or sha256_bytes(observed) != source.sha256
+        ):
+            raise IntegrityError(
+                "Materialized frozen source differs from its snapshot",
+                "candidate_lineage_mismatch",
+            )
+        os.fchmod(descriptor, destination_mode)
+    except OSError as error:
+        raise IntegrityError(
+            "Accepted source destination is unsafe", "invalid_frozen_candidate"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        os.close(root_descriptor)
 
 
-def _verify_candidate_digests(candidate: object, base_root: Path) -> None:
-    editable = tuple(getattr(candidate, "editable_files"))
-    workspace = Path(getattr(candidate, "workspace"))
+def _open_directory(path: Path) -> int:
+    try:
+        return os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise IntegrityError(
+            "Accepted source root is unsafe", "invalid_frozen_candidate"
+        ) from error
+
+
+def _open_relative_directory(root_descriptor: int, parts: Sequence[str]) -> int:
+    descriptor = os.dup(root_descriptor)
+    try:
+        for part in parts:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+    except OSError as error:
+        os.close(descriptor)
+        raise IntegrityError(
+            "Accepted source path traverses an unsafe directory",
+            "invalid_frozen_candidate",
+        ) from error
+    return descriptor
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short frozen source write")
+        view = view[written:]
+
+
+def _read_all(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _verify_candidate_digests(
+    candidate: E2ECandidate, base_root: Path
+) -> None:
+    validate_frozen_sources(candidate)
+    editable = candidate.editable_files
     baseline = _source_set_digest(base_root, editable)
-    optimized = _source_set_digest(workspace, editable, mode_root=base_root)
-    if (
-        baseline != getattr(candidate, "baseline_source_sha256")
-        or optimized != getattr(candidate, "candidate_source_sha256")
-    ):
+    if baseline != candidate.baseline_source_sha256:
         raise IntegrityError(
             "Candidate source lineage changed", "candidate_lineage_mismatch"
         )
 
 
-def _source_set_digest(
-    root: Path, paths: Sequence[str], *, mode_root: Path | None = None
-) -> str:
+def _source_set_digest(root: Path, paths: Sequence[str]) -> str:
     values: list[dict[str, object]] = []
     for relative in paths:
         path = root.joinpath(*PurePosixPath(relative).parts)
@@ -212,12 +317,11 @@ def _source_set_digest(
             raise IntegrityError(
                 "Candidate source is not regular", "invalid_frozen_candidate"
             )
-        mode_path = mode_root.joinpath(*PurePosixPath(relative).parts) if mode_root else path
         values.append(
             {
                 "path": relative,
                 "sha256": sha256_file(path),
-                "mode": mode_path.stat().st_mode & 0o777,
+                "mode": path.stat().st_mode & 0o777,
             }
         )
     return sha256_json({"schema_version": 1, "files": values})

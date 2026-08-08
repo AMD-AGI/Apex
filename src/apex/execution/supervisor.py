@@ -193,12 +193,38 @@ class SubprocessSupervisor:
             observer_stop=observer_stop,
             timeout_seconds=timeout_seconds,
         )
+        if not timed_out and not observer_started:
+            # The wrapper can exit after writing the boundary but before the
+            # stdout reader has evaluated that line. Drain it before freezing
+            # the reason so transcript and containment evidence cannot diverge.
+            readers_finished = self._finish_readers(
+                process.pid, readers, contained=True
+            )
+            observer_started = observer_stop.is_set()
+            reason = (
+                "stdout_budget_boundary"
+                if observer_started
+                else "natural_exit"
+                if readers_finished
+                else "stdout_observer_unresolved"
+            )
+            receipt = finalize_pid_namespace(
+                process,
+                boundary,
+                termination_reason=reason,
+                terminate=observer_started or not readers_finished,
+                timeout_seconds=max(self._kill_grace_seconds, 1.0),
+            )
+            return (
+                False,
+                observer_started,
+                receipt,
+                readers_finished and receipt.namespace_empty_verified,
+            )
         reason = (
             "timeout"
             if timed_out
             else "stdout_budget_boundary"
-            if observer_started
-            else "natural_exit"
         )
         receipt = finalize_pid_namespace(
             process,
@@ -291,10 +317,14 @@ class SubprocessSupervisor:
                         if should_stop:
                             if boundary is None:
                                 raise RuntimeError("stream boundary lacks process containment")
+                            observer_stop.set()
                             try:
                                 boundary.terminate_now()
-                            finally:
-                                observer_stop.set()
+                            except Exception:
+                                # The supervisor observes the boundary and repeats
+                                # exact-pidfd teardown while producing fail-closed
+                                # containment evidence.
+                                return
             finally:
                 pipe.close()  # type: ignore[union-attr]
 
@@ -318,13 +348,16 @@ class SubprocessSupervisor:
         timeout_seconds: int,
     ) -> tuple[bool, bool]:
         deadline = time.monotonic() + timeout_seconds
-        while process.poll() is None:
+        while True:
+            if observer_stop.is_set():
+                return False, True
+            if process.poll() is not None:
+                return False, observer_stop.is_set()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return True, False
             if observer_stop.wait(timeout=min(remaining, 0.05)):
                 return False, True
-        return False, False
 
     def _wait_uncontained(
         self, process: subprocess.Popen[str], timeout_seconds: int

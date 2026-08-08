@@ -9,10 +9,14 @@ import pytest
 import yaml
 
 import apex.bootstrap as application_bootstrap
+import apex.optimization.e2e.candidate_snapshot as candidate_snapshot
 from apex.core import AgentBackendName, ContractError, IntegrityError, TaskStatus, ValidationLevel
 from apex.core import sha256_bytes, sha256_file, sha256_json
-from apex.optimization.e2e.candidate import E2ECandidate
-from apex.optimization.e2e.candidate import AgentCandidateWorker
+from apex.optimization.e2e.candidate import (
+    AgentCandidateWorker,
+    E2ECandidate,
+    FrozenCandidateSource,
+)
 from apex.optimization.e2e.deferred import E2EDeferredMicroQualifier
 from apex.optimization.e2e.oracle_preflight import DockerOracleMicroQualifier
 from apex.optimization.e2e.docker_overlay import (
@@ -35,7 +39,9 @@ from apex.optimization.e2e.services import (
     FinalDeliveryRequest,
     MicroQualification,
     MicroQualificationRequest,
+    NoToolSafetyVerifier,
     SafetyQualification,
+    SafetyQualificationRequest,
 )
 from apex.ports import AgentResult
 from apex.runtime import (
@@ -69,6 +75,8 @@ class FakeEngine:
         self.inspected_parent_id = PARENT_ID
         self.mapping_path = "/usr/lib/python/site-packages/vllm/kernels/op.py"
         self.returned_repo_relative: str | None = None
+        self.built_candidate_source: Path | None = None
+        self.build_failure_reason: str | None = None
         self.calls: list[str] = []
 
     def inspect_image(self, reference, *, cwd):
@@ -97,6 +105,9 @@ class FakeEngine:
 
     def build_overlay(self, *, parent, candidate_source, target, build_root, cwd):
         self.calls.append("build")
+        self.built_candidate_source = candidate_source.resolve(strict=True)
+        if self.build_failure_reason is not None:
+            raise IntegrityError("overlay context drifted", self.build_failure_reason)
         assert parent.image_id == PARENT_ID
         assert parent.verified_repo_digest == PARENT_REPO_DIGEST
         return BuiltOverlay(ContainerImage(DERIVED_ID, DERIVED_ID), "d" * 64, self.candidate_sha)
@@ -179,6 +190,7 @@ def _fixture(tmp_path: Path, *, library: str = "vllm", suffix: str = ".py"):
     candidate_path = workspace / relative
     candidate_path.parent.mkdir(parents=True)
     candidate_path.write_text("BASELINE = False\n", encoding="utf-8")
+    frozen = _frozen_source(relative.as_posix(), candidate_path)
     opportunity = _opportunity(source_root, baseline, library=library, language="triton")
     candidate = E2ECandidate(
         "attempt-1",
@@ -188,9 +200,10 @@ def _fixture(tmp_path: Path, *, library: str = "vllm", suffix: str = ".py"):
         workspace,
         (relative.as_posix(),),
         (relative.as_posix(),),
-        "1" * 64,
-        "2" * 64,
+        _source_set_sha256(relative.as_posix(), baseline),
+        _source_set_sha256(relative.as_posix(), candidate_path),
         AgentResult(AgentBackendName.CODEX, None, 0, False, (), "", "", 1.0),
+        (frozen,),
     )
     views, semantics = _views(tmp_path)
     provenance = _provenance(source_root, library)
@@ -212,6 +225,55 @@ def _fixture(tmp_path: Path, *, library: str = "vllm", suffix: str = ".py"):
         baseline_sha=sha256_file(baseline), candidate_sha=sha256_file(candidate_path)
     )
     return opportunity, candidate, request, engine
+
+
+def _frozen_source(relative: str, path: Path) -> FrozenCandidateSource:
+    content = path.read_bytes()
+    return FrozenCandidateSource(
+        relative,
+        sha256_bytes(content),
+        path.stat().st_mode & 0o777,
+        content,
+    )
+
+
+def _source_set_sha256(relative: str, path: Path) -> str:
+    return sha256_json(
+        {
+            "schema_version": 1,
+            "files": [
+                {
+                    "path": relative,
+                    "sha256": sha256_file(path),
+                    "mode": path.stat().st_mode & 0o777,
+                }
+            ],
+        }
+    )
+
+
+def _remap_candidate(candidate: E2ECandidate, relative: str) -> E2ECandidate:
+    source = candidate.frozen_sources[0]
+    remapped = FrozenCandidateSource(relative, source.sha256, source.mode, source.content)
+    digest = sha256_json(
+        {
+            "schema_version": 1,
+            "files": [
+                {
+                    "path": relative,
+                    "sha256": source.sha256,
+                    "mode": source.mode,
+                }
+            ],
+        }
+    )
+    return replace(
+        candidate,
+        editable_files=(relative,),
+        changed_files=(relative,),
+        candidate_source_sha256=digest,
+        frozen_sources=(remapped,),
+    )
 
 
 def _opportunity(root: Path, source: Path, *, library: str, language: str):
@@ -458,6 +520,86 @@ def test_overlay_success_attests_loaded_bytes_and_changes_only_image(tmp_path: P
         assert after["benchmark"]["docker_image"] == DERIVED_ID
         after["benchmark"]["docker_image"] = before["benchmark"]["docker_image"]
         assert after == before
+
+
+def test_overlay_materializes_frozen_bytes_without_reopening_agent_workspace(
+    tmp_path: Path,
+):
+    _, candidate, request, engine = _fixture(tmp_path)
+    source = candidate.frozen_sources[0]
+    workspace_path = candidate.workspace / source.relative_path
+    workspace_path.unlink()
+
+    deployment = DockerOverlayDeployment(engine, FakeLockVerifier()).deploy(request)
+
+    assert deployment.qualified is True
+    snapshot = request.artifact_root / "frozen-candidate" / source.relative_path
+    assert engine.built_candidate_source == snapshot.resolve(strict=True)
+    assert snapshot.read_bytes() == source.content
+    assert snapshot.stat().st_mode & 0o222 == 0
+
+
+def test_no_tool_safety_uses_artifact_snapshot_after_workspace_disappears(
+    tmp_path: Path,
+):
+    opportunity, candidate, _, _ = _fixture(tmp_path)
+    source = candidate.frozen_sources[0]
+    (candidate.workspace / source.relative_path).unlink()
+    artifact_root = (tmp_path / "safety-artifacts").resolve()
+
+    result = NoToolSafetyVerifier().verify(
+        SafetyQualificationRequest(
+            "run-1", candidate, opportunity, artifact_root, 0
+        )
+    )
+
+    snapshot = artifact_root / "frozen-candidate" / source.relative_path
+    assert result.allowed_to_measure is True
+    assert result.promotion_eligible is True
+    assert snapshot.read_bytes() == source.content
+    assert snapshot.stat().st_mode & 0o222 == 0
+    assert (artifact_root / "evidence").is_dir()
+
+
+def test_no_tool_safety_snapshot_io_failure_is_typed_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    opportunity, candidate, _, _ = _fixture(tmp_path)
+    artifact_root = (tmp_path / "safety-artifacts").resolve()
+
+    def fail_write(_destination, _source):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(candidate_snapshot, "_write_frozen_source", fail_write)
+    with pytest.raises(IntegrityError) as raised:
+        NoToolSafetyVerifier().verify(
+            SafetyQualificationRequest(
+                "run-1", candidate, opportunity, artifact_root, 0
+            )
+        )
+
+    assert raised.value.reason_code == "candidate_snapshot_materialization_failed"
+    assert raised.value.details == {"error_type": "OSError"}
+    assert not (artifact_root / "frozen-candidate").exists()
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    ["candidate_lineage_mismatch", "immutable_overlay_context_drift"],
+)
+def test_overlay_context_mismatch_is_infrastructure_failure(
+    tmp_path: Path, reason_code: str
+):
+    _, _, request, engine = _fixture(tmp_path)
+    if reason_code == "candidate_lineage_mismatch":
+        engine.candidate_sha = "0" * 64
+    else:
+        engine.build_failure_reason = reason_code
+
+    result = DockerOverlayDeployment(engine, FakeLockVerifier()).deploy(request)
+
+    assert result.reason_code == reason_code
+    assert result.infrastructure_failure is True
 
 
 def test_overlay_uses_tag_repository_to_select_one_allowed_digest(tmp_path: Path):
@@ -809,28 +951,24 @@ def test_overlay_does_not_support_unknown_library_or_non_python_source(
     assert adapter.supports(opportunity, request.provenance) is False
 
 
-def test_overlay_classifies_candidate_changed_file_mismatch_as_rejectable(
+def test_overlay_classifies_candidate_changed_file_mismatch_as_infrastructure(
     tmp_path: Path,
 ):
     _, candidate, request, engine = _fixture(tmp_path)
     changed = ("vllm/kernels/other.py",)
     mismatched = replace(
         request,
-        candidate=replace(
-            candidate,
-            editable_files=changed,
-            changed_files=changed,
-        ),
+        candidate=_remap_candidate(candidate, changed[0]),
     )
 
     result = DockerOverlayDeployment(engine, FakeLockVerifier()).deploy(mismatched)
 
     assert result.reason_code == "candidate_source_mapping_mismatch"
-    assert result.infrastructure_failure is False
+    assert result.infrastructure_failure is True
     assert engine.calls == []
 
 
-def test_overlay_classifies_defensive_safety_failure_as_rejectable(tmp_path: Path):
+def test_overlay_classifies_defensive_safety_failure_as_infrastructure(tmp_path: Path):
     _, _, request, engine = _fixture(tmp_path)
     denied = replace(
         request,
@@ -845,7 +983,7 @@ def test_overlay_classifies_defensive_safety_failure_as_rejectable(tmp_path: Pat
     result = DockerOverlayDeployment(engine, FakeLockVerifier()).deploy(denied)
 
     assert result.reason_code == "safety_gate_failed"
-    assert result.infrastructure_failure is False
+    assert result.infrastructure_failure is True
     assert engine.calls == []
 
 
@@ -858,18 +996,7 @@ def test_overlay_rejects_wrong_repo_to_package_mapping(tmp_path: Path):
         request.opportunity.source_root, wrong, library="vllm", language="triton"
     )
     changed = "kernels/op.py"
-    wrong_candidate = E2ECandidate(
-        candidate.attempt_id,
-        candidate.candidate_id,
-        True,
-        candidate.reason_code,
-        candidate.workspace,
-        (changed,),
-        (changed,),
-        candidate.baseline_source_sha256,
-        candidate.candidate_source_sha256,
-        candidate.agent_result,
-    )
+    wrong_candidate = _remap_candidate(candidate, changed)
     wrong_request = CandidateDeploymentRequest(
         request.run_id,
         wrong_candidate,
