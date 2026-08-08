@@ -230,6 +230,7 @@ def _metadata(
     receipt: DependencyReceipt,
     quality_tasks: str,
     evaluator_policy: EvaluatorPolicy | None,
+    diagnostic_trace_only: bool = False,
 ) -> dict[str, Any]:
     return {
         "benchmark_view": {
@@ -255,8 +256,12 @@ def _metadata(
                 },
             },
             "quality_contract": {
-                "required": True,
-                "kind": "lm_eval" if quality_tasks else "framework_quality_gate",
+                "required": not diagnostic_trace_only,
+                "kind": (
+                    "trace_only"
+                    if diagnostic_trace_only
+                    else "lm_eval" if quality_tasks else "framework_quality_gate"
+                ),
                 "tasks": quality_tasks,
                 "evaluator_policy": (
                     evaluator_policy.to_dict() if evaluator_policy else None
@@ -370,6 +375,10 @@ def _diagnostic_document(
 ) -> dict[str, Any]:
     result = copy.deepcopy(dict(document))
     _freeze_quality_contract(result["benchmark"], evaluator_policy)
+    diagnostic_trace_only = bool(quality_tasks)
+    if diagnostic_trace_only:
+        result["benchmark"]["envs"]["RUN_EVAL"] = "false"
+        result["benchmark"].pop("lm_eval_runtime", None)
     _enable_diagnostics(result["benchmark"], binding, source_repository_roots)
     result["benchmark"]["run_kind"] = "diagnostic"
     _attach_metadata(
@@ -382,6 +391,7 @@ def _diagnostic_document(
             receipt=receipt,
             quality_tasks=quality_tasks,
             evaluator_policy=evaluator_policy,
+            diagnostic_trace_only=diagnostic_trace_only,
         ),
     )
     return result
@@ -424,9 +434,21 @@ def _assert_view_semantics(
     quality_tasks: str,
 ) -> None:
     diagnostic_tasks = diagnostic["benchmark"]["envs"].get("MAGPIE_EVAL_TASKS", "")
-    views = (diagnostic["benchmark"], replay["benchmark"])
-    if diagnostic_tasks != quality_tasks or any(
-        sha256_json(_workload_projection(view)) != semantics_sha256 for view in views
+    diagnostic_projection = _workload_projection(diagnostic["benchmark"])
+    replay_projection = _workload_projection(replay["benchmark"])
+    if quality_tasks:
+        diagnostic_projection["envs"]["RUN_EVAL"] = "true"
+        diagnostic_projection["lm_eval_runtime"] = replay_projection["lm_eval_runtime"]
+    metadata = diagnostic["apex"]["benchmark_view"]["quality_contract"]
+    diagnostic_contract_valid = (
+        metadata.get("required") is False
+        and metadata.get("kind") == "trace_only"
+    ) if quality_tasks else metadata.get("required") is True
+    if (
+        diagnostic_tasks != quality_tasks
+        or not diagnostic_contract_valid
+        or sha256_json(diagnostic_projection) != semantics_sha256
+        or sha256_json(replay_projection) != semantics_sha256
     ):
         raise IntegrityError(
             "Generated benchmark views changed workload or quality semantics",
@@ -478,13 +500,7 @@ def build_config_views(
     gpu_devices: str | None = None,
     hf_offline: bool = False,
 ) -> BenchmarkConfigViews:
-    """Create immutable original, measurement, diagnostic, and replay YAML views.
-
-    The original is copied byte-for-byte. Executable views freeze a serving
-    quality contract, measurement/replay disable instrumentation, diagnostic
-    enables only the Torch/TraceLens acquisition stack, and replay may change
-    only the image locator.
-    """
+    """Create immutable phase-specific benchmark configuration views."""
 
     source, destination = _prepare_view_paths(original_config, output_dir)
     source_roots = _validated_source_roots(source_repository_roots)

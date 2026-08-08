@@ -4,6 +4,8 @@ import json
 import hashlib
 from pathlib import Path
 
+import yaml
+
 from apex.benchmark import MagpieBenchmarkAdapter, build_config_views
 from apex.execution import ProcessResult
 from apex.ports import BenchmarkPass, BenchmarkRequest
@@ -202,6 +204,74 @@ class FakeSupervisor:
         )
 
 
+class FakeDiagnosticSupervisor:
+    def __init__(self, receipt: DependencyReceipt) -> None:
+        self.receipt = receipt
+
+    def run(self, argv, *, cwd, environment, timeout_seconds, stdin_text=None):
+        config_path = Path(argv[argv.index("--benchmark-config") + 1])
+        benchmark = yaml.safe_load(config_path.read_text())["benchmark"]
+        assert benchmark["envs"]["RUN_EVAL"] == "false"
+        assert "lm_eval_runtime" not in benchmark
+        output_root = Path(argv[argv.index("--output-dir") + 1])
+        workspace = output_root / "benchmark_vllm_20260807_000001"
+        workspace.mkdir()
+        (workspace / "inferencex_runtime").mkdir()
+        inferencex_receipt = {
+            "schema": "magpie.inferencex-runtime-receipt/v1",
+            "source_root": str(self.receipt.root("inferencex").resolve()),
+            "source_is_git": True,
+            "source_commit": self.receipt.commits["inferencex"],
+            "source_tree": self.receipt.lm_eval_runtime.identity["inferencex_tree"],
+            "source_clean": True,
+            "source_status_sha256": (
+                "e3b0c44298fc1c149afbf4c8996fb924"
+                "27ae41e4649b934ca495991b7852b855"
+            ),
+            "source_status_unchanged": True,
+            "runtime_path": "inferencex_runtime",
+            "materialization_method": "git_private_index_checkout",
+        }
+        (workspace / "inferencex_runtime_receipt.json").write_text(
+            json.dumps(inferencex_receipt), encoding="utf-8"
+        )
+        not_requested = {
+            "schema": "magpie.lm-eval-runtime-evidence/v1",
+            "requested": False,
+            "status": "not_requested",
+            "verified": False,
+            "evidence_present": False,
+            "runtime_sha256": None,
+            "identity": None,
+            "mount_mode": None,
+            "manifest_artifact": None,
+            "receipt_artifact": None,
+            "errors": [],
+        }
+        report = {
+            "success": True,
+            "framework": "vllm",
+            "model": "Qwen/example",
+            "workspace_dir": str(workspace),
+            "profiling_enabled": True,
+            "run_kind": "diagnostic",
+            "reward_eligible": False,
+            "inferencex_runtime_receipt": inferencex_receipt,
+            "lm_eval_runtime_receipt": not_requested,
+            "throughput": {"output_throughput": 9.0},
+            "latency": {},
+            "errors": [],
+        }
+        (workspace / "benchmark_report.json").write_text(
+            json.dumps(report), encoding="utf-8"
+        )
+        return ProcessResult(
+            argv=tuple(argv), exit_code=0, timed_out=False,
+            stdout="ok", stderr="", stdout_truncated=False,
+            stderr_truncated=False, duration_seconds=0.1,
+        )
+
+
 def test_adapter_uses_receipt_python_argv_and_normalizes_result(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -258,6 +328,29 @@ def test_adapter_uses_receipt_python_argv_and_normalizes_result(
     )
 
 
+def test_adapter_runs_serving_diagnostic_without_lm_eval_runtime(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    measurement = _config(tmp_path, receipt)
+    diagnostic = measurement.parent / "benchmark.diagnostic.resolved.yaml"
+    adapter = MagpieBenchmarkAdapter(receipt, FakeDiagnosticSupervisor(receipt))
+    request = BenchmarkRequest(
+        run_id="diagnostic",
+        config_path=diagnostic,
+        output_dir=tmp_path / "runs",
+        pass_type=BenchmarkPass.DIAGNOSTIC,
+        timeout_seconds=99,
+    )
+
+    result = adapter.run_normalized(request)
+
+    assert result.succeeded
+    assert result.quality.required is False
+    assert result.lm_eval_runtime.required is False
+    assert result.lm_eval_runtime.passed
+
+
 def test_lm_eval_evidence_is_required_only_for_lm_eval_quality(tmp_path: Path) -> None:
     receipt = _receipt(tmp_path)
     benchmark = {"run_mode": "docker"}
@@ -265,6 +358,9 @@ def test_lm_eval_evidence_is_required_only_for_lm_eval_quality(tmp_path: Path) -
     assert _lm_eval_expectation(
         benchmark, {"required": True, "kind": "framework_quality_gate"}, receipt
     ) == (None, None)
+    assert _lm_eval_expectation(
+        benchmark, {"required": False, "kind": "trace_only"}, receipt
+    ) == (None, "not_requested")
     assert _lm_eval_expectation(
         benchmark, {"required": True, "kind": "lm_eval"}, receipt
     ) == (receipt.lm_eval_runtime, "docker")

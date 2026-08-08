@@ -119,6 +119,22 @@ def parse_lm_eval_runtime_evidence(
     """Rehash Magpie's receipt and manifest snapshot against Apex's receipt."""
 
     value = report.get("lm_eval_runtime_receipt")
+    if expected is None and execution_mode == "not_requested":
+        if _valid_not_requested(value):
+            return LmEvalRuntimeEvidence(
+                False, True, None, None, None, None, None, None
+            )
+        return LmEvalRuntimeEvidence(
+            False,
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "lm_eval_not_requested_evidence_missing",
+        )
     if expected is None and execution_mode is None:
         if value is None:
             return LmEvalRuntimeEvidence(False, True, None, None, None, None, None, None)
@@ -171,6 +187,26 @@ def parse_lm_eval_runtime_evidence(
     return LmEvalRuntimeEvidence(
         True, True, expected.runtime_sha256, dict(expected.identity),
         manifest_path, receipt_path, execution_mode, read_only,
+    )
+
+
+def _valid_not_requested(value: Any) -> bool:
+    """Accept Magpie's explicit non-evidence receipt for trace-only passes."""
+
+    if not isinstance(value, Mapping) or set(value) != _EVIDENCE_FIELDS:
+        return False
+    return (
+        value.get("schema") == _EVIDENCE_SCHEMA
+        and value.get("requested") is False
+        and value.get("status") == "not_requested"
+        and value.get("verified") is False
+        and value.get("evidence_present") is False
+        and value.get("runtime_sha256") is None
+        and value.get("identity") is None
+        and value.get("mount_mode") is None
+        and value.get("manifest_artifact") is None
+        and value.get("receipt_artifact") is None
+        and value.get("errors") == []
     )
 
 

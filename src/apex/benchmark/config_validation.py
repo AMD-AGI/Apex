@@ -29,11 +29,11 @@ def validate_view_contract(
     _validate_dependency_identity(
         metadata, receipt, tracelens_root, tracelens_commit
     )
-    _validate_semantics_identity(benchmark, metadata)
     _validate_run_kind(benchmark, pass_type)
-    _validate_quality_enabled(benchmark)
+    _validate_quality_contract(benchmark, metadata, pass_type)
+    _validate_semantics_identity(benchmark, metadata, pass_type, receipt)
     _validate_evaluator_policy(benchmark, metadata)
-    _validate_lm_eval_runtime(benchmark, receipt)
+    _validate_lm_eval_runtime(benchmark, receipt, pass_type)
     _validate_instrumentation(benchmark, pass_type, tracelens_root)
 
 
@@ -100,14 +100,41 @@ def _validate_dependency_identity(
         )
 
 
-def _validate_quality_enabled(benchmark: Mapping[str, Any]) -> None:
+def _validate_quality_contract(
+    benchmark: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    pass_type: BenchmarkPass,
+) -> None:
     envs = benchmark.get("envs")
     framework = str(benchmark.get("framework", "")).strip().lower()
-    if framework in SERVING_FRAMEWORKS and (
-        not isinstance(envs, Mapping) or not _enabled(envs.get("RUN_EVAL"))
-    ):
+    if framework not in SERVING_FRAMEWORKS:
+        return
+    quality = metadata.get("quality_contract")
+    if not isinstance(envs, Mapping) or not isinstance(quality, Mapping):
         raise ConfigurationError(
-            "Serving benchmark view is missing RUN_EVAL=true",
+            "Serving benchmark view lacks a typed quality contract",
+            "quality_contract_missing",
+        )
+    tasks = envs.get("MAGPIE_EVAL_TASKS")
+    tasks_match = isinstance(tasks, str) and tasks == quality.get("tasks")
+    if pass_type is BenchmarkPass.MEASUREMENT:
+        valid = (
+            _enabled(envs.get("RUN_EVAL"))
+            and quality.get("required") is True
+            and quality.get("kind") == "lm_eval"
+            and tasks_match
+        )
+    else:
+        valid = (
+            _disabled(envs.get("RUN_EVAL"))
+            and quality.get("required") is False
+            and quality.get("kind") == "trace_only"
+            and tasks_match
+        )
+    if not valid:
+        lane = "measurement quality" if pass_type is BenchmarkPass.MEASUREMENT else "trace-only diagnostic"
+        raise ConfigurationError(
+            f"Serving benchmark view violates its {lane} contract",
             "quality_contract_missing",
         )
 
@@ -137,10 +164,19 @@ def _validate_evaluator_policy(
 
 
 def _validate_lm_eval_runtime(
-    benchmark: Mapping[str, Any], receipt: DependencyReceipt
+    benchmark: Mapping[str, Any],
+    receipt: DependencyReceipt,
+    pass_type: BenchmarkPass,
 ) -> None:
     framework = str(benchmark.get("framework", "")).strip().lower()
     if framework not in SERVING_FRAMEWORKS:
+        return
+    if pass_type is BenchmarkPass.DIAGNOSTIC:
+        if "lm_eval_runtime" in benchmark:
+            raise ConfigurationError(
+                "Trace-only diagnostic cannot carry an lm-eval runtime",
+                "benchmark_lm_eval_runtime_mismatch",
+            )
         return
     runtime = receipt.lm_eval_runtime
     configured = benchmark.get("lm_eval_runtime")
@@ -176,11 +212,30 @@ def _validate_run_kind(
 
 
 def _validate_semantics_identity(
-    benchmark: Mapping[str, Any], metadata: Mapping[str, Any]
+    benchmark: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    pass_type: BenchmarkPass,
+    receipt: DependencyReceipt,
 ) -> None:
     projected = copy.deepcopy(dict(benchmark))
     for key in ("profiler", "gap_analysis", "docker_image", "run_kind"):
         projected.pop(key, None)
+    if (
+        pass_type is BenchmarkPass.DIAGNOSTIC
+        and str(benchmark.get("framework", "")).strip().lower() in SERVING_FRAMEWORKS
+    ):
+        projected["envs"]["RUN_EVAL"] = "true"
+        runtime = receipt.lm_eval_runtime
+        if runtime is None:
+            raise ConfigurationError(
+                "Trace-only diagnostic lacks its formal evaluator binding",
+                "benchmark_lm_eval_runtime_mismatch",
+            )
+        projected["lm_eval_runtime"] = {
+            "path": str(runtime.root),
+            "sha256": runtime.runtime_sha256,
+            "identity": dict(runtime.identity),
+        }
     observed = sha256_json(projected)
     if metadata.get("workload_semantics_sha256") != observed:
         raise ConfigurationError(
@@ -253,6 +308,14 @@ def _enabled(value: Any) -> bool:
         return True
     return isinstance(value, str) and value.strip().lower() in {
         "1", "true", "yes", "on"
+    }
+
+
+def _disabled(value: Any) -> bool:
+    if value is False or value == 0:
+        return True
+    return isinstance(value, str) and value.strip().lower() in {
+        "0", "false", "no", "off"
     }
 
 

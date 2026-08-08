@@ -107,7 +107,9 @@ def _workload(document: dict) -> dict:
     return benchmark
 
 
-def test_builds_four_immutable_semantically_equal_views(tmp_path: Path) -> None:
+def test_builds_trace_only_diagnostic_and_formal_measurement_views(
+    tmp_path: Path,
+) -> None:
     source = _source(tmp_path)
     original_bytes = source.read_bytes()
     receipt = _receipt(tmp_path)
@@ -123,12 +125,32 @@ def test_builds_four_immutable_semantically_equal_views(tmp_path: Path) -> None:
     measurement = _load(views.measurement)
     diagnostic = _load(views.diagnostic)
     replay = _load(views.replay)
-    assert _workload(measurement) == _workload(diagnostic) == _workload(replay)
+    measurement_workload = _workload(measurement)
+    diagnostic_workload = _workload(diagnostic)
+    assert measurement_workload == _workload(replay)
+    assert diagnostic_workload["envs"]["RUN_EVAL"] == "false"
+    assert "lm_eval_runtime" not in diagnostic_workload
+    diagnostic_workload["envs"]["RUN_EVAL"] = "true"
+    diagnostic_workload["lm_eval_runtime"] = measurement_workload["lm_eval_runtime"]
+    assert diagnostic_workload == measurement_workload
     assert measurement["benchmark"]["envs"]["RUN_EVAL"] == "true"
     assert measurement["benchmark"]["envs"]["MAGPIE_EVAL_TASKS"] == "gsm8k"
     assert measurement["benchmark"]["run_kind"] == "measurement"
     assert replay["benchmark"]["run_kind"] == "measurement"
     assert diagnostic["benchmark"]["run_kind"] == "diagnostic"
+    assert diagnostic["apex"]["benchmark_view"]["quality_contract"] == {
+        "required": False,
+        "kind": "trace_only",
+        "tasks": "gsm8k",
+        "evaluator_policy": None,
+    }
+    for document in (measurement, replay):
+        assert document["apex"]["benchmark_view"]["quality_contract"] == {
+            "required": True,
+            "kind": "lm_eval",
+            "tasks": "gsm8k",
+            "evaluator_policy": None,
+        }
     assert not any(
         value.get("enabled")
         for value in measurement["benchmark"]["profiler"].values()
@@ -152,6 +174,7 @@ def test_builds_four_immutable_semantically_equal_views(tmp_path: Path) -> None:
         "sha256": receipt.lm_eval_runtime.runtime_sha256,
         "identity": dict(receipt.lm_eval_runtime.identity),
     }
+    assert "lm_eval_runtime" not in diagnostic["benchmark"]
     assert replay["benchmark"]["docker_image"].startswith("derived@sha256:")
     _, _, delivery_semantics = verify_replay_config_invariants(
         views.measurement,
@@ -262,6 +285,73 @@ def test_validation_rejects_profiler_or_receipt_tampering(tmp_path: Path) -> Non
     assert receipt_error.value.reason_code == "benchmark_dependency_mismatch"
 
 
+@pytest.mark.parametrize("run_eval", [True, "true", 1])
+def test_validation_rejects_quality_execution_in_diagnostic_view(
+    tmp_path: Path, run_eval: object
+) -> None:
+    receipt = _receipt(tmp_path)
+    views = build_config_views(
+        _source(tmp_path), tmp_path / "views", dependency_receipt=receipt
+    )
+    tampered = _load(views.diagnostic)
+    tampered["benchmark"]["envs"]["RUN_EVAL"] = run_eval
+    path = tmp_path / "diagnostic-quality-tampered.yaml"
+    path.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError) as caught:
+        validate_resolved_view(
+            path,
+            pass_type=BenchmarkPass.DIAGNOSTIC,
+            dependency_receipt=receipt,
+        )
+    assert caught.value.reason_code == "quality_contract_missing"
+
+
+def test_validation_rejects_weakened_measurement_quality_metadata(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    views = build_config_views(
+        _source(tmp_path), tmp_path / "views", dependency_receipt=receipt
+    )
+    tampered = _load(views.measurement)
+    quality = tampered["apex"]["benchmark_view"]["quality_contract"]
+    quality.update({"required": False, "kind": "trace_only"})
+    path = tmp_path / "measurement-quality-tampered.yaml"
+    path.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError) as caught:
+        validate_resolved_view(
+            path,
+            pass_type=BenchmarkPass.MEASUREMENT,
+            dependency_receipt=receipt,
+        )
+    assert caught.value.reason_code == "quality_contract_missing"
+
+
+def test_validation_rejects_lm_eval_runtime_in_trace_only_diagnostic(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    views = build_config_views(
+        _source(tmp_path), tmp_path / "views", dependency_receipt=receipt
+    )
+    tampered = _load(views.diagnostic)
+    tampered["benchmark"]["lm_eval_runtime"] = _load(views.measurement)[
+        "benchmark"
+    ]["lm_eval_runtime"]
+    path = tmp_path / "diagnostic-runtime-tampered.yaml"
+    path.write_text(yaml.safe_dump(tampered, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError) as caught:
+        validate_resolved_view(
+            path,
+            pass_type=BenchmarkPass.DIAGNOSTIC,
+            dependency_receipt=receipt,
+        )
+    assert caught.value.reason_code == "benchmark_lm_eval_runtime_mismatch"
+
+
 def test_actual_qwen_config_generates_protected_views(tmp_path: Path) -> None:
     source = Path(
         "/home/viouyang/Magpie/examples/benchmarks/"
@@ -297,6 +387,7 @@ def test_actual_qwen_config_generates_protected_views(tmp_path: Path) -> None:
     assert measurement["gap_analysis"]["enabled"] is False
     assert diagnostic["profiler"]["tracelens"]["enabled"] is True
     assert diagnostic["run_kind"] == "diagnostic"
+    assert diagnostic["envs"]["RUN_EVAL"] == "false"
 
 
 def test_validation_rejects_run_kind_tampering(tmp_path: Path) -> None:
@@ -352,7 +443,7 @@ def test_model_revision_and_cache_are_frozen_into_all_views(tmp_path: Path) -> N
     assert caught.value.reason_code == "benchmark_semantics_mismatch"
 
 
-def test_hf_offline_and_runtime_identity_are_frozen_in_every_view(
+def test_hf_offline_is_global_but_runtime_is_absent_from_diagnostic(
     tmp_path: Path,
 ) -> None:
     receipt = _receipt(tmp_path)
@@ -371,7 +462,10 @@ def test_hf_offline_and_runtime_identity_are_frozen_in_every_view(
         assert benchmark["envs"]["HF_HUB_OFFLINE"] == "1"
         assert benchmark["envs"]["TRANSFORMERS_OFFLINE"] == "1"
         assert benchmark["envs"]["HF_DATASETS_OFFLINE"] == "1"
+    for path in (views.measurement, views.replay):
+        benchmark = _load(path)["benchmark"]
         assert benchmark["lm_eval_runtime"]["sha256"] == "4" * 64
+    assert "lm_eval_runtime" not in _load(views.diagnostic)["benchmark"]
 
     tampered = _load(views.measurement)
     tampered["benchmark"]["lm_eval_runtime"]["sha256"] = "f" * 64

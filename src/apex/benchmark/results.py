@@ -393,7 +393,7 @@ def empty_result(
     empty = LatencyDistribution(None, None, None, None)
     lm_eval_required = (
         expected_lm_eval_runtime is not None
-        or expected_lm_eval_execution_mode is not None
+        or expected_lm_eval_execution_mode in {"docker", "local"}
     )
     return NormalizedBenchmarkResult(
         schema_version=1,
@@ -435,7 +435,9 @@ def empty_result(
             ),
             manifest_path=None,
             receipt_path=None,
-            execution_mode=expected_lm_eval_execution_mode,
+            execution_mode=(
+                expected_lm_eval_execution_mode if lm_eval_required else None
+            ),
             read_only_mount=None,
             error=error if lm_eval_required else None,
         ),

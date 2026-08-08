@@ -169,6 +169,22 @@ def _add_lm_eval_runtime_evidence(report_path: Path) -> LmEvalRuntimeReceipt:
     )
 
 
+def _not_requested_lm_eval_runtime_evidence() -> dict:
+    return {
+        "schema": "magpie.lm-eval-runtime-evidence/v1",
+        "requested": False,
+        "status": "not_requested",
+        "verified": False,
+        "evidence_present": False,
+        "runtime_sha256": None,
+        "identity": None,
+        "mount_mode": None,
+        "manifest_artifact": None,
+        "receipt_artifact": None,
+        "errors": [],
+    }
+
+
 def test_normalizes_percentiles_and_lm_eval_quality(tmp_path: Path) -> None:
     eval_dir = tmp_path / "lm_eval" / "model"
     eval_dir.mkdir(parents=True)
@@ -500,6 +516,94 @@ def test_diagnostic_requires_non_reward_eligible_diagnostic_report(
     assert result.succeeded
     assert result.run_kind == "diagnostic"
     assert result.reward_eligible is False
+
+
+def test_serving_diagnostic_accepts_explicit_trace_only_lm_eval_receipt(
+    tmp_path: Path,
+) -> None:
+    report_path = _report(tmp_path)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "run_kind": "diagnostic",
+            "reward_eligible": False,
+            "profiling_enabled": True,
+            "lm_eval_runtime_receipt": _not_requested_lm_eval_runtime_evidence(),
+        }
+    )
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = parse_benchmark_report(
+        report_path,
+        run_id="trace-only",
+        pass_type=BenchmarkPass.DIAGNOSTIC,
+        quality_required=False,
+        expected_lm_eval_execution_mode="not_requested",
+    )
+
+    assert result.succeeded
+    assert result.quality.required is False
+    assert result.quality.passed
+    assert result.quality.metrics == ()
+    assert result.lm_eval_runtime.required is False
+    assert result.lm_eval_runtime.passed
+    assert result.lm_eval_runtime.manifest_path is None
+    assert result.lm_eval_runtime.receipt_path is None
+
+
+def test_trace_only_diagnostic_rejects_claimed_lm_eval_execution(
+    tmp_path: Path,
+) -> None:
+    report_path = _report(tmp_path)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    evidence = _not_requested_lm_eval_runtime_evidence()
+    evidence["requested"] = True
+    payload.update(
+        {
+            "run_kind": "diagnostic",
+            "reward_eligible": False,
+            "profiling_enabled": True,
+            "lm_eval_runtime_receipt": evidence,
+        }
+    )
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = parse_benchmark_report(
+        report_path,
+        run_id="trace-only-tampered",
+        pass_type=BenchmarkPass.DIAGNOSTIC,
+        quality_required=False,
+        expected_lm_eval_execution_mode="not_requested",
+    )
+
+    assert not result.succeeded
+    assert "lm_eval_not_requested_evidence_missing" in result.errors
+
+
+def test_trace_only_diagnostic_rejects_a_missing_not_requested_receipt(
+    tmp_path: Path,
+) -> None:
+    report_path = _report(tmp_path)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "run_kind": "diagnostic",
+            "reward_eligible": False,
+            "profiling_enabled": True,
+        }
+    )
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = parse_benchmark_report(
+        report_path,
+        run_id="trace-only-missing-receipt",
+        pass_type=BenchmarkPass.DIAGNOSTIC,
+        quality_required=False,
+        expected_lm_eval_execution_mode="not_requested",
+    )
+
+    assert not result.succeeded
+    assert "lm_eval_not_requested_evidence_missing" in result.errors
 
 
 def _add_model_revision_receipt(report_path: Path, revision: str) -> None:

@@ -27,7 +27,10 @@ def _lm_eval_expectation(
     receipt: DependencyReceipt,
 ):
     required = bool(quality_metadata.get("required", True))
-    if not required or quality_metadata.get("kind") != "lm_eval":
+    kind = quality_metadata.get("kind")
+    if not required and kind == "trace_only":
+        return None, "not_requested"
+    if not required or kind != "lm_eval":
         return None, None
     mode = str(benchmark.get("run_mode", "docker")).strip().lower()
     return receipt.lm_eval_runtime, mode

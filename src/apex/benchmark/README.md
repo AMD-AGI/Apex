@@ -16,21 +16,28 @@ profiler.
 - `benchmark.diagnostic.resolved.yaml` forces `run_kind=diagnostic`, enables
   Torch profiling, TraceLens at the
   receipt's exact root, deterministic TargetedKernelTrace acquisition, GPU
-  monitoring, and gap analysis. Its performance
-  numbers are observations only, never reward truth.
+  monitoring, and gap analysis. For serving workloads it explicitly sets
+  `RUN_EVAL=false`: the diagnostic lane exercises the profiled workload but
+  does not repeat lm-eval. Its performance numbers are observations only,
+  never reward or quality truth.
 - `benchmark.replay.yaml` has measurement instrumentation and may differ from
   measurement only in `docker_image`.
 
-Every executable view binds the exact InferenceX receipt. Formal serving runs
-also freeze the same verified `benchmark.lm_eval_runtime` path, digest, and full
-identity in measurement, diagnostic, and replay views, plus the model revision,
-cache root, and physical GPU selection. The runtime is mounted read-only by
-Magpie and is never installed into or inferred from the workload image. For
-serving frameworks, every view freezes `RUN_EVAL=true` and an
-explicit `MAGPIE_EVAL_TASKS` value (default `gsm8k`). An input that explicitly
-disables evaluation is rejected before an agent or GPU starts. Workload
-semantics exclude only instrumentation and deployment image, and their digest
-must match across measurement, diagnostic, and replay.
+Every executable view binds the exact InferenceX receipt, model revision, cache
+root, and physical GPU selection. Formal serving measurement and replay also
+freeze the verified `benchmark.lm_eval_runtime` path, digest, and full identity.
+The serving diagnostic intentionally omits that field, so Magpie does not
+validate, snapshot, mount, import, or invoke the evaluator runtime. The runtime
+is never installed into or inferred from the workload image. For serving
+frameworks, measurement and replay freeze `RUN_EVAL=true` and an explicit
+`MAGPIE_EVAL_TASKS` value (default `gsm8k`). The diagnostic view keeps that task
+and evaluator-policy identity as an inert reference while setting
+`quality_contract.kind=trace_only`, `required=false`, and `RUN_EVAL=false`.
+An input that explicitly disables formal evaluation is still rejected before an
+agent or GPU starts. The workload digest is computed from the formal measurement
+contract; diagnostic validation restores the receipt-pinned runtime and
+normalizes `RUN_EVAL=false` only for this comparison before proving every other
+workload input is identical.
 
 ## Result contract
 
@@ -62,12 +69,13 @@ workload and accuracy semantics; the original benchmark YAML is copied
 byte-for-byte. Apex independently rehashes the results and raw sample receipts
 and requires Magpie's outcome and sample-set digests to match.
 
-Required quality evidence that is missing,
+Required measurement/replay quality evidence that is missing,
 ambiguous, skipped, or empty makes the run fail closed even if Magpie reports
 process success. The report must also agree with the requested evidence lane:
 measurement/replay require `run_kind=measurement`, `reward_eligible=true`, and
-profiling off; diagnostics require the inverse. Candidate-vs-baseline regression
-policy belongs to the E2E optimization module, not this adapter.
+profiling off; diagnostics require the inverse and accept only Magpie's explicit,
+artifact-free `lm_eval_runtime.status=not_requested` receipt. Candidate-vs-baseline
+regression policy belongs to the E2E optimization module, not this adapter.
 
 ## Purpose
 
@@ -81,9 +89,10 @@ the immutable result types exported by `apex.benchmark`.
 
 ## Invariants
 
-Measurement views disable profiling, diagnostic views cannot supply rewards,
-quality stays enabled, replay changes only the allowed image locator, and host
-environment state cannot silently change the imported evaluator.
+Measurement views disable profiling and require quality; serving diagnostic
+views cannot supply rewards or quality claims; replay changes only the allowed
+image locator; host environment state cannot silently change the imported
+evaluator.
 
 ## Dependencies
 
