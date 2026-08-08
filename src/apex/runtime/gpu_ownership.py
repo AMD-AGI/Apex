@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import os
 import re
 import time
@@ -12,29 +11,29 @@ from typing import Protocol
 
 from apex.core import ContractError, sha256_bytes, sha256_file, sha256_json
 
+from .gpu_topology import (
+    GpuDeviceIdentity,
+    GpuSelectorRequest,
+    RsmiDeviceIdentity,
+    capture_selector_request,
+    resolve_gpu_inventory,
+    resolve_gpu_selection,
+)
+from .hsa_inventory import (
+    CleanHsaInventoryProvider,
+    HsaInventoryEvidence,
+    HsaInventoryProvider,
+)
+from .gpu_rsmi import (
+    CtypesOwnershipApi,
+    MAX_RSMI_DEVICES,
+    MAX_RSMI_PROCESSES,
+    OwnershipApi,
+    resolve_rsmi_library,
+)
+
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-_MAX_DEVICES = 1024
-_MAX_PROCESSES = 262_144
-_PROCESS_HEADROOM = 64
-
-
-@dataclass(frozen=True, slots=True)
-class GpuDeviceIdentity:
-    index: int
-    unique_id: str
-    render_node: str
-
-    def __post_init__(self) -> None:
-        if (
-            self.index < 0
-            or not re.fullmatch(r"0x[0-9a-f]{16}", self.unique_id)
-            or not re.fullmatch(r"/dev/dri/renderD[0-9]+", self.render_node)
-        ):
-            raise ContractError(
-                "ROCm SMI returned an invalid GPU identity",
-                "invalid_gpu_physical_identity",
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +42,7 @@ class GpuProcessIdentity:
     uid: int
     start_time_ticks: int
     cmdline_sha256: str
-    device_indices: tuple[int, ...]
+    rsmi_device_indices: tuple[int, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -51,8 +50,9 @@ class GpuProcessIdentity:
             or self.uid < 0
             or self.start_time_ticks <= 0
             or not _DIGEST.fullmatch(self.cmdline_sha256)
-            or not self.device_indices
-            or tuple(sorted(set(self.device_indices))) != self.device_indices
+            or not self.rsmi_device_indices
+            or tuple(sorted(set(self.rsmi_device_indices)))
+            != self.rsmi_device_indices
         ):
             raise ContractError(
                 "ROCm SMI returned an invalid GPU process identity",
@@ -64,36 +64,61 @@ class GpuProcessIdentity:
 class GpuOwnershipReceipt:
     schema_version: int
     policy_id: str
-    selector_scope: str
+    selector_inputs: GpuSelectorRequest
     observed_unix_ns: int
     library_path: str
     library_sha256: str
+    topology_root: str
+    hsa_inventory: HsaInventoryEvidence
+    rsmi_monitor_inventory: tuple[RsmiDeviceIdentity, ...]
+    device_inventory: tuple[GpuDeviceIdentity, ...]
     selected_devices: tuple[GpuDeviceIdentity, ...]
     allowed_owners: tuple[GpuProcessIdentity, ...]
     foreign_owners: tuple[GpuProcessIdentity, ...]
 
     def __post_init__(self) -> None:
         if (
-            self.schema_version != 1
-            or self.policy_id != "rocm_smi_process_gpu_map_v1"
+            self.schema_version != 2
+            or self.policy_id != "clean_hsa_kfd_rsmi_process_gpu_map_v2"
             or self.observed_unix_ns <= 0
             or not Path(self.library_path).is_absolute()
+            or not Path(self.topology_root).is_absolute()
             or not _DIGEST.fullmatch(self.library_sha256)
+            or not self.rsmi_monitor_inventory
+            or not self.device_inventory
             or not self.selected_devices
         ):
             raise ContractError(
                 "GPU ownership receipt is incomplete",
                 "invalid_gpu_ownership_receipt",
             )
+        _validate_receipt_inventory(self)
+        expected = resolve_gpu_selection(self.device_inventory, self.selector_inputs)
+        if expected != self.selected_devices:
+            raise ContractError(
+                "GPU ownership receipt selector resolution is inconsistent",
+                "invalid_gpu_ownership_receipt",
+            )
+
+    @property
+    def selector_scope(self) -> str:
+        return self.selector_inputs.selector_scope
 
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
             "policy_id": self.policy_id,
             "selector_scope": self.selector_scope,
+            "selector_inputs": self.selector_inputs.to_dict(),
             "observed_unix_ns": self.observed_unix_ns,
             "library_path": self.library_path,
             "library_sha256": self.library_sha256,
+            "topology_root": self.topology_root,
+            "hsa_inventory": self.hsa_inventory.to_dict(),
+            "rsmi_monitor_inventory": [
+                asdict(item) for item in self.rsmi_monitor_inventory
+            ],
+            "device_inventory": [asdict(item) for item in self.device_inventory],
             "selected_devices": [asdict(item) for item in self.selected_devices],
             "allowed_owners": [asdict(item) for item in self.allowed_owners],
             "foreign_owners": [asdict(item) for item in self.foreign_owners],
@@ -108,6 +133,11 @@ class GpuOwnershipReceipt:
         values = sorted(device.unique_id for device in self.selected_devices)
         return "amd-gpu-unique-id-set=" + ",".join(values)
 
+    @property
+    def execution_scope(self) -> str:
+        values = (device.unique_id for device in self.selected_devices)
+        return "amd-gpu-set=" + ",".join(values)
+
 
 class GpuOwnershipInspector(Protocol):
     def inspect(
@@ -115,146 +145,56 @@ class GpuOwnershipInspector(Protocol):
     ) -> GpuOwnershipReceipt: ...
 
 
-class OwnershipApi(Protocol):
-    def init(self) -> int: ...
-
-    def shutdown(self) -> int: ...
-
-    def device_count(self) -> tuple[int, int]: ...
-
-    def device_identity(self, index: int) -> tuple[int, int, int]: ...
-
-    def process_pids(self) -> tuple[int, tuple[int, ...]]: ...
-
-    def process_devices(self, pid: int) -> tuple[int, tuple[int, ...]]: ...
-
-
 class RocmSmiGpuOwnershipInspector:
     """Resolve physical devices and map every KFD PID through librocm_smi."""
 
-    def __init__(self, *, library_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        library_path: Path | None = None,
+        topology_root: Path = Path("/sys/class/kfd/kfd/topology/nodes"),
+        hsa_inventory_provider: HsaInventoryProvider | None = None,
+    ) -> None:
         self._library_path = library_path
+        self._topology_root = topology_root
+        self._hsa_inventory_provider = (
+            hsa_inventory_provider or CleanHsaInventoryProvider()
+        )
 
     def inspect(
         self, selector_scope: str, *, allowed_pids: tuple[int, ...] = ()
     ) -> GpuOwnershipReceipt:
-        library = _resolve_library(self._library_path)
-        return collect_gpu_ownership(
-            _CtypesOwnershipApi(library),
+        library = resolve_rsmi_library(self._library_path)
+        selector_inputs = capture_selector_request(selector_scope)
+        library_sha256 = sha256_file(library)
+        receipt = collect_gpu_ownership(
+            CtypesOwnershipApi(library),
             selector_scope=selector_scope,
+            selector_inputs=selector_inputs,
             allowed_pids=allowed_pids,
             library_path=library,
-            library_sha256=sha256_file(library),
+            library_sha256=library_sha256,
+            topology_root=self._topology_root,
+            hsa_inventory=self._hsa_inventory_provider.collect(),
         )
-
-
-class _ProcessInfo(ctypes.Structure):
-    _fields_ = [
-        ("process_id", ctypes.c_uint32),
-        ("pasid", ctypes.c_uint32),
-        ("vram_usage", ctypes.c_uint64),
-        ("sdma_usage", ctypes.c_uint64),
-        ("cu_occupancy", ctypes.c_uint32),
-    ]
-
-
-class _CtypesOwnershipApi:
-    def __init__(self, library_path: Path) -> None:
-        try:
-            self._library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_LOCAL)
-            self._configure()
-        except (OSError, AttributeError) as error:
+        if sha256_file(library) != library_sha256:
             raise ContractError(
-                "The ROCm SMI process API is unavailable",
-                "gpu_ownership_api_unavailable",
-            ) from error
-
-    def _configure(self) -> None:
-        _signature(self._library.rsmi_init, [ctypes.c_uint64])
-        _signature(self._library.rsmi_shut_down, [])
-        _signature(self._library.rsmi_num_monitor_devices, [ctypes.POINTER(ctypes.c_uint32)])
-        _signature(
-            self._library.rsmi_dev_unique_id_get,
-            [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)],
-        )
-        _signature(
-            self._library.rsmi_dev_drm_render_minor_get,
-            [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)],
-        )
-        _signature(
-            self._library.rsmi_compute_process_info_get,
-            [ctypes.POINTER(_ProcessInfo), ctypes.POINTER(ctypes.c_uint32)],
-        )
-        _signature(
-            self._library.rsmi_compute_process_gpus_get,
-            [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)],
-        )
-
-    def init(self) -> int:
-        return int(self._library.rsmi_init(0))
-
-    def shutdown(self) -> int:
-        return int(self._library.rsmi_shut_down())
-
-    def device_count(self) -> tuple[int, int]:
-        count = ctypes.c_uint32(0)
-        status = self._library.rsmi_num_monitor_devices(ctypes.byref(count))
-        return int(status), int(count.value)
-
-    def device_identity(self, index: int) -> tuple[int, int, int]:
-        unique_id = ctypes.c_uint64(0)
-        minor = ctypes.c_uint32(0)
-        first = int(self._library.rsmi_dev_unique_id_get(index, ctypes.byref(unique_id)))
-        second = int(
-            self._library.rsmi_dev_drm_render_minor_get(index, ctypes.byref(minor))
-        )
-        return first or second, int(unique_id.value), int(minor.value)
-
-    def process_pids(self) -> tuple[int, tuple[int, ...]]:
-        count = ctypes.c_uint32(0)
-        status = int(
-            self._library.rsmi_compute_process_info_get(None, ctypes.byref(count))
-        )
-        if status != 0 or count.value > _MAX_PROCESSES:
-            return status or -1, ()
-        capacity = max(int(count.value) + _PROCESS_HEADROOM, _PROCESS_HEADROOM)
-        records = (_ProcessInfo * capacity)()
-        fetched = ctypes.c_uint32(capacity)
-        status = int(
-            self._library.rsmi_compute_process_info_get(records, ctypes.byref(fetched))
-        )
-        if fetched.value > capacity:
-            return -1, ()
-        return status, tuple(int(records[index].process_id) for index in range(fetched.value))
-
-    def process_devices(self, pid: int) -> tuple[int, tuple[int, ...]]:
-        count = ctypes.c_uint32(0)
-        status = int(
-            self._library.rsmi_compute_process_gpus_get(pid, None, ctypes.byref(count))
-        )
-        if status != 0 or count.value > _MAX_DEVICES:
-            return status or -1, ()
-        if count.value == 0:
-            return 0, ()
-        indices = (ctypes.c_uint32 * int(count.value))()
-        fetched = ctypes.c_uint32(count.value)
-        status = int(
-            self._library.rsmi_compute_process_gpus_get(
-                pid, indices, ctypes.byref(fetched)
+                "The ROCm SMI library changed during ownership inspection",
+                "gpu_ownership_api_changed",
             )
-        )
-        if fetched.value > count.value:
-            return -1, ()
-        return status, tuple(int(indices[index]) for index in range(fetched.value))
+        return receipt
 
 
 def collect_gpu_ownership(
     api: OwnershipApi,
     *,
     selector_scope: str,
+    selector_inputs: GpuSelectorRequest | None = None,
     allowed_pids: tuple[int, ...],
     library_path: Path,
     library_sha256: str,
+    topology_root: Path,
+    hsa_inventory: HsaInventoryEvidence,
     proc_root: Path = Path("/proc"),
     observed_unix_ns: int | None = None,
 ) -> GpuOwnershipReceipt:
@@ -275,9 +215,16 @@ def collect_gpu_ownership(
         receipt = _collect_initialized(
             api,
             selector_scope=selector_scope,
+            selector_inputs=(
+                selector_inputs
+                if selector_inputs is not None
+                else capture_selector_request(selector_scope, environment={})
+            ),
             allowed_pids=allowed_pids,
             library_path=library_path,
             library_sha256=library_sha256,
+            topology_root=topology_root,
+            hsa_inventory=hsa_inventory,
             proc_root=proc_root,
             observed_unix_ns=observed_unix_ns,
         )
@@ -305,20 +252,34 @@ def _collect_initialized(
     api: OwnershipApi,
     *,
     selector_scope: str,
+    selector_inputs: GpuSelectorRequest,
     allowed_pids: tuple[int, ...],
     library_path: Path,
     library_sha256: str,
+    topology_root: Path,
+    hsa_inventory: HsaInventoryEvidence,
     proc_root: Path,
     observed_unix_ns: int | None,
 ) -> GpuOwnershipReceipt:
-    devices = _query_devices(api)
-    selected = _select_devices(devices, selector_scope)
-    selected_indices = {device.index for device in selected}
-    first = _query_process_map(api)
+    if selector_inputs.selector_scope != selector_scope:
+        raise ContractError(
+            "GPU selector scope and captured inputs disagree",
+            "invalid_gpu_device_scope",
+        )
+    rsmi_devices = _query_devices(api)
+    devices = resolve_gpu_inventory(
+        rsmi_devices,
+        hsa_inventory=hsa_inventory,
+        topology_root=topology_root,
+    )
+    selected = resolve_gpu_selection(devices, selector_inputs)
+    selected_indices = {device.rsmi_index for device in selected}
+    valid_rsmi_indices = set(range(len(rsmi_devices)))
+    first = _query_process_map(api, valid_indices=valid_rsmi_indices)
     first_owners = _selected_process_identities(
         first, selected_indices=selected_indices, proc_root=proc_root
     )
-    second = _query_process_map(api)
+    second = _query_process_map(api, valid_indices=valid_rsmi_indices)
     second_owners = _selected_process_identities(
         second, selected_indices=selected_indices, proc_root=proc_root
     )
@@ -329,16 +290,78 @@ def _collect_initialized(
         )
     allowed = set(allowed_pids)
     return GpuOwnershipReceipt(
-        1,
-        "rocm_smi_process_gpu_map_v1",
-        selector_scope,
-        observed_unix_ns if observed_unix_ns is not None else time.time_ns(),
-        str(library_path),
-        library_sha256,
-        selected,
-        tuple(owner for owner in second_owners if owner.pid in allowed),
-        tuple(owner for owner in second_owners if owner.pid not in allowed),
+        schema_version=2,
+        policy_id="clean_hsa_kfd_rsmi_process_gpu_map_v2",
+        selector_inputs=selector_inputs,
+        observed_unix_ns=(
+            observed_unix_ns if observed_unix_ns is not None else time.time_ns()
+        ),
+        library_path=str(library_path),
+        library_sha256=library_sha256,
+        topology_root=str(topology_root),
+        hsa_inventory=hsa_inventory,
+        rsmi_monitor_inventory=rsmi_devices,
+        device_inventory=devices,
+        selected_devices=selected,
+        allowed_owners=tuple(owner for owner in second_owners if owner.pid in allowed),
+        foreign_owners=tuple(owner for owner in second_owners if owner.pid not in allowed),
     )
+
+
+def _validate_receipt_inventory(receipt: GpuOwnershipReceipt) -> None:
+    monitors = receipt.rsmi_monitor_inventory
+    if tuple(item.rsmi_index for item in monitors) != tuple(range(len(monitors))):
+        raise ContractError(
+            "GPU ownership monitor inventory is not contiguous",
+            "invalid_gpu_ownership_receipt",
+        )
+    for field in ("unique_id", "node_id", "pci_id", "render_minor"):
+        if len({getattr(item, field) for item in monitors}) != len(monitors):
+            raise ContractError(
+                f"GPU ownership monitor inventory duplicates {field}",
+                "invalid_gpu_ownership_receipt",
+            )
+    if len(receipt.device_inventory) != len(receipt.hsa_inventory.devices):
+        raise ContractError(
+            "GPU ownership HSA and joined inventory sizes differ",
+            "invalid_gpu_ownership_receipt",
+        )
+    if len({item.rsmi_index for item in receipt.device_inventory}) != len(
+        receipt.device_inventory
+    ):
+        raise ContractError(
+            "GPU ownership joined inventory duplicates an RSMI index",
+            "invalid_gpu_ownership_receipt",
+        )
+    valid_rsmi_indices = set(range(len(monitors)))
+    owners = (*receipt.allowed_owners, *receipt.foreign_owners)
+    if len({owner.pid for owner in owners}) != len(owners) or any(
+        not set(owner.rsmi_device_indices).issubset(valid_rsmi_indices)
+        for owner in owners
+    ):
+        raise ContractError(
+            "GPU ownership process identities are inconsistent with RSMI",
+            "invalid_gpu_ownership_receipt",
+        )
+    by_rsmi_index = {item.rsmi_index: item for item in monitors}
+    for joined, hsa in zip(
+        receipt.device_inventory, receipt.hsa_inventory.devices, strict=True
+    ):
+        monitor = by_rsmi_index.get(joined.rsmi_index)
+        if (
+            monitor is None
+            or joined.hsa_gpu_index != hsa.hsa_gpu_index
+            or joined.kfd_node_id != hsa.node_id
+            or joined.unique_id != hsa.unique_id
+            or monitor.node_id != hsa.node_id
+            or monitor.pci_id != hsa.pci_id
+            or monitor.unique_id != hsa.unique_id
+            or monitor.render_minor != joined.render_minor
+        ):
+            raise ContractError(
+                "GPU ownership namespace inventories are inconsistent",
+                "invalid_gpu_ownership_receipt",
+            )
 
 
 def _selected_process_identities(
@@ -354,17 +377,19 @@ def _selected_process_identities(
     )
 
 
-def _query_devices(api: OwnershipApi) -> tuple[GpuDeviceIdentity, ...]:
+def _query_devices(api: OwnershipApi) -> tuple[RsmiDeviceIdentity, ...]:
     status, count = api.device_count()
-    if status != 0 or count < 1 or count > _MAX_DEVICES:
+    if status != 0 or count < 1 or count > MAX_RSMI_DEVICES:
         raise ContractError(
             "ROCm SMI device inventory failed",
             "gpu_physical_mapping_unresolved",
             {"status": status, "count": count},
         )
-    devices: list[GpuDeviceIdentity] = []
+    devices: list[RsmiDeviceIdentity] = []
     for index in range(count):
-        identity_status, unique_id, render_minor = api.device_identity(index)
+        identity_status, unique_id, node_id, pci_id, render_minor = api.device_identity(
+            index
+        )
         if identity_status != 0:
             raise ContractError(
                 "ROCm SMI device identity query failed",
@@ -372,7 +397,13 @@ def _query_devices(api: OwnershipApi) -> tuple[GpuDeviceIdentity, ...]:
                 {"index": index, "status": identity_status},
             )
         devices.append(
-            GpuDeviceIdentity(index, f"0x{unique_id:016x}", f"/dev/dri/renderD{render_minor}")
+            RsmiDeviceIdentity(
+                rsmi_index=index,
+                node_id=node_id,
+                pci_id=pci_id,
+                unique_id=f"GPU-{unique_id:016x}",
+                render_minor=render_minor,
+            )
         )
     if len({device.unique_id for device in devices}) != len(devices):
         raise ContractError(
@@ -382,9 +413,11 @@ def _query_devices(api: OwnershipApi) -> tuple[GpuDeviceIdentity, ...]:
     return tuple(devices)
 
 
-def _query_process_map(api: OwnershipApi) -> tuple[tuple[int, tuple[int, ...]], ...]:
+def _query_process_map(
+    api: OwnershipApi, *, valid_indices: set[int]
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
     status, pids = api.process_pids()
-    if status != 0 or len(pids) > _MAX_PROCESSES or any(pid <= 0 for pid in pids):
+    if status != 0 or len(pids) > MAX_RSMI_PROCESSES or any(pid <= 0 for pid in pids):
         raise ContractError(
             "ROCm SMI KFD process inventory failed",
             "gpu_ownership_query_failed",
@@ -399,7 +432,12 @@ def _query_process_map(api: OwnershipApi) -> tuple[tuple[int, tuple[int, ...]], 
     for pid in sorted(pids):
         device_status, indices = api.process_devices(pid)
         canonical = tuple(sorted(set(indices)))
-        if device_status != 0 or not canonical or canonical != tuple(sorted(indices)):
+        if (
+            device_status != 0
+            or not canonical
+            or canonical != tuple(sorted(indices))
+            or not set(canonical).issubset(valid_indices)
+        ):
             raise ContractError(
                 "ROCm SMI process-to-GPU query failed",
                 "gpu_ownership_query_failed",
@@ -409,43 +447,8 @@ def _query_process_map(api: OwnershipApi) -> tuple[tuple[int, tuple[int, ...]], 
     return tuple(result)
 
 
-def _select_devices(
-    devices: tuple[GpuDeviceIdentity, ...], selector_scope: str
-) -> tuple[GpuDeviceIdentity, ...]:
-    if selector_scope == "all-visible-amd-gpus":
-        return devices
-    prefix = "amd-gpu-set="
-    if not selector_scope.startswith(prefix):
-        raise ContractError("GPU selector is invalid", "gpu_physical_mapping_unresolved")
-    selectors = selector_scope[len(prefix) :].split(",")
-    selected: list[GpuDeviceIdentity] = []
-    for selector in selectors:
-        matches = [device for device in devices if _selector_matches(device, selector)]
-        if len(matches) != 1:
-            raise ContractError(
-                "GPU selector does not resolve to exactly one physical device",
-                "gpu_physical_mapping_unresolved",
-                {"selector": selector},
-            )
-        selected.append(matches[0])
-    if len({device.index for device in selected}) != len(selected):
-        raise ContractError(
-            "GPU selectors resolve to duplicate physical devices",
-            "gpu_physical_mapping_unresolved",
-        )
-    return tuple(sorted(selected, key=lambda device: device.index))
-
-
-def _selector_matches(device: GpuDeviceIdentity, selector: str) -> bool:
-    if selector.isdecimal():
-        return device.index == int(selector)
-    normalized = selector.lower().removeprefix("gpu-")
-    normalized = normalized.removeprefix("0x")
-    return normalized == device.unique_id.removeprefix("0x")
-
-
 def _process_identity(
-    pid: int, device_indices: tuple[int, ...], *, proc_root: Path
+    pid: int, rsmi_device_indices: tuple[int, ...], *, proc_root: Path
 ) -> GpuProcessIdentity:
     root = proc_root / str(pid)
     try:
@@ -465,33 +468,8 @@ def _process_identity(
         metadata.st_uid,
         start_time_ticks,
         sha256_bytes(cmdline),
-        device_indices,
+        rsmi_device_indices,
     )
-
-
-def _resolve_library(explicit: Path | None) -> Path:
-    candidates = [explicit] if explicit is not None else [
-        Path("/opt/rocm/lib/librocm_smi64.so.7"),
-        Path("/opt/rocm/lib/librocm_smi64.so"),
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            resolved = candidate.resolve(strict=True)
-        except OSError:
-            continue
-        if resolved.is_file():
-            return resolved
-    raise ContractError(
-        "A concrete ROCm SMI library could not be resolved",
-        "gpu_ownership_api_unavailable",
-    )
-
-
-def _signature(function: object, argument_types: list[object]) -> None:
-    function.argtypes = argument_types  # type: ignore[attr-defined]
-    function.restype = ctypes.c_int  # type: ignore[attr-defined]
 
 
 __all__ = [

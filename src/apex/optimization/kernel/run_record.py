@@ -92,7 +92,8 @@ class KernelRunRecord:
             "dependency_verified",
             {
                 "kind": "gpu_lease",
-                "device_scope": lease.device_scope,
+                "execution_scope": lease.execution_scope,
+                "physical_scope": lease.physical_scope,
                 "lease_digest": lease.digest,
                 "artifacts": [_artifact_binding("gpu_lease", receipt)],
             },

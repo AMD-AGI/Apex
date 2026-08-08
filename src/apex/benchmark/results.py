@@ -205,14 +205,30 @@ def _normalized_result(
     )
 
 
+def _report_quality(
+    report: Mapping[str, Any],
+    workspace: Path,
+    report_path: Path,
+    framework: str,
+    required: bool,
+    evaluator_policy: Mapping[str, Any] | None,
+) -> QualityEvidence:
+    return parse_quality_evidence(
+        report,
+        workspace,
+        report_path.resolve(),
+        framework,
+        required,
+        evaluator_policy,
+    )
+
+
 def parse_benchmark_report(
     report_path: Path, *, run_id: str,
     pass_type: BenchmarkPass,
     quality_required: bool,
-    command_exit_code: int | None = 0,
-    timed_out: bool = False,
-    expected_model: str | None = None,
-    expected_model_revision: str | None = None,
+    command_exit_code: int | None = 0, timed_out: bool = False,
+    expected_model: str | None = None, expected_model_revision: str | None = None,
     expected_inferencex_root: Path | None = None,
     expected_inferencex_commit: str | None = None,
     expected_inferencex_tree: str | None = None,
@@ -222,6 +238,9 @@ def parse_benchmark_report(
     expected_config_sha256: str | None = None,
     expected_requested_image: str | None = None,
     expected_execution_mode: str | None = None,
+    allow_tracelens_derivation: bool = False,
+    expected_tracelens_commit: str | None = None,
+    expected_tracelens_tree: str | None = None,
 ) -> NormalizedBenchmarkResult:
     """Parse one Magpie report plus its protected quality side artifacts."""
 
@@ -230,13 +249,9 @@ def parse_benchmark_report(
     throughput = _throughput_metrics(report.get("throughput"))
     latency = _latency_metrics(report.get("latency"))
     framework = str(report.get("framework", "")).strip().lower()
-    quality = parse_quality_evidence(
-        report,
-        workspace,
-        report_path.resolve(),
-        framework,
-        quality_required,
-        expected_evaluator_policy,
+    quality = _report_quality(
+        report, workspace, report_path, framework,
+        quality_required, expected_evaluator_policy,
     )
     run_kind = str(report.get("run_kind", "")).strip().lower()
     reward_eligible = report.get("reward_eligible") is True
@@ -254,6 +269,9 @@ def parse_benchmark_report(
         expected_config_sha256,
         expected_requested_image,
         expected_execution_mode,
+        allow_tracelens_derivation,
+        expected_tracelens_commit,
+        expected_tracelens_tree,
     )
     success, errors = _benchmark_verdict(
         report,

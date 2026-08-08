@@ -89,6 +89,19 @@ profiling off; diagnostics require the inverse and accept only Magpie's explicit
 artifact-free `lm_eval_runtime.status=not_requested` receipt. Candidate-vs-baseline
 regression policy belongs to the E2E optimization module, not this adapter.
 
+Docker evidence uses `magpie.serving-runtime-receipt/v2`. The receipt keeps the
+frozen view's `input_image` and resolved immutable `input_image_id` distinct
+from the image reference and ID actually passed to Docker. Measurement and
+replay accept only a direct identity binding. A diagnostic may execute a
+TraceLens-derived vLLM image only when its resolved view explicitly enables
+inference auto-patching and Magpie proves the complete base-to-derived lineage:
+base locator and ID, derived reference and ID, pinned TraceLens commit and tree,
+runtime schema, patch version/path/digest, dependency-wheel manifest digest,
+and successful runtime validation. Apex checks that proof against its verified
+dependency receipt and the actual serving receipt. Missing, legacy, unpinned,
+or internally inconsistent lineage fails closed; changing the requested image
+field alone cannot bypass the frozen input identity.
+
 ## Purpose
 
 The package is Apex's Magpie boundary: it freezes phase-specific workload views
@@ -104,8 +117,8 @@ types exported by `apex.benchmark`.
 
 Measurement views disable profiling and require quality; serving diagnostic
 views cannot supply rewards or quality claims; replay changes only the allowed
-image locator; host environment state cannot silently change the imported
-evaluator.
+image locator; derived runtime images are diagnostic-only and evidence-bound;
+host environment state cannot silently change the imported evaluator.
 
 ## Dependencies
 

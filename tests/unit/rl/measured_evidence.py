@@ -324,6 +324,9 @@ def _benchmark(
             "f" * 64,
             True,
             None,
+            image_id,
+            image_id,
+            _direct_image_derivation(image_id),
         ),
     )
     evidence = persist_benchmark_evidence(artifacts, result, config)
@@ -362,17 +365,41 @@ def _report_document(
         },
         "latency": {"ttft": ttft, "tpot": tpot},
         "serving_runtime_receipt": {
-            "schema": "magpie.serving-runtime-receipt/v1",
+            "schema": "magpie.serving-runtime-receipt/v2",
             "execution_mode": "docker",
             "input_config_sha256": config_digest,
+            "input_image": image_id,
+            "input_image_id": image_id,
             "requested_image": image_id,
             "resolved_image_id": image_id,
+            "image_derivation": _direct_image_derivation(image_id),
             "container_name": f"magpie-benchmark-{workspace.name}",
             "docker_argv_sha256": "f" * 64,
             "process_succeeded": True,
             "verified": True,
             "errors": [],
         },
+    }
+
+
+def _direct_image_derivation(image_id: str) -> dict[str, object]:
+    return {
+        "kind": "direct",
+        "framework": "vllm",
+        "runtime_schema": None,
+        "base_image": image_id,
+        "base_image_id": image_id,
+        "base_image_locator": image_id,
+        "derived_image": image_id,
+        "derived_image_id": image_id,
+        "tracelens_source_commit": None,
+        "tracelens_source_tree": None,
+        "patch_version": None,
+        "patch_path": None,
+        "patch_sha256": None,
+        "dependency_wheel_manifest_sha256": None,
+        "validator": "docker-image-id",
+        "verified": True,
     }
 
 

@@ -340,12 +340,11 @@ evidence but cannot produce formal success.
 
 If the search accepts no source candidate, Apex still runs and records the final
 normal measurement so baseline-versus-replay drift remains observable. That
-measurement is still a hard terminal no-regression gate: exceeding the frozen
-accuracy/latency bounds or the allowed 1% throughput-noise floor returns
-`verification_failed`, even though the source identity is unchanged. Only a
-passing unchanged-source replay returns `no_gain`; unsupported capability
-reasons remain unsupported. `details.observed_replay_verdict` and its CAS-bound
-final lineage preserve the measured decision, while
+measurement is not a candidate no-regression gate because no source change was
+accepted or delivered: the unchanged source identity returns `no_gain` with
+`no_regression=true`, while unsupported capability reasons remain unsupported.
+`details.observed_replay_verdict` and its CAS-bound final lineage preserve any
+measured runtime drift without relabeling it as a candidate regression, while
 `details.final_replay_basis` states that no patch was accepted and delivery was
 not attempted. Once a patch is accepted, the cumulative replay against the live
 anchor is likewise a hard gate.

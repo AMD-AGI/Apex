@@ -288,7 +288,7 @@ class E2EOptimizeUseCase:
             correctness_oracle_policy_sha256=getattr(
                 self._correctness_oracles, "policy_sha256", None
             ),
-            gpu_device_scope=gpu_lease.device_scope,
+            gpu_device_scope=gpu_lease.execution_scope,
         )
         session = E2EBenchmarkSession(
             benchmark=self._benchmark,
@@ -432,7 +432,8 @@ class E2EOptimizeUseCase:
             "dependency_verified",
             {
                 "kind": "gpu_lease",
-                "device_scope": gpu_lease.device_scope,
+                "execution_scope": gpu_lease.execution_scope,
+                "physical_scope": gpu_lease.physical_scope,
                 "lease_digest": gpu_lease.digest,
                 "artifacts": [_binding("gpu_lease", lease_receipt)],
             },
@@ -459,7 +460,8 @@ class E2EOptimizeUseCase:
             "dependency_verified",
             {
                 "kind": "gpu_lease_resume",
-                "device_scope": gpu_lease.device_scope,
+                "execution_scope": gpu_lease.execution_scope,
+                "physical_scope": gpu_lease.physical_scope,
                 "lease_digest": gpu_lease.digest,
                 "artifacts": [_binding("gpu_lease", receipt)],
             },
@@ -518,9 +520,9 @@ def _relocate_views(
 def _verify_resume_gpu_scope(
     request: RecoveredRunRequest, gpu_lease: GpuLeaseReceipt
 ) -> None:
-    if gpu_lease.device_scope != request.gpu_device_scope:
+    if gpu_lease.execution_scope != request.gpu_device_scope:
         raise ContractError(
-            "Physical GPU scope differs from the interrupted run",
+            "GPU execution scope differs from the interrupted run",
             "resume_gpu_scope_mismatch",
         )
 

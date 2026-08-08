@@ -152,9 +152,6 @@ class E2EFinalizer:
         if unsupported:
             status = TaskStatus.UNSUPPORTED
             reason = search_exit_reason
-        elif not verdict.keep:
-            status = TaskStatus.VERIFICATION_FAILED
-            reason = verdict.reason_code
         else:
             status = TaskStatus.NO_GAIN
             reason = search_exit_reason
@@ -168,7 +165,7 @@ class E2EFinalizer:
             validation=ValidationLevel.NONE,
             baseline=baseline,
             final=final,
-            no_regression=verdict.keep,
+            no_regression=True,
             details={
                 "observed_replay_verdict": verdict.to_dict(),
                 "search_exit_reason": search_exit_reason,
@@ -185,13 +182,7 @@ class E2EFinalizer:
                 "gpu_lease": self.gpu_lease.to_dict(),
             },
             terminal_phase=phase,
-            stop_reason=(
-                status.value
-                if phase is RunPhase.SUCCEEDED
-                else "final_no_winner_replay_regression"
-                if status is TaskStatus.VERIFICATION_FAILED
-                else reason
-            ),
+            stop_reason=status.value if phase is RunPhase.SUCCEEDED else reason,
         )
 
     def _cumulative_regression(

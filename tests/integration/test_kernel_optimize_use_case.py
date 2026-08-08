@@ -45,7 +45,15 @@ from apex.ports import (
     KernelMeasurementRequest,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
 )
-from apex.runtime import GpuDeviceIdentity, GpuOwnershipReceipt, LocalGpuLeaseManager
+from apex.runtime import (
+    GpuDeviceIdentity,
+    GpuOwnershipReceipt,
+    GpuSelectorRequest,
+    HsaGpuIdentity,
+    HsaInventoryEvidence,
+    LocalGpuLeaseManager,
+    RsmiDeviceIdentity,
+)
 
 
 def _agent_containment(*, stopped: bool = False) -> AgentProcessContainmentReceipt:
@@ -82,16 +90,32 @@ class _FakeOwnershipInspector:
     def inspect(
         self, selector_scope: str, *, allowed_pids: tuple[int, ...] = ()
     ) -> GpuOwnershipReceipt:
+        unique_id = "GPU-0000000000000001"
+        device = GpuDeviceIdentity(0, 2, 0, unique_id, "/dev/dri/renderD128")
         return GpuOwnershipReceipt(
-            1,
-            "rocm_smi_process_gpu_map_v1",
-            selector_scope,
-            123,
-            "/opt/rocm/lib/librocm_smi64.so.7",
-            "a" * 64,
-            (GpuDeviceIdentity(0, "0x0000000000000001", "/dev/dri/renderD128"),),
-            (),
-            (),
+            schema_version=2,
+            policy_id="clean_hsa_kfd_rsmi_process_gpu_map_v2",
+            selector_inputs=GpuSelectorRequest(requested=("0",)),
+            observed_unix_ns=123,
+            library_path="/opt/rocm/lib/librocm_smi64.so.7",
+            library_sha256="a" * 64,
+            topology_root="/sys/class/kfd/kfd/topology/nodes",
+            hsa_inventory=HsaInventoryEvidence(
+                1,
+                "clean_unfiltered_hsa_gpu_inventory_v1",
+                "/trusted/helper.py",
+                "b" * 64,
+                "/opt/rocm/lib/libhsa-runtime64.so.1",
+                "c" * 64,
+                (HsaGpuIdentity(0, 2, 2, 100, 0, unique_id),),
+            ),
+            rsmi_monitor_inventory=(
+                RsmiDeviceIdentity(0, 2, 100, unique_id, 128),
+            ),
+            device_inventory=(device,),
+            selected_devices=(device,),
+            allowed_owners=(),
+            foreign_owners=(),
         )
 
 

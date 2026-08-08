@@ -136,7 +136,7 @@ def test_repository_lock_contains_reviewed_exact_dependencies():
     assert lock.receipt_schema == "apex.dependencies.receipt/v1"
     assert len(lock.sha256) == 64
     observed = {item.key: item for item in lock.dependencies}
-    assert observed["magpie"].commit == "4773cd1468f56fefec35e6e01df9c85755b7a265"
+    assert observed["magpie"].commit == "210513b31b2f3607920be4000d37fc51f14c5711"
     assert observed["magpie"].import_root == "Magpie"
     assert observed["magpie"].package_version == "0.2.0"
     assert observed["tracelens"].commit == "4f25c1a6f03441e710a97d71a5de9cc5c2fc1555"

@@ -294,7 +294,7 @@ and retains per-file hashes, exclusions, license, and attribution. Obsolete muta
 knowledge storage is not read.
 
 Benchmarking and targeted trace collection use
-[Magpie at `5a7fb05`](https://github.com/AMD-AGI/Magpie/tree/5a7fb05c01019c2a2c6f2ecff671c45be22f82d9);
+[Magpie at `210513b`](https://github.com/AMD-AGI/Magpie/tree/210513b31b2f3607920be4000d37fc51f14c5711);
 trace analysis uses
 [TraceLens at `4f25c1a`](https://github.com/AMD-AGI/TraceLens/tree/4f25c1a6f03441e710a97d71a5de9cc5c2fc1555).
 Serving benchmark execution uses

@@ -37,8 +37,12 @@ from apex.runtime import (
     DependencyReceipt,
     GpuDeviceIdentity,
     GpuOwnershipReceipt,
+    GpuSelectorRequest,
+    HsaGpuIdentity,
+    HsaInventoryEvidence,
     LmEvalRuntimeReceipt,
     LocalGpuLeaseManager,
+    RsmiDeviceIdentity,
     RunProvenance,
 )
 from apex.storage import EventJournal, SnapshotStore
@@ -48,16 +52,32 @@ class _FakeOwnershipInspector:
     def inspect(
         self, selector_scope: str, *, allowed_pids: tuple[int, ...] = ()
     ) -> GpuOwnershipReceipt:
+        unique_id = "GPU-0000000000000001"
+        device = GpuDeviceIdentity(0, 2, 0, unique_id, "/dev/dri/renderD128")
         return GpuOwnershipReceipt(
-            1,
-            "rocm_smi_process_gpu_map_v1",
-            selector_scope,
-            123,
-            "/opt/rocm/lib/librocm_smi64.so.7",
-            "a" * 64,
-            (GpuDeviceIdentity(0, "0x0000000000000001", "/dev/dri/renderD128"),),
-            (),
-            (),
+            schema_version=2,
+            policy_id="clean_hsa_kfd_rsmi_process_gpu_map_v2",
+            selector_inputs=GpuSelectorRequest(requested=("0",)),
+            observed_unix_ns=123,
+            library_path="/opt/rocm/lib/librocm_smi64.so.7",
+            library_sha256="a" * 64,
+            topology_root="/sys/class/kfd/kfd/topology/nodes",
+            hsa_inventory=HsaInventoryEvidence(
+                1,
+                "clean_unfiltered_hsa_gpu_inventory_v1",
+                "/trusted/helper.py",
+                "b" * 64,
+                "/opt/rocm/lib/libhsa-runtime64.so.1",
+                "c" * 64,
+                (HsaGpuIdentity(0, 2, 2, 100, 0, unique_id),),
+            ),
+            rsmi_monitor_inventory=(
+                RsmiDeviceIdentity(0, 2, 100, unique_id, 128),
+            ),
+            device_inventory=(device,),
+            selected_devices=(device,),
+            allowed_owners=(),
+            foreign_owners=(),
         )
 
 
@@ -389,7 +409,7 @@ def test_terminal_resume_rejects_unbound_result_projection(tmp_path: Path) -> No
     assert failure.value.reason_code == "e2e_result_projection_mismatch"
 
 
-def test_e2e_no_winner_final_replay_regression_fails_closed(
+def test_e2e_no_winner_final_replay_drift_remains_observed_evidence(
     tmp_path: Path,
 ) -> None:
     results = tmp_path / "run-regression"
@@ -400,9 +420,9 @@ def test_e2e_no_winner_final_replay_regression_fails_closed(
         provenance=FakeProvenance(),
         gpu_leases=_gpu_leases(tmp_path),
     ).run(_spec(tmp_path, results))
-    assert result.status is TaskStatus.VERIFICATION_FAILED
-    assert result.no_regression is False
-    assert result.reason_code == "insufficient_throughput_gain"
+    assert result.status is TaskStatus.NO_GAIN
+    assert result.no_regression is True
+    assert result.reason_code == "no_opportunities"
     assert result.accepted_patch_ids == ()
     assert result.formal_delivery_verified is False
     assert result.details["observed_replay_verdict"]["keep"] is False
@@ -411,6 +431,25 @@ def test_e2e_no_winner_final_replay_regression_fails_closed(
         == "insufficient_throughput_gain"
     )
     assert result.details["search_exit_reason"] == "no_opportunities"
+    terminal = result.details["terminal_diagnostics"]
+    assert terminal["diagnostic_succeeded"] is True
+    assert terminal["comparison"]["reward_eligible"] is False
+    events = EventJournal(results / "events" / "run.db").iter_events(result.run_id)
+    committed = next(event for event in events if event.event_type == "e2e.final_committed")
+    lineage_digest = committed.payload["receipt"]
+    lineage = json.loads(
+        (
+            results
+            / "artifacts"
+            / "sha256"
+            / lineage_digest[:2]
+            / lineage_digest
+        ).read_text(encoding="utf-8")
+    )
+    assert len(lineage["final_benchmark_receipt"]) == 64
+    assert lineage["observed_replay_verdict"] == result.details[
+        "observed_replay_verdict"
+    ]
     basis = result.details["final_replay_basis"]
     assert basis == {
         "basis": "no_accepted_or_delivered_source_patch",
@@ -427,4 +466,5 @@ def test_e2e_no_winner_final_replay_regression_fails_closed(
     ).state
     assert state.e2e is not None
     assert state.e2e.final_clean_replay_verified is False
-    assert state.phase is RunPhase.FAILED
+    assert state.phase is RunPhase.SUCCEEDED
+    assert state.stop_reason == "no_gain"

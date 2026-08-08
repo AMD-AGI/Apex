@@ -169,10 +169,12 @@ class TaskResult:
         owner_pid = lease.get("owner_pid")
         acquired = lease.get("acquired_unix_seconds")
         if (
-            lease.get("schema_version") != 1
+            lease.get("schema_version") != 2
             or lease.get("run_id") != self.run_id
-            or not isinstance(lease.get("device_scope"), str)
-            or not lease["device_scope"]
+            or not isinstance(lease.get("execution_scope"), str)
+            or not lease["execution_scope"]
+            or not isinstance(lease.get("physical_scope"), str)
+            or not lease["physical_scope"]
             or isinstance(owner_pid, bool)
             or not isinstance(owner_pid, int)
             or owner_pid <= 0

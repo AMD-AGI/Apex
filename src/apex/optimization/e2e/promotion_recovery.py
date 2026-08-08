@@ -18,6 +18,7 @@ from .services import CandidateDeployment
 
 
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+_GPU_UUID = re.compile(r"GPU-[0-9a-f]{16}")
 _ORDER = ("anchor", "candidate", "candidate", "anchor")
 _SLOTS = ("ab-anchor", "ab-candidate", "ba-candidate", "ba-anchor")
 
@@ -392,16 +393,20 @@ def _verify_lease(
     if (
         receipt.digest != value.get("gpu_lease_digest")
         or sha256_json(dict(lease)) != receipt.digest
-        or lease.get("schema_version") != 1
+        or lease.get("schema_version") != 2
         or lease.get("run_id") != record.run_id
-        or lease.get("device_scope") != value.get("gpu_device_scope")
+        or lease.get("execution_scope") != value.get("gpu_device_scope")
+        or not isinstance(lease.get("physical_scope"), str)
         or not isinstance(lease.get("owner_pid"), int)
         or not isinstance(lease.get("acquired_unix_seconds"), (int, float))
         or not isinstance(lease.get("lock_path"), str)
-        or ownership.get("schema_version") != 1
-        or ownership.get("policy_id") != "rocm_smi_process_gpu_map_v1"
+        or ownership.get("schema_version") != 2
+        or ownership.get("policy_id")
+        != "clean_hsa_kfd_rsmi_process_gpu_map_v2"
         or ownership.get("foreign_owners") != []
-        or _physical_scope(ownership) != lease.get("device_scope")
+        or not _valid_gpu_inventory_binding(ownership)
+        or _execution_scope(ownership) != lease.get("execution_scope")
+        or _physical_scope(ownership) != lease.get("physical_scope")
     ):
         raise IntegrityError("Matched GPU lease differs", "promotion_lease_mismatch")
 
@@ -416,6 +421,113 @@ def _physical_scope(ownership: Mapping[str, Any]) -> str:
             return ""
         identities.append(raw["unique_id"])
     return "amd-gpu-unique-id-set=" + ",".join(sorted(identities))
+
+
+def _execution_scope(ownership: Mapping[str, Any]) -> str:
+    devices = ownership.get("selected_devices")
+    if not isinstance(devices, list) or not devices:
+        return ""
+    identities = []
+    for raw in devices:
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("unique_id"), str):
+            return ""
+        identities.append(raw["unique_id"])
+    return "amd-gpu-set=" + ",".join(identities)
+
+
+def _valid_gpu_inventory_binding(ownership: Mapping[str, Any]) -> bool:
+    monitors = ownership.get("rsmi_monitor_inventory")
+    joined = ownership.get("device_inventory")
+    selected = ownership.get("selected_devices")
+    hsa_inventory = ownership.get("hsa_inventory")
+    hsa = hsa_inventory.get("devices") if isinstance(hsa_inventory, Mapping) else None
+    if not all(isinstance(value, list) and value for value in (monitors, joined, selected, hsa)):
+        return False
+    assert isinstance(monitors, list)
+    assert isinstance(joined, list)
+    assert isinstance(selected, list)
+    assert isinstance(hsa, list)
+    if len(joined) != len(hsa):
+        return False
+    monitor_map = _valid_monitor_inventory(monitors)
+    if monitor_map is None:
+        return False
+    joined_rsmi_indices = [
+        item.get("rsmi_index") for item in joined if isinstance(item, Mapping)
+    ]
+    if (
+        len(joined_rsmi_indices) != len(joined)
+        or any(not _strict_int(index) for index in joined_rsmi_indices)
+        or len(set(joined_rsmi_indices)) != len(joined)
+    ):
+        return False
+    for expected_index, (raw_joined, raw_hsa) in enumerate(zip(joined, hsa, strict=True)):
+        if not isinstance(raw_joined, Mapping) or not isinstance(raw_hsa, Mapping):
+            return False
+        rsmi_index = raw_joined.get("rsmi_index")
+        monitor = monitor_map.get(rsmi_index) if _strict_int(rsmi_index) else None
+        if not _joined_identity_matches(raw_joined, raw_hsa, monitor, expected_index):
+            return False
+    selected_indices = [
+        item.get("hsa_gpu_index") for item in selected if isinstance(item, Mapping)
+    ]
+    return (
+        len(selected_indices) == len(selected)
+        and all(_strict_int(index) for index in selected_indices)
+        and len(set(selected_indices)) == len(selected)
+        and all(isinstance(item, Mapping) and item in joined for item in selected)
+    )
+
+
+def _valid_monitor_inventory(
+    monitors: list[Any],
+) -> dict[int, Mapping[str, Any]] | None:
+    result: dict[int, Mapping[str, Any]] = {}
+    for expected_index, raw in enumerate(monitors):
+        if not isinstance(raw, Mapping) or raw.get("rsmi_index") != expected_index:
+            return None
+        if (
+            not _strict_int(raw.get("node_id"))
+            or not _strict_int(raw.get("pci_id"))
+            or not _strict_int(raw.get("render_minor"))
+            or raw.get("render_minor", 0) < 128
+            or not isinstance(raw.get("unique_id"), str)
+            or not _GPU_UUID.fullmatch(raw["unique_id"])
+        ):
+            return None
+        result[expected_index] = raw
+    for field in ("unique_id", "node_id", "pci_id", "render_minor"):
+        if len({item[field] for item in result.values()}) != len(result):
+            return None
+    return result
+
+
+def _joined_identity_matches(
+    joined: Mapping[str, Any],
+    hsa: Mapping[str, Any],
+    monitor: Mapping[str, Any] | None,
+    expected_index: int,
+) -> bool:
+    if monitor is None:
+        return False
+    domain = hsa.get("domain")
+    bdf_id = hsa.get("bdf_id")
+    render_node = joined.get("render_node")
+    if not _strict_int(domain) or not _strict_int(bdf_id) or not isinstance(render_node, str):
+        return False
+    render = render_node.removeprefix("/dev/dri/renderD")
+    return (
+        joined.get("hsa_gpu_index") == expected_index == hsa.get("hsa_gpu_index")
+        and joined.get("kfd_node_id") == hsa.get("node_id") == monitor.get("node_id")
+        and joined.get("unique_id") == hsa.get("unique_id") == monitor.get("unique_id")
+        and render.isdecimal()
+        and int(render) == monitor.get("render_minor")
+        and (domain << 32) | bdf_id == monitor.get("pci_id")
+    )
+
+
+def _strict_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
 
 
 def _required_role(event: EventRecord, role: str) -> ArtifactReceipt:

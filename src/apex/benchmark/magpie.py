@@ -16,7 +16,7 @@ from apex.execution import (
     SubprocessSupervisor,
     build_subprocess_environment,
 )
-from apex.ports import BenchmarkRequest, BenchmarkResult
+from apex.ports import BenchmarkPass, BenchmarkRequest, BenchmarkResult
 from apex.runtime import DependencyReceipt, LmEvalRuntimeReceipt
 
 from .config_views import validate_resolved_view
@@ -39,6 +39,9 @@ class _EvidenceExpectations:
     model: str
     model_revision: str | None
     inferencex_tree: str | None
+    allow_tracelens_derivation: bool
+    tracelens_commit: str | None
+    tracelens_tree: str | None
 
 
 def _lm_eval_expectation(
@@ -54,6 +57,44 @@ def _lm_eval_expectation(
         return None, None
     mode = str(benchmark.get("run_mode", "docker")).strip().lower()
     return receipt.lm_eval_runtime, mode
+
+
+def _dependency_tree(receipt: DependencyReceipt, name: str) -> str | None:
+    dependencies = receipt.raw.get("dependencies")
+    if not isinstance(dependencies, Mapping):
+        return None
+    dependency = dependencies.get(name)
+    if not isinstance(dependency, Mapping):
+        return None
+    tree = dependency.get("tree")
+    return tree if isinstance(tree, str) else None
+
+
+def _allows_tracelens_derivation(
+    request: BenchmarkRequest,
+    document: Mapping[str, Any],
+) -> bool:
+    benchmark = document.get("benchmark")
+    apex = document.get("apex")
+    if not isinstance(benchmark, Mapping) or not isinstance(apex, Mapping):
+        return False
+    view = apex.get("benchmark_view")
+    quality = view.get("quality_contract") if isinstance(view, Mapping) else None
+    profiler = benchmark.get("profiler")
+    tracelens = profiler.get("tracelens") if isinstance(profiler, Mapping) else None
+    return bool(
+        request.pass_type is BenchmarkPass.DIAGNOSTIC
+        and str(benchmark.get("run_mode", "docker")).strip().lower() == "docker"
+        and isinstance(view, Mapping)
+        and view.get("kind") == "diagnostic"
+        and isinstance(quality, Mapping)
+        and quality.get("required") is False
+        and quality.get("kind") == "trace_only"
+        and isinstance(tracelens, Mapping)
+        and tracelens.get("enabled") is True
+        and tracelens.get("analysis_mode") == "inference"
+        and tracelens.get("auto_patch_runtime") is True
+    )
 
 
 class MagpieBenchmarkAdapter:
@@ -150,6 +191,9 @@ class MagpieBenchmarkAdapter:
             if self._receipt.lm_eval_runtime
             else {}
         )
+        allow_tracelens_derivation = _allows_tracelens_derivation(
+            request, document
+        )
         return _EvidenceExpectations(
             quality_required=bool(quality.get("required", True)),
             evaluator_policy=(
@@ -173,6 +217,17 @@ class MagpieBenchmarkAdapter:
                 else None
             ),
             inferencex_tree=identity.get("inferencex_tree"),
+            allow_tracelens_derivation=allow_tracelens_derivation,
+            tracelens_commit=(
+                self._receipt.commits.get("tracelens")
+                if allow_tracelens_derivation
+                else None
+            ),
+            tracelens_tree=(
+                _dependency_tree(self._receipt, "tracelens")
+                if allow_tracelens_derivation
+                else None
+            ),
         )
 
     @staticmethod
@@ -230,6 +285,9 @@ class MagpieBenchmarkAdapter:
             expected_config_sha256=expectations.config_sha256,
             expected_requested_image=expectations.requested_image,
             expected_execution_mode=expectations.execution_mode,
+            allow_tracelens_derivation=expectations.allow_tracelens_derivation,
+            expected_tracelens_commit=expectations.tracelens_commit,
+            expected_tracelens_tree=expectations.tracelens_tree,
         )
 
     def run_normalized(self, request: BenchmarkRequest) -> NormalizedBenchmarkResult:

@@ -119,7 +119,11 @@ from apex.runtime import (
     GpuDeviceIdentity,
     GpuLeaseReceipt,
     GpuOwnershipReceipt,
+    GpuSelectorRequest,
+    HsaGpuIdentity,
+    HsaInventoryEvidence,
     LmEvalRuntimeReceipt,
+    RsmiDeviceIdentity,
     RunProvenance,
 )
 from apex.storage import (
@@ -144,20 +148,40 @@ class _Lease:
         self, run_id: str, state: _LeaseState, generation: int, unique_id: str
     ) -> None:
         self.state = state
+        normalized = unique_id.lower().removeprefix("gpu-").removeprefix("0x")
+        canonical_id = f"GPU-{normalized}"
+        device = GpuDeviceIdentity(
+            0, 2, 0, canonical_id, "/dev/dri/renderD128"
+        )
         ownership = GpuOwnershipReceipt(
-            1,
-            "rocm_smi_process_gpu_map_v1",
-            "amd-gpu-set=0",
-            123,
-            "/opt/rocm/lib/librocm_smi64.so.7",
-            "a" * 64,
-            (GpuDeviceIdentity(0, unique_id, "/dev/dri/renderD128"),),
-            (),
-            (),
+            schema_version=2,
+            policy_id="clean_hsa_kfd_rsmi_process_gpu_map_v2",
+            selector_inputs=GpuSelectorRequest(requested=("0",)),
+            observed_unix_ns=123,
+            library_path="/opt/rocm/lib/librocm_smi64.so.7",
+            library_sha256="a" * 64,
+            topology_root="/sys/class/kfd/kfd/topology/nodes",
+            hsa_inventory=HsaInventoryEvidence(
+                1,
+                "clean_unfiltered_hsa_gpu_inventory_v1",
+                "/trusted/helper.py",
+                "b" * 64,
+                "/opt/rocm/lib/libhsa-runtime64.so.1",
+                "c" * 64,
+                (HsaGpuIdentity(0, 2, 2, 100, 0, canonical_id),),
+            ),
+            rsmi_monitor_inventory=(
+                RsmiDeviceIdentity(0, 2, 100, canonical_id, 128),
+            ),
+            device_inventory=(device,),
+            selected_devices=(device,),
+            allowed_owners=(),
+            foreign_owners=(),
         )
         self.receipt = GpuLeaseReceipt(
-            1,
+            2,
             run_id,
+            ownership.execution_scope,
             ownership.physical_scope,
             1,
             float(generation),
@@ -179,7 +203,7 @@ class _LeaseManager:
     def __init__(
         self,
         state: _LeaseState,
-        unique_ids: tuple[str, ...] = ("0x0000000000000001",),
+        unique_ids: tuple[str, ...] = ("GPU-0000000000000001",),
     ) -> None:
         self.state = state
         self.unique_ids = unique_ids

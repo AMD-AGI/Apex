@@ -17,13 +17,15 @@ from .gpu_ownership import (
     GpuOwnershipReceipt,
     RocmSmiGpuOwnershipInspector,
 )
+from .gpu_topology import selector_scope
 
 
 @dataclass(frozen=True, slots=True)
 class GpuLeaseReceipt:
     schema_version: int
     run_id: str
-    device_scope: str
+    execution_scope: str
+    physical_scope: str
     owner_pid: int
     acquired_unix_seconds: float
     lock_path: str
@@ -37,7 +39,7 @@ class GpuLeaseReceipt:
             sorted(device.unique_id for device in self.ownership.selected_devices)
         )
         if (
-            self.schema_version != 1
+            self.schema_version != 2
             or self.owner_pid <= 0
             or self.acquired_unix_seconds < 0
             or not Path(self.lock_path).is_absolute()
@@ -46,7 +48,8 @@ class GpuLeaseReceipt:
             or len(paths) != len(set(paths))
             or len(unique_ids) != len(set(unique_ids))
             or any(not Path(path).is_absolute() for path in paths)
-            or self.device_scope != self.ownership.physical_scope
+            or self.execution_scope != self.ownership.execution_scope
+            or self.physical_scope != self.ownership.physical_scope
             or self.ownership.foreign_owners
         ):
             raise ContractError(
@@ -58,7 +61,8 @@ class GpuLeaseReceipt:
         return {
             "schema_version": self.schema_version,
             "run_id": self.run_id,
-            "device_scope": self.device_scope,
+            "execution_scope": self.execution_scope,
+            "physical_scope": self.physical_scope,
             "owner_pid": self.owner_pid,
             "acquired_unix_seconds": self.acquired_unix_seconds,
             "lock_path": self.lock_path,
@@ -105,16 +109,18 @@ class LocalGpuLease:
             self._selector_scope, allowed_pids=(os.getpid(),)
         )
         _reject_foreign_owners(preflight)
-        self._device_scope = preflight.physical_scope
+        self._execution_scope = preflight.execution_scope
+        self._physical_scope = preflight.physical_scope
         self._preflight = preflight
         root = lock_root or Path("/tmp/apex-gpu-leases")
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._locks = _physical_lock_paths(root, preflight)
         self._descriptors: tuple[int, ...] = ()
         self.receipt = GpuLeaseReceipt(
-            1,
+            2,
             run_id,
-            self._device_scope,
+            self._execution_scope,
+            self._physical_scope,
             os.getpid(),
             0.0,
             str(self._locks[0][1]),
@@ -127,7 +133,7 @@ class LocalGpuLease:
         try:
             for unique_id, path in self._locks:
                 acquired_descriptors.append(
-                    _acquire_physical_lock(unique_id, path, self._device_scope)
+                    _acquire_physical_lock(unique_id, path, self._physical_scope)
                 )
             ownership = self._ownership_inspector.inspect(
                 self._selector_scope, allowed_pids=(os.getpid(),)
@@ -137,12 +143,22 @@ class LocalGpuLease:
                     "Physical GPU mapping changed while acquiring the lease",
                     "gpu_physical_mapping_changed",
                 )
+            if (
+                ownership.device_inventory != self._preflight.device_inventory
+                or ownership.selector_inputs != self._preflight.selector_inputs
+                or ownership.hsa_inventory != self._preflight.hsa_inventory
+            ):
+                raise ContractError(
+                    "GPU inventory or visibility changed while acquiring the lease",
+                    "gpu_physical_mapping_changed",
+                )
             _reject_foreign_owners(ownership)
             acquired_at = time.time()
             self.receipt = GpuLeaseReceipt(
-                1,
+                2,
                 self._run_id,
-                self._device_scope,
+                self._execution_scope,
+                self._physical_scope,
                 os.getpid(),
                 acquired_at,
                 str(self._locks[0][1]),
@@ -197,61 +213,9 @@ class LocalGpuLeaseManager:
 
 
 def resolve_gpu_device_scope(requested_devices: str | None = None) -> str:
-    """Resolve one physical AMD GPU set and reject split-brain visibility.
+    """Validate a requested selector; the inspector resolves ambient visibility."""
 
-    E2E specs may select devices explicitly while standalone tasks inherit the
-    evaluator-owned process visibility.  The lease identity deliberately omits
-    the environment-variable name so ROCR and HIP users contend on the same
-    physical set.
-    """
-
-    requested = (
-        _parse_device_set(requested_devices, source="requested GPU devices")
-        if requested_devices is not None
-        else None
-    )
-    ambient: list[tuple[str, tuple[str, ...]]] = []
-    for name in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
-        raw = os.environ.get(name)
-        if raw is not None and raw.strip():
-            ambient.append((name, _parse_device_set(raw, source=name)))
-
-    if len({devices for _, devices in ambient}) > 1:
-        raise ContractError(
-            "ROCR_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES select different GPU sets",
-            "gpu_visibility_mismatch",
-            {name: ",".join(devices) for name, devices in ambient},
-        )
-    observed = ambient[0][1] if ambient else None
-    if requested is not None and observed is not None and requested != observed:
-        raise ContractError(
-            "Requested GPU devices disagree with ambient process visibility",
-            "gpu_visibility_mismatch",
-            {
-                "requested": ",".join(requested),
-                "ambient": ",".join(observed),
-            },
-        )
-    selected = requested or observed
-    return (
-        "amd-gpu-set=" + ",".join(selected)
-        if selected is not None
-        else "all-visible-amd-gpus"
-    )
-
-
-def _parse_device_set(raw: str, *, source: str) -> tuple[str, ...]:
-    parts = tuple(part.strip() for part in raw.split(","))
-    if (
-        not parts
-        or any(not part or len(part) > 128 or "\x00" in part for part in parts)
-        or len(parts) != len(set(parts))
-    ):
-        raise ContractError(
-            f"{source} must be a non-empty comma-separated set without duplicates",
-            "invalid_gpu_device_scope",
-        )
-    return tuple(sorted(parts))
+    return selector_scope(requested_devices)
 
 
 def _physical_lock_paths(
@@ -277,7 +241,7 @@ def _physical_lock_paths(
     )
 
 
-def _acquire_physical_lock(unique_id: str, path: Path, device_scope: str) -> int:
+def _acquire_physical_lock(unique_id: str, path: Path, physical_scope: str) -> int:
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
@@ -290,7 +254,7 @@ def _acquire_physical_lock(unique_id: str, path: Path, device_scope: str) -> int
             "Another Apex run holds a selected physical GPU lease",
             "gpu_lease_busy",
             {
-                "device_scope": device_scope,
+                "physical_scope": physical_scope,
                 "physical_unique_id": unique_id,
                 "lock_path": str(path),
                 "owner": owner,

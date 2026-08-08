@@ -59,7 +59,7 @@ def _receipt(tmp_path: Path) -> DependencyReceipt:
             "tracelens": "2" * 40,
             "inferencex": "3" * 40,
         },
-        raw={},
+        raw={"dependencies": {"tracelens": {"tree": "5" * 40}}},
         lm_eval_runtime=LmEvalRuntimeReceipt(
             runtime,
             "4" * 64,
@@ -94,11 +94,84 @@ def _serving_runtime(config_path: Path) -> dict[str, object]:
     ]
     resolved = requested if requested.startswith("sha256:") else "sha256:" + "d" * 64
     return {
-        "schema": "magpie.serving-runtime-receipt/v1",
+        "schema": "magpie.serving-runtime-receipt/v2",
         "execution_mode": "docker",
         "input_config_sha256": sha256_file(config_path),
+        "input_image": requested,
+        "input_image_id": resolved,
         "requested_image": requested,
         "resolved_image_id": resolved,
+        "image_derivation": {
+            "kind": "direct",
+            "framework": "vllm",
+            "runtime_schema": None,
+            "base_image": requested,
+            "base_image_id": resolved,
+            "base_image_locator": requested,
+            "derived_image": requested,
+            "derived_image_id": resolved,
+            "tracelens_source_commit": None,
+            "tracelens_source_tree": None,
+            "patch_version": None,
+            "patch_path": None,
+            "patch_sha256": None,
+            "dependency_wheel_manifest_sha256": None,
+            "validator": "docker-image-id",
+            "verified": True,
+        },
+        "container_name": "magpie-benchmark-test",
+        "docker_argv_sha256": "e" * 64,
+        "process_succeeded": True,
+        "verified": True,
+        "errors": [],
+    }
+
+
+def _tracelens_serving_runtime(
+    config_path: Path,
+    receipt: DependencyReceipt,
+    *,
+    source_commit: str | None = None,
+) -> dict[str, object]:
+    input_image = yaml.safe_load(config_path.read_text(encoding="utf-8"))["benchmark"][
+        "docker_image"
+    ]
+    input_id = "sha256:" + "d" * 64
+    requested = "magpie-tracelens-vllm:test"
+    derived_id = "sha256:" + "9" * 64
+    return {
+        "schema": "magpie.serving-runtime-receipt/v2",
+        "execution_mode": "docker",
+        "input_config_sha256": sha256_file(config_path),
+        "input_image": input_image,
+        "input_image_id": input_id,
+        "requested_image": requested,
+        "resolved_image_id": derived_id,
+        "image_derivation": {
+            "kind": "tracelens-derived",
+            "framework": "vllm",
+            "runtime_schema": "magpie.tracelens-vllm-runtime/v1",
+            "base_image": input_image,
+            "base_image_id": input_id,
+            "base_image_locator": input_id,
+            "derived_image": requested,
+            "derived_image_id": derived_id,
+            "tracelens_source_commit": (
+                source_commit or receipt.commits["tracelens"]
+            ),
+            "tracelens_source_tree": receipt.raw["dependencies"]["tracelens"][
+                "tree"
+            ],
+            "patch_version": "v19",
+            "patch_path": (
+                "examples/custom_workflows/inference_analysis/vllm_patches/"
+                "config_vllm_v0.19.0.patch"
+            ),
+            "patch_sha256": "6" * 64,
+            "dependency_wheel_manifest_sha256": "7" * 64,
+            "validator": "vllm-tracelens-runtime-validation/v1",
+            "verified": True,
+        },
         "container_name": "magpie-benchmark-test",
         "docker_argv_sha256": "e" * 64,
         "process_succeeded": True,
@@ -227,8 +300,14 @@ class FakeSupervisor:
 
 
 class FakeDiagnosticSupervisor:
-    def __init__(self, receipt: DependencyReceipt) -> None:
+    def __init__(
+        self,
+        receipt: DependencyReceipt,
+        *,
+        tracelens_commit: str | None = None,
+    ) -> None:
         self.receipt = receipt
+        self.tracelens_commit = tracelens_commit
 
     def run(self, argv, *, cwd, environment, timeout_seconds, stdin_text=None):
         config_path = Path(argv[argv.index("--benchmark-config") + 1])
@@ -280,7 +359,11 @@ class FakeDiagnosticSupervisor:
             "reward_eligible": False,
             "inferencex_runtime_receipt": inferencex_receipt,
             "lm_eval_runtime_receipt": not_requested,
-            "serving_runtime_receipt": _serving_runtime(config_path),
+            "serving_runtime_receipt": _tracelens_serving_runtime(
+                config_path,
+                self.receipt,
+                source_commit=self.tracelens_commit,
+            ),
             "throughput": {"output_throughput": 9.0},
             "latency": {},
             "errors": [],
@@ -376,6 +459,35 @@ def test_adapter_runs_serving_diagnostic_without_lm_eval_runtime(
     assert result.quality.required is False
     assert result.lm_eval_runtime.required is False
     assert result.lm_eval_runtime.passed
+    assert result.serving_runtime.input_image == "example:image"
+    assert result.serving_runtime.requested_image == "magpie-tracelens-vllm:test"
+    assert result.serving_runtime.resolved_image_id == "sha256:" + "9" * 64
+    assert result.serving_runtime.image_derivation is not None
+    assert result.serving_runtime.image_derivation["kind"] == "tracelens-derived"
+
+
+def test_adapter_rejects_diagnostic_with_unpinned_tracelens_lineage(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    measurement = _config(tmp_path, receipt)
+    diagnostic = measurement.parent / "benchmark.diagnostic.resolved.yaml"
+    adapter = MagpieBenchmarkAdapter(
+        receipt,
+        FakeDiagnosticSupervisor(receipt, tracelens_commit="8" * 40),
+    )
+    request = BenchmarkRequest(
+        run_id="diagnostic",
+        config_path=diagnostic,
+        output_dir=tmp_path / "runs",
+        pass_type=BenchmarkPass.DIAGNOSTIC,
+        timeout_seconds=99,
+    )
+
+    result = adapter.run_normalized(request)
+
+    assert not result.succeeded
+    assert "serving_runtime_image_lineage_mismatch" in result.errors
 
 
 def test_lm_eval_evidence_is_required_only_for_lm_eval_quality(tmp_path: Path) -> None:

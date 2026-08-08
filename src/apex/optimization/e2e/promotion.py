@@ -272,7 +272,7 @@ class MatchedPromotionRunner:
             request.anchor_id,
             request.anchor_generation,
             self.gpu_lease.digest,
-            self.gpu_lease.device_scope,
+            self.gpu_lease.execution_scope,
             observations[0].config.digest,
             observations[1].config.digest,
             anchor_image,

@@ -331,8 +331,11 @@ def _validate_serving_runtime(
     receipt = _mapping(report.get("serving_runtime_receipt"), "runtime receipt")
     expected = {
         "input_config_sha256": serving.get("input_config_sha256"),
+        "input_image": serving.get("input_image"),
+        "input_image_id": serving.get("input_image_id"),
         "requested_image": serving.get("requested_image"),
         "resolved_image_id": serving.get("resolved_image_id"),
+        "image_derivation": serving.get("image_derivation"),
         "container_name": serving.get("container_name"),
         "docker_argv_sha256": serving.get("docker_argv_sha256"),
         "process_succeeded": serving.get("process_succeeded"),
@@ -340,7 +343,7 @@ def _validate_serving_runtime(
     if (
         serving.get("passed") is not True
         or serving.get("error") is not None
-        or receipt.get("schema") != "magpie.serving-runtime-receipt/v1"
+        or receipt.get("schema") != "magpie.serving-runtime-receipt/v2"
         or receipt.get("execution_mode") != "docker"
         or receipt.get("verified") is not True
         or receipt.get("errors") != []

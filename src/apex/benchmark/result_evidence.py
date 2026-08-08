@@ -40,6 +40,9 @@ def parse_attestations(
     expected_config_sha256: str | None,
     expected_requested_image: str | None,
     expected_execution_mode: str | None,
+    allow_tracelens_derivation: bool = False,
+    expected_tracelens_commit: str | None = None,
+    expected_tracelens_tree: str | None = None,
 ) -> Attestations:
     """Parse all protected side-artifact lanes against caller expectations."""
 
@@ -68,6 +71,9 @@ def parse_attestations(
         expected_config_sha256=expected_config_sha256,
         expected_requested_image=expected_requested_image,
         expected_execution_mode=expected_execution_mode,
+        allow_tracelens_derivation=allow_tracelens_derivation,
+        expected_tracelens_commit=expected_tracelens_commit,
+        expected_tracelens_tree=expected_tracelens_tree,
     )
     return model, inferencex, lm_eval, serving
 

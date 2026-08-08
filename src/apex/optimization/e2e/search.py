@@ -92,7 +92,7 @@ class E2ESearchLoop:
         self.safety = safety
         self.deployments = deployments
         self.gpu_lease = gpu_lease
-        self.gpu_device_scope = gpu_lease.device_scope
+        self.gpu_device_scope = gpu_lease.execution_scope
         self.promotions = MatchedPromotionRunner(
             session=session,
             record=record,
