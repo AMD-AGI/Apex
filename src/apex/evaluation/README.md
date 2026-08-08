@@ -47,7 +47,11 @@ candidate receives `-100`, while the explicit source-free outcome
 `agent_made_no_source_change` receives `-20`; inconclusive measurement receives
 `0`. The final scalar is clipped to `[-200, 200]`. These values grade one E2E
 candidate outcome and must not be confused with canonical kernel raw-sample
-reward.
+reward. A matched A/B/B/A window uses the frozen
+`conservative_e2e_reward_v1` selector: any failing comparison sorts before a
+KEEP, then the lowest scalar reward and stable worst-metric/measurement-ID
+tie-breakers select the recorded grade. This is permutation-invariant and never
+averages away a hard-gate regression.
 
 Tests: `pytest tests/unit/evaluation tests/gpu -q`.
 

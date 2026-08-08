@@ -259,9 +259,12 @@ KEEP is evaluated only from a same-window matched comparison against the current
 live anchor, never the original baseline or a historical candidate measurement.
 The counterbalanced order is `A(current), B(candidate), B(candidate), A(current)`;
 both independently recomputed A/B comparisons must pass quality, tail-latency, and
-throughput policy. The lower of their throughput gains is the promotion grade, so
-one favorable ordering cannot hide a regression in the other. REVERT rolls back
-the candidate deployment. A KEEP forces a fresh diagnostic pass before another
+throughput policy. The receipt-bound `conservative_e2e_reward_v1` policy selects
+any failure before a KEEP, then the lowest scalar reward with stable metric and
+measurement-ID tie-breakers; if both pass, this reduces to the lower throughput
+gain. One favorable ordering therefore cannot hide a regression in the other,
+and failure attribution is independent of tuple order. REVERT rolls back the
+candidate deployment. A KEEP forces a fresh diagnostic pass before another
 opportunity is selected. Formal success is impossible until a source-rebuilt
 bundle passes engagement verification and a second clean replay.
 Every selected opportunity has one explicit attempt child. Candidate E2E

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Sequence
 
 from apex.benchmark import (
     InferenceXRuntimeEvidence,
@@ -19,14 +20,25 @@ from apex.core import ValidationLevel, canonical_json_bytes, sha256_file, sha256
 from apex.evaluation import (
     E2EAcceptancePolicy,
     E2ERewardPolicy,
+    e2e_comparison_selection_policy,
     evaluate_current_anchor,
     grade_e2e_outcome,
+    select_conservative_e2e_verdict,
 )
 from apex.intake import RegressionGates
 from apex.optimization.e2e.benchmark_artifacts import persist_benchmark_evidence
 from apex.optimization.e2e.benchmarking import measurement_from_result
 from apex.optimization.e2e.services import CandidateDeployment, DeploymentConfigDigests
 from apex.ports import BenchmarkPass
+from apex.runtime import (
+    GpuDeviceIdentity,
+    GpuLeaseReceipt,
+    GpuOwnershipReceipt,
+    GpuSelectorRequest,
+    HsaGpuIdentity,
+    HsaInventoryEvidence,
+    RsmiDeviceIdentity,
+)
 from apex.storage import ArtifactStore, EventJournal
 
 from .conftest import (
@@ -47,17 +59,18 @@ def build_measured_run(
     *,
     runtime_image: str = _CANDIDATE_IMAGE,
     candidate_config_matches_delivery: bool = True,
-    decision_benchmark_from_baseline: bool = False,
     candidate_lane: BenchmarkPass = BenchmarkPass.MEASUREMENT,
-    decision_candidate_throughput: float = 101.0,
+    decision_candidate_throughput: float | None = None,
     raw_candidate_accuracy: float = 0.81,
-    report_candidate_throughput: float = 101.0,
+    report_candidate_throughput: float | None = None,
     candidate_ttft_p99_ms: float = 1.0,
+    candidate_throughputs: tuple[float, float] = (101.0, 101.0),
     acceptance_gates: RegressionGates = RegressionGates(),
     decision_gates: RegressionGates | None = None,
     objective_hash_matches_request: bool = True,
     reward_opportunity_id: str = "opportunity-1",
     add_legacy_raw_role: bool = False,
+    tamper: str | None = None,
 ) -> dict[str, object]:
     run_id = "run-e2e-measured"
     attempt_id = "attempt-measured"
@@ -72,17 +85,30 @@ def build_measured_run(
         0.8,
         _BASE_IMAGE,
     )
-    candidate = _benchmark(
-        root,
-        artifacts,
-        "candidate",
-        101.0,
-        0.81,
-        runtime_image,
-        lane=candidate_lane,
-        raw_accuracy=raw_candidate_accuracy,
-        report_throughput=report_candidate_throughput,
-        ttft_p99_ms=candidate_ttft_p99_ms,
+    legs = (
+        _benchmark(root, artifacts, "ab-anchor", 100.0, 0.8, _BASE_IMAGE),
+        _benchmark(
+            root,
+            artifacts,
+            "ab-candidate",
+            candidate_throughputs[0],
+            0.81,
+            runtime_image,
+            lane=candidate_lane,
+            raw_accuracy=raw_candidate_accuracy,
+            report_throughput=report_candidate_throughput,
+            ttft_p99_ms=candidate_ttft_p99_ms,
+        ),
+        _benchmark(
+            root,
+            artifacts,
+            "ba-candidate",
+            candidate_throughputs[1],
+            0.81,
+            runtime_image,
+            ttft_p99_ms=candidate_ttft_p99_ms,
+        ),
+        _benchmark(root, artifacts, "ba-anchor", 100.0, 0.8, _BASE_IMAGE),
     )
     packet = make_packet(run_id)
     packet_receipt = artifacts.put_bytes(packet.canonical_bytes, media_type="application/json")
@@ -107,23 +133,22 @@ def build_measured_run(
         artifacts,
         candidate_id,
         candidate_config=(
-            candidate["config_path"]
+            legs[1]["config_path"]
             if candidate_config_matches_delivery
             else baseline["config_path"]
         ),
     )
-    baseline_measurement = _measurement(baseline)
-    decision_measurement = measurement_from_result(
-        _result_for_decision(candidate["result"], decision_candidate_throughput),
-        _PROTOCOL,
-        quality_receipt=candidate["evidence"].quality.digest,
-        measurement_receipt=candidate["evidence"].normalized.digest,
+    pair, pair_receipt, lease, comparisons, selected = _matched_pair(
+        artifacts,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        candidate_id=candidate_id,
+        legs=legs,
+        acceptance_gates=decision_gates or acceptance_gates,
+        decision_candidate_throughput=decision_candidate_throughput,
+        tamper=tamper,
     )
-    verdict = evaluate_current_anchor(
-        baseline_measurement,
-        decision_measurement,
-        E2EAcceptancePolicy(decision_gates or acceptance_gates),
-    )
+    verdict = comparisons[selected]
     decision_name = "keep" if verdict.keep else "revert"
     grade = grade_e2e_outcome(
         verdict=decision_name,
@@ -131,10 +156,10 @@ def build_measured_run(
         candidate_present=True,
         measurement_verdict=verdict,
     )
-    benchmark_receipt = (
-        baseline["evidence"].normalized
-        if decision_benchmark_from_baseline
-        else candidate["evidence"].normalized
+    decision_pair_receipt = (
+        artifacts.put_bytes(b"{}", media_type="application/json")
+        if tamper == "decision_pair_receipt"
+        else pair_receipt
     )
     decision_doc = {
         "schema_version": 1,
@@ -148,8 +173,10 @@ def build_measured_run(
         "micro_receipt": micro.digest,
         "safety_receipt": safety.digest,
         "delivery_receipt": delivery.digest,
-        "benchmark_receipt": benchmark_receipt.digest,
+        "promotion_pair_receipt": decision_pair_receipt.digest,
     }
+    if tamper == "legacy_benchmark_receipt":
+        decision_doc["benchmark_receipt"] = legs[1]["evidence"].normalized.digest
     decision = artifacts.put_bytes(
         canonical_json_bytes(decision_doc), media_type="application/json"
     )
@@ -192,7 +219,11 @@ def build_measured_run(
         delivery,
         delivery_bindings,
         baseline,
-        candidate,
+        legs,
+        pair,
+        pair_receipt,
+        lease,
+        tamper,
     )
     _append_outcome(
         journal,
@@ -211,7 +242,8 @@ def build_measured_run(
         micro,
         safety,
         delivery,
-        candidate["evidence"].normalized,
+        pair_receipt,
+        tamper,
         add_legacy_raw_role,
     )
     append_event(
@@ -227,8 +259,174 @@ def build_measured_run(
         "journal": journal,
         "artifacts": artifacts,
         "decision": decision,
-        "candidate_evidence": candidate["evidence"],
+        "pair": pair,
+        "pair_receipt": pair_receipt,
+        "legs": legs,
+        "selected_comparison": selected,
     }
+
+
+def _matched_pair(
+    artifacts: ArtifactStore,
+    *,
+    run_id: str,
+    attempt_id: str,
+    candidate_id: str,
+    legs: Sequence[dict[str, Any]],
+    acceptance_gates: RegressionGates,
+    decision_candidate_throughput: float | None,
+    tamper: str | None,
+):
+    measurements = tuple(_measurement(item) for item in legs)
+    decision_candidates = (measurements[1], measurements[2])
+    if decision_candidate_throughput is not None:
+        decision_candidates = tuple(
+            measurement_from_result(
+                _result_for_decision(legs[position]["result"], decision_candidate_throughput),
+                _PROTOCOL,
+                quality_receipt=legs[position]["evidence"].quality.digest,
+                measurement_receipt=legs[position]["evidence"].normalized.digest,
+            )
+            for position in (1, 2)
+        )
+    acceptance = E2EAcceptancePolicy(acceptance_gates)
+    comparisons = (
+        evaluate_current_anchor(measurements[0], decision_candidates[0], acceptance),
+        evaluate_current_anchor(measurements[3], decision_candidates[1], acceptance),
+    )
+    selected = select_conservative_e2e_verdict(comparisons)
+    if tamper == "selected_comparison":
+        selected = 1 - selected
+    lease_document = _gpu_lease_document(run_id)
+    if tamper == "gpu_inventory":
+        lease_document["ownership"]["device_inventory"][0]["unique_id"] = (
+            "GPU-ffffffffffffffff"
+        )
+    lease = artifacts.put_bytes(
+        canonical_json_bytes(lease_document), media_type="application/json"
+    )
+    window_id = "window-attempt-measured-10"
+    observations = [
+        _promotion_observation(position, side, window_id, legs[position], measurements[position])
+        for position, side in enumerate(("anchor", "candidate", "candidate", "anchor"))
+    ]
+    if tamper == "observation":
+        observations[1] = dict(observations[1])
+        observations[1]["measurement"] = dict(observations[1]["measurement"])
+        observations[1]["measurement"]["throughput"] += 1.0
+    if tamper == "action_id":
+        observations[2] = dict(observations[2])
+        observations[2]["action_id"] += "-tampered"
+    pair = {
+        "schema": (
+            "apex.e2e-matched-promotion/v1"
+            if tamper == "pair_schema"
+            else "apex.e2e-matched-promotion/v2"
+        ),
+        "pair_id": "pair-attempt-measured-20",
+        "window_id": window_id,
+        "attempt_id": attempt_id,
+        "candidate_id": candidate_id,
+        "opportunity_id": "opportunity-1",
+        "anchor_id": "anchor-0",
+        "anchor_generation": 0,
+        "gpu_lease_digest": lease.digest,
+        "gpu_device_scope": (
+            "amd-gpu-set=GPU-ffffffffffffffff"
+            if tamper == "gpu_scope"
+            else lease_document["execution_scope"]
+        ),
+        "order": ["anchor", "candidate", "candidate", "anchor"],
+        "anchor_config_sha256": legs[0]["evidence"].config.digest,
+        "candidate_config_sha256": legs[1]["evidence"].config.digest,
+        "anchor_image": _bundle_image(legs[0]),
+        "candidate_image": _bundle_image(legs[1]),
+        "observations": observations,
+        "comparisons": [item.to_dict() for item in comparisons],
+        "selection_policy": (
+            {**e2e_comparison_selection_policy(), "policy_id": "tampered"}
+            if tamper == "selection_policy"
+            else e2e_comparison_selection_policy()
+        ),
+        "selected_comparison": selected,
+        "verdict": comparisons[selected].to_dict(),
+    }
+    if tamper == "pair_extra_field":
+        pair["unexpected"] = True
+    receipt = artifacts.put_bytes(
+        canonical_json_bytes(pair), media_type="application/json"
+    )
+    return pair, receipt, lease, comparisons, selected
+
+
+def _promotion_observation(position, side, window_id, bundle, measurement):
+    evidence = bundle["evidence"]
+    return {
+        "position": position,
+        "side": side,
+        "action_id": _promotion_action(window_id, position),
+        "measurement": measurement.to_dict(),
+        "normalized_receipt": evidence.normalized.digest,
+        "quality_receipt": evidence.quality.digest,
+        "config_receipt": evidence.config.digest,
+        **_bundle_image(bundle),
+    }
+
+
+def _bundle_image(bundle):
+    runtime = bundle["result"].serving_runtime
+    return {
+        "requested_image": runtime.requested_image,
+        "resolved_image_id": runtime.resolved_image_id,
+    }
+
+
+def _promotion_action(window_id: str, position: int) -> str:
+    slots = ("ab-anchor", "ab-candidate", "ba-candidate", "ba-anchor")
+    return f"promotion-attempt-measured-{window_id}-{slots[position]}"
+
+
+def _gpu_lease_document(run_id: str) -> dict[str, Any]:
+    unique_id = "GPU-0123456789abcdef"
+    hsa_device = HsaGpuIdentity(0, 2, 2, 1, 0, unique_id)
+    hsa = HsaInventoryEvidence(
+        1,
+        "clean_unfiltered_hsa_gpu_inventory_v1",
+        "/opt/apex/hsa-helper.py",
+        "1" * 64,
+        "/opt/rocm/lib/libhsa-runtime64.so",
+        "2" * 64,
+        (hsa_device,),
+    )
+    monitor = RsmiDeviceIdentity(0, 2, 1, unique_id, 128)
+    device = GpuDeviceIdentity(0, 2, 0, unique_id, "/dev/dri/renderD128")
+    selector = GpuSelectorRequest(requested=(unique_id,))
+    ownership = GpuOwnershipReceipt(
+        2,
+        "clean_hsa_kfd_rsmi_process_gpu_map_v2",
+        selector,
+        1,
+        "/opt/rocm/lib/librocm_smi64.so",
+        "3" * 64,
+        "/sys/class/kfd/kfd/topology/nodes",
+        hsa,
+        (monitor,),
+        (device,),
+        (device,),
+        (),
+        (),
+    )
+    lease = GpuLeaseReceipt(
+        2,
+        run_id,
+        ownership.execution_scope,
+        ownership.physical_scope,
+        1234,
+        1.0,
+        "/tmp/apex-gpu-leases/GPU-0123456789abcdef.lock",
+        ownership,
+    )
+    return lease.to_dict()
 
 
 def _benchmark(
@@ -501,7 +699,11 @@ def _append_history(
     delivery,
     delivery_bindings,
     baseline,
-    candidate,
+    legs,
+    pair,
+    pair_receipt,
+    lease,
+    tamper,
 ) -> None:
     append_event(journal, run_id, "run_started", {"workload_id": "workload-1"}, "run-started")
     append_event(
@@ -590,22 +792,120 @@ def _append_history(
             "deployed": True,
             "engagement_verified": True,
             "infrastructure_failure": False,
-            "config_sha256": _delivery_digests(delivery, candidate, delivery_bindings),
+            "config_sha256": _delivery_digests(delivery_bindings),
             "artifacts": [artifact_binding("primary_delivery", delivery), *delivery_bindings],
         },
         "attempt-delivery",
+    )
+    order = (0, 2, 1, 3) if tamper == "leg_order" else (0, 1, 2, 3)
+    if tamper == "pair_before_final_leg":
+        for position in order[:3]:
+            _append_leg(journal, run_id, common, legs, pair, position)
+        _append_pair(journal, run_id, common, legs, pair, pair_receipt, lease, tamper)
+        _append_leg(journal, run_id, common, legs, pair, order[3])
+        return
+    for position in order:
+        if tamper == "missing_leg" and position == 2:
+            continue
+        _append_leg(journal, run_id, common, legs, pair, position)
+    _append_pair(journal, run_id, common, legs, pair, pair_receipt, lease, tamper)
+    if tamper == "duplicate_pair":
+        _append_pair(
+            journal,
+            run_id,
+            common,
+            legs,
+            pair,
+            pair_receipt,
+            lease,
+            tamper,
+            event_key="attempt-promotion-pair-duplicate",
+        )
+    if tamper == "duplicate_leg":
+        _append_leg(
+            journal,
+            run_id,
+            common,
+            legs,
+            pair,
+            1,
+            event_key="attempt-measurement-1-duplicate",
+        )
+
+
+def _append_leg(journal, run_id, common, legs, pair, position, *, event_key=None):
+    payload = _benchmark_payload(
+        legs[position],
+        {
+            **common,
+            "action_id": pair["observations"][position]["action_id"],
+            "anchor_generation": 0,
+        },
     )
     append_event(
         journal,
         run_id,
         "measurement_result",
-        _benchmark_payload(candidate, common),
-        "attempt-measurement",
+        payload,
+        event_key or f"attempt-measurement-{position}",
     )
 
 
-def _delivery_digests(delivery, candidate, bindings):
-    del delivery, candidate
+def _append_pair(
+    journal,
+    run_id,
+    common,
+    legs,
+    pair,
+    pair_receipt,
+    lease,
+    tamper,
+    *,
+    event_key="attempt-promotion-pair",
+):
+    artifacts = [
+        artifact_binding("matched_promotion_pair", pair_receipt),
+        artifact_binding("promotion_gpu_lease", lease),
+    ]
+    if tamper == "aggregate_extra_role":
+        artifacts.append(artifact_binding("unexpected_pair_artifact", lease))
+    sides = ("anchor", "candidate", "candidate", "anchor")
+    for position, side in enumerate(sides):
+        evidence = legs[position]["evidence"]
+        normalized = (
+            legs[0]["evidence"].normalized
+            if tamper == "pair_binding" and position == 1
+            else evidence.normalized
+        )
+        prefix = f"promotion_{position}_{side}"
+        artifacts.extend(
+            (
+                artifact_binding(f"{prefix}_normalized", normalized),
+                artifact_binding(f"{prefix}_quality", evidence.quality),
+                artifact_binding(f"{prefix}_config", evidence.config),
+            )
+        )
+    append_event(
+        journal,
+        run_id,
+        "measurement_result",
+        {
+            **common,
+            "anchor_id": pair["anchor_id"],
+            "anchor_generation": pair["anchor_generation"],
+            "measurement_kind": "matched_promotion_ab_ba",
+            "pair_id": pair["pair_id"],
+            "window_id": pair["window_id"],
+            "gpu_lease_digest": pair["gpu_lease_digest"],
+            "order": pair["order"],
+            "verdict": pair["verdict"],
+            "artifacts": artifacts,
+        },
+        event_key,
+    )
+
+
+def _delivery_digests(bindings):
     by_role = {item["role"]: item["receipt"]["digest"] for item in bindings}
     return {
         "measurement": by_role["delivery_measurement_config"],
@@ -651,7 +951,8 @@ def _append_outcome(
     micro,
     safety,
     delivery,
-    normalized,
+    pair_receipt,
+    tamper,
     add_legacy_raw_role,
 ) -> None:
     common = {
@@ -669,10 +970,11 @@ def _append_outcome(
         artifact_binding("micro_qualification", micro),
         artifact_binding("safety_qualification", safety),
         artifact_binding("primary_delivery", delivery),
-        artifact_binding("normalized_benchmark", normalized),
     ]
+    if tamper != "reward_pair_missing":
+        reward_artifacts.append(artifact_binding("matched_promotion_pair", pair_receipt))
     if add_legacy_raw_role:
-        reward_artifacts.append(artifact_binding("raw_measurement", normalized))
+        reward_artifacts.append(artifact_binding("raw_measurement", pair_receipt))
     append_event_transaction(
         journal,
         run_id,

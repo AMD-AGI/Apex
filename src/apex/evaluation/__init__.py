@@ -11,8 +11,10 @@ from .e2e import (
 from .e2e_reward import (
     E2ERewardGrade,
     E2ERewardPolicy,
+    e2e_comparison_selection_policy,
     grade_e2e_outcome,
     replay_e2e_reward,
+    select_conservative_e2e_verdict,
 )
 
 from .kernel import (
@@ -79,6 +81,8 @@ __all__ = [
     "validate_baseline_measurement",
     "E2ERewardGrade",
     "E2ERewardPolicy",
+    "e2e_comparison_selection_policy",
     "grade_e2e_outcome",
     "replay_e2e_reward",
+    "select_conservative_e2e_verdict",
 ]

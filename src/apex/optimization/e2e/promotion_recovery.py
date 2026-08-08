@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from apex.core import IntegrityError, sha256_file, sha256_json
-from apex.evaluation import E2EAcceptancePolicy, E2EVerdict, evaluate_current_anchor
+from apex.evaluation import (
+    E2EAcceptancePolicy,
+    E2EVerdict,
+    e2e_comparison_selection_policy,
+    evaluate_current_anchor,
+    select_conservative_e2e_verdict,
+)
 from apex.storage import ArtifactReceipt, EventRecord
 
 from .promotion import MatchedPromotion, PromotionObservation
@@ -55,7 +61,7 @@ def recover_matched_promotion(
         protocol_hash=protocol_hash,
     )
     comparisons = _comparisons(observations, policy)
-    selected = _selected(comparisons)
+    selected = select_conservative_e2e_verdict(comparisons)
     verdict = comparisons[selected]
     _verify_derived(value, observations, comparisons, selected, verdict)
     return MatchedPromotion(
@@ -128,7 +134,7 @@ def _identity(
     opportunity_id: str,
 ) -> tuple[Any, ...]:
     if (
-        value.get("schema") != "apex.e2e-matched-promotion/v1"
+        value.get("schema") != "apex.e2e-matched-promotion/v2"
         or value.get("attempt_id") != attempt_id
         or value.get("candidate_id") != candidate_id
         or value.get("opportunity_id") != opportunity_id
@@ -310,13 +316,6 @@ def _comparisons(
     )
 
 
-def _selected(comparisons: tuple[E2EVerdict, E2EVerdict]) -> int:
-    failures = tuple(index for index, item in enumerate(comparisons) if not item.keep)
-    return failures[0] if failures else min(
-        range(2), key=lambda index: comparisons[index].throughput_gain_pct
-    )
-
-
 def _verify_derived(
     value: Mapping[str, Any],
     observations: tuple[PromotionObservation, ...],
@@ -328,6 +327,7 @@ def _verify_derived(
     candidate = tuple(item for item in observations if item.side == "candidate")
     if (
         value.get("comparisons") != [item.to_dict() for item in comparisons]
+        or value.get("selection_policy") != e2e_comparison_selection_policy()
         or value.get("selected_comparison") != selected
         or value.get("verdict") != verdict.to_dict()
         or value.get("anchor_config_sha256") != anchor[0].config.digest

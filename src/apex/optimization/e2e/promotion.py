@@ -13,7 +13,9 @@ from apex.evaluation import (
     E2EAcceptancePolicy,
     E2EMeasurement,
     E2EVerdict,
+    e2e_comparison_selection_policy,
     evaluate_current_anchor,
+    select_conservative_e2e_verdict,
 )
 from apex.runtime import GpuLeaseReceipt
 from apex.storage import ArtifactReceipt
@@ -87,7 +89,7 @@ class MatchedPromotion:
 
     def document(self) -> dict[str, Any]:
         return {
-            "schema": "apex.e2e-matched-promotion/v1",
+            "schema": "apex.e2e-matched-promotion/v2",
             "pair_id": self.pair_id,
             "window_id": self.window_id,
             "attempt_id": self.attempt_id,
@@ -104,6 +106,7 @@ class MatchedPromotion:
             "candidate_image": dict(self.candidate_image),
             "observations": [item.to_dict() for item in self.observations],
             "comparisons": [item.to_dict() for item in self.comparisons],
+            "selection_policy": e2e_comparison_selection_policy(),
             "selected_comparison": self.selected_comparison,
             "verdict": self.verdict.to_dict(),
         }
@@ -258,7 +261,7 @@ class MatchedPromotionRunner:
                 observations[3].measurement, observations[2].measurement, self.policy
             ),
         )
-        selected = _selected_comparison(comparisons)
+        selected = select_conservative_e2e_verdict(comparisons)
         anchor_image = _side_image(observations, "anchor")
         candidate_image = _side_image(observations, "candidate")
         pair_id = f"pair-{request.attempt_id}-{self.record.controller.state.sequence}"
@@ -351,13 +354,6 @@ def _validate_observation_set(
             raise IntegrityError("Matched configs differ within window", "promotion_config_mismatch")
         if len({(item.requested_image, item.resolved_image_id) for item in values}) != 1:
             raise IntegrityError("Matched images differ within window", "promotion_image_mismatch")
-
-
-def _selected_comparison(comparisons: tuple[E2EVerdict, E2EVerdict]) -> int:
-    failures = tuple(index for index, value in enumerate(comparisons) if not value.keep)
-    if failures:
-        return failures[0]
-    return min(range(2), key=lambda index: comparisons[index].throughput_gain_pct)
 
 
 def _side_image(

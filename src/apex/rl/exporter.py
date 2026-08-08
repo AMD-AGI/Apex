@@ -20,20 +20,36 @@ from .models import CandidateEpisode, EpisodeArtifact, EpisodeGraph, SemanticRol
 
 
 _SECRET_KEY = re.compile(r"(?:api[_-]?key|authorization|password|secret|access[_-]?token)$", re.I)
+_SECRET_NAME = (
+    r"(?:[A-Za-z0-9]+[_-])*"
+    r"(?:api[_-]?key|authorization|password|secret|access[_-]?token)"
+)
 _SECRET_TEXT = re.compile(
     r"(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|"
     r"github_pat_[A-Za-z0-9_]{16,}|Bearer\s+[A-Za-z0-9._~+/-]{16,}|"
     r"https?://[^\s/@:]+:[^\s/@]+@)"
 )
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?:api[_-]?key|authorization|password|secret|access[_-]?token)"
-    r"\s*[:=]\s*[\"']?(?!\[REDACTED\])\S{4,}",
-    re.I,
+_SECRET_VALUE = (
+    r'(?:"[^"\r\n]{4,512}"|'
+    r"'[^'\r\n]{4,512}'|"
+    r"[A-Za-z0-9._~+/@=\[\]-]{4,512})"
+)
+_SECRET_QUOTED_FIELD = re.compile(
+    rf'''^[ \t]*(?:"{_SECRET_NAME}"|'{_SECRET_NAME}')[ \t]*[:=][ \t]*'''
+    rf"(?P<value>{_SECRET_VALUE})[ \t]*(?:$|[,#;}}])",
+    re.I | re.M,
+)
+_SECRET_LINE_ASSIGNMENT = re.compile(
+    rf"^[ \t]*(?:export[ \t]+)?{_SECRET_NAME}[ \t]*[:=][ \t]*"
+    rf"(?P<value>{_SECRET_VALUE})[ \t]*(?:$|[#;])",
+    re.I | re.M,
 )
 _SECRET_OPTION = re.compile(
-    r"--(?:api[_-]?key|authorization|password|secret|access[_-]?token)\s+\S{4,}",
+    rf"(?:^|\s)--{_SECRET_NAME}(?:=|\s+)(?P<value>{_SECRET_VALUE})(?=$|\s)",
     re.I,
 )
+_SECRET_OPTION_NAME = re.compile(rf"--{_SECRET_NAME}", re.I)
+_NON_SECRET_SENTINELS = frozenset({"", "[redacted]", "empty"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +60,7 @@ class DatasetExportConfig:
     policy_id: str | None = None
     on_incomplete: str = "fail"
     include_sft: bool = True
-    exporter_version: str = "apex_rl_export_v1"
+    exporter_version: str = "apex_rl_export_v2"
 
     def __post_init__(self) -> None:
         if self.on_incomplete not in {"fail", "skip"}:
@@ -225,7 +241,7 @@ class DatasetExporter:
         candidate_parts: list[str] = []
         for (role, _), artifact in sorted(unique.items()):
             content = self._artifacts.read_bytes(artifact.receipt)
-            _reject_secrets(content.decode("utf-8", errors="ignore"))
+            _reject_artifact_secrets(content, artifact.receipt.media_type)
             encoding, body = _encode_artifact(content, artifact.receipt)
             value = {
                 "role": role,
@@ -408,26 +424,111 @@ def _encode_artifact(content: bytes, receipt: ArtifactReceipt) -> tuple[str, str
     return "base64", base64.b64encode(content).decode("ascii")
 
 
+def _reject_artifact_secrets(content: bytes, media_type: str) -> None:
+    text = content.decode("utf-8", errors="ignore")
+    if _SECRET_TEXT.search(text):
+        _raise_secret_detected()
+    if media_type == "application/json":
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            _reject_secret_text(text)
+        else:
+            _reject_secrets(value)
+        return
+    if media_type == "application/x-ndjson":
+        for line in text.split("\n"):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                _reject_secret_text(line)
+            else:
+                _reject_secrets(value)
+        return
+    _reject_secret_text(text)
+
+
 def _reject_secrets(value: Any) -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
-            if _SECRET_KEY.search(str(key)) and item is not None and item not in (
-                "",
-                "[REDACTED]",
-            ):
-                raise IntegrityError("Dataset contains a secret field", "dataset_secret_detected")
+            if _SECRET_KEY.search(str(key)) and not _is_non_secret_sentinel(item):
+                _raise_secret_detected(field=True)
             _reject_secrets(item)
         return
     if isinstance(value, (list, tuple)):
+        _reject_secret_option_sequence(value)
         for item in value:
             _reject_secrets(item)
         return
-    if isinstance(value, str) and (
-        _SECRET_TEXT.search(value)
-        or _SECRET_ASSIGNMENT.search(value)
-        or _SECRET_OPTION.search(value)
+    if isinstance(value, str):
+        _reject_secret_text(value)
+
+
+def _reject_secret_text(value: str) -> None:
+    if _SECRET_TEXT.search(value):
+        _raise_secret_detected()
+    _reject_json_document_secrets(value)
+    for pattern in (
+        _SECRET_QUOTED_FIELD,
+        _SECRET_LINE_ASSIGNMENT,
+        _SECRET_OPTION,
     ):
-        raise IntegrityError("Dataset contains secret-like content", "dataset_secret_detected")
+        for match in pattern.finditer(value):
+            if not _is_non_secret_sentinel(match.group("value")):
+                _raise_secret_detected()
+
+
+def _reject_json_document_secrets(value: str) -> None:
+    candidate = value.strip()
+    if len(candidate) < 2 or candidate[0] not in "[{":
+        return
+    try:
+        document = json.loads(candidate)
+    except json.JSONDecodeError:
+        return
+    if isinstance(document, (Mapping, list)):
+        _reject_secrets(document)
+
+
+def _reject_secret_option_sequence(value: Sequence[Any]) -> None:
+    for option, argument in zip(value, value[1:]):
+        if not isinstance(option, str) or not isinstance(argument, str):
+            continue
+        if not _SECRET_OPTION_NAME.fullmatch(option.strip()):
+            continue
+        normalized = _normalized_secret_scalar(argument)
+        if len(normalized) >= 4 and normalized not in _NON_SECRET_SENTINELS:
+            _raise_secret_detected()
+
+
+def _is_non_secret_sentinel(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    return _normalized_secret_scalar(value) in _NON_SECRET_SENTINELS
+
+
+def _normalized_secret_scalar(value: str) -> str:
+    normalized = value.strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"\"", "'"}
+    ):
+        normalized = normalized[1:-1]
+    return normalized.casefold()
+
+
+def _raise_secret_detected(*, field: bool = False) -> None:
+    message = (
+        "Dataset contains a secret field"
+        if field
+        else "Dataset contains secret-like content"
+    )
+    raise IntegrityError(message, "dataset_secret_detected")
 
 
 def _write_files(output_dir: Path, files: Mapping[str, bytes]) -> None:

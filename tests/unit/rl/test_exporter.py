@@ -278,6 +278,34 @@ def test_measured_e2e_export_replays_raw_cas_evidence(tmp_path: Path):
     assert result.record_count == 1
 
 
+def test_measured_e2e_export_replays_four_leg_conservative_selection(
+    tmp_path: Path,
+) -> None:
+    run = build_measured_run(
+        tmp_path / "run",
+        candidate_throughputs=(103.0, 100.6),
+    )
+    pair = run["pair"]
+
+    assert pair["schema"] == "apex.e2e-matched-promotion/v2"
+    assert pair["order"] == ["anchor", "candidate", "candidate", "anchor"]
+    assert len(pair["observations"]) == 4
+    assert len(pair["comparisons"]) == 2
+    assert run["selected_comparison"] == 1
+    assert pair["verdict"] == pair["comparisons"][1]
+
+    graph = EpisodeGraphMaterializer(run["journal"], run["artifacts"]).materialize(
+        run["run_id"]
+    )
+    result = DatasetExporter(run["artifacts"]).export(
+        graph,
+        tmp_path / "export",
+        config=DatasetExportConfig(include_sft=False),
+    )
+
+    assert result.record_count == 1
+
+
 def test_measured_e2e_export_uses_non_default_frozen_gates(tmp_path: Path):
     strict = RegressionGates(ttft_p99_regression_pct=3.0)
     run = build_measured_run(
@@ -321,7 +349,7 @@ def test_measured_e2e_export_rejects_decision_from_different_gates(tmp_path: Pat
     (
         {"runtime_image": "sha256:" + "d" * 64},
         {"candidate_config_matches_delivery": False},
-        {"decision_benchmark_from_baseline": True},
+        {"tamper": "decision_pair_receipt"},
         {"candidate_lane": BenchmarkPass.DIAGNOSTIC},
         {"decision_candidate_throughput": 102.0},
         {"raw_candidate_accuracy": 0.79},
@@ -340,6 +368,43 @@ def test_measured_e2e_export_rejects_unbound_or_fabricated_evidence(
 
     with pytest.raises(IntegrityError):
         DatasetExporter(run["artifacts"]).export(graph, tmp_path / "export")
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "pair_schema",
+        "pair_extra_field",
+        "selection_policy",
+        "selected_comparison",
+        "observation",
+        "action_id",
+        "pair_binding",
+        "aggregate_extra_role",
+        "leg_order",
+        "pair_before_final_leg",
+        "missing_leg",
+        "duplicate_leg",
+        "duplicate_pair",
+        "gpu_scope",
+        "gpu_inventory",
+        "reward_pair_missing",
+        "legacy_benchmark_receipt",
+    ),
+)
+def test_measured_e2e_export_rejects_malformed_matched_promotion_v2(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    run = build_measured_run(tmp_path / "run", tamper=tamper)
+    graph = EpisodeGraphMaterializer(run["journal"], run["artifacts"]).materialize(
+        run["run_id"]
+    )
+
+    with pytest.raises(IntegrityError) as error:
+        DatasetExporter(run["artifacts"]).export(graph, tmp_path / "export")
+
+    assert error.value.reason_code == "e2e_measurement_evidence_mismatch"
 
 
 def test_measured_e2e_opportunity_mismatch_fails_materialization(tmp_path: Path):

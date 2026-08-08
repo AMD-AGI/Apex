@@ -2043,6 +2043,8 @@ def test_keep_requires_both_ab_and_ba_comparisons(tmp_path: Path) -> None:
         )
     )
     document = json.loads(ArtifactStore(tmp_path / "results/artifacts").read_bytes(receipt))
+    assert document["schema"] == "apex.e2e-matched-promotion/v2"
+    assert document["selection_policy"]["policy_id"] == "conservative_e2e_reward_v1"
     assert [item["keep"] for item in document["comparisons"]] == [True, False]
     assert document["verdict"]["keep"] is False
     decision = next(event for event in events if event.event_type == "e2e.candidate_decided")

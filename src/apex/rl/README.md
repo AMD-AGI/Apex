@@ -84,8 +84,11 @@ event, so it must use `evidence_class=derived` and bind canonical
 artifacts. KEEP and REVERT additionally require the clean-cut measured evidence
 roles: `benchmark_config`, `normalized_benchmark`, `benchmark_report`,
 `quality_evidence`, `quality_result`, `primary_delivery`, and all three
-delivery configs. The superseded E2E `raw_measurement` role is rejected; it
-remains valid only for standalone kernel grading. A terminal,
+delivery configs. Their reward lineage also binds the one canonical
+`matched_promotion_pair`; a decision binds its digest as
+`promotion_pair_receipt`. The superseded E2E `raw_measurement` role and legacy
+decision `benchmark_receipt` are rejected; the former remains valid only for
+standalone kernel grading. A terminal,
 non-infrastructure E2E attempt is trainable only with exactly one canonical
 `e2e.candidate_decided` and one reward. Their canonical `transaction_id` values
 must match, and that SQLite transaction must contain exactly those two event
@@ -97,14 +100,29 @@ For candidates that do exist, manifest source receipts must exactly match all
 `candidate_source` artifacts. Cost, variance, and safety uncertainty remain
 separate fields.
 
-Measured E2E export independently rebuilds the anchor and candidate
-`E2EMeasurement` values. It verifies raw normal-lane Magpie report and quality
-files against their normalized documents, rejects diagnostic scoring, and
-requires receipt fields to name the exact bound CAS objects. The benchmark
-config digest must equal the deployed measurement-config digest and the serving
-runtime input digest; requested and resolved runtime images must equal the
-engaged immutable primary-delivery image. Decision receipts must point to those
-same micro, safety, delivery, and normalized benchmark artifacts.
+Measured E2E export accepts only `apex.e2e-matched-promotion/v2`. It locates one
+aggregate pair event and exactly four action-derived measurement events in
+`anchor, candidate, candidate, anchor` order. All four legs must precede the
+aggregate event and have exact attempt, opportunity, candidate, and anchor-
+generation lineage. Every aggregate `promotion_{position}_{side}_{kind}` binding
+must name the same normalized, quality, and config receipt as its leg. There is
+no single-candidate-benchmark compatibility path.
+
+Each leg is independently rebuilt as an `E2EMeasurement`. Export verifies raw
+normal-lane Magpie reports and quality files against normalized documents,
+rejects diagnostic scoring, and requires receipt fields to name the exact bound
+CAS objects. Both candidate legs must use the deployed measurement config and
+engaged immutable image; each side must retain one config and requested/resolved
+image identity across its two legs. The pair's canonical GPU lease is rebuilt
+through the public runtime receipt contracts, including selector, clean HSA,
+KFD/RSMI join, selected devices, process ownership, physical locks, and empty
+foreign-owner evidence.
+
+Export recomputes AB and BA current-anchor comparisons from the frozen gates.
+The shared `conservative_e2e_reward_v1` selector chooses the worse comparison;
+the pair comparison list, policy descriptor, selected index, verdict, aggregate
+event, decision, grade, and reward must all agree exactly. Decision receipts
+must also point to the same micro, safety, delivery, and matched-pair artifacts.
 
 The acceptance gates are never inferred from current code defaults. Export
 reads the unique canonical `run_request` artifact, checks
@@ -137,16 +155,19 @@ mutable reward side channel, or second event writer in this package.
 - `episode_graph.py`: journal/CAS materializer and completeness validation.
 - `kernel_measurement_validation.py`: offline standalone writer/phase/report receipt validation.
 - `e2e_validation.py`: explicit lineage and replayable E2E proof validation.
-- `e2e_measurement_validation.py`: offline image/config/measurement acceptance replay.
+- `e2e_measurement_validation.py`: composition of frozen-policy matched-promotion replay.
+- `e2e_benchmark_validation.py`: raw Magpie bundle and candidate-delivery reconstruction.
+- `e2e_gpu_lease_validation.py`: semantic runtime GPU-lease reconstruction.
+- `e2e_promotion_validation.py`: exact four-leg ABBA lineage and conservative selection replay.
 - `e2e_quality_validation.py`: raw evaluator quality receipt and metric validation.
 - `projection_validation.py`: fail-closed identity and generation merges.
 - `state_validation.py`: full canonical replay check for supplied workload state.
 - `exporter.py`: deterministic grouped RL and SFT export.
 - `tests/unit/rl/`: explicit-lineage, candidate-conflict, source-free E2E,
-  standalone semantic agent export, crash/history, raw-CAS E2E replay,
-  image/config/receipt tampering, non-default
-  gates, diagnostic rejection, artifact, reward replay, split, secret, and
-  byte-stability tests.
+  standalone semantic agent export, crash/history, four-leg raw-CAS E2E replay,
+  conservative comparison selection, ABBA order/completeness, pair/GPU/image/
+  config/receipt tampering, non-default gates, diagnostic rejection, artifact,
+  reward replay, split, secret, and byte-stability tests.
 
 Run `pytest tests/unit/rl -q`.
 

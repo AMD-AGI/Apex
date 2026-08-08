@@ -52,7 +52,10 @@ def validate_quality_evidence(
     raw_receipts = _receipt_documents(quality.get("raw_artifact_receipts"))
     bound_results = _event_role_receipts(event, {"quality_result"})
     bound_all = _event_role_receipts(event, _QUALITY_ROLES)
-    if result_receipts != bound_results or raw_receipts != bound_all:
+    if (
+        result_receipts != bound_results
+        or _receipt_union(result_receipts, raw_receipts) != bound_all
+    ):
         _reject("Quality receipt A differs from bound raw artifact B")
     if len(bound_results) != 1:
         _reject("Scoring quality requires exactly one result artifact")
@@ -97,6 +100,14 @@ def _receipt_documents(value: object) -> tuple[ArtifactReceipt, ...]:
     unique = {item.digest: item for item in receipts}
     if len(unique) != len(receipts):
         _reject("Quality receipt list contains duplicates")
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _receipt_union(
+    first: Sequence[ArtifactReceipt],
+    second: Sequence[ArtifactReceipt],
+) -> tuple[ArtifactReceipt, ...]:
+    unique = {item.digest: item for item in (*first, *second)}
     return tuple(unique[key] for key in sorted(unique))
 
 

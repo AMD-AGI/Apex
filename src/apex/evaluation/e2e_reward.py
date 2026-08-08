@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from apex.core import ContractError, sha256_json
 
@@ -16,6 +16,7 @@ _HARD_GATE_REASONS = frozenset(
     {"accuracy_regression", "ttft_p99_regression", "tpot_p99_regression"}
 )
 _NO_SOURCE_REASON = "agent_made_no_source_change"
+_COMPARISON_SELECTION_POLICY_ID = "conservative_e2e_reward_v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +218,71 @@ def grade_e2e_outcome(
     )
 
 
+def e2e_comparison_selection_policy(
+    policy: E2ERewardPolicy | None = None,
+) -> dict[str, Any]:
+    """Describe the frozen conservative ordering for matched E2E comparisons."""
+
+    chosen = policy or E2ERewardPolicy()
+    return {
+        "schema": "apex.e2e-comparison-selection-policy/v1",
+        "policy_id": _COMPARISON_SELECTION_POLICY_ID,
+        "reward_policy_id": chosen.policy_id,
+        "reward_policy_digest": chosen.digest,
+        "ordering": [
+            "failure_before_keep",
+            "scalar_reward_ascending",
+            "throughput_gain_pct_ascending",
+            "accuracy_regression_pct_descending",
+            "ttft_p99_regression_pct_descending",
+            "tpot_p99_regression_pct_descending",
+            "measurement_ids_ascending",
+        ],
+    }
+
+
+def select_conservative_e2e_verdict(
+    comparisons: Sequence[E2EVerdict],
+    policy: E2ERewardPolicy | None = None,
+) -> int:
+    """Select one replayable worst comparison without depending on tuple order."""
+
+    if not comparisons or any(not isinstance(item, E2EVerdict) for item in comparisons):
+        raise ContractError(
+            "E2E comparison set is invalid",
+            "invalid_e2e_comparison_set",
+        )
+    chosen = policy or E2ERewardPolicy()
+    return min(
+        range(len(comparisons)),
+        key=lambda index: _comparison_selection_key(comparisons[index], chosen),
+    )
+
+
+def _comparison_selection_key(
+    verdict: E2EVerdict,
+    policy: E2ERewardPolicy,
+) -> tuple[object, ...]:
+    decision = "keep" if verdict.keep else "revert"
+    grade = grade_e2e_outcome(
+        verdict=decision,
+        reason_code=verdict.reason_code,
+        candidate_present=True,
+        measurement_verdict=verdict,
+        policy=policy,
+    )
+    return (
+        1 if verdict.keep else 0,
+        grade.scalar_reward,
+        verdict.throughput_gain_pct,
+        -verdict.accuracy_regression_pct,
+        -verdict.ttft_p99_regression_pct,
+        -verdict.tpot_p99_regression_pct,
+        verdict.anchor_measurement_id,
+        verdict.candidate_measurement_id,
+    )
+
+
 def _validate_grade_inputs(
     verdict: str,
     reason_code: str,
@@ -336,6 +402,8 @@ def _finite(value: object) -> float:
 __all__ = [
     "E2ERewardGrade",
     "E2ERewardPolicy",
+    "e2e_comparison_selection_policy",
     "grade_e2e_outcome",
     "replay_e2e_reward",
+    "select_conservative_e2e_verdict",
 ]
