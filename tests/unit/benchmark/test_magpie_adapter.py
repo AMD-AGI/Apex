@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 
 from apex.benchmark import MagpieBenchmarkAdapter, build_config_views
+from apex.core import sha256_file
 from apex.execution import ProcessResult
 from apex.ports import BenchmarkPass, BenchmarkRequest
 from apex.runtime import DependencyReceipt, LmEvalRuntimeReceipt
@@ -87,6 +88,25 @@ def _config(tmp_path: Path, receipt: DependencyReceipt) -> Path:
     ).measurement
 
 
+def _serving_runtime(config_path: Path) -> dict[str, object]:
+    requested = yaml.safe_load(config_path.read_text(encoding="utf-8"))["benchmark"][
+        "docker_image"
+    ]
+    resolved = requested if requested.startswith("sha256:") else "sha256:" + "d" * 64
+    return {
+        "schema": "magpie.serving-runtime-receipt/v1",
+        "execution_mode": "docker",
+        "input_config_sha256": sha256_file(config_path),
+        "requested_image": requested,
+        "resolved_image_id": resolved,
+        "container_name": "magpie-benchmark-test",
+        "docker_argv_sha256": "e" * 64,
+        "process_succeeded": True,
+        "verified": True,
+        "errors": [],
+    }
+
+
 class FakeSupervisor:
     def __init__(self, receipt: DependencyReceipt) -> None:
         self.call = None
@@ -99,6 +119,7 @@ class FakeSupervisor:
             "environment": environment,
             "timeout_seconds": timeout_seconds,
         }
+        config_path = Path(argv[argv.index("--benchmark-config") + 1])
         output_root = Path(argv[argv.index("--output-dir") + 1])
         workspace = output_root / "benchmark_vllm_20260807_000000"
         workspace.mkdir()
@@ -182,6 +203,7 @@ class FakeSupervisor:
                     "reward_eligible": True,
                     "inferencex_runtime_receipt": inferencex_receipt,
                     "lm_eval_runtime_receipt": lm_eval_runtime_evidence,
+                    "serving_runtime_receipt": _serving_runtime(config_path),
                     "throughput": {"output_throughput": 10.0},
                     "latency": {
                         "ttft": {"p99_ms": 3.0},
@@ -258,6 +280,7 @@ class FakeDiagnosticSupervisor:
             "reward_eligible": False,
             "inferencex_runtime_receipt": inferencex_receipt,
             "lm_eval_runtime_receipt": not_requested,
+            "serving_runtime_receipt": _serving_runtime(config_path),
             "throughput": {"output_throughput": 9.0},
             "latency": {},
             "errors": [],

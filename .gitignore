@@ -8,7 +8,7 @@ htmlcov/
 .ruff_cache/
 
 # Local environments and packaging output
-.venv/
+/.venv
 venv/
 env/
 *.egg-info/

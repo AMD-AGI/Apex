@@ -7,10 +7,26 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from apex.context import ContextPacket
-from apex.core import ContractError, IntegrityError, canonical_json_bytes, sha256_json
+from apex.core import (
+    ContractError,
+    IntegrityError,
+    canonical_json_bytes,
+    sha256_json,
+    validate_identifier,
+)
 from apex.orchestration import WorkloadState
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal, EventRecord
 
+from .e2e_validation import (
+    E2E_REWARD_POLICY_ID,
+    MEASURED_E2E_ARTIFACT_ROLES,
+    artifact_roles,
+    e2e_completion_reasons,
+    e2e_outcome_transaction_reasons,
+    explicit_attempt_id,
+    optional_identifier,
+    transaction_members,
+)
 from .models import (
     CandidateEpisode,
     EpisodeArtifact,
@@ -21,6 +37,9 @@ from .models import (
     SemanticRole,
     episode_id,
 )
+from .kernel_measurement_validation import kernel_measurement_evidence_reasons
+from .projection_validation import merge_projected_identifier, merge_projected_int
+from .state_validation import validate_workload_state
 
 
 @dataclass(slots=True)
@@ -28,6 +47,7 @@ class _ChildBuilder:
     attempt_id: str
     events: list[EpisodeEvent] = field(default_factory=list)
     candidate_id: str | None = None
+    opportunity_id: str | None = None
     task_id: str | None = None
     kernel_id: str | None = None
     state_generation: int | None = None
@@ -37,7 +57,11 @@ class _ChildBuilder:
     verdict: str | None = None
     scalar_reward: float | None = None
     reward_vector: Mapping[str, Any] | None = None
+    decision_reason: str | None = None
+    decision_count: int = 0
+    e2e_decision_count: int = 0
     reward_count: int = 0
+    is_e2e: bool = False
     policy_ids: set[str] = field(default_factory=set)
     splits: set[str] = field(default_factory=set)
     visibilities: set[str] = field(default_factory=set)
@@ -61,11 +85,12 @@ class EpisodeGraphMaterializer:
         records = self._journal.iter_events(run_id, verify=True)
         if not records:
             raise ContractError("Run has no canonical events", "episode_run_empty")
-        self._validate_state(run_id, records, workload_state)
+        validate_workload_state(run_id, records, workload_state)
         packets = context_packets or {}
-        candidate_actions = _candidate_action_ids(records)
         parent_events: list[EpisodeEvent] = []
         children: dict[str, _ChildBuilder] = {}
+        candidate_owners: dict[str, str] = {}
+        transactions = transaction_members(records)
         workload_id: str | None = None
         task_id: str | None = None
         provenance: Mapping[str, Any] = {}
@@ -77,10 +102,18 @@ class EpisodeGraphMaterializer:
             task_id = task_id or _text(payload.get("task_id"))
             if not provenance and isinstance(payload.get("provenance"), Mapping):
                 provenance = dict(payload["provenance"])
-            attempt_id = _attempt_id(record, candidate_actions)
+            attempt_id = explicit_attempt_id(record)
             if attempt_id is None:
                 parent_events.append(event)
                 continue
+            candidate_id = optional_identifier(payload, "candidate_id")
+            if candidate_id is not None:
+                owner = candidate_owners.setdefault(candidate_id, attempt_id)
+                if owner != attempt_id:
+                    raise IntegrityError(
+                        "Candidate ID belongs to multiple attempts",
+                        "candidate_id_mismatch",
+                    )
             builder = children.setdefault(attempt_id, _ChildBuilder(attempt_id))
             builder.events.append(event)
             self._update_child(builder, event, packets, workload_state)
@@ -88,7 +121,7 @@ class EpisodeGraphMaterializer:
         kind = "workload" if workload_id is not None else "standalone_task"
         parent_id = episode_id(run_id, workload_id or task_id or "root")
         frozen_children = tuple(
-            self._freeze_child(run_id, parent_id, item)
+            self._freeze_child(run_id, parent_id, item, transactions)
             for _, item in sorted(children.items())
         )
         all_policy_ids = tuple(
@@ -124,6 +157,7 @@ class EpisodeGraphMaterializer:
         return EpisodeEvent(
             sequence=record.sequence,
             event_id=record.event_id,
+            transaction_id=record.transaction_id,
             parent_event_id=record.parent_event_id,
             event_type=record.event_type,
             semantic_role=_semantic_role(record.event_type),
@@ -171,12 +205,22 @@ class EpisodeGraphMaterializer:
         workload_state: WorkloadState | None,
     ) -> None:
         payload = event.payload
-        child.candidate_id = child.candidate_id or _text(payload.get("candidate_id"))
+        normalized = event.event_type.replace(".", "_")
+        child.is_e2e = child.is_e2e or normalized.startswith("e2e_")
+        merge_projected_identifier(
+            child, "candidate_id", optional_identifier(payload, "candidate_id")
+        )
+        merge_projected_identifier(
+            child,
+            "opportunity_id",
+            optional_identifier(payload, "opportunity_id"),
+        )
         child.task_id = child.task_id or _text(payload.get("task_id"))
         child.kernel_id = child.kernel_id or _text(payload.get("kernel_id"))
-        _merge_int(child, "state_generation", payload.get("state_generation"))
-        _merge_int(child, "anchor_generation", payload.get("anchor_generation"))
-        _merge_int(child, "anchor_generation", payload.get("parent_anchor_generation"))
+        if not normalized.startswith("e2e_"):
+            merge_projected_int(child, "state_generation", payload.get("state_generation"))
+        merge_projected_int(child, "anchor_generation", payload.get("anchor_generation"))
+        merge_projected_int(child, "anchor_generation", payload.get("parent_anchor_generation"))
         split = _text(payload.get("split"))
         visibility = _text(payload.get("visibility"))
         if split:
@@ -184,9 +228,17 @@ class EpisodeGraphMaterializer:
         if visibility:
             child.visibilities.add(visibility)
         if event.semantic_role is SemanticRole.DECISION:
+            child.decision_count += 1
+            if child.decision_count > 1:
+                child.validation_reasons.add("multiple_decision_events")
+            if normalized == "e2e_candidate_decided":
+                child.e2e_decision_count += 1
             child.verdict = _text(payload.get("verdict")) or _decision_from_type(event.event_type)
+            child.decision_reason = _text(payload.get("reason"))
         if event.semantic_role is SemanticRole.REWARD:
             self._capture_reward(child, event)
+        if normalized == "experience_deferred":
+            child.validation_reasons.add("external_evaluation_pending")
         context_artifacts = [
             item for item in event.artifacts if item.role == "context_packet"
         ]
@@ -211,7 +263,9 @@ class EpisodeGraphMaterializer:
             raw_packet = self._artifacts.read_bytes(receipt)
             document = json.loads(raw_packet)
             identity = document["identity"]
+            target = document["target"]
             packet_id = str(identity["context_packet_id"])
+            opportunity_id = str(target["opportunity_id"])
             packet_state_generation = int(identity["state_generation"])
             anchor_generation = int(document["current_anchor"]["generation"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -240,6 +294,17 @@ class EpisodeGraphMaterializer:
         supplied = packets.get(packet_id)
         if supplied is not None and supplied.canonical_bytes != self._artifacts.read_bytes(receipt):
             raise IntegrityError("Supplied ContextPacket differs from CAS", "context_packet_mismatch")
+        try:
+            opportunity_id = validate_identifier(
+                opportunity_id,
+                field_name="opportunity_id",
+            )
+        except ContractError as error:
+            raise IntegrityError(
+                "ContextPacket opportunity identity is invalid",
+                "opportunity_id_invalid",
+            ) from error
+        merge_projected_identifier(child, "opportunity_id", opportunity_id)
         if workload_state is not None:
             max_generation = (
                 workload_state.e2e.state_generation
@@ -257,8 +322,8 @@ class EpisodeGraphMaterializer:
             child.validation_reasons.add("multiple_context_packets")
         child.context_packet_receipt = receipt
         child.context_packet_id = packet_id
-        _merge_int(child, "state_generation", packet_state_generation)
-        _merge_int(child, "anchor_generation", anchor_generation)
+        merge_projected_int(child, "state_generation", packet_state_generation)
+        merge_projected_int(child, "anchor_generation", anchor_generation)
 
     def _capture_reward(self, child: _ChildBuilder, event: EpisodeEvent) -> None:
         payload = event.payload
@@ -268,6 +333,8 @@ class EpisodeGraphMaterializer:
         policy = _text(payload.get("policy_id")) or _text(payload.get("reward_policy_id"))
         if policy:
             child.policy_ids.add(policy)
+        if policy == E2E_REWARD_POLICY_ID:
+            child.is_e2e = True
         vector = payload.get("reward_vector")
         if isinstance(vector, Mapping):
             child.reward_vector = dict(vector)
@@ -277,10 +344,23 @@ class EpisodeGraphMaterializer:
                 child.scalar_reward = float(scalar)
             except (TypeError, ValueError):
                 child.validation_reasons.add("invalid_scalar_reward")
-        roles = {item.role for candidate_event in child.events for item in candidate_event.artifacts}
+        roles = artifact_roles(child.events)
+        if policy == E2E_REWARD_POLICY_ID:
+            self._validate_e2e_reward(child, event, roles)
+            return
+        self._validate_kernel_reward(child, event, roles, policy)
+
+    def _validate_kernel_reward(
+        self,
+        child: _ChildBuilder,
+        event: EpisodeEvent,
+        roles: set[str],
+        policy: str | None,
+    ) -> None:
         required = {
             "source": "reward_source_receipt_missing",
             "raw_measurement": "reward_measurement_receipt_missing",
+            "measurement_execution": "reward_measurement_execution_receipt_missing",
             "reward_policy": "reward_policy_receipt_missing",
         }
         if not ({"harness", "reference"} & roles):
@@ -292,15 +372,83 @@ class EpisodeGraphMaterializer:
             child.validation_reasons.add("reward_policy_id_missing")
         if event.evidence_class is not EvidenceClass.MEASURED:
             child.validation_reasons.add("reward_not_measured")
+        child.validation_reasons.update(
+            kernel_measurement_evidence_reasons(child.events, self._artifacts)
+        )
+
+    @staticmethod
+    def _validate_e2e_reward(
+        child: _ChildBuilder,
+        event: EpisodeEvent,
+        roles: set[str],
+    ) -> None:
+        required = {
+            "candidate_manifest": "candidate_manifest_receipt_missing",
+            "decision_evidence": "decision_evidence_receipt_missing",
+            "e2e_grade": "e2e_grade_receipt_missing",
+            "reward_policy": "reward_policy_receipt_missing",
+        }
+        for role, reason in required.items():
+            if role not in roles:
+                child.validation_reasons.add(reason)
+        if event.evidence_class is not EvidenceClass.DERIVED:
+            child.validation_reasons.add("e2e_reward_not_derived")
+        vector = child.reward_vector
+        if not isinstance(vector, Mapping):
+            child.validation_reasons.add("reward_vector_missing")
+            return
+        if vector.get("policy_id") != E2E_REWARD_POLICY_ID:
+            child.validation_reasons.add("reward_policy_id_mismatch")
+        if event.payload.get("policy_digest") != vector.get("policy_digest"):
+            child.validation_reasons.add("reward_policy_digest_mismatch")
+        if event.payload.get("verdict") != vector.get("verdict") or (
+            event.payload.get("reason_code") != vector.get("reason_code")
+        ):
+            child.validation_reasons.add("reward_decision_mismatch")
+        verdict = vector.get("verdict")
+        if verdict in {"keep", "revert"} and not MEASURED_E2E_ARTIFACT_ROLES.issubset(roles):
+            child.validation_reasons.add("e2e_measurement_evidence_missing")
 
     def _freeze_child(
-        self, run_id: str, parent_id: str, child: _ChildBuilder
+        self,
+        run_id: str,
+        parent_id: str,
+        child: _ChildBuilder,
+        transaction_members: Mapping[str, Sequence[str]],
     ) -> CandidateEpisode:
-        roles = {artifact.role for event in child.events for artifact in event.artifacts}
-        failure = any(event.semantic_role is SemanticRole.FAILURE for event in child.events)
+        roles = artifact_roles(child.events)
+        observed_failure = any(
+            event.semantic_role is SemanticRole.FAILURE for event in child.events
+        )
+        e2e_terminal = child.is_e2e and (
+            child.decision_count > 0 or child.reward_count > 0
+        )
+        failure = observed_failure and not e2e_terminal if child.is_e2e else observed_failure
         if child.context_packet_receipt is None:
             child.validation_reasons.add("context_packet_missing")
-        if not failure and not ({"candidate", "candidate_patch", "solution"} & roles):
+        if child.is_e2e:
+            child.validation_reasons.update(
+                e2e_completion_reasons(
+                    infrastructure_failure=failure,
+                    terminal=e2e_terminal,
+                    e2e_decision_count=child.e2e_decision_count,
+                    reward_count=child.reward_count,
+                    roles=roles,
+                    vector=child.reward_vector,
+                    candidate_id=child.candidate_id,
+                    opportunity_id=child.opportunity_id,
+                    verdict=child.verdict,
+                    decision_reason=child.decision_reason,
+                )
+            )
+            if e2e_terminal and not failure:
+                child.validation_reasons.update(
+                    e2e_outcome_transaction_reasons(
+                        child.events,
+                        transaction_members,
+                    )
+                )
+        elif not failure and not ({"candidate", "candidate_patch", "solution"} & roles):
             child.validation_reasons.add("candidate_artifact_missing")
         if not failure and child.verdict is None:
             child.validation_reasons.add("decision_missing")
@@ -315,6 +463,7 @@ class EpisodeGraphMaterializer:
             parent_episode_id=parent_id,
             attempt_id=child.attempt_id,
             candidate_id=child.candidate_id,
+            opportunity_id=child.opportunity_id,
             task_id=child.task_id,
             kernel_id=child.kernel_id,
             state_generation=child.state_generation,
@@ -332,49 +481,6 @@ class EpisodeGraphMaterializer:
             trainability="complete" if not reasons else "truncated",
             validation_reasons=reasons,
         )
-
-    @staticmethod
-    def _validate_state(
-        run_id: str,
-        records: Sequence[EventRecord],
-        state: WorkloadState | None,
-    ) -> None:
-        if state is None:
-            return
-        if state.run_id != run_id or state.sequence > records[-1].sequence:
-            raise IntegrityError("WorkloadState is not anchored to this run", "state_run_mismatch")
-        if state.sequence:
-            event = next((item for item in records if item.sequence == state.sequence), None)
-            if event is None or event.event_id != state.last_event_id:
-                raise IntegrityError("WorkloadState head does not match journal", "state_head_mismatch")
-
-
-def _candidate_action_ids(records: Sequence[EventRecord]) -> set[str]:
-    return {
-        str(record.payload["action_id"])
-        for record in records
-        if record.event_type in {"action.queued", "action_queued"}
-        and "candidate" in str(record.payload.get("action_type", ""))
-        and record.payload.get("action_id")
-    }
-
-
-def _attempt_id(record: EventRecord, candidate_actions: set[str]) -> str | None:
-    explicit = _text(record.payload.get("attempt_id"))
-    if explicit:
-        return explicit
-    candidate = _text(record.payload.get("candidate_id"))
-    if candidate and _semantic_role(record.event_type) in {
-        SemanticRole.ACTION,
-        SemanticRole.OUTCOME,
-        SemanticRole.DECISION,
-        SemanticRole.REWARD,
-        SemanticRole.FAILURE,
-    }:
-        return candidate
-    action = _text(record.payload.get("action_id"))
-    return action if action in candidate_actions else None
-
 
 def _semantic_role(event_type: str) -> SemanticRole:
     normalized = event_type.replace(".", "_")
@@ -404,13 +510,14 @@ def _semantic_role(event_type: str) -> SemanticRole:
         "e2e_micro_verified",
         "e2e_safety_verified",
         "e2e_delivery_verified",
+        "experience_measured",
     }:
         return SemanticRole.OUTCOME
     if normalized in {
         "observation_created",
         "context_packet_created",
         "knowledge_read",
-        "knowledge_outcome_linked",
+        "knowledge_outcome_linked", "experience_deferred",
         "e2e_baseline_committed",
         "e2e_diagnostics_committed",
         "e2e_reprofiled",
@@ -484,21 +591,6 @@ def _decision_from_type(event_type: str) -> str | None:
     if normalized == "action_aborted":
         return "revert"
     return None
-
-
-def _merge_int(child: _ChildBuilder, field_name: str, value: object) -> None:
-    if value is None:
-        return
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        child.validation_reasons.add(f"invalid_{field_name}")
-        return
-    existing = getattr(child, field_name)
-    if existing is not None and existing != parsed:
-        child.validation_reasons.add(f"conflicting_{field_name}")
-    elif existing is None:
-        setattr(child, field_name, parsed)
 
 
 def _text(value: object) -> str | None:

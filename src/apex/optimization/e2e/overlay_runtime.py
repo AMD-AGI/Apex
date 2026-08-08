@@ -226,24 +226,7 @@ class DockerEngine:
         build_root: Path,
         cwd: Path,
     ) -> BuiltOverlay:
-        parent_locator = parent.verified_repo_digest
-        if parent_locator is None:
-            raise IntegrityError(
-                "Parent image has no immutable repo digest for Dockerfile FROM",
-                "immutable_parent_locator_unresolved",
-                {"parent_image_id": parent.image_id},
-            )
-        observed_parent = self.inspect_image(parent_locator, cwd=cwd)
-        if observed_parent.image_id != parent.image_id:
-            raise IntegrityError(
-                "Immutable parent digest changed image identity",
-                "image_identity_mismatch",
-                {
-                    "parent_locator": parent_locator,
-                    "expected_image_id": parent.image_id,
-                    "observed_image_id": observed_parent.image_id,
-                },
-            )
+        parent_locator = self._build_parent_locator(parent, cwd=cwd)
         context, copied, dockerfile, candidate_sha256, dockerfile_sha256 = (
             _materialize_build_context(
                 candidate_source,
@@ -280,11 +263,46 @@ class DockerEngine:
             raise IntegrityError(
                 "Built image inspection changed identity", "image_identity_mismatch"
             )
+        self._verify_parent_locator(parent_locator, parent, cwd=cwd)
         return BuiltOverlay(
             inspected,
             dockerfile_sha256,
             candidate_sha256,
         )
+
+    def _build_parent_locator(self, parent: ContainerImage, *, cwd: Path) -> str:
+        locator = parent.verified_repo_digest
+        if locator is None and parent.reference == parent.image_id:
+            locator = f"apex-overlay-parent:sha256-{parent.image_id.removeprefix('sha256:')}"
+            self._run(
+                ("docker", "image", "tag", parent.image_id, locator),
+                cwd=cwd,
+                timeout=60,
+                stage="derived_parent_alias",
+            )
+        if locator is None:
+            raise IntegrityError(
+                "Parent image has no immutable locator for Dockerfile FROM",
+                "immutable_parent_locator_unresolved",
+                {"parent_image_id": parent.image_id},
+            )
+        self._verify_parent_locator(locator, parent, cwd=cwd)
+        return locator
+
+    def _verify_parent_locator(
+        self, locator: str, parent: ContainerImage, *, cwd: Path
+    ) -> None:
+        observed = self.inspect_image(locator, cwd=cwd)
+        if observed.image_id != parent.image_id:
+            raise IntegrityError(
+                "Overlay parent locator changed image identity",
+                "image_identity_mismatch",
+                {
+                    "parent_locator": locator,
+                    "expected_image_id": parent.image_id,
+                    "observed_image_id": observed.image_id,
+                },
+            )
 
     def _build_image(
         self,

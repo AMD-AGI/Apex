@@ -205,7 +205,7 @@ class _VerificationEvidence:
 
 
 class E2EBundleVerifier:
-    """Integration helper behind the future ``apex bundle verify`` command."""
+    """Independently rebuild, engage, and replay one trusted E2E bundle."""
 
     def __init__(
         self,
@@ -216,6 +216,8 @@ class E2EBundleVerifier:
         engagement_backend: EngagementBackend,
         replay_backend: CleanReplayBackend,
         materializer: CleanPatchMaterializer | None = None,
+        default_source_overrides: Mapping[str, Path] | None = None,
+        trusted_recipe_repositories: Mapping[str, frozenset[str]] | None = None,
     ) -> None:
         self._trusted_recipes = dict(trusted_recipes)
         self._trusted_source_urls = dict(trusted_source_urls)
@@ -223,6 +225,8 @@ class E2EBundleVerifier:
         self._engagement = engagement_backend
         self._replay = replay_backend
         self._materializer = materializer or CleanPatchMaterializer()
+        self._default_source_overrides = dict(default_source_overrides or {})
+        self._trusted_recipe_repositories = dict(trusted_recipe_repositories or {})
 
     def verify(
         self,
@@ -247,11 +251,16 @@ class E2EBundleVerifier:
             result = _verification_result(candidate, evidence, trust_failure)
             return _publish_outcome(candidate, result, result_path, results_dir)
         try:
+            selected_sources = (
+                source_overrides
+                if source_overrides is not None
+                else self._default_source_overrides or None
+            )
             self._collect_evidence(
                 candidate,
                 results_dir,
                 evidence,
-                source_overrides=source_overrides,
+                source_overrides=selected_sources,
             )
             result = _verification_result(candidate, evidence)
         except (ContractError, IntegrityError) as error:
@@ -259,8 +268,18 @@ class E2EBundleVerifier:
         return _publish_outcome(candidate, result, result_path, results_dir)
 
     def _trust_failure(self, candidate: E2EPatchBundle) -> str | None:
-        trusted = self._trusted_recipes.get(candidate.recipe.computed_sha256)
+        recipe_sha = candidate.recipe.computed_sha256
+        trusted = self._trusted_recipes.get(recipe_sha)
         if trusted is None or trusted.to_dict() != candidate.recipe.to_dict():
+            return "untrusted_build_recipe"
+        trusted_repositories = self._trusted_recipe_repositories.get(recipe_sha)
+        candidate_repositories = frozenset(
+            item.repository_id for item in candidate.repositories
+        )
+        if (
+            trusted_repositories is not None
+            and trusted_repositories != candidate_repositories
+        ):
             return "untrusted_build_recipe"
         urls_match = all(
             repository.repository_id in self._trusted_source_urls

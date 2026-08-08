@@ -34,12 +34,12 @@ def deliver_best(
         bundle_dir=session.run_root / "bundle",
     )
     _record_selection(session, outcomes, best, bundle.digest)
-    session.record.finish(RunPhase.SUCCEEDED, "candidate_ready")
+    session.record.finish(RunPhase.SUCCEEDED, best.reason_code)
     result = TaskResult(
         schema_version=1,
         task_id=session.request.task.task_id,
         status=TaskStatus.CANDIDATE_READY,
-        reason_code="candidate_verified_for_external_evaluation",
+        reason_code=best.reason_code,
         applied=False,
         external_verification_required=True,
         bundle_path=str(bundle.path),
@@ -68,7 +68,7 @@ def _record_selection(
             outcome.attempt_id,
             verdict="keep" if selected else "revert",
             reason=(
-                "candidate_verified_for_external_evaluation"
+                best.reason_code
                 if selected
                 else _non_best_reason(outcome)
             ),

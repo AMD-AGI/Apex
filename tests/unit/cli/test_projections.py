@@ -17,28 +17,12 @@ from apex.context import (
     freeze_metrics,
 )
 from apex.core import ContractError
-from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal
+from apex.orchestration import RunController, RunPhase
+from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal, SnapshotStore
 
 
 def _binding(role: str, receipt: ArtifactReceipt) -> dict[str, object]:
     return {"role": role, "receipt": receipt.to_dict()}
-
-
-def _append(
-    journal: EventJournal,
-    run_id: str,
-    event_type: str,
-    payload: dict[str, object],
-    key: str,
-) -> None:
-    head = journal.last_event(run_id)
-    journal.append(
-        run_id=run_id,
-        event_type=event_type,
-        payload=payload,
-        idempotency_key=key,
-        parent_event_id=head.event_id if head is not None else None,
-    )
 
 
 def _packet(run_id: str) -> ContextPacket:
@@ -77,6 +61,12 @@ def canonical_run(tmp_path: Path) -> tuple[Path, str]:
     root = tmp_path / run_id
     journal = EventJournal(root / "events" / "run.db")
     artifacts = ArtifactStore(root / "artifacts")
+    controller = RunController.create(
+        run_id,
+        journal,
+        SnapshotStore(root / "state.snapshot.json"),
+        initial_anchor_id="anchor-cli",
+    )
     packet = _packet(run_id)
     packet_receipt = artifacts.put_bytes(packet.canonical_bytes, media_type="application/json")
     candidate = artifacts.put_bytes(b"def kernel(x):\n    return x\n", media_type="text/x-python")
@@ -90,27 +80,26 @@ def canonical_run(tmp_path: Path) -> tuple[Path, str]:
         "split": "train",
         "visibility": "public",
     }
-    _append(journal, run_id, "run_started", {"task_id": "task-cli"}, "start")
-    _append(
-        journal,
-        run_id,
+    controller.record_domain_event(
         "context_packet_created",
         {
             **common,
             "context_packet_id": packet.context_packet_id,
             "artifacts": [_binding("context_packet", packet_receipt)],
         },
-        "context",
+        idempotency_key="context",
     )
-    _append(
-        journal,
-        run_id,
+    controller.record_domain_event(
         "candidate_frozen",
         {**common, "artifacts": [_binding("candidate", candidate)]},
-        "candidate",
+        idempotency_key="candidate",
     )
-    _append(journal, run_id, "decision", {**common, "verdict": "keep"}, "decision")
-    _append(journal, run_id, "run_finished", {"status": "succeeded"}, "finish")
+    controller.record_domain_event(
+        "decision",
+        {**common, "verdict": "keep"},
+        idempotency_key="decision",
+    )
+    controller.finish(RunPhase.SUCCEEDED, reason="test_complete")
     return root, run_id
 
 
@@ -120,6 +109,12 @@ def test_report_command_rebuilds_only_disposable_views(
     root, run_id = canonical_run
     output = tmp_path / "report"
     before = len(EventJournal(root / "events" / "run.db").iter_events(run_id))
+    evidence_paths = (
+        root / "events" / "run.db",
+        root / "state.snapshot.json",
+        *tuple(path for path in (root / "artifacts").rglob("*") if path.is_file()),
+    )
+    evidence_mtimes = {path: path.stat().st_mtime_ns for path in evidence_paths}
     assert main(
         ["report", "--run-root", str(root), "--output", str(output), "--json"]
     ) == 0
@@ -129,6 +124,9 @@ def test_report_command_rebuilds_only_disposable_views(
     assert (output / "report.json").is_file()
     assert (output / "replication_guide.md").is_file()
     assert len(EventJournal(root / "events" / "run.db").iter_events(run_id)) == before
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert report["workload_state_hash"] is not None
+    assert {path: path.stat().st_mtime_ns for path in evidence_paths} == evidence_mtimes
 
 
 def test_export_rl_command_uses_real_candidate_and_context(

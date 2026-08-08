@@ -1,8 +1,9 @@
 # Execution
 
 `apex.execution` implements the `AgentBackend` port for Codex, Claude Code, and
-Cursor Agent. Codex is the registry default; callers can explicitly select the
-other two without preflighting unrelated credentials.
+Cursor Agent, plus the production `StructuredKernelMeasurementAdapter`. Codex
+is the registry default; callers can explicitly select the other two without
+preflighting unrelated credentials.
 
 All adapters execute argv with `shell=False` through `SubprocessSupervisor`,
 drain stdout and stderr concurrently, bound captured output, and run both CLI
@@ -11,7 +12,23 @@ namespace. They return normalized transcript events and never decide whether a
 candidate is correct or fast.
 
 Public API: `AgentRegistry`, `build_default_registry`, `SubprocessSupervisor`,
-`ProcessResult`, and `build_subprocess_environment`.
+`ProcessResult`, `build_subprocess_environment`,
+`StructuredKernelMeasurementAdapter`, and its immutable adapter/method IDs.
+
+## Kernel measurement adapter
+
+The production adapter runs the descriptor's protected measurement runner in a
+private PID namespace with a bounded, fail-closed runtime environment. Stdout
+must be exactly one strict `apex.kernel-measurement/v1` JSON object with the
+frozen method digest. After the namespace is proven empty, the parent process
+canonicalizes that object and exclusively publishes it into the
+controller-owned private output directory. The runner receives no report path;
+malformed, duplicate-key, nonfinite, truncated, timed-out, nonzero-exit, or
+incompletely contained output fails closed. Statistics and reward remain owned
+by `apex.evaluation`, not this adapter.
+Its V1 identity is `apex-structured-kernel-v1`; the matching immutable method
+digest is
+`4bb99ecf991a6d28448f46c071bc3c09fbe91aba2cf5f5194e3c1928d96990c1`.
 
 ## Structured transcripts
 
@@ -156,8 +173,9 @@ Tests: `pytest tests/unit/execution tests/contract -q`.
 
 ## Purpose
 
-Execution contains stateless Codex, Claude, and Cursor adapters plus one bounded
-subprocess supervisor for trusted fixed-argv commands.
+Execution contains stateless Codex, Claude, Cursor, and structured kernel
+measurement adapters plus one bounded subprocess supervisor for trusted
+fixed-argv commands.
 
 ## Public API
 

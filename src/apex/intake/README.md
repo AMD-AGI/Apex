@@ -32,14 +32,18 @@ every candidate event. Defaults are `train/public`; `heldout_private` is valid
 only with the `heldout` split, and the RL exporter excludes private episodes
 from train exports.
 
-`KernelMeasurementSpec` optionally declares the trusted workspace-relative
-destination of a fresh `apex.kernel-measurement/v1` report and its
-`equal_case` or `workload_weighted` aggregation. The report path is output, not
-editable source: it cannot appear in `editable_files`, cannot already exist at
-resolution time, and must have a confined non-symlink parent. The trusted
-performance argv writes health-bracketed, seeded paired ABBA blocks of raw
-reference and optimized invocation samples there; natural-language instructions
-cannot redefine this contract.
+`KernelMeasurementSpec` optionally names a trusted evaluator adapter, the exact
+protected harness files, a frozen measurement-method SHA-256, a fixed-argv
+`runner` command, and the
+`equal_case` or `workload_weighted` aggregation. Harness files must be regular,
+workspace-confined, and disjoint from `editable_files`; `TaskResolver` records
+their individual hashes and aggregate harness digest. Raw report paths are not
+caller or candidate vocabulary. The controller allocates a fresh output outside
+the candidate workspace, and only the named measurement port may populate it.
+Natural-language instructions and the ordinary performance command cannot
+redefine this authority contract. The runner emits one strict
+`apex.kernel-measurement/v1` JSON document to stdout; it never receives the
+controller's private report path.
 The same spec freezes minimum sample/tail counts, warmup, strict KEEP threshold,
 confidence and worst-case floors, maximum CV, bootstrap confidence level, seed,
 repetitions, and minimum paired-unit count. The report may declare its timing
@@ -77,10 +81,8 @@ interfaces exported from `apex.intake`.
 ## Invariants
 
 Workspace paths are relative and confined, executable commands are fixed argv,
-editable paths are explicit, and measurement reports are never agent-editable.
-Resolving a task rejects a stale report before copying the workspace, preventing
-a prior run or agent-created file from being mistaken for fresh evaluator-owned
-timing evidence.
+editable paths are explicit, and measurement harness files are frozen and never
+agent-editable. Candidate workspaces contain no reward-bearing report destination.
 
 ## Dependencies
 
@@ -90,9 +92,10 @@ benchmark, storage, or optimization dependency.
 ## Failure semantics
 
 Ambiguous language, unsupported modes, unavailable HIP execution, unsafe paths,
-invalid budgets, or an incomplete correctness/measurement recipe fail before execution. Measurement
-path escape, an unsafe parent, a pre-existing report, or overlap with editable
-source has a typed intake failure and cannot fall back to self-reported timing.
+invalid budgets, or an incomplete correctness/measurement recipe fail before
+execution. Missing adapter identity, harness files, method digest, structured
+runner, an unsafe harness, or overlap with editable source has a typed intake failure and cannot
+fall back to self-reported timing.
 
 ## Provenance
 

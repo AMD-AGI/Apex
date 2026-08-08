@@ -22,10 +22,11 @@ from apex.evaluation.safety import (
     VerificationPolicy,
 )
 from apex.execution import AgentRegistry
-from apex.intake import TaskResolver
+from apex.intake import TaskResolver, TaskSpec
 from apex.ports import (
     AgentRequest,
     AgentTerminationKind,
+    KernelMeasurementPort,
     SafetyToolRunRequest,
     SafetyToolRunResult,
     SafetyVerificationPort,
@@ -83,6 +84,7 @@ class KernelOptimizeUseCase:
         safety_policy: VerificationPolicy | None = None,
         safety_tools: Sequence[ToolVerificationPlan] = (),
         gpu_leases: GpuLeaseManager | None = None,
+        measurement_evaluator: KernelMeasurementPort | None = None,
     ) -> None:
         self._agents = agents
         self._verifier = verifier or CandidateVerifier()
@@ -101,6 +103,14 @@ class KernelOptimizeUseCase:
             )
         self._safety_gate = safety_gate or SafetyGate(_UnexpectedSafetyRunner())
         self._gpu_leases = gpu_leases or LocalGpuLeaseManager()
+        self._measurement_evaluator = measurement_evaluator
+
+    @property
+    def measurement_adapter_id(self) -> str | None:
+        """Expose the composed trusted measurement authority without its internals."""
+
+        evaluator = self._measurement_evaluator
+        return evaluator.adapter_id if evaluator is not None else None
 
     def run(self, request: KernelOptimizeRequest) -> TaskResult:
         run_id = new_identifier("run")
@@ -440,11 +450,16 @@ class KernelOptimizeUseCase:
                 closure="complete_revert",
                 measurement=measurement,
             )
+        reason = (
+            "candidate_verified_by_trusted_measurement"
+            if measurement is not None
+            else "candidate_deferred_to_external_evaluator"
+        )
         return close_prepared(
             attempt,
             prepared,
             TaskStatus.CANDIDATE_READY,
-            "candidate_verified_for_external_evaluation",
+            reason,
             complete_evidence,
             safety=safety.result,
             safety_receipt=safety.receipt,
@@ -460,10 +475,30 @@ class KernelOptimizeUseCase:
         safety: SafetyEvidence,
         evidence: tuple[ArtifactReceipt, ...],
     ) -> MeasurementEvidence | KernelAttemptOutcome:
+        if attempt.run.resolved.task.measurement is None:
+            if _uses_external_evaluator(attempt.run.resolved.task):
+                return MeasurementEvidence(None, None, evidence)
+            return close_prepared(
+                attempt,
+                prepared,
+                TaskStatus.NO_MEASUREMENT,
+                "measurement_contract_missing",
+                evidence,
+                safety=safety.result,
+                safety_receipt=safety.receipt,
+                closure="defer",
+                measurement_fields={"measurement_status": "not_configured"},
+            )
         try:
             measurement = evaluate_kernel_measurement(
                 attempt.run.resolved,
                 candidate_root=attempt.candidate.root,
+                run_id=attempt.run.run_id,
+                attempt_id=attempt.attempt_id,
+                output_root=(
+                    attempt.run.run_root / "measurements" / attempt.attempt_id
+                ),
+                evaluator=self._measurement_evaluator,
             )
         except ApexError as error:
             attempt.run.record.record_measurement_error(
@@ -486,7 +521,9 @@ class KernelOptimizeUseCase:
             measurement_receipt = attempt.run.record.record_measurement(
                 attempt.attempt_id,
                 artifact=measurement.artifact,
+                execution=measurement.execution,
                 grade=measurement.grade,
+                harness_receipt=attempt.context.harness_receipt,
             )
             evidence = (*evidence, measurement_receipt)
             if not measurement.reward_eligible:
@@ -524,6 +561,11 @@ class KernelOptimizeUseCase:
             timeout_seconds=task.budget.timeout_seconds,
             runtime_closure_sha256=task.agent_options.runtime_closure_sha256,
         )
+
+
+def _uses_external_evaluator(task: TaskSpec) -> bool:
+    recipe = task.recipe
+    return recipe is not None and recipe.provenance == "external_evaluator"
 
 
 def _agent_failure_status(kind: AgentTerminationKind) -> TaskStatus:

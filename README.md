@@ -83,6 +83,14 @@ A natural-language request selects a checked-in trusted task descriptor. The
 descriptor—not the prose—owns editable paths and fixed-argv compile, correctness,
 performance, and optional safety/measurement contracts.
 
+Production raw-measurement descriptors name
+`adapter_id: apex-structured-kernel-v1`, freeze the protected harness and method,
+and provide a structured `measurement.runner` that emits at least 300 reference
+and optimized invocation samples per case. A successful performance command
+alone is never a measured candidate. Formal controllers such as AKA may instead
+declare a trusted `external_evaluator` recipe; that explicit path receives a
+source bundle with no Apex reward for central scoring.
+
 V1 executes standalone Python and Triton tasks. A standalone task whose language is
 `hip` fails intake with `hip_execution_unavailable`, even if it carries a fixed HIP
 recipe: the current kernel loop does not yet bind trusted build, deploy, and loaded-byte
@@ -113,6 +121,17 @@ result. Verify a kernel bundle independently with:
 
 ```bash
 apex bundle verify --bundle /absolute/path/to/bundle --json
+```
+
+Formal E2E bundles require a fresh evidence directory. This command checks out
+the exact locked sources, rebuilds the immutable image, proves runtime engagement,
+and repeats the unchanged quality/performance replay before returning success:
+
+```bash
+apex bundle verify \
+  --bundle /absolute/path/to/e2e-candidate-bundle \
+  --results /absolute/path/to/fresh-verification \
+  --json
 ```
 
 ### Kernel grade

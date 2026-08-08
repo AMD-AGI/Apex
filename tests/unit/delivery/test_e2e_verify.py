@@ -185,6 +185,32 @@ def test_full_second_clean_replay_finalizes_verified_bundle(make_e2e_bundle, tmp
     assert serialized["replay_receipt"]["fresh_source_materialization"] is True
 
 
+def test_composed_default_sources_are_cloned_into_fresh_verifier_worktrees(
+    make_e2e_bundle, tmp_path: Path
+) -> None:
+    fixture = make_e2e_bundle()
+    verifier_instance = E2EBundleVerifier(
+        trusted_recipes={fixture.recipe.computed_sha256: fixture.recipe},
+        trusted_source_urls={
+            item.repository_id: item.url for item in fixture.bundle.repositories
+        },
+        build_backend=FakeBuild(),
+        engagement_backend=FakeEngagement(),
+        replay_backend=FakeReplay(),
+        default_source_overrides=fixture.bases,
+    )
+
+    outcome = verifier_instance.verify(
+        bundle_dir=fixture.bundle.path,
+        results_dir=tmp_path / "verify-default-sources",
+    )
+
+    assert outcome.result.verified
+    worktree = tmp_path / "verify-default-sources" / "worktrees" / "repo0"
+    assert worktree.is_dir()
+    assert worktree.resolve() != fixture.bases["repo0"].resolve()
+
+
 def test_fixed_recipe_executor_uses_argv_supervisor_without_shell(
     make_e2e_bundle, tmp_path: Path
 ) -> None:
@@ -281,6 +307,34 @@ def test_untrusted_recipe_returns_structured_failure_before_build(make_e2e_bundl
     assert outcome.result.validation_level is ValidationLevel.RUNTIME_OVERLAY_VERIFIED
     assert outcome.result.reason_code == "untrusted_build_recipe"
     assert not (tmp_path / "untrusted" / "worktrees").exists()
+
+
+def test_trusted_recipe_rejects_an_unregistered_repository_set(
+    make_e2e_bundle, tmp_path: Path
+) -> None:
+    fixture = make_e2e_bundle(count=2)
+    verifier_instance = E2EBundleVerifier(
+        trusted_recipes={fixture.recipe.computed_sha256: fixture.recipe},
+        trusted_source_urls={
+            item.repository_id: item.url for item in fixture.bundle.repositories
+        },
+        build_backend=FakeBuild(),
+        engagement_backend=FakeEngagement(),
+        replay_backend=FakeReplay(),
+        trusted_recipe_repositories={
+            fixture.recipe.computed_sha256: frozenset({"repo0"})
+        },
+    )
+
+    outcome = verifier_instance.verify(
+        bundle_dir=fixture.bundle.path,
+        results_dir=tmp_path / "wrong-repository-set",
+        source_overrides=fixture.bases,
+    )
+
+    assert outcome.result.status is TaskStatus.VERIFICATION_FAILED
+    assert outcome.result.reason_code == "untrusted_build_recipe"
+    assert not (tmp_path / "wrong-repository-set" / "worktrees").exists()
 
 
 def test_untrusted_source_url_is_rejected_before_clone(make_e2e_bundle, tmp_path: Path) -> None:

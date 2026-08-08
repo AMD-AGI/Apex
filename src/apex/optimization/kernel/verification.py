@@ -16,6 +16,7 @@ from apex.execution import (
     build_subprocess_environment,
 )
 from apex.intake import CommandSpec, ResolvedTaskSpec
+from apex.ports import AgentProcessContainmentReceipt
 
 
 _PHASES = ("compile", "correctness", "performance")
@@ -30,6 +31,7 @@ class CommandEvidence:
     stdout: str
     stderr: str
     duration_seconds: float
+    process_containment: AgentProcessContainmentReceipt
 
     def __post_init__(self) -> None:
         if self.phase not in _PHASES:
@@ -48,6 +50,7 @@ class CommandEvidence:
             "stdout": self.stdout,
             "stderr": self.stderr,
             "duration_seconds": self.duration_seconds,
+            "process_containment": self.process_containment.to_dict(),
             "passed": self.passed,
         }
 
@@ -126,6 +129,7 @@ class CandidateVerifier:
             cwd=cwd.resolve(strict=True),
             environment=environment,
             timeout_seconds=command.timeout_seconds,
+            require_pid_namespace=True,
         )
         return _evidence(phase, process)
 
@@ -176,6 +180,16 @@ def _assert_source_digest(
 
 
 def _evidence(phase: str, result: ProcessResult) -> CommandEvidence:
+    containment = result.process_containment
+    if (
+        containment is None
+        or not containment.namespace_empty_verified
+        or not result.cleanup_succeeded
+    ):
+        raise IntegrityError(
+            "Kernel verifier process tree was not authoritatively contained",
+            "verifier_process_containment_failed",
+        )
     return CommandEvidence(
         phase=phase,
         argv=result.argv,
@@ -184,6 +198,7 @@ def _evidence(phase: str, result: ProcessResult) -> CommandEvidence:
         stdout=result.stdout,
         stderr=result.stderr,
         duration_seconds=result.duration_seconds,
+        process_containment=containment,
     )
 
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from apex.context import (
     AnchorView,
     ArtifactReference,
+    CampaignAttemptView,
     CompiledContext,
     ContextBudget,
     ContextCompileRequest,
@@ -22,8 +23,6 @@ from apex.evaluation import E2EMeasurement
 from apex.intake import E2EOptimizeSpec
 from apex.knowledge import (
     ExperienceIdentity,
-    ExperienceOutcome,
-    ExperienceRecord,
     ExperienceView,
     KnowledgeRetriever,
     KnowledgeScope,
@@ -208,7 +207,8 @@ def _compile_request(
         ),
         retrieval_scope=_scope(spec, opportunity),
         experience_identity=inputs.identity,
-        experience_view=_experience(record, inputs.identity, opportunity.opportunity_id),
+        experience_view=ExperienceView.from_events(record.iter_events()),
+        campaign_attempts=_campaign_history(record),
     )
 
 
@@ -286,6 +286,8 @@ def _persist_context(
         harness=inputs.harness,
         knowledge=knowledge,
         prompt=prompt,
+        experience_identity=inputs.identity,
+        experience_mechanism=compiled.packet.hypothesis.mechanism,
     )
     return E2EContext(
         compiled,
@@ -399,44 +401,25 @@ def _identity(
     )
 
 
-def _experience(
-    record: E2ERunRecord,
-    identity: ExperienceIdentity,
-    opportunity_id: str,
-) -> ExperienceView:
+def _campaign_history(record: E2ERunRecord) -> tuple[CampaignAttemptView, ...]:
     search = record.controller.state.e2e
     assert search is not None
-    records: list[ExperienceRecord] = []
-    for sequence, decision in enumerate(search.decisions, start=1):
-        if decision.opportunity_id != opportunity_id:
-            continue
-        outcome = {
-            "keep": ExperienceOutcome.SUCCESS,
-            "revert": ExperienceOutcome.NO_GAIN,
-            "reject": ExperienceOutcome.FAILURE,
-            "needs_more_measurement": ExperienceOutcome.FAILURE,
-        }[decision.verdict]
-        records.append(
-            ExperienceRecord(
-                event_sequence=sequence,
-                event_id=f"decision-{sequence}",
-                candidate_id=decision.candidate_id,
-                identity=identity,
-                outcome=outcome,
-                strategy_fingerprint=sha256_json(
-                    {"candidate": decision.candidate_id, "reason": decision.reason}
-                ),
-                mechanism="prior source candidate for this measured opportunity",
-                micro_verdict="qualified" if decision.verdict != "reject" else "rejected",
-                e2e_verdict=decision.verdict,
-                evidence_receipts=(decision.evidence_ref,),
-                failure_reason=None if decision.verdict == "keep" else decision.reason,
-                retry_condition=(
-                    None if decision.verdict == "keep" else "new hypothesis or anchor generation"
-                ),
-            )
+    return tuple(
+        CampaignAttemptView(
+            attempt_id=decision.attempt_id,
+            opportunity_id=decision.opportunity_id,
+            candidate_id=decision.candidate_id,
+            verdict=decision.verdict,
+            reason=decision.reason,
+            anchor_generation=decision.anchor_generation,
+            context_packet_id=decision.context_packet_id,
+            evidence_receipts=(
+                decision.evidence_ref,
+                decision.candidate_artifact_ref,
+            ),
         )
-    return ExperienceView(tuple(records), ())
+        for decision in reversed(search.decisions)
+    )
 
 
 def _workspace_contract(relative: str, source: ArtifactReceipt) -> str:

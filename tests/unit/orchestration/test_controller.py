@@ -75,6 +75,26 @@ def test_rebuild_snapshot_uses_only_journal_history(tmp_path) -> None:
     assert snapshots.load().payload == expected.to_dict()  # type: ignore[union-attr]
 
 
+def test_recover_ignores_validly_rehashed_but_forged_snapshot_fields(
+    tmp_path,
+) -> None:
+    journal, snapshots = stores(tmp_path)
+    controller = RunController.create(
+        "run-1", journal, snapshots, initial_anchor_id="anchor-real"
+    )
+    forged = controller.state.to_dict()
+    forged["anchor_id"] = "anchor-forged"
+    snapshots.save(
+        high_water_mark=controller.state.sequence,
+        payload=forged,
+    )
+
+    recovered = RunController.recover("run-1", journal, snapshots)
+
+    assert recovered.state.anchor_id == "anchor-real"
+    assert snapshots.load().payload == recovered.state.to_dict()  # type: ignore[union-attr]
+
+
 def test_domain_evidence_advances_head_without_mutating_anchor(tmp_path) -> None:
     journal, snapshots = stores(tmp_path)
     controller = RunController.create("run-1", journal, snapshots, initial_anchor_id="source-0")

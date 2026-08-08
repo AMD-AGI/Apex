@@ -112,6 +112,13 @@ def _store_harness(
             for name, command in sorted(resolved.task.commands.items())
         },
         "baseline_file_hashes": dict(sorted(resolved.baseline_file_hashes.items())),
+        "measurement": (
+            resolved.task.measurement.to_dict()
+            if resolved.task.measurement is not None
+            else None
+        ),
+        "harness_file_hashes": dict(sorted(resolved.harness_file_hashes.items())),
+        "harness_sha256": resolved.harness_sha256,
     }
     return record.artifacts.put_bytes(
         canonical_json_bytes(value), media_type="application/json"
@@ -255,7 +262,16 @@ def kernel_experience_identity(resolved: ResolvedTaskSpec) -> ExperienceIdentity
             "shape_hash": sha256_json({"targets": list(task.target_functions)}),
             "source_hash": resolved.resolution_hash,
             "harness_hash": sha256_json(
-                {name: command.to_dict() for name, command in sorted(task.commands.items())}
+                {
+                    "commands": {
+                        name: command.to_dict()
+                        for name, command in sorted(task.commands.items())
+                    },
+                    "harness_sha256": resolved.harness_sha256,
+                    "measurement": (
+                        task.measurement.to_dict() if task.measurement else None
+                    ),
+                }
             ),
             "policy_hash": sha256_json({"policy_id": "kernel_robust_v1"}),
         }

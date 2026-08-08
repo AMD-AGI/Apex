@@ -49,9 +49,17 @@ share. `adapter.py` implements `DiagnosticsPort` without launching a second
 profiler.
 
 The normalizer requires TargetedKernelTrace and has no aggregate-only fallback.
-Heavy trace files stay in the benchmark workspace and are referenced by receipts.
-Only receipt-bound diagnostic files are published to the run artifact store;
-the disposable InferenceX checkout and unrelated workspace files are excluded.
+Planning/reprofile passes publish only receipt-bound diagnostic files. When the
+controller explicitly requests terminal preservation, `adapter.py` additionally
+validates and publishes only the Magpie report's declared rank-0 raw trace and
+TraceLens output files; it never recursively captures the disposable InferenceX
+checkout or unrelated workspace files. `comparison.py` binds the baseline and
+terminal raw trace, benchmark report, and report sheets to verified CAS receipts,
+then invokes the documented report-comparison API from the exact locked TraceLens
+tree. Common stage/sheet groups produce immutable CSV/XLSX outputs which are
+republished to Apex CAS. This is a typed `PARTIAL` result: report comparison ran,
+but the pin still lacks a stable full-attribution contract and MI355X profile.
+That unavailable capability is never inferred from the report diff.
 Diagnostic metrics are observations only; they must never be used as the formal
 E2E reward measurement.
 
@@ -63,7 +71,8 @@ kernel evidence, and ranks observations for kernel-only search.
 ## Public API
 
 Consume the evidence contracts, `TargetedTraceValidator`,
-`TraceEvidenceNormalizer`, `MagpieTraceEvidenceAdapter`, and ranking functions
+`TraceEvidenceNormalizer`, `MagpieTraceEvidenceAdapter`,
+`PinnedTraceLensComparisonAdapter`, and ranking functions
 exported by `apex.diagnostics`.
 
 ## Invariants
@@ -73,8 +82,10 @@ reach planning; joins use exact runtime symbols and preserve unmatched evidence.
 
 ## Dependencies
 
-The package depends only on core contracts and diagnostics ports. It deliberately
-does not import Magpie or TraceLens producer code.
+The package depends on core contracts and diagnostics ports. Acquisition
+validation deliberately does not import Magpie. The comparison adapter loads only
+the hash-checked documented function from the configured locked TraceLens tree at
+call time.
 
 ## Failure semantics
 
@@ -84,7 +95,8 @@ disagreement, or missing targeted evidence fail closed.
 ## Tests
 
 Run `pytest -q -p no:cacheprovider tests/unit/test_targeted_trace_ingestion.py
-tests/unit/test_trace_evidence.py tests/unit/test_e2e_kernel_lane.py`.
+tests/unit/test_trace_comparison.py tests/unit/test_trace_evidence.py
+tests/unit/test_e2e_kernel_lane.py`.
 
 ## Provenance
 

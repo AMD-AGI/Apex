@@ -43,12 +43,14 @@ from .source_delivery_models import (
 )
 from .source_delivery_provenance import ExactRequestProvenance
 from .qwen_profile import (
+    build_qwen_acceptance_bundle_verifier,
     build_qwen_acceptance_delivery,
     build_qwen_acceptance_provenance_resolver,
     build_qwen_correctness_oracles,
     build_qwen_oracle_micro_qualifier,
     default_qwen_source_roots,
 )
+from .qwen_qualification import QwenCompositeMicroQualifier
 from .use_case import BenchmarkAdapter, E2EOptimizeUseCase, ProvenancePort
 
 __all__ = [
@@ -89,6 +91,7 @@ __all__ = [
     "PrimarySourceBuildPort",
     "PrimarySourceBuildRequest",
     "ProvenancePort",
+    "QwenCompositeMicroQualifier",
     "ResolvedCorrectnessOracle",
     "DeliveryProvenancePort",
     "SafetyQualification",
@@ -97,6 +100,7 @@ __all__ = [
     "ExactRequestProvenance",
     "build_e2e_result",
     "build_kernel_opportunity_plan",
+    "build_qwen_acceptance_bundle_verifier",
     "build_qwen_acceptance_delivery",
     "build_qwen_acceptance_provenance_resolver",
     "build_qwen_correctness_oracles",

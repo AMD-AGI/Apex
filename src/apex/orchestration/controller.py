@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
-from apex.core import ApexError, ContractError, StateTransitionError, validate_identifier
+from apex.core import (
+    ContractError,
+    StateTransitionError,
+    validate_identifier,
+)
 
+from .atomic import AtomicJournalPort, ProposedEvent, append_reduced_transaction
+from .replay import replay_workload_state
 from .state import E2ESearchState, RunPhase, WorkloadState
 from .transitions import DOMAIN_EVENT_TYPES, EventLike, reduce_event
 
 
-class JournalPort(Protocol):
+class JournalPort(AtomicJournalPort, Protocol):
     def append(
         self,
         *,
@@ -21,8 +26,6 @@ class JournalPort(Protocol):
         idempotency_key: str,
         parent_event_id: str | None = None,
     ) -> EventLike: ...
-
-    def get_by_idempotency_key(self, run_id: str, idempotency_key: str) -> EventLike | None: ...
 
     def iter_events(
         self,
@@ -46,16 +49,6 @@ class SnapshotPort(Protocol):
     def load(self) -> SnapshotLike | None: ...
 
     def delete(self) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class _ProposedEvent:
-    sequence: int
-    event_id: str
-    run_id: str
-    event_type: str
-    payload: Mapping[str, Any]
-    parent_event_id: str | None
 
 
 class RunController:
@@ -108,11 +101,7 @@ class RunController:
         events = tuple(journal.iter_events(run_id))
         if not events:
             raise ContractError("Run does not exist", "run_not_found")
-        state = _load_projection(run_id, snapshots, events)
-        try:
-            state = _replay(state or WorkloadState.initial(run_id), events)
-        except StateTransitionError:
-            state = _replay(WorkloadState.initial(run_id), events)
+        state = replay_workload_state(run_id, events)
         controller = cls(journal, snapshots, state)
         controller._save_snapshot()
         return controller
@@ -252,34 +241,49 @@ class RunController:
         )
 
     def select_e2e_opportunity(
-        self, *, opportunity_id: str, context_packet_id: str
+        self, *, attempt_id: str, opportunity_id: str, context_packet_id: str
     ) -> WorkloadState:
         search = self._e2e()
+        if attempt_id in {item.attempt_id for item in search.decisions}:
+            raise StateTransitionError(
+                "Attempt ID was already used",
+                "attempt_id_reused",
+            )
         return self._record(
             "e2e.opportunity_selected",
             {
+                "attempt_id": attempt_id,
                 "opportunity_id": opportunity_id,
                 "context_packet_id": context_packet_id,
                 **self._generation_payload(search),
             },
-            f"e2e.candidate.{search.budget.candidates_used + 1}.selected",
+            f"e2e.attempt.{attempt_id}.selected",
         )
 
     def freeze_e2e_candidate(self, *, candidate_id: str, artifact_ref: str) -> WorkloadState:
         search = self._e2e()
         return self._record(
             "e2e.candidate_frozen",
-            {"candidate_id": candidate_id, "artifact_ref": artifact_ref},
+            {
+                **self._active_attempt_payload(search),
+                "candidate_id": candidate_id,
+                "artifact_ref": artifact_ref,
+            },
             f"e2e.candidate.{search.budget.candidates_used}.frozen",
         )
 
     def reject_e2e_execution(
-        self, *, candidate_id: str, receipt: str, reason: str
+        self, *, candidate_id: str | None, receipt: str, reason: str
     ) -> WorkloadState:
         search = self._e2e()
         return self._record(
             "e2e.execution_rejected",
-            {"candidate_id": candidate_id, "receipt": receipt, "reason": reason},
+            {
+                **self._active_attempt_payload(search),
+                **({"candidate_id": candidate_id} if candidate_id is not None else {}),
+                "receipt": receipt,
+                "reason": reason,
+            },
             f"e2e.candidate.{search.budget.candidates_used}.execution_rejected",
         )
 
@@ -290,6 +294,7 @@ class RunController:
         return self._record(
             "e2e.micro_verified",
             {
+                **self._active_attempt_payload(search),
                 "candidate_id": candidate_id,
                 "receipt": receipt,
                 "qualified": qualified,
@@ -312,6 +317,7 @@ class RunController:
         return self._record(
             "e2e.safety_verified",
             {
+                **self._active_attempt_payload(search),
                 "candidate_id": candidate_id,
                 "receipt": receipt,
                 "finding": finding,
@@ -334,6 +340,7 @@ class RunController:
         return self._record(
             "e2e.delivery_verified",
             {
+                **self._active_attempt_payload(search),
                 "candidate_id": candidate_id,
                 "receipt": receipt,
                 "verified": verified,
@@ -345,29 +352,69 @@ class RunController:
     def decide_e2e_candidate(
         self,
         *,
-        candidate_id: str,
+        candidate_id: str | None,
         receipt: str,
         verdict: str,
         reason: str,
+        reward_payload: Mapping[str, Any],
+        decision_artifacts: Sequence[Mapping[str, Any]] = (),
         new_anchor_id: str | None = None,
         accepted_patch_id: str | None = None,
     ) -> WorkloadState:
         search = self._e2e()
         payload: dict[str, Any] = {
-            "candidate_id": candidate_id,
+            **self._active_attempt_payload(search),
             "receipt": receipt,
             "verdict": verdict,
             "reason": reason,
             **self._generation_payload(search),
+            "artifacts": [dict(item) for item in decision_artifacts],
         }
+        if candidate_id is not None:
+            payload["candidate_id"] = candidate_id
         if new_anchor_id is not None:
             payload["new_anchor_id"] = new_anchor_id
         if accepted_patch_id is not None:
             payload["accepted_patch_id"] = accepted_patch_id
-        return self._record(
-            "e2e.candidate_decided",
-            payload,
-            f"e2e.candidate.{search.budget.candidates_used}.decision",
+        lineage = self._active_attempt_payload(search)
+        reward = dict(reward_payload)
+        for key, expected in lineage.items():
+            observed = reward.get(key)
+            if observed is not None and observed != expected:
+                raise ContractError(
+                    "Reward targets another E2E attempt",
+                    "attempt_id_mismatch",
+                )
+            reward[key] = expected
+        if candidate_id is not None:
+            observed_candidate = reward.get("candidate_id")
+            if observed_candidate is not None and observed_candidate != candidate_id:
+                raise ContractError(
+                    "Reward targets another E2E candidate",
+                    "candidate_id_mismatch",
+                )
+            reward["candidate_id"] = candidate_id
+        elif reward.get("candidate_id") is not None:
+            raise ContractError(
+                "Reward claims a candidate for a source-free decision",
+                "candidate_id_mismatch",
+            )
+        _validate_e2e_reward_payload(
+            reward,
+            verdict=verdict,
+            reason=reason,
+            candidate_present=candidate_id is not None,
+        )
+        attempt = str(lineage["attempt_id"])
+        return self._record_transaction(
+            (
+                (
+                    "e2e.candidate_decided",
+                    payload,
+                    f"e2e.attempt.{attempt}.decision",
+                ),
+                ("reward_committed", reward, f"e2e.attempt.{attempt}.reward"),
+            )
         )
 
     def commit_e2e_reprofile(
@@ -438,7 +485,7 @@ class RunController:
     def rebuild_snapshot(self) -> WorkloadState:
         self._journal.verify_run(self.state.run_id)
         events = tuple(self._journal.iter_events(self.state.run_id))
-        self._state = _replay(WorkloadState.initial(self.state.run_id), events)
+        self._state = replay_workload_state(self.state.run_id, events)
         self._save_snapshot()
         return self._state
 
@@ -450,7 +497,7 @@ class RunController:
     ) -> WorkloadState:
         existing = self._journal.get_by_idempotency_key(self.state.run_id, idempotency_key)
         if existing is None:
-            proposal = _ProposedEvent(
+            proposal = ProposedEvent(
                 self.state.sequence + 1,
                 "proposed-event",
                 self.state.run_id,
@@ -472,6 +519,18 @@ class RunController:
         self._save_snapshot()
         return self.state
 
+    def _record_transaction(
+        self,
+        values: Sequence[tuple[str, Mapping[str, Any], str]],
+    ) -> WorkloadState:
+        """Validate and atomically append a short causal event chain."""
+
+        successor = append_reduced_transaction(self._journal, self.state, values)
+        if successor.sequence > self.state.sequence:
+            self._state = successor
+            self._save_snapshot()
+        return self.state
+
     def _save_snapshot(self) -> None:
         self._snapshots.save(
             high_water_mark=self.state.sequence,
@@ -490,33 +549,46 @@ class RunController:
             "state_generation": search.state_generation,
         }
 
-
-def _load_projection(
-    run_id: str,
-    snapshots: SnapshotPort,
-    events: Sequence[EventLike],
-) -> WorkloadState | None:
-    try:
-        snapshot = snapshots.load()
-        if snapshot is None:
-            return None
-        state = WorkloadState.from_dict(snapshot.payload)
-        if state.run_id != run_id or state.sequence != snapshot.high_water_mark:
-            raise ContractError("Snapshot identity does not match", "snapshot_identity_mismatch")
-        if state.sequence:
-            matching = next((event for event in events if event.sequence == state.sequence), None)
-            if matching is None or matching.event_id != state.last_event_id:
-                raise ContractError("Snapshot head is not in the journal", "snapshot_head_mismatch")
-        return state
-    except ApexError:
-        return None
+    @staticmethod
+    def _active_attempt_payload(search: E2ESearchState) -> dict[str, str]:
+        if search.active_attempt_id is None or search.active_opportunity_id is None:
+            raise ContractError("No E2E attempt is active", "attempt_not_active")
+        return {
+            "attempt_id": search.active_attempt_id,
+            "opportunity_id": search.active_opportunity_id,
+        }
 
 
-def _replay(state: WorkloadState, events: Sequence[EventLike]) -> WorkloadState:
-    for event in events:
-        if event.sequence > state.sequence:
-            state = reduce_event(state, event)
-    return state
+def _validate_e2e_reward_payload(
+    reward: Mapping[str, Any],
+    *,
+    verdict: str,
+    reason: str,
+    candidate_present: bool,
+) -> None:
+    vector = reward.get("reward_vector")
+    if not isinstance(vector, Mapping):
+        raise ContractError(
+            "E2E reward vector is missing",
+            "e2e_reward_decision_mismatch",
+        )
+    pairs = (
+        (reward.get("verdict"), verdict),
+        (reward.get("reason_code"), reason),
+        (vector.get("verdict"), verdict),
+        (vector.get("reason_code"), reason),
+        (vector.get("candidate_present"), candidate_present),
+        (vector.get("policy_id"), reward.get("policy_id")),
+        (vector.get("policy_digest"), reward.get("policy_digest")),
+        (vector.get("scalar_reward"), reward.get("scalar_reward")),
+    )
+    if reward.get("evidence_class") != "derived" or any(
+        observed != expected for observed, expected in pairs
+    ):
+        raise ContractError(
+            "E2E reward conflicts with its decision or grade vector",
+            "e2e_reward_decision_mismatch",
+        )
 
 
 __all__ = ["JournalPort", "RunController", "SnapshotLike", "SnapshotPort"]

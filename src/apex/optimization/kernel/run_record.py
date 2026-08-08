@@ -8,8 +8,14 @@ from typing import Mapping, Sequence
 
 from apex.context import CompiledContext
 from apex.core import IntegrityError, canonical_json_bytes
-from apex.evaluation import KernelGrade, KernelMeasurementArtifact, MeasurementStatus
+from apex.evaluation import (
+    KernelGrade,
+    KernelMeasurementArtifact,
+    KernelMeasurementExecutionReceipt,
+    MeasurementStatus,
+)
 from apex.evaluation.safety import PhaseIsolationReceipt, SafetyGateResult, VerificationPlan
+from apex.execution import agent_transcript_document
 from apex.knowledge import ExperienceIdentity, ExperienceOutcome
 from apex.orchestration import RunController, RunPhase
 from apex.ports import AgentResult
@@ -22,13 +28,14 @@ from apex.storage import (
     SnapshotStore,
 )
 
+from ..agent_recording import record_agent_observations
 from .verification import CommandEvidence
 from .grading_record import (
     kernel_reward_policy_source,
     measurement_payload,
     reward_vector,
 )
-from .transcript import transcript_document, transcript_metadata
+from .transcript import transcript_metadata
 
 
 @dataclass(slots=True)
@@ -108,8 +115,15 @@ class KernelRunRecord:
         )
         stderr = self.artifacts.put_bytes(result.stderr.encode(), media_type="text/plain")
         transcript = self.artifacts.put_bytes(
-            canonical_json_bytes(transcript_document(result)),
+            canonical_json_bytes(agent_transcript_document(result)),
             media_type="application/json",
+        )
+        record_agent_observations(
+            self.controller,
+            result=result,
+            common_payload=self._attempt_payload(attempt_id),
+            transcript=transcript,
+            idempotency_prefix=f"attempt.{attempt_id}",
         )
         event_type = (
             "agent_completed" if result.candidate_capture_allowed else "agent_failed"
@@ -278,19 +292,31 @@ class KernelRunRecord:
         attempt_id: str,
         *,
         artifact: KernelMeasurementArtifact,
+        execution: KernelMeasurementExecutionReceipt,
         grade: KernelGrade,
+        harness_receipt: ArtifactReceipt,
     ) -> ArtifactReceipt:
         """Persist raw samples, recomputed grade, and the sole reward event."""
 
-        raw_receipt = self.artifacts.put_file(
-            artifact.path,
-            media_type="application/json",
-        )
+        raw_receipt = self.artifacts.put_file(artifact.path, media_type="application/json")
         if raw_receipt.digest != artifact.sha256:
             raise IntegrityError(
                 "Kernel timing report changed after validation",
                 "measurement_report_changed",
             )
+        if (
+            execution.report_sha256 != artifact.sha256
+            or not grade.gates.tampering_passed
+            or execution.phase != "measurement"
+        ):
+            raise IntegrityError(
+                "Kernel measurement lacks valid evaluator execution evidence",
+                "invalid_measurement_execution_receipt",
+            )
+        self.artifacts.verify(harness_receipt)
+        execution_receipt = self.artifacts.put_bytes(
+            execution.canonical_bytes, media_type="application/json"
+        )
         grade_receipt = self.artifacts.put_bytes(
             canonical_json_bytes(grade.to_dict()),
             media_type="application/json",
@@ -304,9 +330,14 @@ class KernelRunRecord:
             {
                 **self._attempt_payload(attempt_id),
                 **measurement_payload(artifact, grade),
+                "measurement_execution_sha256": execution.fingerprint,
+                "measurement_writer_id": execution.writer_id,
+                "measurement_harness_sha256": execution.harness_sha256,
                 "evidence_class": "measured",
                 "artifacts": [
                     _artifact_binding("raw_measurement", raw_receipt),
+                    _artifact_binding("measurement_execution", execution_receipt),
+                    _artifact_binding("harness", harness_receipt),
                     _artifact_binding("kernel_grade", grade_receipt),
                 ],
             },
@@ -326,6 +357,8 @@ class KernelRunRecord:
                     "evidence_class": "measured",
                     "artifacts": [
                         _artifact_binding("raw_measurement", raw_receipt),
+                        _artifact_binding("measurement_execution", execution_receipt),
+                        _artifact_binding("harness", harness_receipt),
                         _artifact_binding("reward_policy", policy_receipt),
                         _artifact_binding("kernel_grade", grade_receipt),
                     ],

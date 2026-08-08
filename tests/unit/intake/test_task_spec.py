@@ -36,7 +36,19 @@ def _workspace(tmp_path: Path) -> Path:
     workspace = tmp_path / "workspace"
     (workspace / "source").mkdir(parents=True)
     (workspace / "source" / "kernel.py").write_text("def rms_norm(x):\n    return x\n", encoding="utf-8")
+    (workspace / "harness.py").write_text("assert True\n", encoding="utf-8")
     return workspace
+
+
+def _measurement() -> dict[str, object]:
+    return {
+        "schema": "apex.kernel-measurement/v1",
+        "adapter_id": "fixture-evaluator-v1",
+        "harness_files": ["harness.py"],
+        "measurement_method_sha256": "1" * 64,
+        "runner": {"argv": ["python", "harness.py"]},
+        "aggregation": "equal_case",
+    }
 
 
 def test_task_spec_defaults_to_codex_and_bundle(tmp_path: Path) -> None:
@@ -116,29 +128,27 @@ def test_task_spec_rejects_invalid_agent_runtime_closure(tmp_path: Path) -> None
 def test_measurement_contract_is_trusted_and_not_editable(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     data = _task_mapping(workspace, tmp_path / "results")
-    data["measurement"] = {
-        "schema": "apex.kernel-measurement/v1",
-        "report_path": "build/apex_kernel_measurement.json",
-        "aggregation": "equal_case",
-    }
+    data["measurement"] = _measurement()
     task = TaskSpec.from_mapping(data)
     assert task.measurement is not None
-    assert task.measurement.report_path == "build/apex_kernel_measurement.json"
+    assert task.measurement.adapter_id == "fixture-evaluator-v1"
+    assert task.measurement.harness_files == ("harness.py",)
+    assert task.measurement.measurement_method_sha256 == "1" * 64
     assert task.measurement.keep_srobust_threshold == 1.05
     assert task.measurement.bootstrap_seed == 1729
     assert task.measurement.bootstrap_repetitions == 1000
 
-    data["measurement"]["report_path"] = "source/kernel.py"
+    data["measurement"]["harness_files"] = ["source/kernel.py"]
     with pytest.raises(ContractError) as editable:
         TaskSpec.from_mapping(data)
-    assert editable.value.reason_code == "measurement_report_editable"
+    assert editable.value.reason_code == "measurement_harness_editable"
 
 
 def test_measurement_statistics_policy_is_frozen_in_task_round_trip(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     data = _task_mapping(workspace, tmp_path / "results")
     data["measurement"] = {
-        "report_path": "build/timings.json",
+        **_measurement(),
         "keep_srobust_threshold": 1.08,
         "confidence_srobust_floor": 1.01,
         "worst_case_srobust_floor": 1.0,
@@ -154,6 +164,23 @@ def test_measurement_statistics_policy_is_frozen_in_task_round_trip(tmp_path: Pa
 
     assert serialized["measurement"] == task.measurement.to_dict()  # type: ignore[union-attr]
     assert TaskSpec.from_mapping(serialized).to_dict() == serialized
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["adapter_id", "harness_files", "measurement_method_sha256", "runner"],
+)
+def test_measurement_contract_requires_evaluator_authority(
+    tmp_path: Path, missing: str
+) -> None:
+    workspace = _workspace(tmp_path)
+    data = _task_mapping(workspace, tmp_path / "results")
+    measurement = _measurement()
+    measurement.pop(missing)
+    data["measurement"] = measurement
+
+    with pytest.raises(ContractError):
+        TaskSpec.from_mapping(data)
 
 
 @pytest.mark.parametrize(
@@ -176,7 +203,7 @@ def test_invalid_measurement_statistics_policy_fails_closed(
 ) -> None:
     workspace = _workspace(tmp_path)
     data = _task_mapping(workspace, tmp_path / "results")
-    data["measurement"] = {"report_path": "build/timings.json", field: value}
+    data["measurement"] = {**_measurement(), field: value}
 
     with pytest.raises(ContractError) as raised:
         TaskSpec.from_mapping(data)
@@ -184,36 +211,31 @@ def test_invalid_measurement_statistics_policy_fails_closed(
     assert raised.value.reason_code == "invalid_measurement_contract"
 
 
-def test_resolver_rejects_stale_measurement_report(tmp_path: Path) -> None:
+def test_resolver_freezes_protected_measurement_harness(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
-    report = workspace / "build" / "apex_kernel_measurement.json"
-    report.parent.mkdir()
-    report.write_text('{"stale": true}', encoding="utf-8")
     data = _task_mapping(workspace, tmp_path / "results")
-    data["measurement"] = {
-        "report_path": "build/apex_kernel_measurement.json",
-    }
+    data["measurement"] = _measurement()
 
-    with pytest.raises(ContractError) as raised:
-        TaskResolver().resolve(TaskSpec.from_mapping(data))
+    resolved = TaskResolver().resolve(TaskSpec.from_mapping(data))
 
-    assert raised.value.reason_code == "stale_measurement_report"
+    assert set(resolved.harness_file_hashes) == {"harness.py"}
+    assert resolved.harness_file_hashes["harness.py"]
+    assert resolved.harness_sha256 is not None
 
 
-def test_resolver_rejects_symlinked_measurement_parent(tmp_path: Path) -> None:
+def test_resolver_rejects_symlinked_measurement_harness(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     outside = tmp_path / "outside"
-    outside.mkdir()
-    (workspace / "build").symlink_to(outside, target_is_directory=True)
+    outside.write_text("assert True\n", encoding="utf-8")
+    (workspace / "harness.py").unlink()
+    (workspace / "harness.py").symlink_to(outside)
     data = _task_mapping(workspace, tmp_path / "results")
-    data["measurement"] = {
-        "report_path": "build/apex_kernel_measurement.json",
-    }
+    data["measurement"] = _measurement()
 
     with pytest.raises(ContractError) as raised:
         TaskResolver().resolve(TaskSpec.from_mapping(data))
 
-    assert raised.value.reason_code == "measurement_report_path_escape"
+    assert raised.value.reason_code == "measurement_harness_invalid"
 
 
 def test_shell_command_string_is_rejected(tmp_path: Path) -> None:
@@ -281,6 +303,8 @@ def test_resolver_hashes_evaluator_owned_source(tmp_path: Path) -> None:
 
     assert resolved.workspace == workspace.resolve()
     assert set(resolved.baseline_file_hashes) == {"source/kernel.py"}
+    assert resolved.harness_file_hashes == {}
+    assert resolved.harness_sha256 is None
     assert len(resolved.baseline_file_hashes["source/kernel.py"]) == 64
     assert len(resolved.resolution_hash) == 64
 

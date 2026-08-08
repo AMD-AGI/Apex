@@ -8,6 +8,7 @@ import pytest
 from apex.context import (
     AnchorView,
     ArtifactReference,
+    CampaignAttemptView,
     ContextBudget,
     ContextCompileRequest,
     ContextCompiler,
@@ -118,7 +119,12 @@ def _experience() -> ExperienceView:
     return ExperienceView.from_events(events)
 
 
-def _request(*, budget: int = 8_000, view: ExperienceView | None = None) -> ContextCompileRequest:
+def _request(
+    *,
+    budget: int = 8_000,
+    view: ExperienceView | None = None,
+    campaign_attempts: tuple[CampaignAttemptView, ...] = (),
+) -> ContextCompileRequest:
     digest = sha256_json("receipt")
     return ContextCompileRequest(
         run_id="run-1",
@@ -165,6 +171,7 @@ def _request(*, budget: int = 8_000, view: ExperienceView | None = None) -> Cont
         ),
         experience_identity=_identity(),
         experience_view=view or _experience(),
+        campaign_attempts=campaign_attempts,
     )
 
 
@@ -205,6 +212,35 @@ def test_history_is_trimmed_before_hard_facts() -> None:
     assert len(constrained.packet.knowledge_cards) >= 2
     assert len(constrained.packet.attempts) < len(full.packet.attempts)
     assert constrained.estimated_input_tokens <= constrained_budget
+
+
+def test_campaign_history_retains_cross_opportunity_outcomes() -> None:
+    campaign = tuple(
+        CampaignAttemptView(
+            attempt_id=f"attempt-{index}",
+            opportunity_id=f"opportunity-{index}",
+            candidate_id=None if index == 3 else f"candidate-{index}",
+            verdict="reject" if index == 3 else "revert",
+            reason="source_unresolved" if index == 3 else "throughput_not_improved",
+            anchor_generation=index - 1,
+            context_packet_id=f"context-{index}",
+            evidence_receipts=(sha256_json(f"campaign-{index}"),),
+        )
+        for index in (3, 2, 1)
+    )
+
+    compiled = _compiler().compile(_request(campaign_attempts=campaign))
+
+    assert compiled.packet.semantic_dict()["schema_version"] == 2
+    assert [item.attempt_id for item in compiled.packet.campaign_attempts] == [
+        "attempt-3",
+        "attempt-2",
+        "attempt-1",
+    ]
+    assert compiled.packet.campaign_attempts[0].candidate_id is None
+    rendered = compiled.packet.canonical_bytes.decode("utf-8")
+    assert "source_unresolved" in rendered
+    assert "opportunity-2" in rendered
 
 
 def test_mandatory_context_fails_explicitly_when_budget_is_too_small() -> None:

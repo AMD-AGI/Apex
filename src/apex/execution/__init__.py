@@ -8,6 +8,11 @@ from .environment import (
     build_subprocess_environment,
 )
 from .registry import AgentRegistry, build_default_registry
+from .kernel_measurement import (
+    STRUCTURED_KERNEL_MEASUREMENT_ADAPTER_ID,
+    STRUCTURED_KERNEL_MEASUREMENT_METHOD_SHA256,
+    StructuredKernelMeasurementAdapter,
+)
 from .supervisor import ProcessResult, SubprocessSupervisor
 from .transcript import agent_transcript_document
 
@@ -18,7 +23,10 @@ __all__ = [
     "HF_CREDENTIAL_ENVIRONMENT_KEYS",
     "HF_RUNTIME_ENVIRONMENT_KEYS",
     "ProcessResult",
+    "STRUCTURED_KERNEL_MEASUREMENT_ADAPTER_ID",
+    "STRUCTURED_KERNEL_MEASUREMENT_METHOD_SHA256",
     "SubprocessSupervisor",
+    "StructuredKernelMeasurementAdapter",
     "build_default_registry",
     "build_subprocess_environment",
     "agent_transcript_document",

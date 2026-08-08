@@ -284,10 +284,15 @@ def _measurement(result: NormalizedBenchmarkResult, protocol_hash: str) -> E2EMe
         not _normal_measurement(result)
         or result.report_path is None
         or result.report_path.is_symlink()
+        or not result.quality.source_paths
     ):
         raise IntegrityError("Formal benchmark failed", "source_delivery_benchmark_failed")
-    receipt = sha256_file(result.report_path)
-    return measurement_from_result(result, protocol_hash, receipt)
+    return measurement_from_result(
+        result,
+        protocol_hash,
+        quality_receipt=sha256_file(result.quality.source_paths[0]),
+        measurement_receipt=sha256_file(result.report_path),
+    )
 
 
 def _primary_gates(evidence: _PrimaryEvidence) -> dict[str, bool]:

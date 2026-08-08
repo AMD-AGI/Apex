@@ -205,7 +205,14 @@ class RepositoryResolver:
                 )
 
         if managed.exists():
-            return self._require_exact(dependency, managed, "managed")
+            state = inspect_repository(managed)
+            if not repository_errors(dependency, state):
+                return ResolvedRepository(managed.resolve(), "managed", state)
+            managed = self.checkout_root / (
+                f"{dependency.managed_checkout}-{dependency.commit[:12]}"
+            )
+            if managed.exists():
+                return self._require_exact(dependency, managed, "managed-versioned")
 
         clone_source, resolution = self._select_clone_source(
             dependency, sibling_state

@@ -21,6 +21,7 @@ from .models import (
     AnchorView,
     ArtifactReference,
     AttemptView,
+    CampaignAttemptView,
     ContextBudget,
     ContextContract,
     ContextPacket,
@@ -38,6 +39,7 @@ class ContextPolicy:
     policy_id: str = "context_packet_v1"
     max_attempts: int = 6
     max_dead_ends: int = 4
+    max_campaign_attempts: int = 8
     max_knowledge_tokens: int = 1_600
     chars_per_token: int = 4
 
@@ -45,6 +47,7 @@ class ContextPolicy:
         if min(
             self.max_attempts,
             self.max_dead_ends,
+            self.max_campaign_attempts,
             self.max_knowledge_tokens,
             self.chars_per_token,
         ) < 1:
@@ -73,6 +76,7 @@ class ContextCompileRequest:
     retrieval_scope: KnowledgeScope
     experience_identity: ExperienceIdentity
     experience_view: ExperienceView
+    campaign_attempts: tuple[CampaignAttemptView, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +172,7 @@ class ContextCompiler:
             budget=request.budget,
             contract=request.contract,
             artifact_refs=request.artifact_refs,
+            campaign_attempts=(),
         )
 
     def _add_history(self, packet: ContextPacket, request: ContextCompileRequest) -> ContextPacket:
@@ -181,16 +186,27 @@ class ContextCompiler:
             for record in records
             if record.outcome is not ExperienceOutcome.SUCCESS and record.retry_condition
         )[: self._policy.max_dead_ends]
-        return self._fit_history(packet, attempts, dead_ends)
+        campaign = request.campaign_attempts[: self._policy.max_campaign_attempts]
+        return self._fit_history(packet, attempts, dead_ends, campaign)
 
     def _fit_history(
         self,
         packet: ContextPacket,
         attempts: tuple[AttemptView, ...],
         dead_ends: tuple[DeadEndView, ...],
+        campaign_attempts: tuple[CampaignAttemptView, ...],
     ) -> ContextPacket:
         selected_attempts: list[AttemptView] = []
         selected_dead_ends: list[DeadEndView] = []
+        selected_campaign: list[CampaignAttemptView] = []
+        for attempt in campaign_attempts:
+            candidate = replace(
+                packet,
+                campaign_attempts=tuple((*selected_campaign, attempt)),
+            )
+            if self._tokens(candidate) <= packet.budget.input_tokens:
+                selected_campaign.append(attempt)
+        packet = replace(packet, campaign_attempts=tuple(selected_campaign))
         for dead_end in dead_ends:
             candidate = replace(packet, dead_ends=tuple((*selected_dead_ends, dead_end)))
             if self._tokens(candidate) <= packet.budget.input_tokens:

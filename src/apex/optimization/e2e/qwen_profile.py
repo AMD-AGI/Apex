@@ -19,6 +19,7 @@ from apex.runtime import (
 )
 
 from .oracles import CorrectnessOracleBinding, CorrectnessOracleRegistry
+from .deferred import E2EDeferredMicroQualifier
 from .oracle_preflight import (
     DockerOracleMicroQualifier,
     DockerOraclePolicy,
@@ -35,6 +36,7 @@ from .source_delivery_adapters import (
     QwenPrimarySourceBuilder,
 )
 from .source_image_runtime import DockerPythonSourceImageBuilder
+from .qwen_qualification import QwenCompositeMicroQualifier
 
 
 QWEN_MODEL_ID = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
@@ -152,36 +154,20 @@ def build_qwen_acceptance_delivery(
 ) -> SourceRebuildFinalDelivery:
     """Compose the sole reviewed live profile; no tag or repository fallback."""
 
-    roots = dict(source_roots or default_qwen_source_roots())
-    if set(roots) != set(_source_identities()):
-        raise ContractError("Qwen source roots are incomplete", "source_lock_unresolved")
+    roots = _validated_source_roots(source_roots)
     profiles = _profiles()
     primary_images = _image_builder()
-    verifier_images = _image_builder()
     primary = QwenPrimarySourceBuilder(
         primary_images, MagpieBenchmarkAdapter(dependency_receipt)
     )
-    independent_build = QwenIndependentSourceBuild(verifier_images)
-    independent_engagement = QwenIndependentEngagement(
-        verifier_images, _project_root()
-    )
-    independent_replay = QwenIndependentReplay(
-        MagpieBenchmarkAdapter(dependency_receipt)
+    verifier = build_qwen_acceptance_bundle_verifier(
+        dependency_receipt, source_roots=roots
     )
     bindings = tuple(
         FormalDeliveryBinding(
             profile,
             primary,
-            E2EBundleVerifier(
-                trusted_recipes={profile.recipe.computed_sha256: profile.recipe},
-                trusted_source_urls={
-                    item.repository_id: item.trusted_url
-                    for item in profile.repositories
-                },
-                build_backend=independent_build,
-                engagement_backend=independent_engagement,
-                replay_backend=independent_replay,
-            ),
+            verifier,
             {
                 item.repository_id: roots[item.repository_id]
                 for item in profile.repositories
@@ -194,8 +180,41 @@ def build_qwen_acceptance_delivery(
     )
 
 
+def build_qwen_acceptance_bundle_verifier(
+    dependency_receipt: DependencyReceipt,
+    *,
+    source_roots: Mapping[str, Path] | None = None,
+) -> E2EBundleVerifier:
+    """Compose the reviewed recipes and independent Qwen verification backends."""
+
+    roots = _validated_source_roots(source_roots)
+    profiles = _profiles()
+    images = _image_builder()
+    identities = _source_identities()
+    return E2EBundleVerifier(
+        trusted_recipes={item.recipe.computed_sha256: item.recipe for item in profiles},
+        trusted_source_urls={name: value["url"] for name, value in identities.items()},
+        build_backend=QwenIndependentSourceBuild(images),
+        engagement_backend=QwenIndependentEngagement(images, _project_root()),
+        replay_backend=QwenIndependentReplay(MagpieBenchmarkAdapter(dependency_receipt)),
+        default_source_overrides=roots,
+        trusted_recipe_repositories={
+            item.recipe.computed_sha256: item.repository_ids for item in profiles
+        },
+    )
+
+
 def default_qwen_source_roots() -> Mapping[str, Path]:
     return default_source_roots(_qwen_source_lock())
+
+
+def _validated_source_roots(
+    source_roots: Mapping[str, Path] | None,
+) -> dict[str, Path]:
+    roots = dict(source_roots or default_qwen_source_roots())
+    if set(roots) != set(_source_identities()):
+        raise ContractError("Qwen source roots are incomplete", "source_lock_unresolved")
+    return roots
 
 
 def build_qwen_acceptance_provenance_resolver(
@@ -295,24 +314,27 @@ def _qwen_oracle_bindings() -> tuple[CorrectnessOracleBinding, ...]:
 
 def build_qwen_oracle_micro_qualifier(
     oracles: CorrectnessOracleRegistry,
-) -> DockerOracleMicroQualifier:
-    """Bind the reviewed tests-only preflight to the immutable Qwen parent."""
+) -> QwenCompositeMicroQualifier:
+    """Bind strict vLLM and deferred AITER lanes to the reviewed Qwen parent."""
 
     identities = _source_identities()
-    return DockerOracleMicroQualifier(
-        oracles=oracles,
-        policy=DockerOraclePolicy(
-            QWEN_PARENT_LOCATOR,
-            QWEN_PARENT_IMAGE_ID,
-            tuple(
-                OracleSourceLock(name, identity["commit"], identity["tree"])
-                for name, identity in sorted(identities.items())
-            ),
-            (
-                OracleDependencyLock("pytest", "9.0.2"),
-                OracleDependencyLock("einops", "0.8.2"),
+    return QwenCompositeMicroQualifier(
+        vllm=DockerOracleMicroQualifier(
+            oracles=oracles,
+            policy=DockerOraclePolicy(
+                QWEN_PARENT_LOCATOR,
+                QWEN_PARENT_IMAGE_ID,
+                tuple(
+                    OracleSourceLock(name, identity["commit"], identity["tree"])
+                    for name, identity in sorted(identities.items())
+                ),
+                (
+                    OracleDependencyLock("pytest", "9.0.2"),
+                    OracleDependencyLock("einops", "0.8.2"),
+                ),
             ),
         ),
+        aiter=E2EDeferredMicroQualifier(),
     )
 
 
@@ -471,6 +493,7 @@ __all__ = [
     "QWEN_SOURCE_DATE_EPOCH",
     "QwenAcceptanceProvenance",
     "QwenAcceptanceProvenanceResolver",
+    "build_qwen_acceptance_bundle_verifier",
     "build_qwen_acceptance_delivery",
     "build_qwen_acceptance_provenance_resolver",
     "build_qwen_correctness_oracles",

@@ -8,6 +8,12 @@ from .e2e import (
     evaluate_no_regression,
     validate_baseline_measurement,
 )
+from .e2e_reward import (
+    E2ERewardGrade,
+    E2ERewardPolicy,
+    grade_e2e_outcome,
+    replay_e2e_reward,
+)
 
 from .kernel import (
     CaseTiming,
@@ -21,6 +27,10 @@ from .kernel_report import (
     KernelMeasurementArtifact,
     REPORT_SCHEMA,
     load_kernel_measurement_report,
+)
+from .kernel_execution import (
+    EXECUTION_RECEIPT_SCHEMA,
+    KernelMeasurementExecutionReceipt,
 )
 from .statistics import (
     GpuHealthSnapshot,
@@ -47,6 +57,7 @@ __all__ = [
     "GpuHealthSnapshot",
     "KernelGrade",
     "KernelMeasurementArtifact",
+    "KernelMeasurementExecutionReceipt",
     "MeasurementBlock",
     "MeasurementPolicy",
     "MeasurementStatus",
@@ -55,6 +66,7 @@ __all__ = [
     "SampleSeries",
     "TimingProtocol",
     "REPORT_SCHEMA",
+    "EXECUTION_RECEIPT_SCHEMA",
     "grade_kernel",
     "bootstrap_interval",
     "coefficient_of_variation",
@@ -65,4 +77,8 @@ __all__ = [
     "paired_block_bootstrap",
     "quantiles",
     "validate_baseline_measurement",
+    "E2ERewardGrade",
+    "E2ERewardPolicy",
+    "grade_e2e_outcome",
+    "replay_e2e_reward",
 ]

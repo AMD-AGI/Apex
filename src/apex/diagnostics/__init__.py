@@ -1,6 +1,7 @@
 """Validated Magpie/TraceLens evidence consumed by Apex."""
 
 from .adapter import MagpieTraceEvidenceAdapter
+from .comparison import PinnedTraceLensComparisonAdapter
 from .evidence import (
     AcquisitionCoverage,
     EvidenceArtifacts,
@@ -28,6 +29,7 @@ __all__ = [
     "KernelEvidence",
     "KernelVolume",
     "MagpieTraceEvidenceAdapter",
+    "PinnedTraceLensComparisonAdapter",
     "OperationEvidence",
     "OpportunityRankings",
     "PerformanceModelEvidence",

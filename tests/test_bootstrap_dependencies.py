@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -13,6 +14,16 @@ import apex.runtime as bootstrap
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "bootstrap_dependencies.py"
+
+
+def load_launcher():
+    spec = importlib.util.spec_from_file_location(
+        "apex_bootstrap_dependencies_test", SCRIPT_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def git(root: Path, *args: str) -> str:
@@ -125,7 +136,7 @@ def test_repository_lock_contains_reviewed_exact_dependencies():
     assert lock.receipt_schema == "apex.dependencies.receipt/v1"
     assert len(lock.sha256) == 64
     observed = {item.key: item for item in lock.dependencies}
-    assert observed["magpie"].commit == "fa39dde9e18b8f50762ffbe9f5caaa2c32a9b748"
+    assert observed["magpie"].commit == "4773cd1468f56fefec35e6e01df9c85755b7a265"
     assert observed["magpie"].import_root == "Magpie"
     assert observed["magpie"].package_version == "0.2.0"
     assert observed["tracelens"].commit == "4f25c1a6f03441e710a97d71a5de9cc5c2fc1555"
@@ -224,6 +235,35 @@ def test_offline_resolver_clones_pin_without_mutating_advanced_sibling(
     assert git(resolved.root, "remote", "get-url", "origin") == (
         "https://github.com/AMD-AGI/Magpie.git"
     )
+
+
+def test_resolver_preserves_stale_managed_checkout_and_uses_versioned_target(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("MAGPIE_ROOT", raising=False)
+    sibling = tmp_path / "siblings" / "Magpie"
+    locked_commit = init_repository(
+        sibling, "https://github.com/AMD-AGI/Magpie.git"
+    )
+    add_commit(sibling)
+    stale = tmp_path / "managed" / "magpie"
+    init_repository(
+        stale, "https://github.com/AMD-AGI/Magpie.git"
+    )
+    stale_commit = add_commit(stale)
+    resolver = bootstrap.RepositoryResolver(
+        sibling_root=sibling.parent,
+        checkout_root=stale.parent,
+        explicit_roots={},
+        offline=True,
+        dry_run=False,
+    )
+
+    resolved = resolver.resolve(dependency(locked_commit))
+
+    assert resolved.root.name == f"magpie-{locked_commit[:12]}"
+    assert resolved.state and resolved.state.commit == locked_commit
+    assert git(stale, "rev-parse", "HEAD") == stale_commit
 
 
 def test_explicit_mismatched_checkout_fails_instead_of_falling_back(
@@ -494,7 +534,6 @@ def test_fresh_checkout_shim_executes_runtime_cli_for_dry_run(
             sys.executable,
             str(SCRIPT_PATH),
             "install",
-            "--offline",
             "--dry-run",
             "--json",
             "--venv",
@@ -521,3 +560,42 @@ def test_fresh_checkout_shim_executes_runtime_cli_for_dry_run(
     assert receipt["dependencies"]["inferencex"]["action"] == (
         "verify-repository"
     )
+
+
+def test_launcher_installs_and_rechecks_exact_editable_build_tools(
+    tmp_path, monkeypatch
+):
+    launcher = load_launcher()
+    states = iter((False, True))
+    commands = []
+    monkeypatch.setattr(launcher, "_build_tools_ready", lambda _python: next(states))
+    monkeypatch.setattr(
+        launcher,
+        "_run",
+        lambda argv, **_kwargs: commands.append(tuple(argv)),
+    )
+
+    launcher._prepare_build_tools(tmp_path / "venv/bin/python", offline=False)
+
+    assert commands == [
+        (
+            str(tmp_path / "venv/bin/python"),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "packaging==26.3",
+            "setuptools==83.0.0",
+            "wheel==0.47.0",
+        )
+    ]
+
+
+def test_offline_launcher_fails_before_editable_install_without_build_tools(
+    tmp_path, monkeypatch
+):
+    launcher = load_launcher()
+    monkeypatch.setattr(launcher, "_build_tools_ready", lambda _python: False)
+
+    with pytest.raises(launcher.LauncherError, match="offline setup requires"):
+        launcher._prepare_build_tools(tmp_path / "venv/bin/python", offline=True)

@@ -21,6 +21,7 @@ from .result_evidence import (
     parse_attestations,
     result_verdict,
 )
+from .serving_runtime import ServingRuntimeEvidence
 from apex.runtime import LmEvalRuntimeReceipt
 
 
@@ -75,6 +76,9 @@ class NormalizedBenchmarkResult:
     timed_out: bool = False
     lm_eval_runtime: LmEvalRuntimeEvidence = LmEvalRuntimeEvidence(
         False, True, None, None, None, None, None, None
+    )
+    serving_runtime: ServingRuntimeEvidence = ServingRuntimeEvidence(
+        False, True, None, None, None, None, None, None, None
     )
 
     def metric_mapping(self) -> Mapping[str, float | int | str | None]:
@@ -173,7 +177,7 @@ def _normalized_result(
     command_exit_code: int | None,
     timed_out: bool,
 ) -> NormalizedBenchmarkResult:
-    model, inferencex, lm_eval = attestations
+    model, inferencex, lm_eval, serving = attestations
     return NormalizedBenchmarkResult(
         schema_version=1,
         run_id=run_id,
@@ -197,6 +201,7 @@ def _normalized_result(
         command_exit_code=command_exit_code,
         timed_out=timed_out,
         lm_eval_runtime=lm_eval,
+        serving_runtime=serving,
     )
 
 
@@ -214,6 +219,9 @@ def parse_benchmark_report(
     expected_lm_eval_runtime: LmEvalRuntimeReceipt | None = None,
     expected_lm_eval_execution_mode: str | None = None,
     expected_evaluator_policy: Mapping[str, Any] | None = None,
+    expected_config_sha256: str | None = None,
+    expected_requested_image: str | None = None,
+    expected_execution_mode: str | None = None,
 ) -> NormalizedBenchmarkResult:
     """Parse one Magpie report plus its protected quality side artifacts."""
 
@@ -243,23 +251,20 @@ def parse_benchmark_report(
         expected_inferencex_tree,
         expected_lm_eval_runtime,
         expected_lm_eval_execution_mode,
+        expected_config_sha256,
+        expected_requested_image,
+        expected_execution_mode,
     )
-    lane_errors = _evidence_lane_errors(
+    success, errors = _benchmark_verdict(
+        report,
+        quality,
+        attestations,
         pass_type=pass_type,
         run_kind=run_kind,
         reward_eligible=reward_eligible,
         profiling_enabled=profiling_enabled,
-    )
-    base_errors = _result_errors(report, quality, command_exit_code, timed_out) + lane_errors
-    success, errors = result_verdict(
-        report,
-        quality_passed=quality.passed,
-        quality_required=quality.required,
         command_exit_code=command_exit_code,
         timed_out=timed_out,
-        lane_errors=lane_errors,
-        base_errors=base_errors,
-        attestations=attestations,
     )
     return _normalized_result(
         report=report,
@@ -279,6 +284,40 @@ def parse_benchmark_report(
         errors=errors,
         command_exit_code=command_exit_code,
         timed_out=timed_out,
+    )
+
+
+def _benchmark_verdict(
+    report: Mapping[str, Any],
+    quality: QualityEvidence,
+    attestations: Attestations,
+    *,
+    pass_type: BenchmarkPass,
+    run_kind: str,
+    reward_eligible: bool,
+    profiling_enabled: bool,
+    command_exit_code: int | None,
+    timed_out: bool,
+) -> tuple[bool, tuple[str, ...]]:
+    lane_errors = _evidence_lane_errors(
+        pass_type=pass_type,
+        run_kind=run_kind,
+        reward_eligible=reward_eligible,
+        profiling_enabled=profiling_enabled,
+    )
+    base_errors = (
+        _result_errors(report, quality, command_exit_code, timed_out)
+        + lane_errors
+    )
+    return result_verdict(
+        report,
+        quality_passed=quality.passed,
+        quality_required=quality.required,
+        command_exit_code=command_exit_code,
+        timed_out=timed_out,
+        lane_errors=lane_errors,
+        base_errors=base_errors,
+        attestations=attestations,
     )
 
 
@@ -389,6 +428,9 @@ def empty_result(
     timed_out: bool,
     expected_lm_eval_runtime: LmEvalRuntimeReceipt | None = None,
     expected_lm_eval_execution_mode: str | None = None,
+    expected_config_sha256: str | None = None,
+    expected_requested_image: str | None = None,
+    expected_execution_mode: str | None = None,
 ) -> NormalizedBenchmarkResult:
     empty = LatencyDistribution(None, None, None, None)
     lm_eval_required = (
@@ -440,6 +482,17 @@ def empty_result(
             ),
             read_only_mount=None,
             error=error if lm_eval_required else None,
+        ),
+        serving_runtime=ServingRuntimeEvidence(
+            required=expected_execution_mode == "docker",
+            passed=expected_execution_mode != "docker",
+            input_config_sha256=expected_config_sha256,
+            requested_image=expected_requested_image,
+            resolved_image_id=None,
+            container_name=None,
+            docker_argv_sha256=None,
+            process_succeeded=False if expected_execution_mode == "docker" else None,
+            error=error if expected_execution_mode == "docker" else None,
         ),
     )
 

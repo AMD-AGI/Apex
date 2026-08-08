@@ -37,9 +37,13 @@ uses the same source and the sole `DatasetExporter`; `--split`, `--policy-id`,
 `--on-incomplete`, and `--no-sft` expose its fail-closed selection policy.
 Both commands require an explicit output directory, never append events, and
 refuse to place disposable projections inside `events/` or `artifacts/`.
-`apex bundle verify` detects and verifies both standalone kernel bundles and
-formal E2E patch bundles; E2E output distinguishes static tree verification
-from the terminal second-clean-replay verdict.
+`apex bundle verify` detects both standalone kernel bundles and formal E2E
+patch bundles. Kernel verification preserves its static content/baseline
+contract. E2E verification additionally requires a new absolute `--results`
+directory and invokes the composition-root verifier: exact clean source
+materialization, trusted source rebuild, loaded-byte/build-ID engagement, and a
+fresh unchanged-workload replay all contribute to the typed terminal outcome.
+Static E2E tree loading is never presented as terminal verification.
 `apex bundle apply --bundle <dir> --workspace <clean-git-root>` is the only
 opt-in caller-workspace mutation. It accepts kernel bundles only, repeats digest,
 patch-target, exact baseline and candidate-byte checks, refuses a dirty tree,

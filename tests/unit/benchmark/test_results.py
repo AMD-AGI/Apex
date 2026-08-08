@@ -472,6 +472,27 @@ def test_skipped_framework_quality_gate_fails_closed(tmp_path: Path) -> None:
     assert result.quality.error == "quality_gate_not_passed"
 
 
+def test_report_claiming_success_with_errors_fails_closed(tmp_path: Path) -> None:
+    report_path = _report(
+        tmp_path,
+        quality_gate={"passed": True, "ssim": 0.99},
+        framework="xdit",
+    )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["errors"] = ["server emitted a partial result"]
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = parse_benchmark_report(
+        report_path,
+        run_id="candidate",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+    )
+
+    assert not result.succeeded
+    assert "server emitted a partial result" in result.errors
+
+
 def test_measurement_rejects_diagnostic_or_ineligible_report(
     tmp_path: Path,
 ) -> None:

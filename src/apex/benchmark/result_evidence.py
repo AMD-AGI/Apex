@@ -13,10 +13,17 @@ from .inferencex_runtime import (
 )
 from .lm_eval_runtime import LmEvalRuntimeEvidence, parse_lm_eval_runtime_evidence
 from .model_revision import ModelRevisionEvidence, parse_model_revision_evidence
+from .serving_runtime import (
+    ServingRuntimeEvidence,
+    parse_serving_runtime_evidence,
+)
 
 
 Attestations = tuple[
-    ModelRevisionEvidence, InferenceXRuntimeEvidence, LmEvalRuntimeEvidence
+    ModelRevisionEvidence,
+    InferenceXRuntimeEvidence,
+    LmEvalRuntimeEvidence,
+    ServingRuntimeEvidence,
 ]
 
 
@@ -30,6 +37,9 @@ def parse_attestations(
     expected_inferencex_tree: str | None,
     expected_lm_eval_runtime: LmEvalRuntimeReceipt | None,
     expected_lm_eval_execution_mode: str | None,
+    expected_config_sha256: str | None,
+    expected_requested_image: str | None,
+    expected_execution_mode: str | None,
 ) -> Attestations:
     """Parse all protected side-artifact lanes against caller expectations."""
 
@@ -53,7 +63,13 @@ def parse_attestations(
         expected=expected_lm_eval_runtime,
         execution_mode=expected_lm_eval_execution_mode,
     )
-    return model, inferencex, lm_eval
+    serving = parse_serving_runtime_evidence(
+        report,
+        expected_config_sha256=expected_config_sha256,
+        expected_requested_image=expected_requested_image,
+        expected_execution_mode=expected_execution_mode,
+    )
+    return model, inferencex, lm_eval, serving
 
 
 def result_verdict(
@@ -80,6 +96,7 @@ def result_verdict(
         and (quality_passed or not quality_required)
         and not lane_errors
         and all(evidence.passed for evidence in attestations)
+        and not errors
     )
     return success, errors
 
@@ -87,7 +104,7 @@ def result_verdict(
 def evidence_artifacts(attestations: Attestations) -> tuple[Path, ...]:
     """Return every independently rehashed side artifact for persistence."""
 
-    model, inferencex, lm_eval = attestations
+    model, inferencex, lm_eval, _serving = attestations
     paths: tuple[Path, ...] = ()
     if model.source_path:
         paths += (model.source_path,)

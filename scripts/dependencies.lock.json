@@ -6,7 +6,7 @@
     "magpie": {
       "name": "Magpie",
       "repository": "https://github.com/AMD-AGI/Magpie.git",
-      "commit": "fa39dde9e18b8f50762ffbe9f5caaa2c32a9b748",
+      "commit": "4773cd1468f56fefec35e6e01df9c85755b7a265",
       "sibling": "Magpie",
       "managed_checkout": "magpie",
       "root_env": "MAGPIE_ROOT",

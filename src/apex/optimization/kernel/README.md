@@ -36,7 +36,10 @@ agent exits
   -> correctness
   -> safety
   -> normal, uninstrumented performance qualification
+  -> trusted evaluator measurement port
+     OR explicit external-evaluator recipe deferral
   -> typed measured outcome in canonical history
+     OR non-measured pending-external-evaluator observation
   -> next fresh attempt (while budget remains)
   -> deterministic best-candidate selection
   -> one source-only bundle
@@ -69,9 +72,14 @@ to reject a freeze race.
   it does not silently consume the rest of the search.
 - Candidate selection is not last-write-wins. Candidates with trusted grades
   are ordered by `Srobust`, then reward, then stable attempt order. If the caller
-  (for example AKA) retains the only trusted performance evaluator, Apex does
-  not infer speed from stdout: equally eligible unmeasured candidates use the
-  earliest stable attempt as the deterministic fallback.
+  (for example AKA) explicitly supplies a trusted recipe whose provenance is
+  `external_evaluator`, Apex does not infer speed from stdout: equally eligible
+  deferred candidates use the earliest stable attempt as the deterministic
+  fallback. Command success alone cannot activate this path.
+- A deferred external-evaluator candidate emits `experience.deferred` with
+  `evidence_class=derived` and `status=pending_external_evaluator`. It has no
+  outcome field, is never projected into measured experience, and cannot become
+  a trainable RL/SFT success until a future evaluator-owned result is bound.
 - Each normally closed attempt has exactly one semantic
   KEEP/REVERT/REJECT/NEEDS_MORE_MEASUREMENT decision and at most one
   evaluator-owned reward. Integrity-fatal attempts terminate as typed failures.
@@ -86,6 +94,10 @@ to reject a freeze race.
   a fabricated clean result.
 - Candidate source digests are checked before and after every verifier command.
   Symlinks, hardlinks, undeclared edits, and source mutation fail integrity.
+- Every compile, correctness, and normal-performance command runs in a private
+  PID namespace. Apex requires the namespace-init/pidfd receipt to prove zero
+  surviving members before the next phase; a candidate cannot leave a detached
+  writer racing measurement freeze.
 - Verifier commands receive only an explicit host runtime allowlist (paths,
   locale, GPU visibility/ROCm, and non-secret Hugging Face cache controls) plus
   safe `CommandSpec.env` entries. Shell/Python/loader injection and credentials
@@ -94,8 +106,18 @@ to reject a freeze race.
 - Safety artifacts are diagnostic-only. Their instrumented bytes and timing are
   forbidden inputs to normal performance evidence.
 - The standalone `performance` command is only a normal-runtime qualification
-  gate. Backend stdout and self-reported scores are untrusted. A robust grade is
-  created only from evaluator-owned `apex.kernel-measurement/v1` reports:
+  gate. Its stdout, workspace files, and self-reported scores are untrusted. A
+  candidate cannot create a robust grade by writing a timing-report file. A
+  robust grade is created only through the frozen `KernelMeasurementPort` named
+  by the task, writing into a fresh controller-owned directory outside the
+  candidate workspace. The controller authors an execution receipt binding the
+  adapter writer, measurement phase/timeline, source, harness, method, policy,
+  and exact report digest. Only then does it parse `apex.kernel-measurement/v1`:
+  a production adapter's evaluator parent writes the report, and no candidate
+  subprocess may receive or discover the report path. The production structured
+  adapter runs the frozen `measurement.runner` in a private PID namespace,
+  accepts one strict JSON stdout document, proves teardown, and only then has
+  the parent process publish the report.
   seeded paired ABBA blocks, `inner_repeats=1`, explicit timer resolution and
   measurement-method hash, healthy GPU snapshots around every block, and at
   least 300 raw invocations per implementation and case. Apex uses true-median
@@ -109,7 +131,9 @@ to reject a freeze race.
   with their typed reason and point reward retained for training.
 - The event chain distinguishes `performance_command_result` (the command
   completed) from evaluator-owned `measurement_result` (raw report parsed and
-  grade recomputed). Only a valid measured grade emits `reward_committed`.
+  grade recomputed). Both measurement and reward events bind the raw report,
+  execution receipt, and protected harness. Only a valid measured grade emits
+  `reward_committed`.
   Missing or insufficient p99 cannot be promoted to a speedup or reward.
 - Before invocation, `KernelContextBuilder` records source/harness receipts,
   bounded knowledge selection (including typed unavailability), prompt, and
@@ -118,9 +142,12 @@ context packet in CAS and the append-only event chain.
   `TaskSpec` to the agent invocation receipt. This supports matched external
   campaigns without letting agent text assert runtime identity.
 - Every normalized agent transcript is stored as one canonical JSON CAS
-  artifact in addition to raw stdout/stderr. Turn, tool, usage, and cost metadata
-  is projected only from structured backend events; human text is never parsed
-  as accounting evidence.
+  artifact in addition to raw stdout/stderr. The shared backend-neutral recorder
+  emits each `agent_message`, `tool_called`, and `tool_result`, followed by
+  explicit `usage_recorded` and `cost_recorded` events, all bound to that CAS
+  receipt before `agent_completed|agent_failed`. Turn, tool, usage, and cost
+  metadata is projected only from structured backend events; human text is never
+  parsed as accounting evidence.
 
 ## Dependencies
 
@@ -137,14 +164,19 @@ Invalid input or a forged/stale safety result returns `invalid_request` or
 `rejected` with a stable reason code. Agent timeout is terminal; an ordinary
 backend, compile, correctness, safety, or measurement failure is retained as a
 typed outcome while later budgeted attempts continue. No source change is
-`no_gain`. An unsuccessful normal performance command, invalid report, or fewer
-than 300 valid samples per implementation/case is `no_measurement` with no
+`no_gain`. A missing measurement contract without an explicit trusted
+`external_evaluator` recipe, an unsuccessful normal performance command,
+invalid report, or fewer than 300 valid samples per implementation/case is
+`no_measurement` with no
 reward. A valid but non-improving robust grade is `no_gain` while retaining its
 evaluator-owned training reward. After search, Apex writes exactly one final
 machine result and at most one immutable source-only bundle. A selected candidate
 is `candidate_ready`, `applied=false`, and
 `external_verification_required=true`; AKA or another caller retains authority
-for external scoring and host application.
+for external scoring and host application. An explicit external-evaluator
+candidate uses `candidate_deferred_to_external_evaluator`, carries no Apex
+reward, and remains subject to the caller's central
+compile/correctness/performance score.
 Standalone HIP fails before a run, GPU lease, agent invocation, or evaluator
 command with the stable `hip_execution_unavailable` reason.
 The result binds its run ID, baseline resolution/file hashes, internal verdict
@@ -163,7 +195,8 @@ pytest -q -p no:cacheprovider tests/unit/optimization \
 
 The integration suite asserts strict phase order, default no-tool behavior,
 safety-finding performance skip, advisory-incomplete continuation, source-only
-delivery, v2 raw measurement/reward ownership, 299-versus-300 sample boundary,
+delivery, raw measurement/reward ownership, candidate-forged report rejection,
+writer/harness/method receipt mismatch, 299-versus-300 sample boundary,
 three-attempt robust best selection, compile-failure retry, exact iteration
 bounds, fresh-workspace/report isolation, canonical typed context history,
 canonical agent transcripts, original-workspace immutability, and verifier

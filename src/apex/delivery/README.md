@@ -139,6 +139,12 @@ Once independent E2E verification starts, evidence failures produce a structured
 engagement, or replay map to `verification_failed`. Retry uses a new results
 path, so partial evidence cannot masquerade as resumed success.
 
+The production CLI reaches this use case through the sole bootstrap composition
+root. `apex bundle verify --bundle /abs/bundle --results /abs/new-results`
+requires an unused absolute evidence directory. It exits successfully only when
+the verifier's typed result is `succeeded`; a structurally valid but terminally
+unverified E2E bundle is an input to verification, not a successful verdict.
+
 ## Tests
 
 Run the deterministic delivery suite and architecture documentation gate with:

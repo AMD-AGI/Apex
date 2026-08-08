@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from apex.execution import build_default_registry
+from apex.delivery import E2EBundleVerifier
+from apex.execution import StructuredKernelMeasurementAdapter, build_default_registry
 from apex.knowledge import KnowledgeRetriever, load_knowledge_catalog
 from apex.optimization.e2e import (
     AgentCandidateWorker,
@@ -14,6 +15,7 @@ from apex.optimization.e2e import (
     E2EDeferredMicroQualifier,
     E2EOptimizeUseCase,
     FinalDeliveryPort,
+    build_qwen_acceptance_bundle_verifier,
     build_qwen_acceptance_delivery,
     build_qwen_acceptance_provenance_resolver,
     build_qwen_correctness_oracles,
@@ -27,11 +29,13 @@ from apex.runtime import verify_runtime_dependencies
 class Application:
     kernel_optimizer: KernelOptimizeUseCase
     e2e_optimizer: E2EOptimizeUseCase | None = None
+    e2e_bundle_verifier: E2EBundleVerifier | None = None
 
 
 def build_application(
     *,
     include_e2e: bool = False,
+    include_e2e_verifier: bool = False,
     knowledge_catalog: Path | None = None,
     knowledge_enabled: bool = True,
     e2e_final_delivery: FinalDeliveryPort | None = None,
@@ -43,10 +47,24 @@ def build_application(
     kernel = KernelOptimizeUseCase(
         agents=agents,
         contexts=KernelContextBuilder(retriever),
+        measurement_evaluator=StructuredKernelMeasurementAdapter(),
     )
-    if not include_e2e:
+    if not include_e2e and not include_e2e_verifier:
         return Application(kernel_optimizer=kernel)
     receipt = verify_runtime_dependencies()
+    bundle_verifier = None
+    if include_e2e_verifier:
+        verification_roots = {
+            name: receipt.source_root(name) for name in ("vllm", "aiter")
+        }
+        bundle_verifier = build_qwen_acceptance_bundle_verifier(
+            receipt, source_roots=verification_roots
+        )
+    if not include_e2e:
+        return Application(
+            kernel_optimizer=kernel,
+            e2e_bundle_verifier=bundle_verifier,
+        )
     final_delivery = e2e_final_delivery
     provenance = None
     correctness_oracles = None
@@ -67,7 +85,11 @@ def build_application(
         final_delivery=final_delivery,
         correctness_oracles=correctness_oracles,
     )
-    return Application(kernel_optimizer=kernel, e2e_optimizer=e2e)
+    return Application(
+        kernel_optimizer=kernel,
+        e2e_optimizer=e2e,
+        e2e_bundle_verifier=bundle_verifier,
+    )
 
 
 def _knowledge_retriever(path: Path | None, *, enabled: bool) -> KnowledgeRetriever:

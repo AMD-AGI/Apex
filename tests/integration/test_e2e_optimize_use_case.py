@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ from apex.benchmark import (
     QualityMetric,
     ThroughputMetrics,
 )
-from apex.core import IntegrityError, TaskStatus
+from apex.core import ConfigurationError, IntegrityError, TaskStatus
 from apex.diagnostics import (
     AcquisitionCoverage,
     EvidenceArtifacts,
@@ -29,15 +30,42 @@ from apex.diagnostics import (
 )
 from apex.intake import E2EOptimizeSpec
 from apex.optimization.e2e import E2EOptimizeUseCase
-from apex.orchestration import RunController
+from apex.orchestration import RunController, RunPhase
 from apex.ports import BenchmarkPass, DiagnosticsResult
 from apex.runtime import (
     ContainerIdentity,
     DependencyReceipt,
+    GpuDeviceIdentity,
+    GpuOwnershipReceipt,
     LmEvalRuntimeReceipt,
+    LocalGpuLeaseManager,
     RunProvenance,
 )
 from apex.storage import EventJournal, SnapshotStore
+
+
+class _FakeOwnershipInspector:
+    def inspect(
+        self, selector_scope: str, *, allowed_pids: tuple[int, ...] = ()
+    ) -> GpuOwnershipReceipt:
+        return GpuOwnershipReceipt(
+            1,
+            "rocm_smi_process_gpu_map_v1",
+            selector_scope,
+            123,
+            "/opt/rocm/lib/librocm_smi64.so.7",
+            "a" * 64,
+            (GpuDeviceIdentity(0, "0x0000000000000001", "/dev/dri/renderD128"),),
+            (),
+            (),
+        )
+
+
+def _gpu_leases(tmp_path: Path) -> LocalGpuLeaseManager:
+    return LocalGpuLeaseManager(
+        lock_root=tmp_path / "gpu-leases",
+        ownership_inspector=_FakeOwnershipInspector(),
+    )
 
 
 class FakeBenchmark:
@@ -203,6 +231,7 @@ def test_e2e_vertical_slice_records_trace_and_no_regression(tmp_path: Path) -> N
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
+        gpu_leases=_gpu_leases(tmp_path),
     )
     result = use_case.run(_spec(tmp_path, results))
     assert result.status is TaskStatus.NO_GAIN
@@ -242,6 +271,25 @@ def test_e2e_vertical_slice_records_trace_and_no_regression(tmp_path: Path) -> N
     assert use_case.resume(results).to_dict() == result.to_dict()
 
 
+def test_intake_config_failure_does_not_leave_a_running_run(tmp_path: Path) -> None:
+    results = tmp_path / "invalid-intake-run"
+    receipt = replace(_receipt(tmp_path), lm_eval_runtime=None)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=FakeBenchmark(),
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+        gpu_leases=_gpu_leases(tmp_path),
+    )
+
+    with pytest.raises(ConfigurationError) as failure:
+        use_case.run(_spec(tmp_path, results))
+
+    assert failure.value.reason_code == "lm_eval_runtime_missing"
+    assert not results.exists()
+    assert not tuple(tmp_path.glob(".apex-e2e-configs-*"))
+
+
 def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Path) -> None:
     results = tmp_path / "resume-run"
     benchmark = FakeBenchmark()
@@ -251,6 +299,7 @@ def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Pat
         benchmark=benchmark,
         diagnostics=CrashDiagnostics(),
         provenance=FakeProvenance(),
+        gpu_leases=_gpu_leases(tmp_path),
     )
     with pytest.raises(RuntimeError, match="simulated process loss"):
         interrupted.run(_spec(tmp_path, results))
@@ -266,6 +315,7 @@ def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Pat
         benchmark=benchmark,
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
+        gpu_leases=_gpu_leases(tmp_path),
     ).resume(results)
 
     assert resumed.status is TaskStatus.NO_GAIN
@@ -296,6 +346,7 @@ def test_resume_rejects_mutated_run_request_projection(tmp_path: Path) -> None:
         benchmark=FakeBenchmark(),
         diagnostics=CrashDiagnostics(),
         provenance=FakeProvenance(),
+        gpu_leases=_gpu_leases(tmp_path),
     )
     with pytest.raises(RuntimeError, match="simulated process loss"):
         interrupted.run(_spec(tmp_path, results))
@@ -311,6 +362,7 @@ def test_resume_rejects_mutated_run_request_projection(tmp_path: Path) -> None:
             benchmark=FakeBenchmark(),
             diagnostics=FakeDiagnostics(),
             provenance=FakeProvenance(),
+            gpu_leases=_gpu_leases(tmp_path),
         ).resume(results)
     assert failure.value.reason_code == "run_request_projection_mismatch"
 
@@ -323,6 +375,7 @@ def test_terminal_resume_rejects_unbound_result_projection(tmp_path: Path) -> No
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
+        gpu_leases=_gpu_leases(tmp_path),
     )
     use_case.run(_spec(tmp_path, results))
     result_path = results / "result.json"
@@ -336,7 +389,7 @@ def test_terminal_resume_rejects_unbound_result_projection(tmp_path: Path) -> No
     assert failure.value.reason_code == "e2e_result_projection_mismatch"
 
 
-def test_e2e_no_winner_final_replay_drift_remains_observed_evidence(
+def test_e2e_no_winner_final_replay_regression_fails_closed(
     tmp_path: Path,
 ) -> None:
     results = tmp_path / "run-regression"
@@ -345,10 +398,11 @@ def test_e2e_no_winner_final_replay_drift_remains_observed_evidence(
         benchmark=FakeBenchmark(final_throughput=98.0),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
+        gpu_leases=_gpu_leases(tmp_path),
     ).run(_spec(tmp_path, results))
-    assert result.status is TaskStatus.NO_GAIN
-    assert result.no_regression is True
-    assert result.reason_code == "no_opportunities"
+    assert result.status is TaskStatus.VERIFICATION_FAILED
+    assert result.no_regression is False
+    assert result.reason_code == "insufficient_throughput_gain"
     assert result.accepted_patch_ids == ()
     assert result.formal_delivery_verified is False
     assert result.details["observed_replay_verdict"]["keep"] is False
@@ -356,7 +410,8 @@ def test_e2e_no_winner_final_replay_drift_remains_observed_evidence(
         result.details["observed_replay_verdict"]["reason_code"]
         == "insufficient_throughput_gain"
     )
-    basis = result.details["no_regression_basis"]
+    assert result.details["search_exit_reason"] == "no_opportunities"
+    basis = result.details["final_replay_basis"]
     assert basis == {
         "basis": "no_accepted_or_delivered_source_patch",
         "source_identity_unchanged": True,
@@ -372,3 +427,4 @@ def test_e2e_no_winner_final_replay_drift_remains_observed_evidence(
     ).state
     assert state.e2e is not None
     assert state.e2e.final_clean_replay_verified is False
+    assert state.phase is RunPhase.FAILED

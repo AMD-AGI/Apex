@@ -15,6 +15,7 @@ from apex.core import ContractError, IntegrityError, canonical_json_bytes, sha25
 from apex.evaluation import GateVerdict, kernel_reward
 from apex.storage import ArtifactReceipt, ArtifactStore
 
+from .e2e_validation import allows_source_free_e2e, validate_e2e_export_reward
 from .models import CandidateEpisode, EpisodeArtifact, EpisodeGraph, SemanticRole
 
 
@@ -162,7 +163,7 @@ class DatasetExporter:
         artifact_values, candidate_text = self._materialize_artifacts(child)
         events = [event.to_dict() for event in child.events]
         _reject_secrets(events)
-        self._validate_reward(child)
+        self._validate_reward(graph, child)
         roles: dict[str, list[Mapping[str, Any]]] = {}
         for item in artifact_values:
             roles.setdefault(str(item["role"]), []).append(item)
@@ -175,6 +176,7 @@ class DatasetExporter:
             "run_id": graph.run_id,
             "attempt_id": child.attempt_id,
             "candidate_id": child.candidate_id,
+            "opportunity_id": child.opportunity_id,
             "task_id": child.task_id,
             "kernel_id": child.kernel_id,
             "state_generation": child.state_generation,
@@ -185,6 +187,7 @@ class DatasetExporter:
                 "receipt": child.context_packet_receipt.to_dict(),
                 "content": observation,
             },
+            "observations": _events_with_roles(child, {SemanticRole.OBSERVATION}),
             "actions": _events_with_roles(child, {SemanticRole.ACTION}),
             "tools": _events_with_roles(child, {SemanticRole.TOOL}),
             "outcomes": _events_with_roles(child, {SemanticRole.OUTCOME}),
@@ -231,20 +234,35 @@ class DatasetExporter:
                 "content": body,
             }
             values.append(value)
-            if role in {"candidate", "candidate_patch", "solution"} and encoding == "utf-8":
+            if role in {
+                "candidate",
+                "candidate_patch",
+                "candidate_source",
+                "solution",
+            } and encoding == "utf-8":
                 if not body.strip():
                     raise IntegrityError("Candidate artifact is empty", "empty_candidate_artifact")
                 candidate_parts.append(
                     f"# artifact role={role} sha256={artifact.receipt.digest}\n{body}"
                 )
         candidate_text = "\n\n".join(candidate_parts) if candidate_parts else None
-        if child.status != "infrastructure_error" and candidate_text is None:
+        if (
+            child.status != "infrastructure_error"
+            and candidate_text is None
+            and not allows_source_free_e2e(child)
+        ):
             raise IntegrityError("Real textual candidate is missing", "candidate_artifact_missing")
         return values, candidate_text
 
-    @staticmethod
-    def _validate_reward(child: CandidateEpisode) -> None:
+    def _validate_reward(
+        self,
+        graph: EpisodeGraph,
+        child: CandidateEpisode,
+    ) -> None:
         if not child.policy_ids:
+            return
+        if "e2e_kernel_candidate_v1" in child.policy_ids:
+            validate_e2e_export_reward(graph, child, self._artifacts)
             return
         if "kernel_robust_v1" not in child.policy_ids:
             return

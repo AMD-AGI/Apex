@@ -227,9 +227,12 @@ class TaskScope:
 
 @dataclass(frozen=True, slots=True)
 class KernelMeasurementSpec:
-    """Trusted location and aggregation policy for raw invocation evidence."""
+    """Trusted evaluator adapter, harness, method, and aggregation policy."""
 
-    report_path: str
+    adapter_id: str
+    harness_files: tuple[str, ...]
+    measurement_method_sha256: str
+    runner: CommandSpec
     aggregation: str = "equal_case"
     schema: str = "apex.kernel-measurement/v1"
     policy_id: str = "kernel_invocation_nearest_rank_v1"
@@ -248,7 +251,27 @@ class KernelMeasurementSpec:
     min_bootstrap_units: int = 2
 
     def __post_init__(self) -> None:
-        _relative_source_path(self.report_path, field_name="measurement report path")
+        validate_identifier(self.adapter_id, field_name="measurement adapter ID")
+        if not self.harness_files:
+            raise ContractError(
+                "Kernel measurement requires protected harness files",
+                "invalid_measurement_contract",
+            )
+        for path in self.harness_files:
+            _relative_source_path(path, field_name="measurement harness file")
+        if len(set(self.harness_files)) != len(self.harness_files):
+            raise ContractError(
+                "Kernel measurement harness files are duplicated",
+                "invalid_measurement_contract",
+            )
+        digest = self.measurement_method_sha256.removeprefix("sha256:")
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise ContractError(
+                "Kernel measurement method digest is invalid",
+                "invalid_measurement_contract",
+            )
         if self.aggregation not in {"equal_case", "workload_weighted"}:
             raise ContractError(
                 "Unsupported kernel measurement aggregation",
@@ -305,8 +328,24 @@ class KernelMeasurementSpec:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "KernelMeasurementSpec":
+        runner = data.get("runner")
+        if not isinstance(runner, Mapping):
+            raise ContractError(
+                "Kernel measurement requires a structured runner command",
+                "invalid_measurement_contract",
+            )
         return cls(
-            report_path=str(data.get("report_path", "")),
+            adapter_id=str(data.get("adapter_id", "")),
+            harness_files=tuple(
+                _relative_source_path(item, field_name="measurement harness file")
+                for item in _string_tuple(
+                    data.get("harness_files"), field_name="measurement harness files"
+                )
+            ),
+            measurement_method_sha256=str(
+                data.get("measurement_method_sha256", "")
+            ),
+            runner=CommandSpec.from_mapping(runner),
             aggregation=str(data.get("aggregation", "equal_case")),
             schema=str(data.get("schema", "apex.kernel-measurement/v1")),
             policy_id=str(data.get("policy_id", "kernel_invocation_nearest_rank_v1")),
@@ -328,7 +367,10 @@ class KernelMeasurementSpec:
     def to_dict(self) -> dict[str, object]:
         return {
             "schema": self.schema,
-            "report_path": self.report_path,
+            "adapter_id": self.adapter_id,
+            "harness_files": list(self.harness_files),
+            "measurement_method_sha256": self.measurement_method_sha256,
+            "runner": self.runner.to_dict(),
             "aggregation": self.aggregation,
             "policy_id": self.policy_id,
             "sample_unit": self.sample_unit,
@@ -400,11 +442,16 @@ class TaskSpec:
         if missing:
             raise ContractError(f"Missing task commands: {', '.join(missing)}", "missing_task_commands")
         self._validate_recipe()
-        if self.measurement and self.measurement.report_path in self.editable_files:
-            raise ContractError(
-                "Measurement report cannot be agent-editable",
-                "measurement_report_editable",
+        if self.measurement:
+            overlap = sorted(
+                set(self.measurement.harness_files).intersection(self.editable_files)
             )
+            if overlap:
+                raise ContractError(
+                    "Measurement harness cannot be agent-editable",
+                    "measurement_harness_editable",
+                    {"paths": overlap},
+                )
         if self.dataset_split not in _DATASET_SPLITS:
             raise ContractError("Invalid dataset split", "invalid_dataset_split")
         if self.data_visibility not in _DATA_VISIBILITIES:
@@ -519,4 +566,6 @@ class ResolvedTaskSpec:
     workspace: Path
     editable_paths: tuple[Path, ...]
     baseline_file_hashes: Mapping[str, str]
+    harness_file_hashes: Mapping[str, str]
+    harness_sha256: str | None
     resolution_hash: str

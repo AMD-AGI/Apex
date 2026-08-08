@@ -41,8 +41,11 @@ from apex.ports import (
     AgentTranscriptEvent,
     AgentTerminationKind,
     AgentUsage,
+    KernelMeasurementOutput,
+    KernelMeasurementRequest,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
 )
+from apex.runtime import GpuDeviceIdentity, GpuOwnershipReceipt, LocalGpuLeaseManager
 
 
 def _agent_containment(*, stopped: bool = False) -> AgentProcessContainmentReceipt:
@@ -73,6 +76,30 @@ def _agent_containment(*, stopped: bool = False) -> AgentProcessContainmentRecei
     )
 from apex.rl import DatasetExportConfig, DatasetExporter, EpisodeGraphMaterializer
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal
+
+
+class _FakeOwnershipInspector:
+    def inspect(
+        self, selector_scope: str, *, allowed_pids: tuple[int, ...] = ()
+    ) -> GpuOwnershipReceipt:
+        return GpuOwnershipReceipt(
+            1,
+            "rocm_smi_process_gpu_map_v1",
+            selector_scope,
+            123,
+            "/opt/rocm/lib/librocm_smi64.so.7",
+            "a" * 64,
+            (GpuDeviceIdentity(0, "0x0000000000000001", "/dev/dri/renderD128"),),
+            (),
+            (),
+        )
+
+
+def _gpu_leases(tmp_path: Path) -> LocalGpuLeaseManager:
+    return LocalGpuLeaseManager(
+        lock_root=tmp_path / "gpu-leases",
+        ownership_inspector=_FakeOwnershipInspector(),
+    )
 
 
 class EditingAgent:
@@ -210,6 +237,15 @@ class SequencedEditingAgent:
                     tool_name="edit",
                     tool_call_id="tool-1",
                 ),
+                AgentSemanticEvent(
+                    index=2,
+                    source_event_index=0,
+                    source_kind="turn.completed",
+                    kind="tool_result",
+                    tool_name="edit",
+                    tool_call_id="tool-1",
+                    succeeded=True,
+                ),
             ),
             usage=AgentUsage(
                 input_tokens=index + 1,
@@ -234,13 +270,116 @@ def _digest(label: str) -> str:
     return sha256_bytes(label.encode())
 
 
+def _measurement_report(
+    reference: float,
+    optimized: float,
+    samples: int,
+    *,
+    method_sha256: str = "1" * 64,
+) -> dict[str, object]:
+    per_block = tuple(
+        samples // 4 + (1 if index < samples % 4 else 0) for index in range(4)
+    )
+    health = {
+        "device": "gfx950:0",
+        "healthy": True,
+        "temperature_c": 45.0,
+        "clock_mhz": 2100.0,
+    }
+    implementations = (
+        "reference", "optimized", "optimized", "reference",
+        "optimized", "reference", "reference", "optimized",
+    )
+    seen = {"reference": 0, "optimized": 0}
+    order: list[tuple[str, float, int]] = []
+    for implementation in implementations:
+        index = seen[implementation]
+        seen[implementation] += 1
+        latency = reference if implementation == "reference" else optimized
+        order.append((implementation, latency, per_block[index]))
+    return {
+        "schema": "apex.kernel-measurement/v1",
+        "policy_id": "kernel_invocation_nearest_rank_v1",
+        "sample_unit": "kernel_invocation",
+        "quantile_method": "nearest_rank_v1",
+        "timer": "hip_event",
+        "timer_resolution_ns": 1.0,
+        "inner_repeats": 1,
+        "measurement_method_sha256": method_sha256,
+        "abba_seed": 17,
+        "warmup_samples": 20,
+        "cases": [
+            {
+                "case_id": "fixture-case",
+                "blocks": [
+                    {
+                        "block_id": index,
+                        "order_position": index,
+                        "implementation": implementation,
+                        "samples_ms": [latency] * count,
+                        "invalid_sample_counts": {},
+                        "gpu_health_before": health,
+                        "gpu_health_after": health,
+                    }
+                    for index, (implementation, latency, count) in enumerate(order)
+                ],
+            }
+        ],
+    }
+
+
+class FixtureMeasurementEvaluator:
+    adapter_id = "fixture-evaluator-v1"
+
+    def __init__(
+        self,
+        values: tuple[float, float, int] | None = None,
+        *,
+        dynamic: bool = False,
+        writer_id: str | None = None,
+        measurement_method_sha256: str = "1" * 64,
+        report_method_sha256: str | None = None,
+        mutate_harness: bool = False,
+    ) -> None:
+        self.values = values
+        self.dynamic = dynamic
+        self.writer_id = writer_id or self.adapter_id
+        self.measurement_method_sha256 = measurement_method_sha256
+        self.report_method_sha256 = report_method_sha256
+        self.mutate_harness = mutate_harness
+        self.requests: list[KernelMeasurementRequest] = []
+
+    def measure(self, request: KernelMeasurementRequest) -> KernelMeasurementOutput:
+        self.requests.append(request)
+        if self.mutate_harness:
+            request.harness_paths[0].write_text("raise SystemExit(0)\n", encoding="utf-8")
+        if self.dynamic:
+            source = (request.candidate_root / "source" / "kernel.py").read_text()
+            marker = "SPEED_MS = "
+            optimized = float(source.split(marker, 1)[1].splitlines()[0])
+            values = (10.0, optimized, 300)
+        else:
+            assert self.values is not None
+            values = self.values
+        report = _measurement_report(
+            *values,
+            method_sha256=(
+                self.report_method_sha256 or self.measurement_method_sha256
+            ),
+        )
+        request.report_path.write_text(json.dumps(report), encoding="utf-8")
+        return KernelMeasurementOutput(self.writer_id, request.report_path)
+
+
 def _task(
     tmp_path: Path,
     *,
     performance_marker: Path | None = None,
     measurement_values: tuple[float, float, int] | None = None,
     dynamic_measurement: bool = False,
+    candidate_forges_report: bool = False,
     max_iterations: int = 1,
+    external_evaluator: bool = True,
 ) -> TaskSpec:
     workspace = tmp_path / "workspace"
     (workspace / "source").mkdir(parents=True)
@@ -268,58 +407,8 @@ def _task(
                 f"Path({str(performance_marker)!r}).write_text('normal-runtime')"
             ),
         ]
-    if measurement_values is not None:
-        reference, optimized, samples = measurement_values
-        per_block = tuple(
-            samples // 4 + (1 if index < samples % 4 else 0)
-            for index in range(4)
-        )
-        health = {
-            "device": "gfx950:0",
-            "healthy": True,
-            "temperature_c": 45.0,
-            "clock_mhz": 2100.0,
-        }
-        implementations = (
-            "reference", "optimized", "optimized", "reference",
-            "optimized", "reference", "reference", "optimized",
-        )
-        seen = {"reference": 0, "optimized": 0}
-        order = []
-        for implementation in implementations:
-            index = seen[implementation]
-            seen[implementation] += 1
-            latency = reference if implementation == "reference" else optimized
-            order.append((implementation, latency, per_block[index]))
-        report = {
-            "schema": "apex.kernel-measurement/v1",
-            "policy_id": "kernel_invocation_nearest_rank_v1",
-            "sample_unit": "kernel_invocation",
-            "quantile_method": "nearest_rank_v1",
-            "timer": "hip_event",
-            "timer_resolution_ns": 1.0,
-            "inner_repeats": 1,
-            "measurement_method_sha256": "1" * 64,
-            "abba_seed": 17,
-            "warmup_samples": 20,
-            "cases": [
-                {
-                    "case_id": "fixture-case",
-                    "blocks": [
-                        {
-                            "block_id": index,
-                            "order_position": index,
-                            "implementation": implementation,
-                            "samples_ms": [latency] * count,
-                            "invalid_sample_counts": {},
-                            "gpu_health_before": health,
-                            "gpu_health_after": health,
-                        }
-                        for index, (implementation, latency, count) in enumerate(order)
-                    ],
-                }
-            ],
-        }
+    if candidate_forges_report:
+        report = _measurement_report(100.0, 0.1, 300)
         performance = [
             sys.executable,
             "-c",
@@ -327,36 +416,6 @@ def _task(
                 "import json; from pathlib import Path; "
                 "Path('build').mkdir(); "
                 f"Path('build/timings.json').write_text(json.dumps({report!r}))"
-            ),
-        ]
-    if dynamic_measurement:
-        performance = [
-            sys.executable,
-            "-c",
-            (
-                "import json,re; from pathlib import Path; "
-                "source=Path('source/kernel.py').read_text(); "
-                "match=re.search(r'SPEED_MS\\s*=\\s*([0-9.]+)', source); "
-                "optimized=float(match.group(1)); samples=75; "
-                "health={'device':'gfx950:0','healthy':True,"
-                "'temperature_c':45.0,'clock_mhz':2100.0}; "
-                "order=[('reference',10.0),('optimized',optimized),"
-                "('optimized',optimized),('reference',10.0),"
-                "('optimized',optimized),('reference',10.0),"
-                "('reference',10.0),('optimized',optimized)]; "
-                "blocks=[{'block_id':index,'order_position':index,"
-                "'implementation':implementation,'samples_ms':[latency]*samples,"
-                "'invalid_sample_counts':{},'gpu_health_before':health,"
-                "'gpu_health_after':health} for index,(implementation,latency) in enumerate(order)]; "
-                "report={'schema':'apex.kernel-measurement/v1',"
-                "'policy_id':'kernel_invocation_nearest_rank_v1',"
-                "'sample_unit':'kernel_invocation','quantile_method':'nearest_rank_v1',"
-                "'timer':'hip_event','timer_resolution_ns':1.0,'inner_repeats':1,"
-                "'measurement_method_sha256':'1'*64,'abba_seed':17,"
-                "'warmup_samples':20,'cases':[{'case_id':'fixture-case',"
-                "'blocks':blocks}]}; "
-                "Path('build').mkdir(); "
-                "Path('build/timings.json').write_text(json.dumps(report))"
             ),
         ]
     data = {
@@ -372,12 +431,22 @@ def _task(
                 "correctness": {"argv": success},
                 "performance": {"argv": performance},
             },
-            "budget": {"max_iterations": max_iterations},
+        "budget": {"max_iterations": max_iterations},
+    }
+    if external_evaluator:
+        data["recipe"] = {
+            "kind": "python_triton",
+            "recipe_id": "external-central-evaluator-v1",
+            "sha256": "e" * 64,
+            "provenance": "external_evaluator",
         }
-    if measurement_values is not None or dynamic_measurement:
+    if measurement_values is not None or dynamic_measurement or candidate_forges_report:
         data["measurement"] = {
             "schema": "apex.kernel-measurement/v1",
-            "report_path": "build/timings.json",
+            "adapter_id": "fixture-evaluator-v1",
+            "harness_files": ["harness.py"],
+            "measurement_method_sha256": "1" * 64,
+            "runner": {"argv": [sys.executable, "harness.py"]},
             "aggregation": "equal_case",
         }
     return TaskSpec.from_mapping(data)
@@ -404,6 +473,12 @@ def _run(
         safety_gate=safety_gate,
         safety_policy=safety_policy,
         safety_tools=safety_tools,
+        gpu_leases=_gpu_leases(tmp_path),
+        measurement_evaluator=(
+            FixtureMeasurementEvaluator(measurement_values)
+            if measurement_values is not None
+            else None
+        ),
     )
     result = use_case.run(KernelOptimizeRequest(task=task, result_json=result_json))
     return task, result, result_json
@@ -424,7 +499,13 @@ def _run_sequence(
     )
     result_json = tmp_path / "machine" / "result.json"
     use_case = KernelOptimizeUseCase(
-        agents=AgentRegistry([agent], default=AgentBackendName.CODEX)
+        agents=AgentRegistry([agent], default=AgentBackendName.CODEX),
+        measurement_evaluator=(
+            FixtureMeasurementEvaluator(dynamic=True)
+            if dynamic_measurement
+            else None
+        ),
+        gpu_leases=_gpu_leases(tmp_path),
     )
     result = use_case.run(KernelOptimizeRequest(task=task, result_json=result_json))
     run_root = next((task.results_dir / "runs").iterdir())
@@ -436,6 +517,8 @@ def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path
     task, result, result_json = _run(tmp_path, EditingAgent())
 
     assert result.status is TaskStatus.CANDIDATE_READY
+    assert result.reason_code == "candidate_deferred_to_external_evaluator"
+    assert result.reward is None
     assert result.applied is False
     assert result.external_verification_required is True
     assert (task.workspace / "source" / "kernel.py").read_text().endswith("return x\n")
@@ -463,7 +546,7 @@ def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path
     serialized = json.loads(result_json.read_text())
     assert serialized["run_id"] == result.run_id
     assert serialized["internal_verdict_ref"] == result.internal_verdict_ref
-    assert serialized["gpu_lease"] == result.gpu_lease
+    assert serialized["gpu_lease"] == json.loads(json.dumps(result.gpu_lease))
     assert serialized["gpu_lease_receipt_digest"] == result.gpu_lease_receipt_digest
 
     run_root = next((task.results_dir / "runs").iterdir())
@@ -475,12 +558,21 @@ def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path
     ):
         assert (run_root / projection).is_file()
     journal = EventJournal(run_root / "events" / "run.db")
+    events = journal.iter_events(run_root.name)
+    assert not any(item.event_type == "experience.measured" for item in events)
+    deferred = [item for item in events if item.event_type == "experience.deferred"]
+    assert len(deferred) == 1
+    assert deferred[0].payload["evidence_class"] == "derived"
+    assert deferred[0].payload["status"] == "pending_external_evaluator"
+    assert deferred[0].payload["external_verification_required"] is True
+    assert "outcome" not in deferred[0].payload
     graph = EpisodeGraphMaterializer(
         journal, ArtifactStore(run_root / "artifacts")
     ).materialize(run_root.name)
     child = graph.children[0]
     assert child.context_packet_id is not None
-    assert child.trainability == "complete"
+    assert child.trainability == "truncated"
+    assert child.validation_reasons == ("external_evaluation_pending",)
     assert child.verdict == "keep"
     event_types = [item.event_type for item in child.events]
     assert event_types.index("context_packet_created") < event_types.index("prompt_sent")
@@ -490,6 +582,26 @@ def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path
     assert event_types.index("compile_result") < event_types.index("correctness_result")
     assert event_types.index("correctness_result") < event_types.index("safety_result")
     assert event_types.index("safety_result") < event_types.index("performance_command_result")
+
+
+def test_command_success_without_measurement_authority_never_becomes_candidate_ready(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path, external_evaluator=False)
+    result = KernelOptimizeUseCase(
+        agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
+        gpu_leases=_gpu_leases(tmp_path),
+    ).run(
+        KernelOptimizeRequest(
+            task=task,
+            result_json=tmp_path / "machine" / "result.json",
+        )
+    )
+
+    assert result.status is TaskStatus.NO_MEASUREMENT
+    assert result.reason_code == "measurement_contract_missing"
+    assert result.bundle_path is None
+    assert result.reward is None
 
 
 def test_use_case_rejects_harness_tampering_without_bundle(tmp_path: Path) -> None:
@@ -794,6 +906,26 @@ def test_raw_measurement_commits_robust_reward_and_rl_receipts(tmp_path: Path) -
     assert child.scalar_reward == 170.0
     assert child.policy_ids == ("kernel_robust_v1",)
     assert child.trainability == "complete"
+    measured = next(event for event in events if event.event_type == "measurement_result")
+    bindings = {item["role"]: item["receipt"] for item in measured.payload["artifacts"]}
+    assert {"raw_measurement", "measurement_execution", "harness", "kernel_grade"} <= set(bindings)
+    execution = json.loads(
+        ArtifactStore(run_root / "artifacts").read_bytes(
+            ArtifactReceipt.from_dict(bindings["measurement_execution"])
+        )
+    )
+    assert execution["schema"] == "apex.kernel-measurement-execution/v1"
+    assert execution["writer_kind"] == "trusted_evaluator_adapter"
+    assert execution["writer_id"] == "fixture-evaluator-v1"
+    assert execution["phase"] == "measurement"
+    assert execution["harness_sha256"] == measured.payload[
+        "measurement_harness_sha256"
+    ]
+    assert execution["phase_started_monotonic_ns"] <= execution[
+        "adapter_returned_monotonic_ns"
+    ] <= execution["output_observed_monotonic_ns"] <= execution[
+        "phase_completed_monotonic_ns"
+    ]
     exported = DatasetExporter(ArtifactStore(run_root / "artifacts")).export(
         graph,
         tmp_path / "rl-export",
@@ -805,6 +937,118 @@ def test_raw_measurement_commits_robust_reward_and_rl_receipts(tmp_path: Path) -
     )
     assert transition["reward"]["scalar"] == 170.0
     assert transition["reward"]["vector"]["kernel_srobust"] == 1.25
+
+
+def test_candidate_written_measurement_cannot_create_tampering_pass_or_reward(
+    tmp_path: Path,
+) -> None:
+    task = _task(
+        tmp_path,
+        candidate_forges_report=True,
+    )
+    result_json = tmp_path / "machine" / "result.json"
+    use_case = KernelOptimizeUseCase(
+        agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
+        gpu_leases=_gpu_leases(tmp_path),
+    )
+
+    result = use_case.run(KernelOptimizeRequest(task=task, result_json=result_json))
+
+    assert result.status is TaskStatus.NO_MEASUREMENT
+    assert result.reason_code == "measurement_evaluator_unavailable"
+    assert result.reward is None
+    assert result.bundle_path is None
+    run_root = next((task.results_dir / "runs").iterdir())
+    events = EventJournal(run_root / "events" / "run.db").iter_events(run_root.name)
+    assert any(event.event_type == "performance_command_result" for event in events)
+    assert not any(event.event_type == "reward_committed" for event in events)
+    error = next(event for event in events if event.event_type == "measurement_result")
+    assert error.payload["reason_code"] == "measurement_evaluator_unavailable"
+    assert "tampering_passed" not in error.payload
+    forged = next((run_root / "projections").rglob("timings.json"))
+    assert forged.is_file()
+
+
+def test_candidate_report_is_ignored_when_trusted_evaluator_is_bound(
+    tmp_path: Path,
+) -> None:
+    task = _task(
+        tmp_path,
+        measurement_values=(10.0, 8.0, 300),
+        candidate_forges_report=True,
+    )
+    evaluator = FixtureMeasurementEvaluator((10.0, 8.0, 300))
+    use_case = KernelOptimizeUseCase(
+        agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
+        measurement_evaluator=evaluator,
+        gpu_leases=_gpu_leases(tmp_path),
+    )
+
+    result = use_case.run(
+        KernelOptimizeRequest(task=task, result_json=tmp_path / "machine" / "result.json")
+    )
+
+    assert result.status is TaskStatus.CANDIDATE_READY
+    assert result.srobust == 1.25
+    assert result.reward == 170.0
+    assert len(evaluator.requests) == 1
+    request = evaluator.requests[0]
+    assert not request.report_path.is_relative_to(request.candidate_root)
+
+
+@pytest.mark.parametrize(
+    ("evaluator", "reason_code"),
+    [
+        (
+            FixtureMeasurementEvaluator(
+                (10.0, 8.0, 300), writer_id="candidate-self-report"
+            ),
+            "measurement_writer_mismatch",
+        ),
+        (
+            FixtureMeasurementEvaluator(
+                (10.0, 8.0, 300), measurement_method_sha256="2" * 64
+            ),
+            "measurement_method_mismatch",
+        ),
+        (
+            FixtureMeasurementEvaluator(
+                (10.0, 8.0, 300), report_method_sha256="2" * 64
+            ),
+            "measurement_method_mismatch",
+        ),
+        (
+            FixtureMeasurementEvaluator(
+                (10.0, 8.0, 300), mutate_harness=True
+            ),
+            "measurement_harness_changed",
+        ),
+    ],
+)
+def test_measurement_authority_mismatch_never_commits_reward(
+    tmp_path: Path,
+    evaluator: FixtureMeasurementEvaluator,
+    reason_code: str,
+) -> None:
+    task = _task(tmp_path, measurement_values=(10.0, 8.0, 300))
+    use_case = KernelOptimizeUseCase(
+        agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
+        measurement_evaluator=evaluator,
+        gpu_leases=_gpu_leases(tmp_path),
+    )
+
+    result = use_case.run(
+        KernelOptimizeRequest(task=task, result_json=tmp_path / "machine" / "result.json")
+    )
+
+    assert result.status is TaskStatus.NO_MEASUREMENT
+    assert result.reason_code == reason_code
+    assert result.reward is None
+    run_root = next((task.results_dir / "runs").iterdir())
+    events = EventJournal(run_root / "events" / "run.db").iter_events(run_root.name)
+    assert not any(event.event_type == "reward_committed" for event in events)
+    if evaluator.measurement_method_sha256 != "1" * 64:
+        assert evaluator.requests == []
 
 
 def test_299_samples_return_no_measurement_without_reward(tmp_path: Path) -> None:
@@ -1007,6 +1251,60 @@ def test_max_iterations_one_emits_canonical_agent_transcript(tmp_path: Path) -> 
     assert [item["kind"] for item in transcript["semantic_events"]] == [
         "agent_message",
         "tool_called",
+        "tool_result",
     ]
     assert transcript["usage"]["total_tokens"] == 3
     assert transcript["cost"]["amount"] == "0.125"
+
+    attempt_events = tuple(
+        event for event in events if event.payload.get("attempt_id") == agent.requests[0].attempt_id
+    )
+    event_types = [event.event_type for event in attempt_events]
+    canonical = (
+        "agent_message",
+        "tool_called",
+        "tool_result",
+        "usage_recorded",
+        "cost_recorded",
+        "agent_completed",
+    )
+    assert all(
+        event_types.index(first) < event_types.index(second)
+        for first, second in zip(canonical, canonical[1:])
+    )
+    for event in attempt_events:
+        if event.event_type not in canonical[:-1]:
+            continue
+        assert event.payload["evidence_class"] == "self_reported"
+        assert any(
+            item["role"] == "agent_transcript"
+            for item in event.payload["artifacts"]
+        )
+
+    graph = EpisodeGraphMaterializer(
+        EventJournal(run_root / "events" / "run.db"),
+        ArtifactStore(run_root / "artifacts"),
+    ).materialize(run_root.name)
+    exported = DatasetExporter(ArtifactStore(run_root / "artifacts")).export(
+        graph,
+        tmp_path / "standalone-agent-rl",
+        config=DatasetExportConfig(include_sft=False),
+    )
+    assert exported.record_count == 1
+    transition = json.loads(
+        (tmp_path / "standalone-agent-rl" / "dataset.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "agent_message" in {
+        event["event_type"] for event in transition["actions"]
+    }
+    assert {event["event_type"] for event in transition["tools"]} == {
+        "tool_called",
+        "tool_result",
+    }
+    assert {event["event_type"] for event in transition["costs"]["events"]} >= {
+        "usage_recorded",
+        "cost_recorded",
+    }
+    assert "agent_transcript" in transition["artifacts_by_role"]

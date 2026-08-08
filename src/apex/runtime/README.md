@@ -23,7 +23,8 @@ select a Magpie checkout independently.
 | `SourceLockSet`, `SourceLockSpec`, `load_source_lock` | `source_locks.py` | Strict formal E2E source lock and checked-in content digest |
 | `SourceLockManager`, `SourceLockReceipt` | `source_locks.py` | Managed exact-checkout materialization, read-only verification, and receipts |
 | `RunProvenance`, `ProvenanceResolver`, `RepositoryLock` | `provenance.py` | Best-effort image observation and strict clean-source locks |
-| `GpuLeaseManager`, `LocalGpuLeaseManager`, `GpuLeaseReceipt` | `gpu.py` | Run-scoped cooperative cross-process GPU ownership |
+| `GpuLeaseManager`, `LocalGpuLeaseManager`, `GpuLeaseReceipt` | `gpu.py` | Run-scoped physical-GPU lock bound to ownership evidence |
+| `GpuOwnershipReceipt`, `RocmSmiGpuOwnershipInspector` | `gpu_ownership.py` | Race-checked physical identity and KFD PID-to-GPU preflight |
 
 The package `__all__` is authoritative. Public symbols are loaded lazily so
 `python -m apex.runtime.dependencies` can serve as the bootstrap subprocess
@@ -91,6 +92,27 @@ inherit only named daemon/context/config/TLS fields; inline
 the selected `DOCKER_CONFIG` directory. Git inspection disables system/global
 configuration and prompting so provenance reads cannot execute user-configured
 helpers or silently change repository identity.
+
+## GPU ownership boundary
+
+Before an agent or benchmark starts, `LocalGpuLeaseManager` resolves selectors to
+ROCm SMI device indices, immutable 64-bit unique IDs, and render nodes. It queries
+the authoritative KFD process inventory twice and maps every PID back to its
+physical GPU; any API failure, mapping ambiguity, inventory race, unreadable
+process identity, or foreign owner fails closed. PID receipts bind UID, Linux
+start time, command-line digest, and device indices without persisting command
+arguments or credentials. The cooperative lease acquires one lock for every
+selected physical unique ID in canonical sorted order. Therefore overlapping
+sets, including an all-visible lease and any explicit subset, contend on the
+same per-device inode instead of acquiring split set-level locks. If any lock is
+busy or post-lock ownership verification fails, every lock already acquired by
+that attempt is released before the error is returned. The receipt records the
+complete ordered `lock_paths` set as well as its primary `lock_path`.
+
+The product never terminates a foreign process. `gpu_foreign_owner` includes the
+typed ownership receipt so an authorized operator can resolve the exact PID and
+start-time tuple outside Apex and retry. A successful lease records the second
+post-lock ownership observation in the canonical run artifacts.
 
 `PythonEnvironment` removes `PYTHONPATH` and disables user-site packages for
 package probes, preventing an old editable Magpie checkout from silently winning

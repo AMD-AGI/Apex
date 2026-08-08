@@ -18,8 +18,23 @@ from .agent_containment import (
     AgentProcessContainmentReceipt,
 )
 from .benchmark import BenchmarkPass, BenchmarkPort, BenchmarkRequest, BenchmarkResult
-from .diagnostics import DiagnosticsPort, DiagnosticsRequest, DiagnosticsResult
+from .diagnostics import (
+    DiagnosticsPort,
+    DiagnosticsRequest,
+    DiagnosticsResult,
+    TraceComparisonArtifact,
+    TraceComparisonPort,
+    TraceComparisonRequest,
+    TraceComparisonResult,
+    TraceComparisonStatus,
+    TraceDiagnosticEvidence,
+)
 from .knowledge import KnowledgePort, KnowledgeQuery, KnowledgeResult
+from .kernel_measurement import (
+    KernelMeasurementOutput,
+    KernelMeasurementPort,
+    KernelMeasurementRequest,
+)
 from .safety import (
     SafetyToolRunRequest,
     SafetyToolRunResult,
@@ -47,9 +62,18 @@ __all__ = [
     "DiagnosticsPort",
     "DiagnosticsRequest",
     "DiagnosticsResult",
+    "TraceComparisonArtifact",
+    "TraceComparisonPort",
+    "TraceComparisonRequest",
+    "TraceComparisonResult",
+    "TraceComparisonStatus",
+    "TraceDiagnosticEvidence",
     "KnowledgePort",
     "KnowledgeQuery",
     "KnowledgeResult",
+    "KernelMeasurementOutput",
+    "KernelMeasurementPort",
+    "KernelMeasurementRequest",
     "SafetyToolRunRequest",
     "SafetyToolRunResult",
     "SafetyToolRunner",

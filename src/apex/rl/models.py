@@ -65,6 +65,7 @@ class EpisodeEvent:
 
     sequence: int
     event_id: str
+    transaction_id: str
     parent_event_id: str | None
     event_type: str
     semantic_role: SemanticRole
@@ -79,6 +80,7 @@ class EpisodeEvent:
         return {
             "sequence": self.sequence,
             "event_id": self.event_id,
+            "transaction_id": self.transaction_id,
             "parent_event_id": self.parent_event_id,
             "event_type": self.event_type,
             "semantic_role": self.semantic_role.value,
@@ -99,6 +101,7 @@ class CandidateEpisode:
     parent_episode_id: str
     attempt_id: str
     candidate_id: str | None
+    opportunity_id: str | None
     task_id: str | None
     kernel_id: str | None
     state_generation: int | None
@@ -122,6 +125,7 @@ class CandidateEpisode:
             "parent_episode_id": self.parent_episode_id,
             "attempt_id": self.attempt_id,
             "candidate_id": self.candidate_id,
+            "opportunity_id": self.opportunity_id,
             "task_id": self.task_id,
             "kernel_id": self.kernel_id,
             "state_generation": self.state_generation,

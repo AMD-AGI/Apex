@@ -36,6 +36,7 @@ from apex.optimization.e2e.kernel_lane import KernelOpportunity
 from apex.optimization.e2e.services import (
     AcceptedCandidate,
     CandidateDeployment,
+    DeploymentConfigDigests,
     FinalDeliveryRequest,
     MicroQualification,
     SafetyQualification,
@@ -209,6 +210,9 @@ def _candidate(
         (),
         {"policy_fingerprint": "6" * 64},
     )
+    config_sha256 = DeploymentConfigDigests.capture(
+        configs["measurement"], configs["diagnostic"], configs["replay"]
+    )
     deployment = CandidateDeployment(
         candidate.candidate_id or "",
         True,
@@ -218,9 +222,15 @@ def _candidate(
         configs["replay"],
         semantics,
         candidate_digest,
+        "sha256:" + "f" * 64,
         ValidationLevel.RUNTIME_OVERLAY_VERIFIED,
         True,
-        {"formal_source_rebuild": False},
+        {
+            "formal_source_rebuild": False,
+            "derived_image": {"image_id": "sha256:" + "f" * 64},
+            "config_sha256": config_sha256.to_dict(),
+        },
+        config_sha256=config_sha256,
     )
     return AcceptedCandidate(
         candidate,

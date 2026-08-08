@@ -23,6 +23,25 @@ import pathlib
 print(pathlib.Path(apex.__file__).resolve())
 """
 
+BUILD_TOOL_VERSIONS = {
+    "packaging": "26.3",
+    "setuptools": "83.0.0",
+    "wheel": "0.47.0",
+}
+BUILD_TOOL_PROBE = r"""
+import importlib.metadata
+import json
+import setuptools.build_meta
+import sys
+
+expected = json.loads(sys.argv[1])
+observed = {name: importlib.metadata.version(name) for name in expected}
+print(json.dumps({
+    "versions": observed,
+    "build_editable": hasattr(setuptools.build_meta, "build_editable"),
+}, sort_keys=True))
+"""
+
 
 class LauncherError(RuntimeError):
     """The Apex runtime CLI could not be prepared safely."""
@@ -90,6 +109,59 @@ def _runtime_is_installed(python: Path, apex_root: Path) -> bool:
     return True
 
 
+def _build_tools_ready(python: Path) -> bool:
+    result = subprocess.run(
+        (
+            str(python),
+            "-c",
+            BUILD_TOOL_PROBE,
+            json.dumps(BUILD_TOOL_VERSIONS, sort_keys=True),
+        ),
+        env=_clean_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        observed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return bool(
+        observed.get("versions") == BUILD_TOOL_VERSIONS
+        and observed.get("build_editable") is True
+    )
+
+
+def _prepare_build_tools(python: Path, *, offline: bool) -> None:
+    """Install the exact backend needed by old system pip without isolation."""
+
+    if _build_tools_ready(python):
+        return
+    requirements = tuple(
+        f"{name}=={version}" for name, version in BUILD_TOOL_VERSIONS.items()
+    )
+    if offline:
+        raise LauncherError(
+            "offline setup requires locked build tools in the selected venv: "
+            + ", ".join(requirements)
+        )
+    _run(
+        (
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            *requirements,
+        ),
+        env=_clean_env(),
+    )
+    if not _build_tools_ready(python):
+        raise LauncherError("locked Python build tools failed verification")
+
+
 def _install_runtime(
     python: Path, apex_root: Path, *, offline: bool
 ) -> None:
@@ -99,12 +171,13 @@ def _install_runtime(
         "pip",
         "install",
         "--disable-pip-version-check",
+        "--no-build-isolation",
         "--no-deps",
         "--editable",
         str(apex_root),
     ]
     if offline:
-        argv[5:5] = ["--no-index", "--no-build-isolation"]
+        argv[5:5] = ["--no-index"]
     _run(argv, env=_clean_env())
     if not _runtime_is_installed(python, apex_root):
         raise LauncherError(
@@ -148,6 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     venv = options.venv.expanduser().resolve()
     try:
         python = _prepare_venv(venv, options.python)
+        _prepare_build_tools(python, offline=options.offline)
         if not _runtime_is_installed(python, apex_root):
             _install_runtime(python, apex_root, offline=options.offline)
         env = _clean_env()

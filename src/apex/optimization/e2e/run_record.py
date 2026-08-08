@@ -2,27 +2,36 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from apex.benchmark import NormalizedBenchmarkResult
 from apex.context import CompiledContext
-from apex.core import canonical_json_bytes
+from apex.core import ContractError, canonical_json_bytes
 from apex.execution import agent_transcript_document
+from apex.evaluation import E2ERewardGrade, E2ERewardPolicy
+from apex.knowledge import ExperienceIdentity
 from apex.orchestration import RunController
-from apex.ports import AgentSemanticEvent
-from apex.ports import DiagnosticsResult
+from apex.ports import DiagnosticsResult, TraceComparisonResult
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal, SnapshotStore
 
+from ..agent_recording import record_agent_observations
+
+from .benchmark_artifacts import (
+    BenchmarkEvidenceReceipts,
+    persist_benchmark_evidence,
+)
 from .candidate import E2ECandidate
 from .candidate_record import candidate_manifest, store_candidate_sources
+from .deployment_artifacts import persist_deployment_configs
 from .services import (
     CandidateDeployment,
     FinalDeliveryResult,
     MicroQualification,
     SafetyQualification,
 )
+from .trace_comparison_record import persist_trace_comparison
 
 
 @dataclass(slots=True)
@@ -30,6 +39,7 @@ class E2ERunRecord:
     run_id: str
     root: Path
     artifacts: ArtifactStore
+    journal: EventJournal
     controller: RunController
     dataset_split: str
     data_visibility: str
@@ -45,9 +55,10 @@ class E2ERunRecord:
         data_visibility: str,
     ) -> "E2ERunRecord":
         root.mkdir(parents=True, exist_ok=False)
+        journal = EventJournal(root / "events" / "run.db")
         controller = RunController.create(
             run_id,
-            EventJournal(root / "events" / "run.db"),
+            journal,
             SnapshotStore(root / "state.snapshot.json"),
             initial_anchor_id=initial_anchor_id,
         )
@@ -55,10 +66,16 @@ class E2ERunRecord:
             run_id,
             root,
             ArtifactStore(root / "artifacts"),
+            journal,
             controller,
             dataset_split,
             data_visibility,
         )
+
+    def iter_events(self):
+        """Return verified canonical history for fresh context projections."""
+
+        return self.journal.iter_events(self.run_id, verify=True)
 
     def put_json(self, value: Mapping[str, Any]) -> ArtifactReceipt:
         return self.artifacts.put_bytes(canonical_json_bytes(value), media_type="application/json")
@@ -68,24 +85,35 @@ class E2ERunRecord:
         self.controller.start_action(action_id)
 
     def record_benchmark(
-        self, action_id: str, result: NormalizedBenchmarkResult
-    ) -> ArtifactReceipt:
-        receipts = [
-            self.artifacts.put_file(path, media_type=_media_type(path))
-            for path in result.artifacts
-            if path.is_file()
-        ]
-        normalized = self.put_json(_benchmark_dict(result))
-        receipts.append(normalized)
-        self.controller.mark_artifacts_ready(action_id, [item.digest for item in receipts])
+        self,
+        action_id: str,
+        result: NormalizedBenchmarkResult,
+        config_path: Path,
+        *,
+        attempt_id: str | None = None,
+        candidate_id: str | None = None,
+        opportunity_id: str | None = None,
+    ) -> BenchmarkEvidenceReceipts:
+        evidence = persist_benchmark_evidence(
+            self.artifacts, result, config_path
+        )
+        self.controller.mark_artifacts_ready(
+            action_id, [item.digest for item in evidence.receipts]
+        )
         if result.succeeded:
-            self.controller.verify_action(action_id, normalized.digest)
+            self.controller.verify_action(action_id, evidence.normalized.digest)
             self.controller.complete_action(action_id)
         else:
             self.controller.fail_action(action_id, ";".join(result.errors) or "benchmark_failed")
+        lineage: dict[str, object] = {}
+        if attempt_id is not None:
+            lineage = self._attempt_payload(attempt_id, candidate_id=candidate_id)
+            if opportunity_id is not None:
+                lineage["opportunity_id"] = opportunity_id
         self.controller.record_domain_event(
             "measurement_result",
             {
+                **lineage,
                 "action_id": action_id,
                 "pass_type": result.pass_type.value,
                 "succeeded": result.succeeded,
@@ -102,31 +130,73 @@ class E2ERunRecord:
                 "model_revision_verified": result.model_revision.passed,
                 "inferencex_runtime_verified": result.inferencex_runtime.passed,
                 "lm_eval_runtime_verified": result.lm_eval_runtime.passed,
-                "artifacts": [_artifact_binding("normalized_benchmark", normalized)],
+                "serving_runtime_verified": result.serving_runtime.passed,
+                "resolved_image_id": result.serving_runtime.resolved_image_id,
+                "config_sha256": evidence.config.digest,
+                "normalized_benchmark_receipt": evidence.normalized.digest,
+                "quality_receipt": evidence.quality.digest,
+                "artifacts": [dict(item) for item in evidence.bindings],
             },
             idempotency_key=f"benchmark.{action_id}.measurement",
         )
-        return normalized
+        return evidence
 
-    def record_diagnostics(self, result: DiagnosticsResult) -> tuple[ArtifactReceipt, ...]:
-        receipts = tuple(
-            self.artifacts.put_file(path, media_type=_media_type(path))
+    def record_diagnostics(
+        self,
+        result: DiagnosticsResult,
+        *,
+        action_id: str,
+        terminal: bool = False,
+    ) -> tuple[ArtifactReceipt, ...]:
+        stored = tuple(
+            (
+                path,
+                self.artifacts.put_file(path, media_type=_media_type(path)),
+            )
             for path in result.artifacts
             if path.is_file()
         )
+        receipts = tuple(receipt for _, receipt in stored)
         self.controller.record_domain_event(
             "tool_result",
             {
-                "tool": "tracelens_diagnostics",
+                "tool": (
+                    "tracelens_terminal_diagnostics"
+                    if terminal
+                    else "tracelens_diagnostics"
+                ),
                 "succeeded": result.succeeded,
+                "terminal": terminal,
+                "evidence_class": "diagnostic",
+                "reward_eligible": False,
                 "summary": dict(result.summary),
                 "artifacts": [
-                    _artifact_binding("diagnostic_artifact", receipt) for receipt in receipts
+                    _artifact_binding(
+                        result.artifact_roles.get(
+                            str(path.resolve()), "diagnostic_artifact"
+                        ),
+                        receipt,
+                    )
+                    for path, receipt in stored
                 ],
             },
-            idempotency_key=f"diagnostics.{self.controller.state.e2e.bottleneck_generation if self.controller.state.e2e else 0}.result",
+            idempotency_key=f"diagnostics.{action_id}.result",
         )
         return receipts
+
+    def record_trace_comparison(
+        self,
+        result: TraceComparisonResult,
+        *,
+        action_id: str,
+    ) -> ArtifactReceipt:
+        comparison = persist_trace_comparison(self.artifacts, result)
+        self.controller.record_domain_event(
+            "tool_result",
+            comparison.event_payload,
+            idempotency_key=f"diagnostics.{action_id}.comparison",
+        )
+        return comparison.receipt
 
     def record_context(
         self,
@@ -138,6 +208,8 @@ class E2ERunRecord:
         harness: ArtifactReceipt,
         knowledge: ArtifactReceipt,
         prompt: str,
+        experience_identity: ExperienceIdentity,
+        experience_mechanism: str,
     ) -> ArtifactReceipt:
         prompt_receipt = self.artifacts.put_bytes(prompt.encode(), media_type="text/plain")
         context = compiled.packet
@@ -153,6 +225,8 @@ class E2ERunRecord:
                 "anchor_generation": context.current_anchor.generation,
                 "cycle": context.cycle,
                 "compiler_receipt": compiled.receipt,
+                "experience_identity": experience_identity.to_dict(),
+                "experience_mechanism": experience_mechanism,
                 "artifacts": [
                     _artifact_binding("context_packet", packet),
                     _artifact_binding("baseline_source", source),
@@ -166,6 +240,7 @@ class E2ERunRecord:
             "knowledge_read",
             {
                 **common,
+                "read_id": f"read-{attempt_id}",
                 "context_packet_id": context.context_packet_id,
                 "selection_receipt": selection.digest,
                 "selection_policy": selection.selection_policy,
@@ -219,50 +294,13 @@ class E2ERunRecord:
         common = self._attempt_payload(
             candidate.attempt_id, candidate_id=candidate.candidate_id
         )
-        binding = [_artifact_binding("agent_transcript", transcript)]
-        for event in result.semantic_events:
-            self.controller.record_domain_event(
-                event.kind,
-                {
-                    **common,
-                    "backend": result.backend.value,
-                    "model": result.model,
-                    "effort": result.effort,
-                    **_semantic_agent_payload(event),
-                    "artifacts": binding,
-                },
-                idempotency_key=(
-                    f"attempt.{candidate.attempt_id}.agent_event.{event.index}"
-                ),
-            )
-        if result.usage is not None:
-            self.controller.record_domain_event(
-                "usage_recorded",
-                {
-                    **common,
-                    "backend": result.backend.value,
-                    "model": result.model,
-                    "effort": result.effort,
-                    "evidence_class": "self_reported",
-                    **result.usage.to_dict(),
-                    "artifacts": binding,
-                },
-                idempotency_key=f"attempt.{candidate.attempt_id}.usage",
-            )
-        if result.cost is not None:
-            self.controller.record_domain_event(
-                "cost_recorded",
-                {
-                    **common,
-                    "backend": result.backend.value,
-                    "model": result.model,
-                    "effort": result.effort,
-                    "evidence_class": "self_reported",
-                    **result.cost.to_dict(),
-                    "artifacts": binding,
-                },
-                idempotency_key=f"attempt.{candidate.attempt_id}.cost",
-            )
+        record_agent_observations(
+            self.controller,
+            result=result,
+            common_payload=common,
+            transcript=transcript,
+            idempotency_prefix=f"attempt.{candidate.attempt_id}",
+        )
         agent_type = (
             "agent_completed" if result.candidate_capture_allowed else "agent_failed"
         )
@@ -379,6 +417,9 @@ class E2ERunRecord:
 
     def record_delivery(self, attempt_id: str, result: CandidateDeployment) -> ArtifactReceipt:
         receipt = self.put_json(result.to_dict())
+        config_bindings = persist_deployment_configs(
+            self.artifacts, self.root, result
+        )
         self.controller.record_domain_event(
             "delivery_result",
             {
@@ -388,33 +429,71 @@ class E2ERunRecord:
                 "validation_level": result.validation_level.value,
                 "reason_code": result.reason_code,
                 "infrastructure_failure": result.infrastructure_failure,
-                "artifacts": [_artifact_binding("primary_delivery", receipt)],
+                "config_sha256": (
+                    result.config_sha256.to_dict()
+                    if result.config_sha256 is not None
+                    else None
+                ),
+                "artifacts": [
+                    _artifact_binding("primary_delivery", receipt),
+                    *config_bindings,
+                ],
             },
             idempotency_key=f"attempt.{attempt_id}.delivery",
         )
         return receipt
 
-    def record_decision(
+    def prepare_outcome(
         self,
         attempt_id: str,
         *,
-        candidate_id: str,
+        candidate_id: str | None,
         verdict: str,
         reason: str,
         evidence: Mapping[str, Any],
-    ) -> ArtifactReceipt:
-        receipt = self.put_json(dict(evidence))
-        self.controller.record_domain_event(
-            "decision",
-            {
-                **self._attempt_payload(attempt_id, candidate_id=candidate_id),
-                "verdict": verdict,
-                "reason": reason,
-                "artifacts": [_artifact_binding("decision_evidence", receipt)],
-            },
-            idempotency_key=f"attempt.{attempt_id}.decision.evidence",
+        grade: E2ERewardGrade,
+        evidence_artifacts: tuple[tuple[str, ArtifactReceipt], ...],
+    ) -> tuple[ArtifactReceipt, tuple[Mapping[str, Any], ...], Mapping[str, Any]]:
+        if grade.verdict != verdict or grade.reason_code != reason:
+            raise ContractError(
+                "E2E decision and reward grade differ",
+                "e2e_reward_verdict_mismatch",
+            )
+        if grade.candidate_present != (candidate_id is not None):
+            raise ContractError(
+                "E2E reward candidate presence differs",
+                "e2e_reward_candidate_mismatch",
+            )
+        policy = E2ERewardPolicy()
+        if grade.policy_id != policy.policy_id or grade.policy_digest != policy.digest:
+            raise ContractError(
+                "E2E reward policy is not the active policy",
+                "e2e_reward_policy_mismatch",
+            )
+        decision = self.put_json(dict(evidence))
+        grade_receipt = self.put_json(grade.to_dict())
+        policy_receipt = self.put_json(policy.to_dict())
+        bindings = (
+            _artifact_binding("decision_evidence", decision),
+            _artifact_binding("e2e_grade", grade_receipt),
+            _artifact_binding("reward_policy", policy_receipt),
+            *(
+                _artifact_binding(role, receipt)
+                for role, receipt in evidence_artifacts
+            ),
         )
-        return receipt
+        reward_payload = {
+            **self._attempt_payload(attempt_id, candidate_id=candidate_id),
+            "verdict": verdict,
+            "reason_code": reason,
+            "policy_id": grade.policy_id,
+            "policy_digest": grade.policy_digest,
+            "scalar_reward": grade.scalar_reward,
+            "reward_vector": grade.to_dict(),
+            "evidence_class": "derived",
+            "artifacts": [dict(item) for item in bindings],
+        }
+        return decision, (bindings[0],), reward_payload
 
     def record_final_delivery(self, result: FinalDeliveryResult) -> ArtifactReceipt:
         receipt = self.put_json(result.to_dict())
@@ -436,81 +515,15 @@ class E2ERunRecord:
     def _attempt_payload(
         self, attempt_id: str, *, candidate_id: str | None = None
     ) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "attempt_id": attempt_id,
-            "candidate_id": candidate_id or attempt_id,
             "anchor_generation": self.controller.state.anchor_generation,
             "split": self.dataset_split,
             "visibility": self.data_visibility,
         }
-
-
-def _benchmark_dict(result: NormalizedBenchmarkResult) -> dict[str, Any]:
-    return {
-        "schema_version": result.schema_version,
-        "run_id": result.run_id,
-        "pass_type": result.pass_type.value,
-        "succeeded": result.succeeded,
-        "framework": result.framework,
-        "model": result.model,
-        "workspace_path": str(result.workspace_path),
-        "report_path": str(result.report_path) if result.report_path else None,
-        "throughput": asdict(result.throughput),
-        "latency": asdict(result.latency),
-        "quality": {
-            **asdict(result.quality),
-            "source_paths": [str(path) for path in result.quality.source_paths],
-            "raw_artifact_paths": [
-                str(path) for path in result.quality.raw_artifact_paths
-            ],
-        },
-        "profiling_enabled": result.profiling_enabled,
-        "run_kind": result.run_kind,
-        "reward_eligible": result.reward_eligible,
-        "model_revision": {
-            **asdict(result.model_revision),
-            "source_path": (
-                str(result.model_revision.source_path)
-                if result.model_revision.source_path
-                else None
-            ),
-        },
-        "inferencex_runtime": {
-            **asdict(result.inferencex_runtime),
-            "source_root": (
-                str(result.inferencex_runtime.source_root)
-                if result.inferencex_runtime.source_root
-                else None
-            ),
-            "runtime_path": (
-                str(result.inferencex_runtime.runtime_path)
-                if result.inferencex_runtime.runtime_path
-                else None
-            ),
-            "receipt_path": (
-                str(result.inferencex_runtime.receipt_path)
-                if result.inferencex_runtime.receipt_path
-                else None
-            ),
-        },
-        "lm_eval_runtime": {
-            **asdict(result.lm_eval_runtime),
-            "manifest_path": (
-                str(result.lm_eval_runtime.manifest_path)
-                if result.lm_eval_runtime.manifest_path
-                else None
-            ),
-            "receipt_path": (
-                str(result.lm_eval_runtime.receipt_path)
-                if result.lm_eval_runtime.receipt_path
-                else None
-            ),
-        },
-        "artifacts": [str(path) for path in result.artifacts],
-        "errors": list(result.errors),
-        "command_exit_code": result.command_exit_code,
-        "timed_out": result.timed_out,
-    }
+        if candidate_id is not None:
+            payload["candidate_id"] = candidate_id
+        return payload
 
 
 def _media_type(path: Path) -> str:
@@ -520,37 +533,12 @@ def _media_type(path: Path) -> str:
         ".yaml": "application/yaml",
         ".yml": "application/yaml",
         ".gz": "application/gzip",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }.get(path.suffix.lower(), "application/octet-stream")
 
 
 def _artifact_binding(role: str, receipt: ArtifactReceipt) -> dict[str, object]:
     return {"role": role, "receipt": receipt.to_dict()}
-
-
-def _semantic_agent_payload(event: AgentSemanticEvent) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "semantic_index": event.index,
-        "source_event_index": event.source_event_index,
-        "source_kind": event.source_kind,
-        "evidence_class": "self_reported",
-    }
-    if event.kind == "agent_message":
-        payload.update(
-            {
-                "role": event.role or "assistant",
-                "has_text": event.text is not None,
-                "text_length": len(event.text) if event.text is not None else 0,
-            }
-        )
-    else:
-        payload.update(
-            {
-                "tool_name": event.tool_name,
-                "call_id": event.tool_call_id,
-                "succeeded": event.succeeded,
-            }
-        )
-    return payload
 
 
 def _agent_execution_payload(result: AgentResult) -> dict[str, object]:

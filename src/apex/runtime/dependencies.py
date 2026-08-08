@@ -358,11 +358,12 @@ class PythonEnvironment:
             "pip",
             "install",
             "--disable-pip-version-check",
+            "--no-build-isolation",
             "--editable",
             str(root) + dependency.pip_spec_suffix,
         ]
         if self.offline:
-            argv[5:5] = ["--no-index", "--no-deps", "--no-build-isolation"]
+            argv[5:5] = ["--no-index", "--no-deps"]
         run_command(argv, env=self._env())
 
 

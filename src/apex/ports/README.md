@@ -2,7 +2,8 @@
 
 `apex.ports` contains dependency-inversion protocols and immutable request/result
 objects for agent execution, Magpie benchmarking, TraceLens diagnostics, knowledge
-retrieval, and sanitizer evidence. A port imports only `apex.core` and the Python
+retrieval, standalone kernel measurement, and sanitizer evidence. A port imports
+only `apex.core` and the Python
 standard library; it never imports a concrete adapter.
 
 The safety boundary has two protocols. `SafetyToolRunner` receives only an
@@ -13,6 +14,13 @@ trusted policy, or accepted receipt through these ports.
 
 Public API is the `__all__` list in `apex.ports`. Port values are safe to record
 as canonical events after conversion to JSON-compatible dictionaries.
+
+Terminal diagnostics use separate `TraceComparisonRequest` and
+`TraceComparisonResult` values. Each request binds baseline/final raw traces,
+benchmark reports, and analysis reports to their CAS receipts and producer-relative
+logical paths. `PARTIAL` means the documented report comparison ran while full
+attribution remained unavailable; `UNAVAILABLE` never implies either ran. Output
+artifacts are explicit and these results can never be reward eligible.
 
 Agent execution returns raw structured `AgentTranscriptEvent` objects alongside
 provider-neutral `AgentSemanticEvent`, `AgentUsage`, and `AgentCost` values.
@@ -36,6 +44,17 @@ tokens or money from assistant prose, stderr, or heuristic text matching.
 Knowledge queries include an independent evidence-derived hypothesis, dtype and
 software-version scope, and a token budget. Advisory retrieval is never an
 unscoped prelude that can replace live measurement.
+
+`KernelMeasurementPort` is the only standalone boundary that may return raw
+samples with grading authority. The controller gives it frozen source, harness,
+method, and policy digests, a fixed runner argv/cwd/environment/timeout, plus a
+fresh report path outside the candidate workspace. The adapter must keep that
+output channel out of candidate code; its
+result is still rehashed and wrapped in an evaluator-authored execution receipt.
+Its immutable `measurement_method_sha256` must equal the frozen task method
+before execution. The evaluator parent, not a candidate subprocess, writes the
+report. An ordinary verifier command or candidate-created JSON never implements
+this port.
 
 Tests: `pytest tests/contract tests/architecture -q`.
 

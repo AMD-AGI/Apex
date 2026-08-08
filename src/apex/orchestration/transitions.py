@@ -35,6 +35,7 @@ DOMAIN_EVENT_TYPES = frozenset(
         "tool_called",
         "tool_result",
         "usage_recorded",
+        "experience.deferred",
         "experience.measured",
     }
 )

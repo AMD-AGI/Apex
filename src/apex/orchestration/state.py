@@ -38,6 +38,7 @@ class SearchStage(str, Enum):
     SAFETY_VERIFYING = "safety_verifying"
     DELIVERY_VERIFYING = "delivery_verifying"
     E2E_VERIFYING = "e2e_verifying"
+    DECIDING = "deciding"
     REPROFILING = "reprofiling"
     UPDATING = "updating"
     FINALIZING = "finalizing"
@@ -79,20 +80,33 @@ class SearchBudget:
 
 @dataclass(frozen=True, slots=True)
 class SearchDecision:
+    attempt_id: str
     opportunity_id: str
-    candidate_id: str
+    candidate_id: str | None
     verdict: str
     reason: str
     evidence_ref: str
     anchor_generation: int
+    candidate_artifact_ref: str
+    context_packet_id: str
 
     def __post_init__(self) -> None:
+        validate_identifier(self.attempt_id, field_name="attempt_id")
         validate_identifier(self.opportunity_id, field_name="opportunity_id")
-        validate_identifier(self.candidate_id, field_name="candidate_id")
+        if self.candidate_id is not None:
+            validate_identifier(self.candidate_id, field_name="candidate_id")
         if self.verdict not in {"keep", "revert", "reject", "needs_more_measurement"}:
             raise ContractError("Unknown search verdict", "invalid_search_verdict")
-        if not self.reason or not self.evidence_ref or self.anchor_generation < 0:
+        if (
+            not self.reason
+            or not self.evidence_ref
+            or not self.candidate_artifact_ref
+            or not self.context_packet_id
+            or self.anchor_generation < 0
+        ):
             raise ContractError("Search decision is incomplete", "invalid_search_decision")
+        if self.candidate_id is None and self.verdict != "reject":
+            raise ContractError("Source-free decision must reject", "invalid_search_decision")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -101,12 +115,15 @@ class SearchDecision:
     def from_dict(cls, value: Mapping[str, Any]) -> "SearchDecision":
         try:
             return cls(
+                attempt_id=str(value["attempt_id"]),
                 opportunity_id=str(value["opportunity_id"]),
-                candidate_id=str(value["candidate_id"]),
+                candidate_id=_optional_string(value.get("candidate_id")),
                 verdict=str(value["verdict"]),
                 reason=str(value["reason"]),
                 evidence_ref=str(value["evidence_ref"]),
                 anchor_generation=int(value["anchor_generation"]),
+                candidate_artifact_ref=str(value["candidate_artifact_ref"]),
+                context_packet_id=str(value["context_packet_id"]),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ContractError("Malformed search decision", "invalid_search_decision") from error
@@ -131,6 +148,7 @@ class E2ESearchState:
     opportunity_queue: tuple[str, ...] = ()
     opportunity_attempts: tuple[tuple[str, int], ...] = ()
     bottleneck_generation: int = 0
+    active_attempt_id: str | None = None
     active_opportunity_id: str | None = None
     active_candidate_id: str | None = None
     context_packet_id: str | None = None
@@ -161,6 +179,26 @@ class E2ESearchState:
             raise ContractError("Opportunity attempt accounting is invalid", "invalid_e2e_state")
         for opportunity_id in attempts:
             validate_identifier(opportunity_id, field_name="opportunity_id")
+        for opportunity_id in self.opportunity_queue:
+            validate_identifier(opportunity_id, field_name="opportunity_id")
+        active_lineage = (
+            self.active_attempt_id,
+            self.active_opportunity_id,
+            self.context_packet_id,
+        )
+        if any(item is None for item in active_lineage) != all(
+            item is None for item in active_lineage
+        ):
+            raise ContractError("Active attempt lineage is partial", "invalid_e2e_state")
+        if self.active_attempt_id is not None:
+            validate_identifier(self.active_attempt_id, field_name="attempt_id")
+            assert self.active_opportunity_id is not None
+            validate_identifier(self.active_opportunity_id, field_name="opportunity_id")
+        if self.active_candidate_id is not None:
+            validate_identifier(self.active_candidate_id, field_name="candidate_id")
+        decision_attempts = tuple(item.attempt_id for item in self.decisions)
+        if len(set(decision_attempts)) != len(decision_attempts):
+            raise ContractError("Attempt decisions must be unique", "invalid_e2e_state")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -179,6 +217,7 @@ class E2ESearchState:
             "opportunity_queue": list(self.opportunity_queue),
             "opportunity_attempts": dict(self.opportunity_attempts),
             "bottleneck_generation": self.bottleneck_generation,
+            "active_attempt_id": self.active_attempt_id,
             "active_opportunity_id": self.active_opportunity_id,
             "active_candidate_id": self.active_candidate_id,
             "context_packet_id": self.context_packet_id,
@@ -216,6 +255,7 @@ class E2ESearchState:
                     )
                 ),
                 bottleneck_generation=int(value.get("bottleneck_generation", 0)),
+                active_attempt_id=_optional_string(value.get("active_attempt_id")),
                 active_opportunity_id=_optional_string(value.get("active_opportunity_id")),
                 active_candidate_id=_optional_string(value.get("active_candidate_id")),
                 context_packet_id=_optional_string(value.get("context_packet_id")),
@@ -289,7 +329,7 @@ class WorkloadState:
     @classmethod
     def initial(cls, run_id: str) -> "WorkloadState":
         validate_identifier(run_id, field_name="run_id")
-        return cls(1, run_id, RunPhase.NEW, 0, None, "anchor-0", 0, (), None, ())
+        return cls(2, run_id, RunPhase.NEW, 0, None, "anchor-0", 0, (), None, ())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -327,7 +367,7 @@ class WorkloadState:
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ContractError("Malformed workload state", "invalid_workload_state") from error
-        if state.schema_version != 1 or state.sequence < 0 or state.anchor_generation < 0:
+        if state.schema_version != 2 or state.sequence < 0 or state.anchor_generation < 0:
             raise ContractError("Unsupported workload state", "invalid_workload_state")
         validate_identifier(state.run_id, field_name="run_id")
         return state

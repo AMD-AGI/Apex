@@ -92,6 +92,10 @@ def _opportunity_selected(
 ) -> WorkloadState:
     search = _require_stage(state, SearchStage.PLANNING)
     _require_current_generation(state, search, payload)
+    attempt = _required_string(payload, "attempt_id")
+    validate_identifier(attempt, field_name="attempt_id")
+    if attempt in {item.attempt_id for item in search.decisions}:
+        _reject("Attempt ID was already used", "attempt_id_reused")
     opportunity = _required_string(payload, "opportunity_id")
     context = _required_string(payload, "context_packet_id")
     if opportunity not in search.opportunity_queue:
@@ -108,6 +112,7 @@ def _opportunity_selected(
             stage=SearchStage.EXECUTING,
             budget=budget,
             opportunity_attempts=tuple(sorted(attempts.items())),
+            active_attempt_id=attempt,
             active_opportunity_id=opportunity,
             context_packet_id=context,
             active_candidate_id=None,
@@ -122,19 +127,18 @@ def _execution_rejected(
     state: WorkloadState, payload: Mapping[str, Any], _event_type: str
 ) -> WorkloadState:
     search = _require_stage(state, SearchStage.EXECUTING)
-    candidate = _required_string(payload, "candidate_id")
+    _require_active_attempt(search, payload)
+    candidate = _optional_candidate(payload)
     receipt = _required_string(payload, "receipt")
     reason = _required_string(payload, "reason")
-    decision = _decision(state, search, candidate, "reject", reason, receipt)
     return replace(
         state,
         e2e=_advance(
             search,
-            stage=SearchStage.UPDATING,
+            stage=SearchStage.DECIDING,
             active_candidate_id=candidate,
             candidate_artifact_ref=receipt,
             verification_receipts=(receipt,),
-            decisions=(*search.decisions, decision),
             exit_reason=reason,
         ),
     )
@@ -144,12 +148,15 @@ def _candidate_frozen(
     state: WorkloadState, payload: Mapping[str, Any], _event_type: str
 ) -> WorkloadState:
     search = _require_stage(state, SearchStage.EXECUTING)
+    _require_active_attempt(search, payload)
+    candidate = _required_string(payload, "candidate_id")
+    validate_identifier(candidate, field_name="candidate_id")
     return replace(
         state,
         e2e=_advance(
             search,
             stage=SearchStage.MICRO_VERIFYING,
-            active_candidate_id=_required_string(payload, "candidate_id"),
+            active_candidate_id=candidate,
             candidate_artifact_ref=_required_string(payload, "artifact_ref"),
         ),
     )
@@ -159,6 +166,7 @@ def _micro_verified(
     state: WorkloadState, payload: Mapping[str, Any], _event_type: str
 ) -> WorkloadState:
     search = _require_stage(state, SearchStage.MICRO_VERIFYING)
+    _require_active_attempt(search, payload)
     candidate = _require_active_candidate(search, payload)
     receipt = _required_string(payload, "receipt")
     qualified = payload.get("qualified")
@@ -172,12 +180,10 @@ def _micro_verified(
         )
     else:
         reason = _required_string(payload, "reason")
-        decision = _decision(state, search, candidate, "reject", reason, receipt)
         successor = _advance(
             search,
-            stage=SearchStage.UPDATING,
+            stage=SearchStage.DECIDING,
             verification_receipts=(*search.verification_receipts, receipt),
-            decisions=(*search.decisions, decision),
             exit_reason=reason,
         )
     return replace(state, e2e=successor)
@@ -187,6 +193,7 @@ def _safety_verified(
     state: WorkloadState, payload: Mapping[str, Any], _event_type: str
 ) -> WorkloadState:
     search = _require_stage(state, SearchStage.SAFETY_VERIFYING)
+    _require_active_attempt(search, payload)
     candidate = _require_active_candidate(search, payload)
     receipt = _required_string(payload, "receipt")
     finding = payload.get("finding")
@@ -196,12 +203,10 @@ def _safety_verified(
         _reject("Safety decision fields must be boolean", "event_field_invalid")
     if finding or not allowed or not promotion:
         reason = _required_string(payload, "reason")
-        decision = _decision(state, search, candidate, "reject", reason, receipt)
         successor = _advance(
             search,
-            stage=SearchStage.UPDATING,
+            stage=SearchStage.DECIDING,
             verification_receipts=(*search.verification_receipts, receipt),
-            decisions=(*search.decisions, decision),
             exit_reason=reason,
         )
     else:
@@ -217,6 +222,7 @@ def _delivery_verified(
     state: WorkloadState, payload: Mapping[str, Any], _event_type: str
 ) -> WorkloadState:
     search = _require_stage(state, SearchStage.DELIVERY_VERIFYING)
+    _require_active_attempt(search, payload)
     candidate = _require_active_candidate(search, payload)
     receipt = _required_string(payload, "receipt")
     verified = payload.get("verified", True)
@@ -232,14 +238,12 @@ def _delivery_verified(
             ),
         )
     reason = _required_string(payload, "reason")
-    decision = _decision(state, search, candidate, "reject", reason, receipt)
     return replace(
         state,
         e2e=_advance(
             search,
-            stage=SearchStage.UPDATING,
+            stage=SearchStage.DECIDING,
             verification_receipts=(*search.verification_receipts, receipt),
-            decisions=(*search.decisions, decision),
             exit_reason=reason,
         ),
     )
@@ -248,14 +252,23 @@ def _delivery_verified(
 def _candidate_decided(
     state: WorkloadState, payload: Mapping[str, Any], _event_type: str
 ) -> WorkloadState:
-    search = _require_stage(state, SearchStage.E2E_VERIFYING)
+    search = _require_stages(
+        state, {SearchStage.DECIDING, SearchStage.E2E_VERIFYING}
+    )
+    _require_active_attempt(search, payload)
     _require_current_generation(state, search, payload)
-    candidate = _require_active_candidate(search, payload)
+    candidate = _optional_candidate(payload)
+    if candidate != search.active_candidate_id:
+        _reject("Event targets another E2E candidate", "candidate_id_mismatch")
     receipt = _required_string(payload, "receipt")
     verdict = _required_string(payload, "verdict")
     reason = _required_string(payload, "reason")
-    if verdict not in {"keep", "revert", "needs_more_measurement"}:
+    if verdict not in {"keep", "revert", "reject", "needs_more_measurement"}:
         _reject("Invalid E2E candidate verdict", "invalid_search_verdict")
+    if search.stage is SearchStage.DECIDING and verdict != "reject":
+        _reject("Failed pre-measurement gates require REJECT", "invalid_search_verdict")
+    if candidate is None and verdict != "reject":
+        _reject("A source-free attempt can only be rejected", "invalid_search_verdict")
     decision = _decision(state, search, candidate, verdict, reason, receipt)
     successor = _advance(
         search,
@@ -293,6 +306,7 @@ def _reprofiled(
             opportunity_queue=opportunities,
             opportunity_attempts=(),
             bottleneck_generation=search.bottleneck_generation + 1,
+            active_attempt_id=None,
             active_opportunity_id=None,
             active_candidate_id=None,
             context_packet_id=None,
@@ -329,6 +343,7 @@ def _updated(
             cycle=next_cycle,
             budget=budget,
             opportunity_queue=queue,
+            active_attempt_id=None,
             active_opportunity_id=None,
             active_candidate_id=None,
             context_packet_id=None,
@@ -388,7 +403,7 @@ def _opportunity_ids(
 def _decision(
     state: WorkloadState,
     search: E2ESearchState,
-    candidate: str,
+    candidate: str | None,
     verdict: str,
     reason: str,
     receipt: str,
@@ -396,13 +411,21 @@ def _decision(
     opportunity = search.active_opportunity_id
     if opportunity is None:
         _reject("No E2E opportunity is active", "opportunity_not_active")
+    attempt = search.active_attempt_id
+    context = search.context_packet_id
+    candidate_artifact = search.candidate_artifact_ref
+    if attempt is None or context is None or candidate_artifact is None:
+        _reject("E2E attempt lineage is incomplete", "attempt_lineage_missing")
     return SearchDecision(
+        attempt,
         opportunity,
         candidate,
         verdict,
         reason,
         receipt,
         state.anchor_generation,
+        candidate_artifact,
+        context,
     )
 
 
@@ -424,6 +447,20 @@ def _require_stage(state: WorkloadState, stage: SearchStage) -> E2ESearchState:
     if search is None:
         _reject("E2E workload is not initialized", "e2e_not_initialized")
     if search.stage is not stage:
+        _reject("E2E search stage transition is illegal", "illegal_e2e_transition")
+    return search
+
+
+def _require_stages(
+    state: WorkloadState, stages: set[SearchStage]
+) -> E2ESearchState:
+    _require_running(state)
+    if state.pending_action is not None:
+        _reject("A side-effecting action is still pending", "pending_action_at_transition")
+    search = state.e2e
+    if search is None:
+        _reject("E2E workload is not initialized", "e2e_not_initialized")
+    if search.stage not in stages:
         _reject("E2E search stage transition is illegal", "illegal_e2e_transition")
     return search
 
@@ -452,6 +489,25 @@ def _require_active_candidate(
     if candidate != search.active_candidate_id:
         _reject("Event targets another E2E candidate", "candidate_id_mismatch")
     return candidate
+
+
+def _require_active_attempt(
+    search: E2ESearchState, payload: Mapping[str, Any]
+) -> str:
+    attempt = _required_string(payload, "attempt_id")
+    if attempt != search.active_attempt_id:
+        _reject("Event targets another E2E attempt", "attempt_id_mismatch")
+    return attempt
+
+
+def _optional_candidate(payload: Mapping[str, Any]) -> str | None:
+    value = payload.get("candidate_id")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        _reject("candidate_id must be a non-empty string", "event_field_invalid")
+    validate_identifier(value, field_name="candidate_id")
+    return value
 
 
 def _metric_pairs(value: object) -> tuple[tuple[str, float], ...]:

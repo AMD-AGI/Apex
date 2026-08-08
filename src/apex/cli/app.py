@@ -14,7 +14,6 @@ from apex.core import AgentBackendName, ApexError, TaskStatus
 from apex.delivery import (
     apply_verified_kernel_bundle,
     detect_bundle_kind,
-    load_and_verify_e2e_bundle,
     load_and_verify_kernel_bundle,
 )
 from apex.intake import (
@@ -83,8 +82,9 @@ def _parser() -> argparse.ArgumentParser:
 
     bundle = commands.add_parser("bundle", help="Inspect or verify source bundles")
     bundle_commands = bundle.add_subparsers(dest="bundle_command", required=True)
-    verify = bundle_commands.add_parser("verify", help="Verify a content-digested kernel bundle")
+    verify = bundle_commands.add_parser("verify", help="Independently verify a source bundle")
     verify.add_argument("--bundle", type=Path, required=True)
+    verify.add_argument("--results", type=Path, help="New absolute E2E evidence directory")
     verify.add_argument("--digest")
     verify.add_argument("--json", action="store_true")
     apply_bundle = bundle_commands.add_parser(
@@ -222,34 +222,80 @@ def _bundle_verify(args: argparse.Namespace) -> int:
     path = args.bundle.expanduser()
     kind = detect_bundle_kind(path)
     if kind == "kernel":
-        bundle = load_and_verify_kernel_bundle(path, expected_digest=args.digest)
-        result = {
-            "schema_version": 1,
-            "status": "verified",
-            "bundle_kind": kind,
-            "task_id": bundle.task_id,
-            "bundle_path": str(bundle.path),
-            "bundle_digest": bundle.digest,
-            "changed_files": list(bundle.changed_files),
-        }
-    else:
-        e2e_bundle = load_and_verify_e2e_bundle(path, expected_digest=args.digest)
-        result = {
-            "schema_version": 1,
-            "status": "verified",
-            "bundle_kind": kind,
-            "bundle_id": e2e_bundle.bundle_id,
-            "bundle_path": str(e2e_bundle.path),
-            "bundle_digest": e2e_bundle.digest,
-            "terminal_verified": e2e_bundle.verified,
-            "repositories": [item.repository_id for item in e2e_bundle.repositories],
-            "derived_image": e2e_bundle.derived_image.reference,
-        }
-    if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
-    else:
-        print(f"verified {result['bundle_digest']} ({kind} bundle)")
+        return _verify_kernel_bundle(path, args)
+    return _verify_e2e_bundle(path, args)
+
+
+def _verify_kernel_bundle(path: Path, args: argparse.Namespace) -> int:
+    if args.results is not None:
+        raise ApexError(
+            "--results is used only for E2E bundle verification",
+            "kernel_bundle_results_unsupported",
+        )
+    bundle = load_and_verify_kernel_bundle(path, expected_digest=args.digest)
+    result = {
+        "schema_version": 1,
+        "status": "verified",
+        "bundle_kind": "kernel",
+        "task_id": bundle.task_id,
+        "bundle_path": str(bundle.path),
+        "bundle_digest": bundle.digest,
+        "changed_files": list(bundle.changed_files),
+    }
+    _print_bundle_result(result, json_output=args.json)
     return 0
+
+
+def _verify_e2e_bundle(path: Path, args: argparse.Namespace) -> int:
+    results_dir = _e2e_verification_results(args.results)
+    application = build_application(include_e2e_verifier=True)
+    verifier = application.e2e_bundle_verifier
+    if verifier is None:
+        raise ApexError(
+            "E2E bundle verification composition is unavailable",
+            "e2e_bundle_verifier_not_composed",
+        )
+    outcome = verifier.verify(
+        bundle_dir=path.resolve(strict=True),
+        results_dir=results_dir,
+        expected_digest=args.digest,
+    )
+    verified = outcome.verified_bundle
+    result = {
+        **outcome.result.to_dict(),
+        "bundle_kind": "e2e",
+        "input_bundle_path": str(path.resolve(strict=True)),
+        "verification_result_path": str(outcome.result_path),
+        "verified_bundle_path": str(verified.path) if verified else None,
+        "verified_bundle_digest": verified.digest if verified else None,
+    }
+    _print_bundle_result(result, json_output=args.json)
+    return _status_exit_code(outcome.result.status)
+
+
+def _e2e_verification_results(value: Path | None) -> Path:
+    if value is None:
+        raise ApexError(
+            "E2E bundle verification requires --results",
+            "e2e_verification_results_required",
+        )
+    expanded = value.expanduser()
+    if not expanded.is_absolute():
+        raise ApexError(
+            "E2E bundle verification --results must be absolute",
+            "invalid_bundle_path",
+        )
+    return expanded.resolve()
+
+
+def _print_bundle_result(result: dict[str, object], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    status = "verified" if result.get("verified") is True else result["status"]
+    reason = result.get("reason_code")
+    detail = f"; {reason}" if reason and status != "verified" else ""
+    print(f"{status} {result['bundle_digest']} ({result['bundle_kind']} bundle{detail})")
 
 
 def _bundle_apply(args: argparse.Namespace) -> int:

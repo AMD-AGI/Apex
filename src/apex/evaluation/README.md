@@ -38,6 +38,17 @@ live anchor. Accuracy cannot regress; by default TTFT p99 may regress by at most
 5%, TPOT p99 by at most 2%, and throughput must improve by at least 0.5% before
 a kernel patch is kept. A diagnostic pass is rejected if presented for scoring.
 
+`e2e_reward.py` owns the separate `e2e_kernel_candidate_v1` attempt reward. A
+KEEP starts at `100` and adds only positive throughput shaping; an ordinary
+measured REVERT starts at `-10` and keeps signed throughput shaping; an
+accuracy/TTFT/TPOT hard-gate REVERT starts at `-100` and can only become more
+negative. Throughput shaping is `10 * clip(gain_pct, -10, 10)`. A rejected
+candidate receives `-100`, while the explicit source-free outcome
+`agent_made_no_source_change` receives `-20`; inconclusive measurement receives
+`0`. The final scalar is clipped to `[-200, 200]`. These values grade one E2E
+candidate outcome and must not be confused with canonical kernel raw-sample
+reward.
+
 Tests: `pytest tests/unit/evaluation tests/gpu -q`.
 
 ## Purpose
@@ -57,6 +68,13 @@ raw p50/p99 evidence with at least 300 invocation samples per implementation and
 case. The evaluator accepts only `apex.kernel-measurement/v1` with policy
 `kernel_invocation_nearest_rank_v1`; it parses positive finite raw samples and
 recomputes every quantile, speedup, aggregate, and reward.
+
+The raw report alone has no authority. `KernelMeasurementExecutionReceipt`
+must bind the trusted adapter writer, the `measurement` phase, monotonic
+start/return/observation/completion order, frozen candidate source, protected
+harness, method and policy digests, and the exact report digest and size. Missing
+or mismatched execution evidence cannot set `tampering_passed` and cannot emit a
+reward.
 
 `performance_command_result` means only that the normal-runtime command exited.
 The evaluator alone emits `measurement_result` after validating the raw report,
@@ -82,4 +100,7 @@ and safety policy; marked GPU tests validate real measurement adapters.
 ## Provenance
 
 Grades name their policy IDs and retain raw-report artifact digests so reward can
-be replayed independently of the agent transcript.
+be replayed independently of the agent transcript. E2E reward commits retain the
+policy and grade artifacts, current-anchor and candidate measurement identities,
+decision evidence, and explicit attempt/candidate lineage; `replay_e2e_reward`
+recomputes the scalar without trusting the stored scalar field.

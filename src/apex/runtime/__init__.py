@@ -50,6 +50,12 @@ _EXPORT_MODULES = {
     "LocalGpuLease": "gpu",
     "LocalGpuLeaseManager": "gpu",
     "resolve_gpu_device_scope": "gpu",
+    "GpuDeviceIdentity": "gpu_ownership",
+    "GpuOwnershipInspector": "gpu_ownership",
+    "GpuOwnershipReceipt": "gpu_ownership",
+    "GpuProcessIdentity": "gpu_ownership",
+    "RocmSmiGpuOwnershipInspector": "gpu_ownership",
+    "collect_gpu_ownership": "gpu_ownership",
 }
 
 

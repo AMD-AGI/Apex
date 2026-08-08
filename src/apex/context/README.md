@@ -17,6 +17,9 @@ history is not a correctness or recovery dependency.
    data and cannot delete the independent candidate family.
 4. Project provenance-exact positive and negative attempts from
    `ExperienceView`, including dead-end evidence and explicit retry conditions.
+   For E2E campaigns, also project a newest-first `CampaignAttemptView` summary
+   across kernel opportunities, with attempt/opportunity/context/anchor IDs and
+   CAS receipts. This prevents target changes from erasing prior outcomes.
 5. Add history only while the rendered packet remains inside the input-token
    budget. Mandatory fields and selected cards are never silently summarized;
    an undersized mandatory/card budget fails explicitly.
@@ -56,6 +59,10 @@ The renderer never loads global files or backend-specific prompts.
 
 The packet itself is the policy observation captured for RL export. A report or
 end-of-run summary must not replace it after the fact.
+
+`ContextPacket` schema v2 does not retain an unbounded transcript. The canonical
+event log and typed workload state are the complete long-running memory; each
+packet is a rebuildable, token-bounded observation of that memory.
 
 ## Tests
 

@@ -12,6 +12,7 @@ import apex.bootstrap as application_bootstrap
 import apex.optimization.e2e.candidate_snapshot as candidate_snapshot
 from apex.core import AgentBackendName, ContractError, IntegrityError, TaskStatus, ValidationLevel
 from apex.core import sha256_bytes, sha256_file, sha256_json
+from apex.delivery import E2EBundleVerifier
 from apex.optimization.e2e.candidate import (
     AgentCandidateWorker,
     E2ECandidate,
@@ -19,6 +20,7 @@ from apex.optimization.e2e.candidate import (
 )
 from apex.optimization.e2e.deferred import E2EDeferredMicroQualifier
 from apex.optimization.e2e.oracle_preflight import DockerOracleMicroQualifier
+from apex.optimization.e2e.qwen_qualification import QwenCompositeMicroQualifier
 from apex.optimization.e2e.docker_overlay import (
     DockerOverlayDeployment,
     OverlayOnlyFinalDelivery,
@@ -35,6 +37,7 @@ from apex.optimization.e2e.overlay_runtime import (
 )
 from apex.execution import ProcessResult
 from apex.optimization.e2e.services import (
+    AcceptedCandidate,
     CandidateDeploymentRequest,
     FinalDeliveryRequest,
     MicroQualification,
@@ -56,6 +59,7 @@ from apex.runtime import (
 
 PARENT_ID = "sha256:" + "a" * 64
 DERIVED_ID = "sha256:" + "b" * 64
+SECOND_DERIVED_ID = "sha256:" + "e" * 64
 PARENT_REPO_DIGEST = "example@sha256:" + "c" * 64
 OTHER_PARENT_REPO_DIGEST = "aaa.example@sha256:" + "d" * 64
 PARENT_REPO_DIGESTS = tuple(sorted((OTHER_PARENT_REPO_DIGEST, PARENT_REPO_DIGEST)))
@@ -117,6 +121,35 @@ class FakeEngine:
         return LoadedFileReceipt(container_path, self.loaded_sha, 16, 0o444)
 
 
+class ChainedFakeEngine(FakeEngine):
+    """Second-layer engine whose only admissible parent is the first derived ID."""
+
+    def resolve_python_target(self, image_id, *, library, repo_relative_path, cwd):
+        self.calls.append("resolve")
+        module_relative = Path(repo_relative_path).relative_to(library).as_posix()
+        return InstalledPythonTarget(
+            library,
+            repo_relative_path,
+            module_relative,
+            f"/usr/lib/python/site-packages/{repo_relative_path}",
+            self.baseline_sha,
+            12,
+            0o644,
+        )
+
+    def build_overlay(self, *, parent, candidate_source, target, build_root, cwd):
+        self.calls.append("build")
+        self.built_candidate_source = candidate_source.resolve(strict=True)
+        assert parent.reference == DERIVED_ID
+        assert parent.image_id == DERIVED_ID
+        assert parent.verified_repo_digest is None
+        return BuiltOverlay(
+            ContainerImage(SECOND_DERIVED_ID, SECOND_DERIVED_ID),
+            "d" * 64,
+            self.candidate_sha,
+        )
+
+
 class FakeDockerSupervisor:
     def __init__(
         self,
@@ -125,11 +158,13 @@ class FakeDockerSupervisor:
         build_failures: int = 0,
         revalidated_parent_id: str = PARENT_ID,
         mutate_context_after_failure: bool = False,
+        built_image_id: str = DERIVED_ID,
     ) -> None:
         self.candidate_sha = candidate_sha
         self.build_failures = build_failures
         self.revalidated_parent_id = revalidated_parent_id
         self.mutate_context_after_failure = mutate_context_after_failure
+        self.built_image_id = built_image_id
         self.argv: list[tuple[str, ...]] = []
         self.build_calls = 0
 
@@ -141,12 +176,22 @@ class FakeDockerSupervisor:
         exit_code = 0
         if command[1:3] == ("image", "inspect"):
             reference = command[3]
-            if reference == DERIVED_ID:
-                payload = {"Id": DERIVED_ID, "RepoDigests": []}
+            if reference == self.built_image_id:
+                payload = {"Id": self.built_image_id, "RepoDigests": []}
             elif reference == PARENT_REPO_DIGEST:
                 payload = {
                     "Id": self.revalidated_parent_id,
                     "RepoDigests": list(PARENT_REPO_DIGESTS),
+                }
+            elif reference.startswith("sha256:"):
+                payload = {
+                    "Id": self.revalidated_parent_id,
+                    "RepoDigests": [],
+                }
+            elif reference.startswith("apex-overlay-parent:"):
+                payload = {
+                    "Id": self.revalidated_parent_id,
+                    "RepoDigests": [],
                 }
             else:
                 payload = {
@@ -154,9 +199,15 @@ class FakeDockerSupervisor:
                     "RepoDigests": list(PARENT_REPO_DIGESTS),
                 }
             stdout = json.dumps([payload])
+        elif command[1:3] == ("image", "tag"):
+            pass
         elif command[1] == "run":
             target = "/usr/lib/python/site-packages/vllm/kernels/op.py"
-            digest = self.candidate_sha if command[6] == DERIVED_ID else "a" * 64
+            digest = (
+                self.candidate_sha
+                if command[6] == self.built_image_id
+                else "a" * 64
+            )
             stdout = (
                 "__APEX_PROBE_V1__"
                 + '{"mode":420,"package_root":"/usr/lib/python/site-packages/vllm",'
@@ -174,7 +225,7 @@ class FakeDockerSupervisor:
                     dockerfile.write_text("FROM changed:latest\n", encoding="utf-8")
             else:
                 iidfile = Path(command[command.index("--iidfile") + 1])
-                iidfile.write_text(DERIVED_ID, encoding="utf-8")
+                iidfile.write_text(self.built_image_id, encoding="utf-8")
         return ProcessResult(
             command, exit_code, False, stdout, stderr, False, False, 0.01
         )
@@ -273,6 +324,23 @@ def _remap_candidate(candidate: E2ECandidate, relative: str) -> E2ECandidate:
         changed_files=(relative,),
         candidate_source_sha256=digest,
         frozen_sources=(remapped,),
+    )
+
+
+def _accepted_overlay(
+    candidate: E2ECandidate,
+    opportunity: KernelOpportunity,
+    safety: SafetyQualification,
+    deployment,
+) -> AcceptedCandidate:
+    return AcceptedCandidate(
+        candidate,
+        opportunity,
+        object(),  # type: ignore[arg-type]
+        safety,
+        deployment,
+        object(),  # type: ignore[arg-type]
+        "f" * 64,
     )
 
 
@@ -506,12 +574,17 @@ def test_production_composition_injects_reviewed_qwen_source_delivery(
     )
 
     application = application_bootstrap.build_application(
-        include_e2e=True, knowledge_enabled=False
+        include_e2e=True,
+        include_e2e_verifier=True,
+        knowledge_enabled=False,
     )
 
     assert application.e2e_optimizer is not None
+    assert isinstance(application.e2e_bundle_verifier, E2EBundleVerifier)
     assert isinstance(application.e2e_optimizer._candidate_worker, AgentCandidateWorker)
-    assert isinstance(application.e2e_optimizer._micro, DockerOracleMicroQualifier)
+    assert isinstance(application.e2e_optimizer._micro, QwenCompositeMicroQualifier)
+    assert isinstance(application.e2e_optimizer._micro._vllm, DockerOracleMicroQualifier)
+    assert isinstance(application.e2e_optimizer._micro._aiter, E2EDeferredMicroQualifier)
     assert isinstance(application.e2e_optimizer._deployments, DockerOverlayDeployment)
     assert isinstance(application.e2e_optimizer._final_delivery, SourceRebuildFinalDelivery)
     for binding in application.e2e_optimizer._final_delivery._bindings:
@@ -582,6 +655,102 @@ def test_overlay_success_attests_loaded_bytes_and_changes_only_image(tmp_path: P
         assert after["benchmark"]["docker_image"] == DERIVED_ID
         after["benchmark"]["docker_image"] = before["benchmark"]["docker_image"]
         assert after == before
+
+
+def test_overlay_builds_second_layer_from_evidence_bound_keep_chain(tmp_path: Path):
+    opportunity, candidate, request, first_engine = _fixture(tmp_path)
+    adapter = DockerOverlayDeployment(first_engine, FakeLockVerifier())
+    first = adapter.deploy(request)
+    accepted = _accepted_overlay(candidate, opportunity, request.safety, first)
+
+    relative = Path("vllm/kernels/op2.py")
+    baseline = request.opportunity.source_root / relative
+    baseline.write_text("SECOND = 1\n", encoding="utf-8")
+    workspace = tmp_path / "candidate-2"
+    candidate_path = workspace / relative
+    candidate_path.parent.mkdir(parents=True)
+    candidate_path.write_text("SECOND = 2\n", encoding="utf-8")
+    second_candidate = replace(
+        candidate,
+        attempt_id="attempt-2",
+        candidate_id="candidate-2",
+        workspace=workspace,
+        editable_files=(relative.as_posix(),),
+        changed_files=(relative.as_posix(),),
+        baseline_source_sha256=_source_set_sha256(relative.as_posix(), baseline),
+        candidate_source_sha256=_source_set_sha256(relative.as_posix(), candidate_path),
+        frozen_sources=(_frozen_source(relative.as_posix(), candidate_path),),
+    )
+    second_opportunity = replace(
+        opportunity,
+        opportunity_id="kernel-2",
+        runtime_name="runtime_symbol_2",
+        source_path=baseline,
+        test_file=baseline,
+    )
+    second_request = replace(
+        request,
+        candidate=second_candidate,
+        opportunity=second_opportunity,
+        benchmark_measurement=first.measurement_config,
+        benchmark_diagnostic=first.diagnostic_config,
+        benchmark_replay=first.replay_config,
+        artifact_root=tmp_path / "artifacts-2",
+        anchor_generation=1,
+        safety=replace(request.safety, candidate_id="candidate-2"),
+        accepted_stack=(accepted,),
+    )
+    second_engine = ChainedFakeEngine(
+        baseline_sha=sha256_file(baseline),
+        candidate_sha=sha256_file(candidate_path),
+    )
+
+    second = DockerOverlayDeployment(second_engine, FakeLockVerifier()).deploy(
+        second_request
+    )
+
+    assert second.qualified is True
+    assert second.deployed_image_id == SECOND_DERIVED_ID
+    assert second.evidence["parent_image"]["image_id"] == DERIVED_ID
+    assert second.evidence["parent_image"]["verified_repo_digest"] is None
+    receipt = second.evidence["overlay_build_receipt"]
+    assert receipt["anchor_generation"] == 1
+    assert receipt["parent_kind"] == "accepted_overlay"
+    assert receipt["parent_image_id"] == DERIVED_ID
+    assert receipt["parent_candidate_id"] == "candidate-1"
+    assert receipt["parent_decision_receipt"] == "f" * 64
+    assert receipt["parent_ancestry_image_ids"] == [PARENT_ID, DERIVED_ID]
+    assert receipt["parent_accepted_candidate_ids"] == ["candidate-1"]
+    assert second_engine.calls == ["inspect", "resolve", "build", "read"]
+
+
+def test_overlay_rejects_tampered_accepted_build_receipt_before_build(tmp_path: Path):
+    opportunity, candidate, request, first_engine = _fixture(tmp_path)
+    first = DockerOverlayDeployment(first_engine, FakeLockVerifier()).deploy(request)
+    tampered_evidence = dict(first.evidence)
+    tampered_evidence["overlay_build_receipt_sha256"] = "0" * 64
+    tampered = replace(first, evidence=tampered_evidence)
+    accepted = _accepted_overlay(candidate, opportunity, request.safety, tampered)
+    chained = replace(
+        request,
+        benchmark_measurement=first.measurement_config,
+        benchmark_diagnostic=first.diagnostic_config,
+        benchmark_replay=first.replay_config,
+        artifact_root=tmp_path / "artifacts-2",
+        anchor_generation=1,
+        accepted_stack=(accepted,),
+    )
+    engine = ChainedFakeEngine(
+        baseline_sha=sha256_file(request.opportunity.source_path),
+        candidate_sha=sha256_file(candidate.workspace / candidate.changed_files[0]),
+    )
+
+    result = DockerOverlayDeployment(engine, FakeLockVerifier()).deploy(chained)
+
+    assert result.deployed is False
+    assert result.reason_code == "overlay_build_receipt_mismatch"
+    assert result.infrastructure_failure is True
+    assert engine.calls == ["inspect"]
 
 
 def test_overlay_materializes_frozen_bytes_without_reopening_agent_workspace(
@@ -728,6 +897,47 @@ def test_docker_engine_uses_fixed_argv_and_immutable_parent(tmp_path: Path):
     build_commands = [command for command in supervisor.argv if command[1] == "build"]
     assert len(build_commands) == 2
     assert build_commands[0] == build_commands[1]
+
+
+def test_docker_engine_accepts_exact_derived_image_id_as_overlay_parent(
+    tmp_path: Path,
+):
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("VALUE = 3\n", encoding="utf-8")
+    supervisor = FakeDockerSupervisor(
+        sha256_file(candidate),
+        revalidated_parent_id=DERIVED_ID,
+        built_image_id=SECOND_DERIVED_ID,
+    )
+    engine = DockerEngine(supervisor)  # type: ignore[arg-type]
+    parent = ContainerImage(DERIVED_ID, DERIVED_ID)
+    target = InstalledPythonTarget(
+        "vllm",
+        "vllm/kernels/op.py",
+        "kernels/op.py",
+        "/usr/lib/python/site-packages/vllm/kernels/op.py",
+        "a" * 64,
+        12,
+        0o644,
+    )
+
+    built = engine.build_overlay(
+        parent=parent,
+        candidate_source=candidate,
+        target=target,
+        build_root=tmp_path / "build-derived",
+        cwd=tmp_path,
+    )
+
+    assert built.image.image_id == SECOND_DERIVED_ID
+    dockerfile = (tmp_path / "build-derived/context/Dockerfile").read_text()
+    alias = f"apex-overlay-parent:sha256-{DERIVED_ID.removeprefix('sha256:')}"
+    assert dockerfile.startswith(f"FROM {alias}\n")
+    assert target.container_path in dockerfile
+    tag_commands = [command for command in supervisor.argv if command[1:3] == ("image", "tag")]
+    assert tag_commands == [("docker", "image", "tag", DERIVED_ID, alias)]
+    build_commands = [command for command in supervisor.argv if command[1] == "build"]
+    assert len(build_commands) == 1
 
 
 def test_docker_engine_rejects_repo_digest_to_image_id_drift(tmp_path: Path):

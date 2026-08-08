@@ -72,6 +72,10 @@ def kernel_reward_policy_source(policy: MeasurementPolicy) -> dict[str, object]:
         "policy_id": "kernel_robust_v1",
         "measurement_policy": policy.to_dict(),
         "timing_protocol": {
+            "execution_receipt": "apex.kernel-measurement-execution/v1",
+            "writer": "trusted_evaluator_adapter",
+            "phase": "measurement",
+            "protected_harness_digest_required": True,
             "ordering": "seeded_paired_abba_blocks",
             "inner_repeats": 1,
             "timer_resolution_required": True,

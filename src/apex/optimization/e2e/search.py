@@ -8,17 +8,36 @@ from typing import Mapping
 
 from apex.benchmark import BenchmarkConfigViews
 from apex.core import ApexError, ContractError, IntegrityError
-from apex.evaluation import E2EAcceptancePolicy, E2EMeasurement, evaluate_current_anchor
+from apex.evaluation import (
+    E2EAcceptancePolicy,
+    E2EMeasurement,
+)
 from apex.intake import E2EOptimizeSpec
 from apex.orchestration import SearchStage
-from apex.runtime import RunProvenance
+from apex.runtime import GpuLeaseReceipt, RunProvenance
 from apex.storage import ArtifactReceipt
 
 from .benchmarking import Diagnosis, E2EBenchmarkSession
 from .candidate import CandidateWorker, E2ECandidate, E2ECandidateRequest
 from .context import E2EContextBuilder
 from .kernel_lane import KernelOpportunity
+from .outcomes import commit_e2e_reject, commit_measured_e2e_outcome
+from .promotion import MatchedPromotion, MatchedPromotionRunner
+from .recovery_search import RecoveredSearch
 from .run_record import E2ERunRecord
+from .search_recovery import SearchRecovery
+from .search_support import (
+    QualifiedAttempt as _QualifiedAttempt,
+    candidate_id as _candidate_id,
+    commit_qualified_reject as _commit_qualified_reject,
+    opportunity_map as _opportunity_map,
+    promotion_artifacts as _promotion_artifacts,
+    promotion_receipts as _promotion_receipts,
+    raise_agent_teardown_infrastructure as _raise_agent_teardown_infrastructure,
+    search_stage as _stage,
+    source_key as _source_key,
+    validate_deployment as _validate_deployment,
+)
 from .services import (
     AcceptedCandidate,
     CandidateDeployment,
@@ -33,12 +52,6 @@ from .services import (
 )
 
 
-_AGENT_TEARDOWN_INFRASTRUCTURE_FAILURES = {
-    "agent_process_cleanup_failed",
-    "agent_process_containment_unverified",
-}
-
-
 @dataclass(frozen=True, slots=True)
 class SearchOutcome:
     """Durable search output consumed by finalization."""
@@ -49,20 +62,6 @@ class SearchOutcome:
     diagnostic_config: Path
     replay_config: Path
     diagnostic_history: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _QualifiedAttempt:
-    attempt_id: str
-    opportunity: KernelOpportunity
-    candidate: E2ECandidate
-    micro: MicroQualification
-    micro_receipt: ArtifactReceipt
-    safety: SafetyQualification
-    safety_receipt: ArtifactReceipt
-    deployment: CandidateDeployment
-    delivery_receipt: ArtifactReceipt
-
 
 class E2ESearchLoop:
     """Consume a dynamic opportunity queue using fresh stateless agent calls."""
@@ -80,7 +79,7 @@ class E2ESearchLoop:
         micro: MicroQualificationPort,
         safety: CandidateSafetyPort,
         deployments: CandidateDeploymentPort,
-        gpu_device_scope: str,
+        gpu_lease: GpuLeaseReceipt,
     ) -> None:
         self.spec = spec
         self.record = record
@@ -92,16 +91,27 @@ class E2ESearchLoop:
         self.micro = micro
         self.safety = safety
         self.deployments = deployments
-        self.gpu_device_scope = gpu_device_scope
+        self.gpu_lease = gpu_lease
+        self.gpu_device_scope = gpu_lease.device_scope
+        self.promotions = MatchedPromotionRunner(
+            session=session,
+            record=record,
+            gpu_lease=gpu_lease,
+            policy=E2EAcceptancePolicy(spec.goal.gates),
+        )
 
-    def run(self, initial: Diagnosis, baseline: E2EMeasurement) -> SearchOutcome:
-        opportunities = _opportunity_map(initial)
-        diagnosis = initial
-        accepted: list[AcceptedCandidate] = []
-        accepted_sources: set[str] = set()
-        anchor = baseline
-        configs = (self.views.measurement, self.views.diagnostic, self.views.replay)
-        history = [str(initial.evidence_path)]
+    def run(
+        self,
+        initial: Diagnosis,
+        baseline: E2EMeasurement,
+        *,
+        recovery: RecoveredSearch | None = None,
+    ) -> SearchOutcome:
+        recovery_driver = SearchRecovery(self)
+        progress = recovery_driver.progress(initial, baseline, recovery)
+        if recovery is not None:
+            recovery_driver.reconcile(progress, recovery.active)
+        opportunities = _opportunity_map(progress.diagnosis)
         while _stage(self.record) is SearchStage.PLANNING:
             opportunity, reason = self._select_available(opportunities)
             if opportunity is None:
@@ -111,22 +121,32 @@ class E2ESearchLoop:
                 break
             winner = self._attempt(
                 opportunity,
-                anchor,
-                diagnosis.evidence_receipt,
-                configs,
+                progress.anchor,
+                progress.diagnosis.evidence_receipt,
+                progress.configs,
+                (
+                    progress.accepted[-1].deployment.deployed_image_id
+                    if progress.accepted
+                    else None
+                ),
+                tuple(progress.accepted),
             )
             if winner is None:
                 continue
-            accepted.append(winner)
-            accepted_sources.add(_source_key(winner.opportunity))
-            anchor = winner.primary_measurement
-            configs = _candidate_configs(winner)
-            diagnosis = self._reprofile(
-                configs[1], len(accepted), frozenset(accepted_sources)
+            recovery_driver.accept(progress, winner)
+            progress.diagnosis = self._reprofile(
+                progress.configs[1],
+                len(progress.accepted),
+                frozenset(progress.accepted_sources),
             )
-            history.append(str(diagnosis.evidence_path))
-            opportunities = _opportunity_map(diagnosis)
-        return SearchOutcome(tuple(accepted), anchor, *configs, tuple(history))
+            recovery_driver.append_history(progress, progress.diagnosis)
+            opportunities = _opportunity_map(progress.diagnosis)
+        return SearchOutcome(
+            tuple(progress.accepted),
+            progress.anchor,
+            *progress.configs,
+            tuple(progress.history),
+        )
 
     def _select_available(
         self, opportunities: Mapping[str, KernelOpportunity]
@@ -160,35 +180,43 @@ class E2ESearchLoop:
         anchor: E2EMeasurement,
         diagnostic_receipt: ArtifactReceipt,
         configs: tuple[Path, Path, Path],
+        anchor_image_id: str | None,
+        accepted_stack: tuple[AcceptedCandidate, ...],
     ) -> AcceptedCandidate | None:
         generated = self._generate(opportunity, anchor, diagnostic_receipt)
         if generated is None:
             return None
-        attempt_id, candidate = generated
-        micro = self._micro_gate(attempt_id, candidate, opportunity)
+        attempt_id, candidate, candidate_receipt = generated
+        micro = self._micro_gate(
+            attempt_id, candidate, candidate_receipt, opportunity
+        )
         if micro is None:
             return None
-        safety = self._safety_gate(attempt_id, candidate, opportunity)
+        safety = self._safety_gate(
+            attempt_id, candidate, candidate_receipt, opportunity
+        )
         if safety is None:
             return None
         qualified = self._deployment_gate(
             attempt_id,
             candidate,
+            candidate_receipt,
             opportunity,
             micro,
             safety,
             configs,
+            accepted_stack,
         )
         if qualified is None:
             return None
-        return self._e2e_gate(qualified, anchor)
+        return self._e2e_gate(qualified, configs[0], anchor_image_id)
 
     def _generate(
         self,
         opportunity: KernelOpportunity,
         anchor: E2EMeasurement,
         diagnostic_receipt: ArtifactReceipt,
-    ) -> tuple[str, E2ECandidate] | None:
+    ) -> tuple[str, E2ECandidate, ArtifactReceipt] | None:
         search = self.record.controller.state.e2e
         assert search is not None and self.worker is not None
         attempt_id = f"attempt-{search.budget.candidates_used + 1}"
@@ -204,6 +232,7 @@ class E2ESearchLoop:
             ),
         )
         self.record.controller.select_e2e_opportunity(
+            attempt_id=attempt_id,
             opportunity_id=opportunity.opportunity_id,
             context_packet_id=context.compiled.packet.context_packet_id,
         )
@@ -219,12 +248,29 @@ class E2ESearchLoop:
                 "candidate_generation_infrastructure_failed",
                 {"error_type": type(error).__name__},
             ) from error
+        if candidate.attempt_id != attempt_id:
+            raise IntegrityError(
+                "Candidate worker returned another attempt",
+                "candidate_attempt_mismatch",
+                {
+                    "expected_attempt_id": attempt_id,
+                    "observed_attempt_id": candidate.attempt_id,
+                },
+            )
         receipt = self.record.record_candidate(candidate)
         if not candidate.succeeded or candidate.candidate_id is None:
             _raise_agent_teardown_infrastructure(candidate, receipt)
             self.record.controller.reject_e2e_execution(
-                candidate_id=attempt_id,
+                candidate_id=None,
                 receipt=receipt.digest,
+                reason=candidate.reason_code,
+            )
+            commit_e2e_reject(
+                self.record,
+                attempt_id=attempt_id,
+                opportunity_id=opportunity.opportunity_id,
+                candidate_id=None,
+                candidate_manifest=receipt,
                 reason=candidate.reason_code,
             )
             self.record.controller.complete_e2e_update(stop=False, reason=candidate.reason_code)
@@ -233,7 +279,7 @@ class E2ESearchLoop:
             candidate_id=candidate.candidate_id,
             artifact_ref=receipt.digest,
         )
-        return attempt_id, candidate
+        return attempt_id, candidate, receipt
 
     def _candidate_request(
         self, attempt_id: str, opportunity: KernelOpportunity, prompt: str
@@ -250,10 +296,12 @@ class E2ESearchLoop:
             max_turns=self.spec.max_turns,
             timeout_seconds=self.spec.agent_timeout_seconds,
         )
+
     def _micro_gate(
         self,
         attempt_id: str,
         candidate: E2ECandidate,
+        candidate_receipt: ArtifactReceipt,
         opportunity: KernelOpportunity,
     ) -> tuple[MicroQualification, ArtifactReceipt] | None:
         result = self.micro.verify(
@@ -276,6 +324,16 @@ class E2ESearchLoop:
         )
         if result.qualified:
             return result, receipt
+        commit_e2e_reject(
+            self.record,
+            attempt_id=attempt_id,
+            opportunity_id=opportunity.opportunity_id,
+            candidate_id=_candidate_id(candidate),
+            candidate_manifest=candidate_receipt,
+            reason=result.reason_code,
+            evidence_receipts={"micro_receipt": receipt.digest},
+            evidence_artifacts=(("micro_qualification", receipt),),
+        )
         self.record.controller.complete_e2e_update(stop=False, reason=result.reason_code)
         return None
 
@@ -283,6 +341,7 @@ class E2ESearchLoop:
         self,
         attempt_id: str,
         candidate: E2ECandidate,
+        candidate_receipt: ArtifactReceipt,
         opportunity: KernelOpportunity,
     ) -> tuple[SafetyQualification, ArtifactReceipt] | None:
         result = self.safety.verify(
@@ -307,6 +366,16 @@ class E2ESearchLoop:
         )
         if result.qualified:
             return result, receipt
+        commit_e2e_reject(
+            self.record,
+            attempt_id=attempt_id,
+            opportunity_id=opportunity.opportunity_id,
+            candidate_id=_candidate_id(candidate),
+            candidate_manifest=candidate_receipt,
+            reason=reason,
+            evidence_receipts={"safety_receipt": receipt.digest},
+            evidence_artifacts=(("safety_qualification", receipt),),
+        )
         self.record.controller.complete_e2e_update(stop=False, reason=reason)
         return None
 
@@ -314,10 +383,12 @@ class E2ESearchLoop:
         self,
         attempt_id: str,
         candidate: E2ECandidate,
+        candidate_receipt: ArtifactReceipt,
         opportunity: KernelOpportunity,
         micro_pair: tuple[MicroQualification, ArtifactReceipt],
         safety_pair: tuple[SafetyQualification, ArtifactReceipt],
         configs: tuple[Path, Path, Path],
+        accepted_stack: tuple[AcceptedCandidate, ...],
     ) -> _QualifiedAttempt | None:
         safety, safety_receipt = safety_pair
         result = self.deployments.deploy(
@@ -333,44 +404,36 @@ class E2ESearchLoop:
                 anchor_generation=self.record.controller.state.anchor_generation,
                 safety=safety,
                 benchmark_replay=configs[2],
+                accepted_stack=accepted_stack,
             )
         )
         _validate_deployment(result, candidate, self.views)
         receipt = self.record.record_delivery(attempt_id, result)
         assert candidate.candidate_id is not None
-        if result.qualified:
-            self.record.controller.commit_e2e_delivery_verification(
-                candidate_id=candidate.candidate_id,
-                receipt=receipt.digest,
-                verified=True,
-                reason=result.reason_code,
+        if not result.qualified:
+            self._reject_deployment(
+                attempt_id,
+                candidate,
+                candidate_receipt,
+                opportunity,
+                micro_pair,
+                safety_receipt,
+                result,
+                receipt,
             )
-        else:
-            self.deployments.rollback(result)
-            if result.infrastructure_failure:
-                raise IntegrityError(
-                    "Candidate deployment infrastructure failed",
-                    "deployment_infrastructure_failed",
-                    {
-                        "candidate_id": candidate.candidate_id,
-                        "deployment_reason_code": result.reason_code,
-                        "delivery_receipt": receipt.digest,
-                        "deployment_evidence": dict(result.evidence),
-                    },
-                )
-            self.record.controller.commit_e2e_delivery_verification(
-                candidate_id=candidate.candidate_id,
-                receipt=receipt.digest,
-                verified=False,
-                reason=result.reason_code,
-            )
-            self.record.controller.complete_e2e_update(stop=False, reason=result.reason_code)
             return None
+        self.record.controller.commit_e2e_delivery_verification(
+            candidate_id=candidate.candidate_id,
+            receipt=receipt.digest,
+            verified=True,
+            reason=result.reason_code,
+        )
         micro, micro_receipt = micro_pair
         return _QualifiedAttempt(
             attempt_id,
             opportunity,
             candidate,
+            candidate_receipt,
             micro,
             micro_receipt,
             safety,
@@ -379,79 +442,131 @@ class E2ESearchLoop:
             receipt,
         )
 
+    def _reject_deployment(
+        self,
+        attempt_id: str,
+        candidate: E2ECandidate,
+        candidate_receipt: ArtifactReceipt,
+        opportunity: KernelOpportunity,
+        micro_pair: tuple[MicroQualification, ArtifactReceipt],
+        safety_receipt: ArtifactReceipt,
+        result: CandidateDeployment,
+        receipt: ArtifactReceipt,
+    ) -> None:
+        self.deployments.rollback(result)
+        if result.infrastructure_failure:
+            raise IntegrityError(
+                "Candidate deployment infrastructure failed",
+                "deployment_infrastructure_failed",
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "deployment_reason_code": result.reason_code,
+                    "delivery_receipt": receipt.digest,
+                    "deployment_evidence": dict(result.evidence),
+                },
+            )
+        self.record.controller.commit_e2e_delivery_verification(
+            candidate_id=_candidate_id(candidate),
+            receipt=receipt.digest,
+            verified=False,
+            reason=result.reason_code,
+        )
+        _, micro_receipt = micro_pair
+        commit_e2e_reject(
+            self.record,
+            attempt_id=attempt_id,
+            opportunity_id=opportunity.opportunity_id,
+            candidate_id=_candidate_id(candidate),
+            candidate_manifest=candidate_receipt,
+            reason=result.reason_code,
+            evidence_receipts={
+                "micro_receipt": micro_receipt.digest,
+                "safety_receipt": safety_receipt.digest,
+                "delivery_receipt": receipt.digest,
+            },
+            evidence_artifacts=(
+                ("micro_qualification", micro_receipt),
+                ("safety_qualification", safety_receipt),
+                ("primary_delivery", receipt),
+            ),
+        )
+        self.record.controller.complete_e2e_update(
+            stop=False,
+            reason=result.reason_code,
+        )
+
     def _e2e_gate(
-        self, attempt: _QualifiedAttempt, anchor: E2EMeasurement
+        self,
+        attempt: _QualifiedAttempt,
+        anchor_config: Path,
+        anchor_image_id: str | None,
     ) -> AcceptedCandidate | None:
-        result, measurement, receipt = self.session.measure(
-            f"candidate-measurement-{attempt.attempt_id}",
-            attempt.deployment.measurement_config,
-        )
         candidate_id = _candidate_id(attempt.candidate)
-        if not result.succeeded or measurement is None:
-            return self._revert(attempt, receipt, "candidate_e2e_measurement_failed")
-        verdict = evaluate_current_anchor(
-            anchor,
-            measurement,
-            E2EAcceptancePolicy(self.spec.goal.gates),
-        )
-        decision = self.record.record_decision(
-            attempt.attempt_id,
+        try:
+            result = self.promotions.run(
+                attempt_id=attempt.attempt_id,
+                candidate_id=candidate_id,
+                opportunity_id=attempt.opportunity.opportunity_id,
+                anchor_config=anchor_config,
+                anchor_image_id=anchor_image_id,
+                deployment=attempt.deployment,
+            )
+        except IntegrityError:
+            self.deployments.rollback(attempt.deployment)
+            raise
+        if result.promotion is None:
+            _commit_qualified_reject(
+                self.record, attempt, result.evidence_receipt, result.reason_code
+            )
+            return self._rollback(attempt, result.reason_code)
+        return self._decide_promotion(attempt, result.promotion)
+
+    def _decide_promotion(
+        self,
+        attempt: _QualifiedAttempt,
+        promotion: MatchedPromotion,
+    ) -> AcceptedCandidate | None:
+        candidate_id = _candidate_id(attempt.candidate)
+        verdict = promotion.verdict
+        candidate_source = attempt.candidate.candidate_source_sha256
+        decision = commit_measured_e2e_outcome(
+            self.record,
+            attempt_id=attempt.attempt_id,
+            opportunity_id=attempt.opportunity.opportunity_id,
             candidate_id=candidate_id,
-            verdict="keep" if verdict.keep else "revert",
-            reason=verdict.reason_code,
-            evidence=_decision_evidence(attempt, receipt, verdict.to_dict()),
+            candidate_manifest=attempt.candidate_receipt,
+            verdict=verdict,
+            evidence_receipts=_promotion_receipts(attempt, promotion.receipt),
+            evidence_artifacts=_promotion_artifacts(attempt, promotion.receipt),
+            new_anchor_id=(
+                f"anchor-{attempt.deployment.deployed_source_sha256[:16]}"
+                if verdict.keep
+                else None
+            ),
+            accepted_patch_id=(
+                f"patch-{candidate_source[:16]}"
+                if verdict.keep and candidate_source is not None
+                else None
+            ),
         )
         if not verdict.keep:
-            return self._revert(attempt, decision, verdict.reason_code, recorded=True)
-        assert attempt.candidate.candidate_source_sha256 is not None
-        self.record.controller.decide_e2e_candidate(
-            candidate_id=candidate_id,
-            receipt=decision.digest,
-            verdict="keep",
-            reason=verdict.reason_code,
-            new_anchor_id=f"anchor-{attempt.deployment.deployed_source_sha256[:16]}",
-            accepted_patch_id=f"patch-{attempt.candidate.candidate_source_sha256[:16]}",
-        )
+            return self._rollback(attempt, verdict.reason_code)
         return AcceptedCandidate(
             attempt.candidate,
             attempt.opportunity,
             attempt.micro,
             attempt.safety,
             attempt.deployment,
-            measurement,
+            promotion.primary_measurement,
             decision.digest,
         )
 
-    def _revert(
+    def _rollback(
         self,
         attempt: _QualifiedAttempt,
-        receipt: ArtifactReceipt,
         reason: str,
-        *,
-        recorded: bool = False,
     ) -> None:
-        candidate_id = _candidate_id(attempt.candidate)
-        decision = receipt
-        if not recorded:
-            decision = self.record.record_decision(
-                attempt.attempt_id,
-                candidate_id=candidate_id,
-                verdict="revert",
-                reason=reason,
-                evidence={
-                    "schema_version": 1,
-                    "candidate_id": candidate_id,
-                    "benchmark_receipt": receipt.digest,
-                    "verdict": "revert",
-                },
-            )
         self.deployments.rollback(attempt.deployment)
-        self.record.controller.decide_e2e_candidate(
-            candidate_id=candidate_id,
-            receipt=decision.digest,
-            verdict="revert",
-            reason=reason,
-        )
         self.record.controller.complete_e2e_update(stop=False, reason=reason)
         return None
 
@@ -470,7 +585,7 @@ class E2ESearchLoop:
             if _source_key(item) not in accepted_sources
         )
         self.record.controller.commit_e2e_reprofile(
-            receipt=diagnosis.evidence_receipt.digest,
+            receipt=diagnosis.state_receipt.digest,
             opportunity_ids=tuple(item.opportunity_id for item in eligible),
         )
         self.record.controller.complete_e2e_update(
@@ -478,103 +593,5 @@ class E2ESearchLoop:
             reason="no_reprofiled_opportunities" if not eligible else "continue",
         )
         return diagnosis
-
-
-def _raise_agent_teardown_infrastructure(
-    candidate: E2ECandidate, receipt: ArtifactReceipt
-) -> None:
-    if candidate.reason_code not in _AGENT_TEARDOWN_INFRASTRUCTURE_FAILURES:
-        return
-    result = candidate.agent_result
-    raise IntegrityError(
-        "Agent process teardown could not be verified",
-        candidate.reason_code,
-        {
-            "attempt_id": candidate.attempt_id,
-            "candidate_manifest_receipt": receipt.digest,
-            "capture_status": result.capture_status.value,
-            "termination_kind": result.termination_kind.value,
-            "termination_reason": result.termination_reason,
-            "process_containment": (
-                result.process_containment.to_dict()
-                if result.process_containment is not None
-                else None
-            ),
-        },
-    )
-
-
-def _opportunity_map(diagnosis: Diagnosis) -> dict[str, KernelOpportunity]:
-    return {item.opportunity_id: item for item in diagnosis.plan.opportunities}
-
-
-def _candidate_configs(candidate: AcceptedCandidate) -> tuple[Path, Path, Path]:
-    deployment = candidate.deployment
-    return (
-        deployment.measurement_config,
-        deployment.diagnostic_config,
-        deployment.replay_config,
-    )
-
-
-def _candidate_id(candidate: E2ECandidate) -> str:
-    if candidate.candidate_id is None:
-        raise ContractError("Candidate is not frozen", "invalid_frozen_candidate")
-    return candidate.candidate_id
-
-
-def _source_key(opportunity: KernelOpportunity) -> str:
-    if opportunity.source_root is None or opportunity.source_path is None:
-        raise ContractError("Kernel source is unresolved", "source_unresolved")
-    root = opportunity.source_root.resolve(strict=True)
-    relative = opportunity.source_path.resolve(strict=True).relative_to(root)
-    return f"{root}:{relative.as_posix()}"
-
-
-def _stage(record: E2ERunRecord) -> SearchStage:
-    search = record.controller.state.e2e
-    if search is None:
-        raise ContractError("E2E state is not initialized", "e2e_not_initialized")
-    return search.stage
-
-
-def _validate_deployment(
-    deployment: CandidateDeployment,
-    candidate: E2ECandidate,
-    views: BenchmarkConfigViews,
-) -> None:
-    if candidate.candidate_id != deployment.candidate_id:
-        raise ContractError("Deployment targets another candidate", "candidate_id_mismatch")
-    if deployment.workload_semantics_sha256 != views.workload_semantics_sha256:
-        raise ContractError("Deployment changed workload semantics", "benchmark_semantics_changed")
-    if not deployment.deployed:
-        return
-    if deployment.deployed_source_sha256 != candidate.candidate_source_sha256:
-        raise ContractError("Deployed source differs from frozen candidate", "candidate_lineage_mismatch")
-    for path in (
-        deployment.measurement_config,
-        deployment.diagnostic_config,
-        deployment.replay_config,
-    ):
-        if not path.is_absolute() or not path.is_file() or path.is_symlink():
-            raise ContractError("Deployment config is missing or unsafe", "invalid_replay_config")
-
-
-def _decision_evidence(
-    attempt: _QualifiedAttempt,
-    benchmark_receipt: ArtifactReceipt,
-    verdict: Mapping[str, object],
-) -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "candidate_id": _candidate_id(attempt.candidate),
-        "opportunity_id": attempt.opportunity.opportunity_id,
-        "micro_receipt": attempt.micro_receipt.digest,
-        "safety_receipt": attempt.safety_receipt.digest,
-        "delivery_receipt": attempt.delivery_receipt.digest,
-        "benchmark_receipt": benchmark_receipt.digest,
-        "verdict": dict(verdict),
-    }
-
 
 __all__ = ["E2ESearchLoop", "SearchOutcome"]

@@ -50,6 +50,7 @@ class E2EFinalizer:
         self.accuracy_policy_sha256 = accuracy_policy_sha256
         self.performance_policy_sha256 = performance_policy_sha256
         self.safety_policy_sha256 = safety_policy_sha256
+        self._terminal_diagnostics: Mapping[str, object] | None = None
 
     def run(
         self,
@@ -57,13 +58,14 @@ class E2EFinalizer:
         initial: Diagnosis,
         baseline: E2EMeasurement,
         search: SearchOutcome,
+        measurement_action_id: str = "final-measurement",
     ) -> E2EOptimizationResult:
         if _stage(self.record) is not SearchStage.FINALIZING:
             raise ContractError(
                 "E2E search did not reach finalization", "illegal_e2e_transition"
             )
         benchmark, final, receipt = self.session.measure(
-            "final-measurement", search.measurement_config
+            measurement_action_id, search.measurement_config
         )
         if not benchmark.succeeded or final is None:
             return self.failure(
@@ -72,6 +74,14 @@ class E2EFinalizer:
                 status=TaskStatus.VERIFICATION_FAILED,
                 reason="final_measurement_failed",
             )
+        terminal_action_id = measurement_action_id.replace(
+            "measurement", "diagnostic"
+        )
+        self._terminal_diagnostics = self.session.terminal_diagnostics(
+            terminal_action_id,
+            search.diagnostic_config,
+            baseline=initial,
+        ).to_dict()
         if not search.accepted:
             return self._without_winner(initial, baseline, final, receipt.digest, search)
         cumulative = evaluate_no_regression(
@@ -124,13 +134,33 @@ class E2EFinalizer:
         verdict = evaluate_no_regression(
             baseline, final, policy=self.acceptance_policy
         )
-        self.record.controller.commit_e2e_final(
-            receipt=final_receipt, clean_replay_verified=False
+        lineage = self.record.put_json(
+            {
+                "schema_version": 1,
+                "final_benchmark_receipt": final_receipt,
+                "observed_replay_verdict": verdict.to_dict(),
+                "clean_replay_verified": False,
+            }
         )
-        reason = _exit_reason(self.record) or "no_source_candidate_improved_workload"
-        unsupported = reason in _UNSUPPORTED_REASONS
-        status = TaskStatus.UNSUPPORTED if unsupported else TaskStatus.NO_GAIN
-        phase = RunPhase.FAILED if unsupported else RunPhase.SUCCEEDED
+        self.record.controller.commit_e2e_final(
+            receipt=lineage.digest, clean_replay_verified=False
+        )
+        search_exit_reason = (
+            _exit_reason(self.record) or "no_source_candidate_improved_workload"
+        )
+        unsupported = search_exit_reason in _UNSUPPORTED_REASONS
+        if unsupported:
+            status = TaskStatus.UNSUPPORTED
+            reason = search_exit_reason
+        elif not verdict.keep:
+            status = TaskStatus.VERIFICATION_FAILED
+            reason = verdict.reason_code
+        else:
+            status = TaskStatus.NO_GAIN
+            reason = search_exit_reason
+        phase = (
+            RunPhase.SUCCEEDED if status is TaskStatus.NO_GAIN else RunPhase.FAILED
+        )
         return self._write(
             initial=initial,
             status=status,
@@ -138,10 +168,11 @@ class E2EFinalizer:
             validation=ValidationLevel.NONE,
             baseline=baseline,
             final=final,
-            no_regression=True,
+            no_regression=verdict.keep,
             details={
                 "observed_replay_verdict": verdict.to_dict(),
-                "no_regression_basis": {
+                "search_exit_reason": search_exit_reason,
+                "final_replay_basis": {
                     "basis": "no_accepted_or_delivered_source_patch",
                     "source_identity_unchanged": True,
                     "accepted_candidate_count": 0,
@@ -154,7 +185,13 @@ class E2EFinalizer:
                 "gpu_lease": self.gpu_lease.to_dict(),
             },
             terminal_phase=phase,
-            stop_reason=status.value if phase is RunPhase.SUCCEEDED else reason,
+            stop_reason=(
+                status.value
+                if phase is RunPhase.SUCCEEDED
+                else "final_no_winner_replay_regression"
+                if status is TaskStatus.VERIFICATION_FAILED
+                else reason
+            ),
         )
 
     def _cumulative_regression(
@@ -280,6 +317,11 @@ class E2EFinalizer:
         terminal_phase: RunPhase,
         stop_reason: str,
     ) -> E2EOptimizationResult:
+        if self._terminal_diagnostics is not None:
+            details = {
+                **details,
+                "terminal_diagnostics": dict(self._terminal_diagnostics),
+            }
         result = build_e2e_result(
             record=self.record,
             views=self.views,

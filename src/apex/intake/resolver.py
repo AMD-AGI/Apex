@@ -57,22 +57,34 @@ class TaskResolver:
             editable_paths.append(path)
             baseline_hashes[relative] = sha256_file(path)
 
+        harness_hashes: dict[str, str] = {}
+        harness_sha256: str | None = None
         if task.measurement is not None:
-            self._validate_measurement_destination(
-                workspace,
-                task.measurement.report_path,
+            for relative in task.measurement.harness_files:
+                path = workspace.joinpath(*relative.split("/"))
+                self._validate_harness(path, workspace, relative)
+                harness_hashes[relative] = sha256_file(path)
+            harness_sha256 = sha256_json(
+                {
+                    "schema": "apex.kernel-measurement-harness/v1",
+                    "files": dict(sorted(harness_hashes.items())),
+                }
             )
 
         resolution = {
             "task": task.to_dict(),
             "workspace": str(workspace),
             "baseline_file_hashes": baseline_hashes,
+            "harness_file_hashes": harness_hashes,
+            "harness_sha256": harness_sha256,
         }
         return ResolvedTaskSpec(
             task=task,
             workspace=workspace,
             editable_paths=tuple(editable_paths),
             baseline_file_hashes=baseline_hashes,
+            harness_file_hashes=harness_hashes,
+            harness_sha256=harness_sha256,
             resolution_hash=sha256_json(resolution),
         )
 
@@ -94,40 +106,16 @@ class TaskResolver:
         if stat.st_nlink != 1:
             raise ContractError(f"Editable source may not be hard-linked: {relative}", "source_hardlink")
 
-    @staticmethod
-    def _validate_measurement_destination(workspace: Path, relative: str) -> None:
-        """Require a fresh evaluator-owned report path inside the workspace.
-
-        A pre-existing report could be stale baseline evidence, and an existing
-        symlink parent could redirect the performance harness outside the
-        isolated candidate checkout.  The harness may create missing normal
-        directories when it runs; it may never reuse an existing report.
-        """
-
-        destination = workspace.joinpath(*relative.split("/"))
-        if destination.exists() or destination.is_symlink():
-            raise ContractError(
-                "measurement report destination must not already exist",
-                "stale_measurement_report",
-            )
-        ancestor = destination.parent
-        while not ancestor.exists():
-            if ancestor == workspace:
-                break
-            ancestor = ancestor.parent
+    @classmethod
+    def _validate_harness(cls, path: Path, workspace: Path, relative: str) -> None:
         try:
-            resolved_ancestor = ancestor.resolve(strict=True)
-            resolved_ancestor.relative_to(workspace)
-        except (FileNotFoundError, ValueError) as error:
+            cls._validate_source(path, workspace, relative)
+        except ContractError as error:
             raise ContractError(
-                "measurement report destination escapes workspace",
-                "measurement_report_path_escape",
+                f"Protected measurement harness is invalid: {relative}",
+                "measurement_harness_invalid",
+                {"path": relative, "cause": error.reason_code},
             ) from error
-        if ancestor.is_symlink() or not resolved_ancestor.is_dir():
-            raise ContractError(
-                "measurement report parent is not a safe directory",
-                "unsafe_measurement_report_parent",
-            )
 
 
 class NaturalLanguageTaskResolver:

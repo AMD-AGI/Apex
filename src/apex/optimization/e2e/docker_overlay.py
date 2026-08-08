@@ -22,6 +22,10 @@ from .candidate import (
     validate_frozen_sources,
 )
 from .kernel_lane import KernelOpportunity
+from .overlay_lineage import (
+    capture_overlay_build_receipt,
+    validate_accepted_overlay_parent,
+)
 from .overlay_config import OverlayConfigSet, derive_overlay_configs
 from .overlay_runtime import (
     BuiltOverlay,
@@ -32,8 +36,10 @@ from .overlay_runtime import (
     LoadedFileReceipt,
 )
 from .services import (
+    AcceptedCandidate,
     CandidateDeployment,
     CandidateDeploymentRequest,
+    DeploymentConfigDigests,
     FinalDeliveryRequest,
     FinalDeliveryResult,
 )
@@ -176,7 +182,13 @@ class DockerOverlayDeployment:
     ) -> tuple[ContainerImage, InstalledPythonTarget]:
         parent_reference = _config_image(request.benchmark_measurement)
         inspected = self._engine.inspect_image(parent_reference, cwd=artifact_root)
-        parent = _validate_parent(parent_reference, inspected, request.provenance)
+        parent = _validate_parent(
+            parent_reference,
+            inspected,
+            request.provenance,
+            accepted=request.accepted_stack,
+            anchor_generation=request.anchor_generation,
+        )
         target = self._engine.resolve_python_target(
             parent.image_id,
             library=request.opportunity.origin_library,
@@ -295,6 +307,23 @@ def _successful_deployment(
 ) -> CandidateDeployment:
     candidate = request.candidate
     assert candidate.candidate_id and candidate.candidate_source_sha256
+    config_digests = DeploymentConfigDigests.capture(
+        configs.measurement,
+        configs.diagnostic,
+        configs.replay,
+    )
+    build_receipt = capture_overlay_build_receipt(
+        candidate_id=candidate.candidate_id,
+        candidate_source_sha256=candidate.candidate_source_sha256,
+        parent=parent,
+        built=built,
+        dockerfile_sha256=built.dockerfile_sha256,
+        candidate_file_sha256=candidate_sha,
+        loaded=loaded,
+        accepted=request.accepted_stack,
+        anchor_generation=request.anchor_generation,
+        provenance=request.provenance,
+    )
     evidence = {
         "schema_version": 1,
         "deployment_kind": "docker_python_runtime_overlay",
@@ -309,16 +338,14 @@ def _successful_deployment(
         "baseline_source_sha256": baseline_sha,
         "candidate_file_sha256": candidate_sha,
         "loaded_candidate": loaded.to_dict(),
+        "overlay_build_receipt": build_receipt.to_dict(),
+        "overlay_build_receipt_sha256": build_receipt.digest,
         "config_paths": {
             "measurement": str(configs.measurement),
             "diagnostic": str(configs.diagnostic),
             "replay": str(configs.replay),
         },
-        "config_sha256": {
-            "measurement": sha256_file(configs.measurement),
-            "diagnostic": sha256_file(configs.diagnostic),
-            "replay": sha256_file(configs.replay),
-        },
+        "config_sha256": config_digests.to_dict(),
     }
     return CandidateDeployment(
         candidate.candidate_id,
@@ -329,9 +356,11 @@ def _successful_deployment(
         configs.replay,
         request.workload_semantics_sha256,
         candidate.candidate_source_sha256,
+        built.image.image_id,
         ValidationLevel.RUNTIME_OVERLAY_VERIFIED,
         True,
         evidence,
+        config_sha256=config_digests,
     )
 
 
@@ -340,7 +369,16 @@ def _validate_request(request: CandidateDeploymentRequest) -> None:
     if not request.safety.qualified:
         raise ContractError("Safety gate did not permit deployment", "safety_gate_failed")
     if (
-        not candidate.succeeded
+        request.anchor_generation != len(request.accepted_stack)
+        or len(
+            {
+                item.candidate.candidate_id
+                for item in request.accepted_stack
+                if item.candidate.candidate_id is not None
+            }
+        )
+        != len(request.accepted_stack)
+        or not candidate.succeeded
         or not candidate.candidate_id
         or not candidate.candidate_source_sha256
         or len(candidate.changed_files) != 1
@@ -452,10 +490,27 @@ def _config_image(path: Path) -> str:
 
 
 def _validate_parent(
-    reference: str, parent: ContainerImage, provenance: RunProvenance
+    reference: str,
+    parent: ContainerImage,
+    provenance: RunProvenance,
+    *,
+    accepted: tuple[AcceptedCandidate, ...],
+    anchor_generation: int,
 ) -> ContainerImage:
     if not _IMAGE_ID.fullmatch(parent.image_id):
         raise IntegrityError("Parent image is not immutable", "invalid_image_id")
+    if accepted:
+        return validate_accepted_overlay_parent(
+            reference=reference,
+            inspected=parent,
+            provenance=provenance,
+            accepted=accepted,
+            anchor_generation=anchor_generation,
+        )
+    if anchor_generation != 0:
+        raise IntegrityError(
+            "Initial overlay generation is not zero", "overlay_ancestry_mismatch"
+        )
     if parent.image_id != provenance.container.image_id:
         raise IntegrityError("Parent differs from provenance", "image_identity_mismatch")
     if _IMAGE_ID.fullmatch(reference):
@@ -521,6 +576,7 @@ def _failed_deployment(
         request.benchmark_replay or request.benchmark_measurement,
         request.workload_semantics_sha256,
         candidate.candidate_source_sha256 or "",
+        None,
         ValidationLevel.NONE,
         False,
         {"schema_version": 1, "failure": reason, "details": dict(details)},

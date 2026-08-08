@@ -406,6 +406,62 @@ def test_diagnostics_adapter_excludes_disposable_runtime_tree(tmp_path: Path) ->
     assert all("inferencex_runtime" not in path.parts for path in result.artifacts)
 
 
+def test_terminal_diagnostics_preserves_declared_raw_trace_and_reports(
+    tmp_path: Path,
+) -> None:
+    benchmark = tmp_path / "benchmark"
+    benchmark.mkdir()
+    paths = _write_fixture(benchmark)
+    raw_trace = benchmark / "torch_trace" / "rank0.pt.trace.json.gz"
+    raw_trace.parent.mkdir()
+    raw_trace.write_bytes(b"raw-trace")
+    report_root = benchmark / "tracelens" / "decode_only"
+    report_root.mkdir(parents=True)
+    report_csv = report_root / "ops_summary.csv"
+    report_csv.write_text("name,time ms\nkernel,1.0\n", encoding="utf-8")
+    _rewrite_json(
+        paths["report"],
+        lambda value: value.update(
+            tracelens_analysis={
+                "enabled": True,
+                "rank0_trace": str(raw_trace),
+                "output_dir": str(benchmark / "tracelens"),
+                "output_files": [str(report_csv)],
+            }
+        ),
+    )
+
+    result = MagpieTraceEvidenceAdapter().analyze(
+        DiagnosticsRequest(
+            "run-1",
+            benchmark,
+            tmp_path / "normalized",
+            PROVENANCE,
+            preserve_raw_trace=True,
+        )
+    )
+
+    assert result.succeeded
+    assert result.summary["raw_trace_preserved"] is True
+    assert raw_trace.resolve() in result.artifacts
+    assert report_csv.resolve() in result.artifacts
+    assert result.artifact_roles[str(raw_trace.resolve())] == "diagnostic_raw_trace"
+    assert result.artifact_roles[str(report_csv.resolve())] == (
+        "diagnostic_tracelens_report"
+    )
+    manifest = result.summary["raw_artifact_manifest"]
+    assert {item["role"] for item in manifest} >= {
+        "diagnostic_raw_trace",
+        "diagnostic_tracelens_report",
+        "diagnostic_benchmark_report",
+    }
+    assert {item["comparison_logical_path"] for item in manifest} == {
+        "metadata/benchmark_report.json",
+        "raw/rank0.pt.trace.json.gz",
+        "reports/decode_only/ops_summary.csv",
+    }
+
+
 def test_exact_symbol_join_does_not_guess_by_substring(tmp_path: Path) -> None:
     paths = _write_fixture(
         tmp_path,

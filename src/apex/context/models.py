@@ -168,6 +168,56 @@ class DeadEndView:
 
 
 @dataclass(frozen=True, slots=True)
+class CampaignAttemptView:
+    """Receipt-linked outcome retained across different E2E opportunities."""
+
+    attempt_id: str
+    opportunity_id: str
+    candidate_id: str | None
+    verdict: str
+    reason: str
+    anchor_generation: int
+    context_packet_id: str
+    evidence_receipts: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        validate_identifier(self.attempt_id, field_name="attempt_id")
+        validate_identifier(self.opportunity_id, field_name="opportunity_id")
+        if self.candidate_id is not None:
+            validate_identifier(self.candidate_id, field_name="candidate_id")
+        if self.verdict not in {
+            "keep",
+            "revert",
+            "reject",
+            "needs_more_measurement",
+        }:
+            raise ContractError(
+                "Campaign attempt verdict is invalid", "invalid_campaign_history"
+            )
+        if self.anchor_generation < 0:
+            raise ContractError(
+                "Campaign attempt anchor is invalid", "invalid_campaign_history"
+            )
+        validate_identifier(self.context_packet_id, field_name="context_packet_id")
+        _require_text(self.reason, "campaign_attempt.reason")
+        _validate_digests(
+            self.evidence_receipts, "campaign_attempt.evidence_receipts"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "opportunity_id": self.opportunity_id,
+            "candidate_id": self.candidate_id,
+            "verdict": self.verdict,
+            "reason": self.reason,
+            "anchor_generation": self.anchor_generation,
+            "context_packet_id": self.context_packet_id,
+            "evidence_receipts": list(self.evidence_receipts),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AdvisoryCard:
     """Quoted card projection; it has no instruction or execution authority."""
 
@@ -284,6 +334,7 @@ class ContextPacket:
     budget: ContextBudget
     contract: ContextContract
     artifact_refs: tuple[ArtifactReference, ...]
+    campaign_attempts: tuple[CampaignAttemptView, ...] = ()
 
     def __post_init__(self) -> None:
         validate_identifier(self.run_id, field_name="run_id")
@@ -315,7 +366,7 @@ class ContextPacket:
 
     def semantic_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "identity": {
                 "run_id": self.run_id,
                 "workload_id": self.workload_id,
@@ -335,6 +386,9 @@ class ContextPacket:
             "relevant_history": {
                 "attempts": [item.to_dict() for item in self.attempts],
                 "dead_ends": [item.to_dict() for item in self.dead_ends],
+                "campaign_attempts": [
+                    item.to_dict() for item in self.campaign_attempts
+                ],
             },
             "knowledge": {
                 "selection_receipt": self.knowledge_selection_receipt,

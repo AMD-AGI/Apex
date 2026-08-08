@@ -17,6 +17,7 @@ from apex.storage import ArtifactReceipt
 
 from .attempts import AttemptSession, KernelAttemptOutcome, PreparedCandidate
 from .context import kernel_experience_identity
+from .experience_recording import record_deferred_experience
 from .measurement import KernelMeasurementEvaluation
 
 
@@ -58,17 +59,28 @@ def close_attempt(
     stop_search: bool = False,
 ) -> KernelAttemptOutcome:
     receipts = unique_receipts(evidence)
-    attempt.run.record.record_experience(
-        attempt.attempt_id,
-        identity=kernel_experience_identity(attempt.run.resolved),
-        outcome=experience_outcome(status, measurement),
-        strategy_fingerprint=strategy,
-        mechanism=f"Fresh isolated candidate attempt ended with evaluator outcome {reason}.",
-        micro_verdict=reason,
-        evidence=receipts,
-        failure_reason=None if eligible else reason,
-        retry_condition=None if eligible else retry_condition(reason),
-    )
+    identity = kernel_experience_identity(attempt.run.resolved)
+    if status is TaskStatus.CANDIDATE_READY and measurement is None:
+        record_deferred_experience(
+            attempt.run.record,
+            attempt.attempt_id,
+            identity=identity,
+            strategy_fingerprint=strategy,
+            reason=reason,
+            evidence=receipts,
+        )
+    else:
+        attempt.run.record.record_experience(
+            attempt.attempt_id,
+            identity=identity,
+            outcome=experience_outcome(status, measurement),
+            strategy_fingerprint=strategy,
+            mechanism=f"Fresh isolated candidate attempt ended with evaluator outcome {reason}.",
+            micro_verdict=reason,
+            evidence=receipts,
+            failure_reason=None if eligible else reason,
+            retry_condition=None if eligible else retry_condition(reason),
+        )
     decided = close_action(
         attempt,
         closure=closure,

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
-from apex.core import ContractError, TaskStatus, ValidationLevel
+from apex.core import ContractError, TaskStatus, ValidationLevel, sha256_file
 from apex.evaluation import E2EMeasurement, KernelGrade, MeasurementStatus
 from apex.evaluation.safety import (
     ArtifactKind,
@@ -26,6 +27,10 @@ from apex.runtime import RunProvenance
 
 from .candidate import E2ECandidate, materialize_frozen_sources, validate_frozen_sources
 from .kernel_lane import KernelOpportunity
+
+
+_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +295,39 @@ class CandidateDeploymentRequest:
     anchor_generation: int
     safety: SafetyQualification
     benchmark_replay: Path | None = None
+    accepted_stack: tuple[AcceptedCandidate, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentConfigDigests:
+    """Exact benchmark-config bytes derived for one immutable image."""
+
+    measurement: str
+    diagnostic: str
+    replay: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not _SHA256.fullmatch(value)
+            for value in (self.measurement, self.diagnostic, self.replay)
+        ):
+            raise ContractError(
+                "Deployment config digest is invalid",
+                "invalid_deployment_config_digest",
+            )
+
+    @classmethod
+    def capture(
+        cls, measurement: Path, diagnostic: Path, replay: Path
+    ) -> "DeploymentConfigDigests":
+        return cls(
+            sha256_file(measurement),
+            sha256_file(diagnostic),
+            sha256_file(replay),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,10 +342,36 @@ class CandidateDeployment:
     replay_config: Path
     workload_semantics_sha256: str
     deployed_source_sha256: str
+    deployed_image_id: str | None
     validation_level: ValidationLevel
     engagement_verified: bool
     evidence: Mapping[str, Any]
     infrastructure_failure: bool = False
+    config_sha256: DeploymentConfigDigests | None = None
+
+    def __post_init__(self) -> None:
+        derived = self.evidence.get("derived_image")
+        evidence_image_id = (
+            derived.get("image_id") if isinstance(derived, Mapping) else None
+        )
+        if self.deployed:
+            if (
+                self.deployed_image_id is None
+                or not _IMAGE_ID.fullmatch(self.deployed_image_id)
+                or evidence_image_id != self.deployed_image_id
+                or self.config_sha256 is None
+                or self.evidence.get("config_sha256")
+                != self.config_sha256.to_dict()
+            ):
+                raise ContractError(
+                    "Deployment lacks immutable image/config identity",
+                    "invalid_deployment_identity",
+                )
+        elif self.deployed_image_id is not None or self.config_sha256 is not None:
+            raise ContractError(
+                "Failed deployment cannot claim deployed identities",
+                "invalid_deployment_identity",
+            )
 
     @property
     def qualified(self) -> bool:
@@ -319,6 +383,9 @@ class CandidateDeployment:
         value["diagnostic_config"] = str(self.diagnostic_config)
         value["replay_config"] = str(self.replay_config)
         value["validation_level"] = self.validation_level.value
+        value["config_sha256"] = (
+            self.config_sha256.to_dict() if self.config_sha256 else None
+        )
         return value
 
 

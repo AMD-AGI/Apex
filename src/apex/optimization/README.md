@@ -6,6 +6,10 @@ I/O; those are reached through ports and explicit collaborators.
 
 `kernel/` handles bounded standalone tasks. `e2e/` handles workload state,
 dynamic kernel opportunity selection, live-anchor KEEP/REVERT, and replanning.
+`agent_recording.py` is the one backend-neutral journal projection for both
+loops: it writes each structured `agent_message`, `tool_called`, `tool_result`,
+`usage_recorded`, and `cost_recorded` event against the same transcript CAS
+receipt before the aggregate agent terminal event.
 
 Tests: `pytest tests/unit/optimization tests/integration -q`.
 

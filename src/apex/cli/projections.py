@@ -8,8 +8,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from apex.core import ContractError, validate_identifier
+from apex.orchestration.replay import replay_workload_state
 from apex.reporting import build_replication_guide, build_report, write_run_projections
-from apex.rl import DatasetExportConfig, DatasetExporter, EpisodeGraphMaterializer
+from apex.rl import (
+    DatasetExportConfig,
+    DatasetExporter,
+    EpisodeGraph,
+    EpisodeGraphMaterializer,
+)
 from apex.storage import ArtifactStore, EventJournal
 
 
@@ -33,9 +39,7 @@ def rebuild_report(
 
     source = resolve_run_source(run_root, run_id=run_id)
     destination = resolve_projection_output(source.root, output_dir)
-    graph = EpisodeGraphMaterializer(source.journal, source.artifacts).materialize(
-        source.run_id
-    )
+    graph = _materialize_graph(source)
     report = build_report(graph)
     replication = build_replication_guide(graph)
     paths = write_run_projections(
@@ -66,9 +70,7 @@ def export_rl_dataset(
 
     source = resolve_run_source(run_root, run_id=run_id)
     destination = resolve_projection_output(source.root, output_dir)
-    graph = EpisodeGraphMaterializer(source.journal, source.artifacts).materialize(
-        source.run_id
-    )
+    graph = _materialize_graph(source)
     result = DatasetExporter(source.artifacts).export(
         graph,
         destination,
@@ -134,6 +136,14 @@ def resolve_projection_output(run_root: Path, output_dir: Path) -> Path:
             "projection_output_overlaps_evidence",
         )
     return destination
+
+
+def _materialize_graph(source: RunProjectionSource) -> EpisodeGraph:
+    events = tuple(source.journal.iter_events(source.run_id, verify=True))
+    state = replay_workload_state(source.run_id, events)
+    return EpisodeGraphMaterializer(source.journal, source.artifacts).materialize(
+        source.run_id, workload_state=state
+    )
 
 
 def _resolve_run_id(root: Path, supplied: str | None) -> str:
