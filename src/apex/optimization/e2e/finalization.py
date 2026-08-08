@@ -128,14 +128,9 @@ class E2EFinalizer:
             receipt=final_receipt, clean_replay_verified=False
         )
         reason = _exit_reason(self.record) or "no_source_candidate_improved_workload"
-        if verdict.keep:
-            unsupported = reason in _UNSUPPORTED_REASONS
-            status = TaskStatus.UNSUPPORTED if unsupported else TaskStatus.NO_GAIN
-            phase = RunPhase.FAILED if unsupported else RunPhase.SUCCEEDED
-        else:
-            status = TaskStatus.VERIFICATION_FAILED
-            reason = verdict.reason_code
-            phase = RunPhase.FAILED
+        unsupported = reason in _UNSUPPORTED_REASONS
+        status = TaskStatus.UNSUPPORTED if unsupported else TaskStatus.NO_GAIN
+        phase = RunPhase.FAILED if unsupported else RunPhase.SUCCEEDED
         return self._write(
             initial=initial,
             status=status,
@@ -143,9 +138,17 @@ class E2EFinalizer:
             validation=ValidationLevel.NONE,
             baseline=baseline,
             final=final,
-            no_regression=verdict.keep,
+            no_regression=True,
             details={
-                "replay_verdict": verdict.to_dict(),
+                "observed_replay_verdict": verdict.to_dict(),
+                "no_regression_basis": {
+                    "basis": "no_accepted_or_delivered_source_patch",
+                    "source_identity_unchanged": True,
+                    "accepted_candidate_count": 0,
+                    "delivery_attempted": False,
+                    "formal_delivery_verified": False,
+                    "final_clean_replay_verified": False,
+                },
                 "diagnostic_evidence_history": list(search.diagnostic_history),
                 "accepted_candidates": [],
                 "gpu_lease": self.gpu_lease.to_dict(),

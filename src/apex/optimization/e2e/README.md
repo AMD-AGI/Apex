@@ -246,6 +246,19 @@ candidate reject, rotate to another opportunity, or run a final baseline replay.
 Missing source provenance or second-clean-replay proof can retain primary
 evidence but cannot produce formal success.
 
+If the search accepts no source candidate, Apex still runs and records the final
+normal measurement so baseline-versus-replay drift remains observable. That
+measurement's gate verdict is evidence about runtime variance, not a verdict on
+a source change: crossing a gate cannot produce `verification_failed` when no
+patch was accepted or delivered. The terminal result is `no_gain` (or preserves
+an existing unsupported reason) with `no_regression=true` on the unchanged-source
+basis. `details.observed_replay_verdict` records the measured drift separately
+from `details.no_regression_basis`; the latter also states that delivery was not
+attempted and both formal-delivery and final-clean-replay verification are false.
+This exception is limited to the zero-winner path. Once any patch is accepted,
+the cumulative final replay remains a hard gate and a regression is
+`verification_failed`.
+
 Missing exact source/model/image identity is `provenance_unresolved`. An exact
 source stack without a matching trusted fixed recipe, attestor, engagement
 backend, or replay backend is `verification_failed`. Primary output must contain

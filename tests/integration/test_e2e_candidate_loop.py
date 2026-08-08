@@ -764,8 +764,35 @@ def test_e2e_revert_rolls_back_and_returns_no_gain(tmp_path: Path) -> None:
 
     assert result.status is TaskStatus.NO_GAIN
     assert result.accepted_patch_ids == ()
+    assert result.no_regression is True
+    assert result.details["observed_replay_verdict"]["keep"] is True
+    assert result.details["no_regression_basis"]["source_identity_unchanged"] is True
+    assert result.details["no_regression_basis"]["delivery_attempted"] is False
     assert system[8].rollbacks == ["candidate-attempt-1"]
     assert system[9].requests == []
+
+
+def test_accepted_winner_cumulative_replay_regression_fails_verification(
+    tmp_path: Path,
+) -> None:
+    system = _system(tmp_path, [100.0, 102.0, 99.0], [True])
+
+    result = system[0].run(_spec(tmp_path, iterations=1))
+
+    assert result.status is TaskStatus.VERIFICATION_FAILED
+    assert result.reason_code == "insufficient_throughput_gain"
+    assert result.no_regression is False
+    assert result.accepted_patch_ids
+    assert result.formal_delivery_verified is False
+    assert result.details["cumulative_verdict"]["keep"] is False
+    assert system[9].requests == []
+    recovered = RunController.recover(
+        result.run_id,
+        EventJournal(tmp_path / "results" / "events" / "run.db"),
+        SnapshotStore(tmp_path / "results" / "state.snapshot.json"),
+    )
+    assert recovered.state.e2e is not None
+    assert recovered.state.e2e.final_clean_replay_verified is False
 
 
 def test_final_no_regression_uses_the_exact_requested_gates(

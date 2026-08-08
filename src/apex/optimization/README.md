@@ -33,6 +33,11 @@ No lower package may import it.
 
 Agent, verification, measurement, deployment, and delivery failures become typed
 events/results; missing formal proof never becomes a successful deliverable.
+When search accepts no source patch, the terminal normal replay is retained only
+as observed drift evidence. Its runtime variance cannot turn the unchanged source
+identity into `verification_failed`: the result is `no_gain` (or the existing
+unsupported result), `no_regression=true` is explicitly based on there being no
+accepted or delivered source change, and formal-delivery claims remain false.
 
 ## Tests
 

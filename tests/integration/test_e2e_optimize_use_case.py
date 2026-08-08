@@ -336,7 +336,9 @@ def test_terminal_resume_rejects_unbound_result_projection(tmp_path: Path) -> No
     assert failure.value.reason_code == "e2e_result_projection_mismatch"
 
 
-def test_e2e_final_replay_regression_fails_verification(tmp_path: Path) -> None:
+def test_e2e_no_winner_final_replay_drift_remains_observed_evidence(
+    tmp_path: Path,
+) -> None:
     results = tmp_path / "run-regression"
     result = E2EOptimizeUseCase(
         dependency_receipt=_receipt(tmp_path),
@@ -344,6 +346,29 @@ def test_e2e_final_replay_regression_fails_verification(tmp_path: Path) -> None:
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
     ).run(_spec(tmp_path, results))
-    assert result.status is TaskStatus.VERIFICATION_FAILED
-    assert result.no_regression is False
-    assert result.reason_code == "insufficient_throughput_gain"
+    assert result.status is TaskStatus.NO_GAIN
+    assert result.no_regression is True
+    assert result.reason_code == "no_opportunities"
+    assert result.accepted_patch_ids == ()
+    assert result.formal_delivery_verified is False
+    assert result.details["observed_replay_verdict"]["keep"] is False
+    assert (
+        result.details["observed_replay_verdict"]["reason_code"]
+        == "insufficient_throughput_gain"
+    )
+    basis = result.details["no_regression_basis"]
+    assert basis == {
+        "basis": "no_accepted_or_delivered_source_patch",
+        "source_identity_unchanged": True,
+        "accepted_candidate_count": 0,
+        "delivery_attempted": False,
+        "formal_delivery_verified": False,
+        "final_clean_replay_verified": False,
+    }
+    state = RunController.recover(
+        result.run_id,
+        EventJournal(results / "events" / "run.db"),
+        SnapshotStore(results / "state.snapshot.json"),
+    ).state
+    assert state.e2e is not None
+    assert state.e2e.final_clean_replay_verified is False
