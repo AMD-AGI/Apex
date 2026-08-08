@@ -133,6 +133,7 @@ def _request(tmp_path: Path) -> AgentRequest:
         model="test-model",
         effort="high",
         timeout_seconds=42,
+        runtime_closure_sha256="c" * 64,
     )
 
 
@@ -173,6 +174,7 @@ def test_codex_uses_stdin_ephemeral_process_and_hides_other_backend_secrets(
     assert result.invocation.cli_version == "test-agent 1.2.3"
     assert result.invocation.argv == supervisor.call["argv"]
     assert result.invocation.entrypoint_sha256
+    assert result.invocation.runtime_closure_sha256 == "c" * 64
     assert result.invocation.allowed_files_enforced_by_cli is False
     assert supervisor.pid_namespace_requests == [True, True]
     assert dict(result.invocation.isolation)["sandbox"] == "workspace-write"

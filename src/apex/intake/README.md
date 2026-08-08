@@ -20,8 +20,11 @@ The public API is the exact `apex.intake.__all__` list. `TaskScope` carries
 trusted dtype, regime, framework, and version facts for strict advisory
 retrieval; unknown dimensions stay empty and never get guessed from prose.
 `AgentOptions` and `TaskBudget` freeze backend/model/effort/turn/iteration/time
-controls for fair external comparisons. Codex is the default backend and bundle
-delivery never modifies the caller workspace.
+controls for fair external comparisons. An optional
+`runtime_closure_sha256` additionally binds a formal external campaign's sealed
+backend runtime closure; it is provenance supplied by that controller, not an
+Apex measurement claim. Codex is the default backend and bundle delivery never
+modifies the caller workspace.
 The E2E spec carries the same explicit `agent_model` and `agent_effort` identity;
 an empty value is invalid rather than an implicit backend-specific guess.
 `dataset_split` and `data_visibility` are frozen before execution and copied to

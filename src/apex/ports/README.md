@@ -23,6 +23,10 @@ effort is rejected instead of being silently ignored.
 pidfd, private-procfs, wrapper/status-FD, and zero-member teardown proof. A
 candidate cannot cross source freeze without a complete runtime receipt, whether
 the CLI ended naturally or at an exact-turn boundary.
+For matched external campaigns, the request and invocation receipt also carry
+the controller's sealed backend-runtime-closure SHA-256. The value binds lineage
+across controllers; it never substitutes for executable-byte or containment
+evidence owned by the concrete execution layer.
 Usage distinguishes input, cached input, cache creation, output, reasoning, total
 tokens, turns, and tool calls, with exact source-event indexes. Cost keeps an
 explicit provider amount as a canonical decimal string plus currency and source

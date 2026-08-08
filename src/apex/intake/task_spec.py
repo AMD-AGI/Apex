@@ -154,12 +154,23 @@ class AgentOptions:
 
     model: str | None = None
     effort: str | None = None
+    runtime_closure_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.model is not None and not self.model.strip():
             raise ContractError("agent model may not be empty", "invalid_agent_options")
         if self.effort is not None and not self.effort.strip():
             raise ContractError("agent effort may not be empty", "invalid_agent_options")
+        if self.runtime_closure_sha256 is not None and (
+            len(self.runtime_closure_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.runtime_closure_sha256
+            )
+        ):
+            raise ContractError(
+                "agent runtime closure digest is invalid", "invalid_agent_options"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,6 +447,11 @@ class TaskSpec:
             agent_options=AgentOptions(
                 model=str(agent_data["model"]) if agent_data.get("model") else None,
                 effort=str(agent_data["effort"]) if agent_data.get("effort") else None,
+                runtime_closure_sha256=(
+                    str(agent_data["runtime_closure_sha256"])
+                    if agent_data.get("runtime_closure_sha256") is not None
+                    else None
+                ),
             ),
             budget=TaskBudget(
                 max_iterations=int(budget_data.get("max_iterations", 1)),
@@ -476,7 +492,11 @@ class TaskSpec:
             "gpu_arch": self.gpu_arch,
             "mode": self.mode,
             "agent_backend": self.agent_backend.value,
-            "agent_options": {"model": self.agent_options.model, "effort": self.agent_options.effort},
+            "agent_options": {
+                "model": self.agent_options.model,
+                "effort": self.agent_options.effort,
+                "runtime_closure_sha256": self.agent_options.runtime_closure_sha256,
+            },
             "budget": {
                 "max_iterations": self.budget.max_iterations,
                 "max_turns": self.budget.max_turns,

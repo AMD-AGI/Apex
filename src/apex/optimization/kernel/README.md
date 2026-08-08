@@ -113,7 +113,10 @@ to reject a freeze race.
   Missing or insufficient p99 cannot be promoted to a speedup or reward.
 - Before invocation, `KernelContextBuilder` records source/harness receipts,
   bounded knowledge selection (including typed unavailability), prompt, and
-  context packet in CAS and the append-only event chain.
+context packet in CAS and the append-only event chain.
+- A caller-supplied sealed backend-runtime-closure digest flows unchanged from
+  `TaskSpec` to the agent invocation receipt. This supports matched external
+  campaigns without letting agent text assert runtime identity.
 - Every normalized agent transcript is stored as one canonical JSON CAS
   artifact in addition to raw stdout/stderr. Turn, tool, usage, and cost metadata
   is projected only from structured backend events; human text is never parsed

@@ -34,6 +34,9 @@ Every production result also embeds an `apex.agent-invocation/v3` receipt. It
 records the discovered and resolved CLI entrypoint, SHA-256 of those exact
 entrypoint bytes, the CLI's bounded `--version` output, actual argv, prompt
 transport, requested editable files, turn policy, and explicit isolation modes.
+When a formal caller supplies a sealed backend-runtime-closure digest, the exact
+digest is copied from the immutable request into this receipt so an outer
+evaluator can reject cross-runtime lineage drift.
 It also binds `private_pid_namespace_init_pidfd_v1` as the non-configurable
 process-containment policy. Runtime proof is separate from invocation intent and
 uses `apex.agent-process-containment/v1`.

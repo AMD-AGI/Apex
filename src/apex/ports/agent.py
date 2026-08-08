@@ -200,6 +200,7 @@ class AgentRequest:
     max_turns: int = 25
     timeout_seconds: int = 3600
     environment: Mapping[str, str] = field(default_factory=dict)
+    runtime_closure_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -214,6 +215,12 @@ class AgentRequest:
             or self.timeout_seconds <= 0
         ):
             raise ContractError("Agent timeout must be positive", "invalid_agent_budget")
+        if self.runtime_closure_sha256 is not None and not _SHA256.fullmatch(
+            self.runtime_closure_sha256
+        ):
+            raise ContractError(
+                "Agent runtime closure digest is invalid", "invalid_agent_invocation"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +241,7 @@ class AgentInvocationReceipt:
     turn_policy: str
     process_containment_policy_id: str
     isolation: tuple[tuple[str, str], ...]
+    runtime_closure_sha256: str | None = None
 
     def __post_init__(self) -> None:
         strings = (
@@ -253,6 +261,12 @@ class AgentInvocationReceipt:
             raise ContractError("Agent invocation paths must be absolute", "invalid_agent_invocation")
         if not _SHA256.fullmatch(self.entrypoint_sha256):
             raise ContractError("Agent entrypoint digest is invalid", "invalid_agent_invocation")
+        if self.runtime_closure_sha256 is not None and not _SHA256.fullmatch(
+            self.runtime_closure_sha256
+        ):
+            raise ContractError(
+                "Agent runtime closure digest is invalid", "invalid_agent_invocation"
+            )
         if not self.argv or any(not isinstance(value, str) or not value for value in self.argv):
             raise ContractError("Agent argv is invalid", "invalid_agent_invocation")
         if any(
@@ -286,6 +300,7 @@ class AgentInvocationReceipt:
             "executable_path": self.executable_path,
             "resolved_executable_path": self.resolved_executable_path,
             "entrypoint_sha256": self.entrypoint_sha256,
+            "runtime_closure_sha256": self.runtime_closure_sha256,
             "argv": list(self.argv),
             "workspace": self.workspace,
             "prompt_transport": self.prompt_transport,

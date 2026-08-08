@@ -88,6 +88,7 @@ def invocation_receipt(
         turn_policy=turn_policy,
         process_containment_policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
         isolation=tuple(sorted(isolation.items())),
+        runtime_closure_sha256=request.runtime_closure_sha256,
     )
 
 

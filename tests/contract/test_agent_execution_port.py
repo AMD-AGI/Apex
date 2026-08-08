@@ -102,6 +102,7 @@ def _invocation(max_turns: int = 2) -> AgentInvocationReceipt:
 
 
 def test_exact_boundary_is_typed_and_candidate_capture_is_fail_closed() -> None:
+    assert _invocation().to_dict()["runtime_closure_sha256"] is None
     result = AgentResult(
         AgentBackendName.CODEX,
         None,

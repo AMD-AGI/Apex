@@ -76,7 +76,11 @@ def test_task_spec_round_trip_json(tmp_path: Path) -> None:
 def test_task_spec_preserves_matched_agent_options_and_budget(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     data = _task_mapping(workspace, tmp_path / "results")
-    data["agent_options"] = {"model": "gpt-5.5", "effort": "xhigh"}
+    data["agent_options"] = {
+        "model": "gpt-5.5",
+        "effort": "xhigh",
+        "runtime_closure_sha256": "b" * 64,
+    }
     data["budget"] = {"max_iterations": 2, "max_turns": 40, "timeout_seconds": 3600}
     data["scope"] = {
         "dtype": ["FP16", "bf16"],
@@ -89,6 +93,8 @@ def test_task_spec_preserves_matched_agent_options_and_budget(tmp_path: Path) ->
 
     assert task.agent_options.model == "gpt-5.5"
     assert task.agent_options.effort == "xhigh"
+    assert task.agent_options.runtime_closure_sha256 == "b" * 64
+    assert task.to_dict()["agent_options"]["runtime_closure_sha256"] == "b" * 64
     assert task.budget.max_iterations == 2
     assert task.budget.max_turns == 40
     assert task.budget.timeout_seconds == 3600
@@ -96,6 +102,15 @@ def test_task_spec_preserves_matched_agent_options_and_budget(tmp_path: Path) ->
     assert task.scope.regime == ("decode",)
     assert task.scope.framework == ("vllm",)
     assert task.scope.versions == (("rocm", "7.2"),)
+
+
+def test_task_spec_rejects_invalid_agent_runtime_closure(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    data = _task_mapping(workspace, tmp_path / "results")
+    data["agent_options"] = {"runtime_closure_sha256": "not-a-digest"}
+
+    with pytest.raises(ContractError, match="runtime closure"):
+        TaskSpec.from_mapping(data)
 
 
 def test_measurement_contract_is_trusted_and_not_editable(tmp_path: Path) -> None:

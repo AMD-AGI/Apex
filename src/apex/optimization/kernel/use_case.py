@@ -522,6 +522,7 @@ class KernelOptimizeUseCase:
             effort=request.effort_override or task.agent_options.effort,
             max_turns=task.budget.max_turns,
             timeout_seconds=task.budget.timeout_seconds,
+            runtime_closure_sha256=task.agent_options.runtime_closure_sha256,
         )
 
 
