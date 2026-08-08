@@ -11,7 +11,8 @@ from typing import Any, Mapping
 
 import yaml
 
-from apex.core import ConfigurationError, IntegrityError, sha256_json
+from apex.benchmark import validate_phase_set_contract
+from apex.core import ConfigurationError, IntegrityError
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,23 +39,48 @@ def derive_overlay_configs(
     if output_dir.exists() and output_dir.is_symlink():
         raise IntegrityError("Overlay config directory is a symlink", "unsafe_path")
     output.mkdir(parents=True, exist_ok=True)
-    paths: list[Path] = []
-    for kind, source in (
+    sources = (
         ("measurement", measurement),
         ("diagnostic", diagnostic),
         ("replay", replay),
-    ):
-        before = _load(source)
-        _validate_semantics(before, workload_semantics_sha256)
+    )
+    originals = tuple(_load(source) for _, source in sources)
+    validate_phase_set_contract(
+        *originals,
+        expected_semantics_sha256=workload_semantics_sha256,
+    )
+    derived: list[dict[str, Any]] = []
+    for before in originals:
         after = copy.deepcopy(before)
         after["benchmark"]["docker_image"] = image_id
         _assert_only_image_changed(before, after)
-        destination = output / f"{kind}.yaml"
-        _write_once(destination, yaml.safe_dump(after, sort_keys=False).encode("utf-8"))
-        reloaded = _load(destination)
-        _assert_only_image_changed(before, reloaded)
-        _validate_semantics(reloaded, workload_semantics_sha256)
-        paths.append(destination.resolve())
+        derived.append(after)
+    serialized = tuple(
+        yaml.safe_dump(after, sort_keys=False).encode("utf-8") for after in derived
+    )
+    round_tripped = tuple(_parse(content.decode("utf-8")) for content in serialized)
+    for before, observed in zip(originals, round_tripped, strict=True):
+        _assert_only_image_changed(before, observed)
+    validate_phase_set_contract(
+        *round_tripped,
+        expected_semantics_sha256=workload_semantics_sha256,
+    )
+
+    destinations = tuple(output / f"{kind}.yaml" for kind, _ in sources)
+    if any(path.exists() or path.is_symlink() for path in destinations):
+        raise IntegrityError(
+            "Overlay config path already exists", "immutable_benchmark_view"
+        )
+    for destination, content in zip(destinations, serialized, strict=True):
+        _write_once(destination, content)
+    paths = tuple(path.resolve() for path in destinations)
+    reloaded = tuple(_load(path) for path in paths)
+    for before, observed in zip(originals, reloaded, strict=True):
+        _assert_only_image_changed(before, observed)
+    validate_phase_set_contract(
+        *reloaded,
+        expected_semantics_sha256=workload_semantics_sha256,
+    )
     return OverlayConfigSet(*paths)
 
 
@@ -62,34 +88,17 @@ def _load(path: Path) -> dict[str, Any]:
     if not path.is_absolute() or not path.is_file() or path.is_symlink():
         raise ConfigurationError("Benchmark view is missing or unsafe", "invalid_replay_config")
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return _parse(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as error:
         raise ConfigurationError("Benchmark view is invalid YAML", "invalid_replay_config") from error
+
+
+def _parse(content: str) -> dict[str, Any]:
+    value = yaml.safe_load(content)
     benchmark = value.get("benchmark") if isinstance(value, dict) else None
     if not isinstance(benchmark, dict) or not isinstance(benchmark.get("docker_image"), str):
         raise ConfigurationError("Benchmark view lacks docker_image", "invalid_replay_config")
     return value
-
-
-def _validate_semantics(document: Mapping[str, Any], expected: str) -> None:
-    benchmark = document["benchmark"]
-    projected = copy.deepcopy(dict(benchmark))
-    projected.pop("profiler", None)
-    projected.pop("gap_analysis", None)
-    projected.pop("docker_image", None)
-    projected.pop("run_kind", None)
-    if sha256_json(projected) != expected:
-        raise IntegrityError(
-            "Benchmark workload semantics changed before overlay deployment",
-            "benchmark_semantics_changed",
-        )
-    apex = document.get("apex")
-    metadata = apex.get("benchmark_view") if isinstance(apex, Mapping) else None
-    if not isinstance(metadata, Mapping) or metadata.get("workload_semantics_sha256") != expected:
-        raise IntegrityError(
-            "Benchmark view metadata does not bind workload semantics",
-            "benchmark_semantics_changed",
-        )
 
 
 def _assert_only_image_changed(before: Mapping[str, Any], after: Mapping[str, Any]) -> None:

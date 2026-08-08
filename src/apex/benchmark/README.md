@@ -39,6 +39,15 @@ contract; diagnostic validation restores the receipt-pinned runtime and
 normalizes `RUN_EVAL=false` only for this comparison before proving every other
 workload input is identical.
 
+`validate_phase_set_contract` is the shared, receipt-independent guard used
+before the initial views are written and again before and after an immutable
+image overlay is serialized. It verifies exact phase roles, common provenance
+metadata, formal/replay identity, quality and evaluator-policy consistency,
+profiler isolation, and the normalized workload digest across all three views.
+This self-consistency check complements `validate_resolved_view`, whose trusted
+dependency receipt proves that embedded paths, revisions, and runtime identities
+match the live environment.
+
 ## Result contract
 
 `MagpieBenchmarkAdapter` invokes an argv array through `SubprocessSupervisor`
@@ -87,8 +96,9 @@ and normalizes evaluator-owned performance and quality evidence.
 
 ## Public API
 
-Use `build_config_views`, `validate_resolved_view`, `MagpieBenchmarkAdapter`, and
-the immutable result types exported by `apex.benchmark`.
+Use `build_config_views`, `validate_phase_set_contract`,
+`validate_resolved_view`, `MagpieBenchmarkAdapter`, and the immutable result
+types exported by `apex.benchmark`.
 
 ## Invariants
 

@@ -8,6 +8,7 @@ import yaml
 from apex.benchmark import build_config_views, validate_resolved_view
 from apex.core import ConfigurationError, IntegrityError
 from apex.delivery import verify_replay_config_invariants
+from apex.optimization.e2e.overlay_config import derive_overlay_configs
 from apex.ports import BenchmarkPass
 from apex.runtime import DependencyReceipt, LmEvalRuntimeReceipt
 
@@ -198,6 +199,39 @@ def test_builds_trace_only_diagnostic_and_formal_measurement_views(
         pass_type=BenchmarkPass.MEASUREMENT,
         dependency_receipt=receipt,
     )
+
+
+def test_generated_trace_only_views_support_immutable_image_overlay(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    views = build_config_views(
+        _source(tmp_path),
+        tmp_path / "views",
+        dependency_receipt=receipt,
+        replay_image="derived@sha256:" + "f" * 64,
+    )
+    source_paths = (views.measurement, views.diagnostic, views.replay)
+    originals = tuple(_load(path) for path in source_paths)
+
+    derived = derive_overlay_configs(
+        measurement=views.measurement,
+        diagnostic=views.diagnostic,
+        replay=views.replay,
+        output_dir=tmp_path / "overlay",
+        image_id="sha256:" + "e" * 64,
+        workload_semantics_sha256=views.workload_semantics_sha256,
+    )
+
+    for original, path in zip(
+        originals,
+        (derived.measurement, derived.diagnostic, derived.replay),
+        strict=True,
+    ):
+        observed = _load(path)
+        assert observed["benchmark"]["docker_image"] == "sha256:" + "e" * 64
+        observed["benchmark"]["docker_image"] = original["benchmark"]["docker_image"]
+        assert observed == original
 
 
 def test_refuses_to_replace_an_immutable_view(tmp_path: Path) -> None:

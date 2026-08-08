@@ -28,7 +28,12 @@ The latter binds the inspected parent image ID to the unique
 provenance-approved immutable `repo@sha256` locator from the same inspection,
 re-inspects that locator immediately before build, changes one installed Python
 file, proves the loaded bytes in a clean container, and derives Magpie configs
-whose sole workload change is `benchmark.docker_image`. A bare local image ID
+whose sole workload change is `benchmark.docker_image`. The measurement,
+trace-only diagnostic, and replay views are validated together against one
+formal workload hash before any derived YAML is written. For hash comparison
+only, the diagnostic view restores the measurement view's `RUN_EVAL=true` and
+receipt-pinned lm-eval runtime; its emitted config remains `RUN_EVAL=false` and
+contains no evaluator runtime or quality claim. A bare local image ID
 remains valid for `docker run` and byte probes but is never written in
 Dockerfile `FROM`, where BuildKit interprets it as a registry reference. Missing
 or ambiguous repo-digest provenance for a tag or bare image ID fails closed. An

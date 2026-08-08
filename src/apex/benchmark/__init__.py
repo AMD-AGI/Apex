@@ -1,5 +1,6 @@
 """Magpie benchmark boundary and immutable phase views."""
 
+from .config_validation import validate_phase_set_contract
 from .config_views import (
     BenchmarkConfigViews,
     TraceLensBinding,
@@ -54,5 +55,6 @@ __all__ = [
     "parse_model_revision_evidence",
     "resolve_evaluator_policy",
     "qwen_evaluator_policy",
+    "validate_phase_set_contract",
     "validate_resolved_view",
 ]

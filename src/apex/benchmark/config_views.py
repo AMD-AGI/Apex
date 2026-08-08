@@ -16,7 +16,7 @@ from apex.core import ConfigurationError, IntegrityError, sha256_bytes, sha256_j
 from apex.ports import BenchmarkPass
 from apex.runtime import DependencyReceipt
 
-from .config_validation import validate_view_contract
+from .config_validation import validate_phase_set_contract, validate_view_contract
 from .evaluator_policy import EvaluatorPolicy, resolve_evaluator_policy
 from .runtime_inputs import pin_runtime_inputs
 
@@ -427,35 +427,6 @@ def _replay_document(
     return result
 
 
-def _assert_view_semantics(
-    diagnostic: Mapping[str, Any],
-    replay: Mapping[str, Any],
-    semantics_sha256: str,
-    quality_tasks: str,
-) -> None:
-    diagnostic_tasks = diagnostic["benchmark"]["envs"].get("MAGPIE_EVAL_TASKS", "")
-    diagnostic_projection = _workload_projection(diagnostic["benchmark"])
-    replay_projection = _workload_projection(replay["benchmark"])
-    if quality_tasks:
-        diagnostic_projection["envs"]["RUN_EVAL"] = "true"
-        diagnostic_projection["lm_eval_runtime"] = replay_projection["lm_eval_runtime"]
-    metadata = diagnostic["apex"]["benchmark_view"]["quality_contract"]
-    diagnostic_contract_valid = (
-        metadata.get("required") is False
-        and metadata.get("kind") == "trace_only"
-    ) if quality_tasks else metadata.get("required") is True
-    if (
-        diagnostic_tasks != quality_tasks
-        or not diagnostic_contract_valid
-        or sha256_json(diagnostic_projection) != semantics_sha256
-        or sha256_json(replay_projection) != semantics_sha256
-    ):
-        raise IntegrityError(
-            "Generated benchmark views changed workload or quality semantics",
-            "benchmark_semantics_changed",
-        )
-
-
 def _view_paths(
     destination: Path,
     original_sha256: str,
@@ -542,7 +513,9 @@ def build_config_views(
         dependency_receipt,
         evaluator_policy,
     )
-    _assert_view_semantics(diagnostic, replay, semantics_sha256, quality_tasks)
+    validate_phase_set_contract(
+        measurement, diagnostic, replay, semantics_sha256
+    )
     paths = _view_paths(
         destination,
         original_sha256,

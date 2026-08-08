@@ -327,32 +327,94 @@ def _provenance(source_root: Path, library: str) -> RunProvenance:
 
 
 def _views(tmp_path: Path):
+    return _trace_only_views(tmp_path)
+
+
+def _trace_only_views(tmp_path: Path):
+    tracelens = (tmp_path / "tracelens").resolve()
+    tracelens.mkdir(exist_ok=True)
     benchmark = {
         "framework": "vllm",
         "model": "Qwen/example",
         "docker_image": "example:v1",
-        "envs": {"RUN_EVAL": "true", "TP": 1},
-        "profiler": {"torch_profiler": {"enabled": False}},
+        "run_kind": "measurement",
+        "envs": {
+            "RUN_EVAL": "true",
+            "MAGPIE_EVAL_TASKS": "gsm8k",
+            "TP": 1,
+        },
+        "lm_eval_runtime": {
+            "path": "/runtime/lm-eval",
+            "sha256": "a" * 64,
+            "identity": {"commit": "b" * 40},
+        },
+        "profiler": {
+            "torch_profiler": {"enabled": False},
+            "tracelens": {
+                "enabled": False,
+                "tracelens_repo_path": str(tracelens),
+            },
+            "targeted_trace": {"enabled": False, "targets": []},
+        },
         "gap_analysis": {"enabled": False},
     }
     projected = copy.deepcopy(benchmark)
-    projected.pop("docker_image")
-    projected.pop("profiler")
-    projected.pop("gap_analysis")
+    for key in ("docker_image", "run_kind", "profiler", "gap_analysis"):
+        projected.pop(key)
     semantics = sha256_json(projected)
     paths = []
     for kind in ("measurement", "diagnostic", "replay"):
+        selected = copy.deepcopy(benchmark)
+        quality = {
+            "required": True,
+            "kind": "lm_eval",
+            "tasks": "gsm8k",
+            "evaluator_policy": None,
+        }
+        if kind == "diagnostic":
+            selected["run_kind"] = "diagnostic"
+            selected["envs"]["RUN_EVAL"] = "false"
+            selected.pop("lm_eval_runtime")
+            selected["profiler"]["torch_profiler"]["enabled"] = True
+            selected["profiler"]["tracelens"]["enabled"] = True
+            selected["profiler"]["targeted_trace"] = {
+                "enabled": True,
+                "targets": [{"name_patterns": ["*"]}],
+            }
+            selected["gap_analysis"]["enabled"] = True
+            quality = {
+                "required": False,
+                "kind": "trace_only",
+                "tasks": "gsm8k",
+                "evaluator_policy": None,
+            }
         document = {
-            "benchmark": copy.deepcopy(benchmark),
+            "benchmark": selected,
             "apex": {
                 "benchmark_view": {
                     "schema": "apex.benchmark-view.v1",
                     "kind": kind,
+                    "original_sha256": "d" * 64,
                     "workload_semantics_sha256": semantics,
+                    "dependencies": {
+                        "receipt_schema": "apex.dependency-receipt.v1",
+                        "lock_sha256": "e" * 64,
+                        "python": "/usr/bin/python3",
+                        "magpie": {"root": "/magpie", "commit": "1" * 40},
+                        "tracelens": {
+                            "root": str(tracelens),
+                            "commit": "2" * 40,
+                        },
+                        "inferencex": {
+                            "root": "/inferencex",
+                            "commit": "3" * 40,
+                        },
+                    },
+                    "quality_contract": quality,
                 }
             },
         }
-        path = tmp_path / f"{kind}.yaml"
+        path = tmp_path / f"trace-{kind}.yaml"
         path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
         paths.append(path.resolve())
     return tuple(paths), semantics
@@ -1035,16 +1097,115 @@ def test_overlay_config_rejects_workload_mutation(tmp_path: Path):
     mutated["benchmark"]["envs"]["TP"] = 8
     paths[2].write_text(yaml.safe_dump(mutated), encoding="utf-8")
 
+    output = tmp_path / "derived"
     with pytest.raises(IntegrityError, match="semantics") as caught:
         derive_overlay_configs(
             measurement=paths[0],
             diagnostic=paths[1],
             replay=paths[2],
-            output_dir=tmp_path / "derived",
+            output_dir=output,
             image_id=DERIVED_ID,
             workload_semantics_sha256=semantics,
         )
     assert caught.value.reason_code == "benchmark_semantics_changed"
+    assert not tuple(output.glob("*.yaml"))
+
+
+def test_overlay_config_preserves_trace_only_diagnostic_semantics(tmp_path: Path):
+    paths, semantics = _trace_only_views(tmp_path)
+
+    derived = derive_overlay_configs(
+        measurement=paths[0],
+        diagnostic=paths[1],
+        replay=paths[2],
+        output_dir=tmp_path / "derived",
+        image_id=DERIVED_ID,
+        workload_semantics_sha256=semantics,
+    )
+
+    documents = tuple(
+        yaml.safe_load(path.read_text(encoding="utf-8"))
+        for path in (derived.measurement, derived.diagnostic, derived.replay)
+    )
+    assert all(item["benchmark"]["docker_image"] == DERIVED_ID for item in documents)
+    diagnostic = documents[1]
+    assert diagnostic["benchmark"]["envs"]["RUN_EVAL"] == "false"
+    assert "lm_eval_runtime" not in diagnostic["benchmark"]
+    assert diagnostic["apex"]["benchmark_view"]["quality_contract"] == {
+        "required": False,
+        "kind": "trace_only",
+        "tasks": "gsm8k",
+        "evaluator_policy": None,
+    }
+    for source_path, observed in zip(paths, documents, strict=True):
+        original = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+        observed["benchmark"]["docker_image"] = original["benchmark"]["docker_image"]
+        assert observed == original
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda document: document["benchmark"]["envs"].update({"TP": 8}),
+        lambda document: document["benchmark"]["envs"].update({"RUN_EVAL": "true"}),
+        lambda document: document["benchmark"].update({"envs": None}),
+        lambda document: document["apex"]["benchmark_view"][
+            "quality_contract"
+        ].update({"evaluator_policy": {"sha256": "c" * 64}}),
+        lambda document: document["apex"]["benchmark_view"].update(
+            {"kind": "measurement"}
+        ),
+        lambda document: document["apex"]["benchmark_view"].update(
+            {"schema": "apex.benchmark-view.v2"}
+        ),
+    ),
+)
+def test_overlay_config_rejects_trace_only_contract_drift(
+    tmp_path: Path, mutation
+):
+    paths, semantics = _trace_only_views(tmp_path)
+    diagnostic = yaml.safe_load(paths[1].read_text(encoding="utf-8"))
+    mutation(diagnostic)
+    paths[1].write_text(
+        yaml.safe_dump(diagnostic, sort_keys=False), encoding="utf-8"
+    )
+    output = tmp_path / "derived"
+
+    with pytest.raises(IntegrityError) as caught:
+        derive_overlay_configs(
+            measurement=paths[0],
+            diagnostic=paths[1],
+            replay=paths[2],
+            output_dir=output,
+            image_id=DERIVED_ID,
+            workload_semantics_sha256=semantics,
+        )
+
+    assert caught.value.reason_code == "benchmark_semantics_changed"
+    assert not tuple(output.glob("*.yaml"))
+
+
+def test_overlay_config_preflights_all_destination_collisions(tmp_path: Path):
+    paths, semantics = _trace_only_views(tmp_path)
+    output = tmp_path / "derived"
+    output.mkdir()
+    collision = output / "diagnostic.yaml"
+    collision.write_text("existing\n", encoding="utf-8")
+
+    with pytest.raises(IntegrityError) as caught:
+        derive_overlay_configs(
+            measurement=paths[0],
+            diagnostic=paths[1],
+            replay=paths[2],
+            output_dir=output,
+            image_id=DERIVED_ID,
+            workload_semantics_sha256=semantics,
+        )
+
+    assert caught.value.reason_code == "immutable_benchmark_view"
+    assert collision.read_text(encoding="utf-8") == "existing\n"
+    assert not (output / "measurement.yaml").exists()
+    assert not (output / "replay.yaml").exists()
 
 
 def test_overlay_final_delivery_never_claims_source_rebuild(tmp_path: Path):

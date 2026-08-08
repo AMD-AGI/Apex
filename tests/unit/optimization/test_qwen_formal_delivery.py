@@ -411,12 +411,26 @@ def test_exact_config_injects_reviewed_source_and_model_locks(
 
 
 def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
+    tracelens = (tmp_path / "tracelens").resolve()
+    tracelens.mkdir(exist_ok=True)
     benchmark = {
         "framework": "vllm",
         "model": QWEN_MODEL_ID,
         "docker_image": QWEN_PARENT_REFERENCE,
-        "envs": {"RUN_EVAL": "true"},
-        "profiler": {"torch_profiler": {"enabled": False}},
+        "envs": {"RUN_EVAL": "true", "MAGPIE_EVAL_TASKS": "gsm8k"},
+        "lm_eval_runtime": {
+            "path": "/runtime/lm-eval",
+            "sha256": "8" * 64,
+            "identity": {"commit": "9" * 40},
+        },
+        "profiler": {
+            "torch_profiler": {"enabled": False},
+            "tracelens": {
+                "enabled": False,
+                "tracelens_repo_path": str(tracelens),
+            },
+            "targeted_trace": {"enabled": False, "targets": []},
+        },
         "gap_analysis": {"enabled": False},
     }
     projected = copy.deepcopy(benchmark)
@@ -429,12 +443,51 @@ def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
         benchmark_view["run_kind"] = (
             "diagnostic" if role == "diagnostic" else "measurement"
         )
+        quality = {
+            "required": True,
+            "kind": "lm_eval",
+            "tasks": "gsm8k",
+            "evaluator_policy": None,
+        }
+        if role == "diagnostic":
+            benchmark_view["envs"]["RUN_EVAL"] = "false"
+            benchmark_view.pop("lm_eval_runtime")
+            benchmark_view["profiler"]["torch_profiler"]["enabled"] = True
+            benchmark_view["profiler"]["tracelens"]["enabled"] = True
+            benchmark_view["profiler"]["targeted_trace"] = {
+                "enabled": True,
+                "targets": [{"name_patterns": ["*"]}],
+            }
+            benchmark_view["gap_analysis"]["enabled"] = True
+            quality = {
+                "required": False,
+                "kind": "trace_only",
+                "tasks": "gsm8k",
+                "evaluator_policy": None,
+            }
         document = {
             "benchmark": benchmark_view,
             "apex": {
                 "benchmark_view": {
+                    "schema": "apex.benchmark-view.v1",
                     "kind": role,
+                    "original_sha256": "a" * 64,
                     "workload_semantics_sha256": semantics,
+                    "dependencies": {
+                        "receipt_schema": "apex.dependency-receipt.v1",
+                        "lock_sha256": "b" * 64,
+                        "python": "/usr/bin/python3",
+                        "magpie": {"root": "/magpie", "commit": "1" * 40},
+                        "tracelens": {
+                            "root": str(tracelens),
+                            "commit": "2" * 40,
+                        },
+                        "inferencex": {
+                            "root": "/inferencex",
+                            "commit": "3" * 40,
+                        },
+                    },
+                    "quality_contract": quality,
                 }
             },
         }

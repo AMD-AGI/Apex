@@ -3,16 +3,229 @@
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
-from apex.core import ConfigurationError, sha256_json
+from apex.core import ConfigurationError, IntegrityError, sha256_json
 from apex.ports import BenchmarkPass
 from apex.runtime import DependencyReceipt
+
+from .evaluator_policy import EvaluatorPolicy
 
 
 VIEW_SCHEMA = "apex.benchmark-view.v1"
 SERVING_FRAMEWORKS = frozenset({"vllm", "sglang", "atom"})
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+_QUALITY_FIELDS = frozenset({"required", "kind", "tasks", "evaluator_policy"})
+_POLICY_FIELDS = frozenset(
+    ("policy_id", "tasks", "primary_metric", "max_length", "max_gen_tokens", "sha256")
+)
+_PHASE_PASSES = (
+    BenchmarkPass.MEASUREMENT, BenchmarkPass.DIAGNOSTIC, BenchmarkPass.MEASUREMENT
+)
+
+
+def validate_phase_set_contract(
+    measurement: Mapping[str, Any],
+    diagnostic: Mapping[str, Any],
+    replay: Mapping[str, Any],
+    expected_semantics_sha256: str,
+) -> None:
+    """Validate the self-contained invariants of one resolved phase set."""
+
+    try:
+        _validate_phase_set(measurement, diagnostic, replay, expected_semantics_sha256)
+    except IntegrityError:
+        raise
+    except (
+        AttributeError, ConfigurationError, KeyError, OSError,
+        RuntimeError, TypeError, ValueError,
+    ) as error:
+        raise _phase_set_changed() from error
+
+
+def _validate_phase_set(
+    measurement: Mapping[str, Any],
+    diagnostic: Mapping[str, Any],
+    replay: Mapping[str, Any],
+    expected: str,
+) -> None:
+    documents = (measurement, diagnostic, replay)
+    benchmarks = tuple(_benchmark(document) for document in documents)
+    metadata = tuple(_view_metadata(document) for document in documents)
+    _validate_phase_metadata(metadata, expected)
+    _validate_shared_envelope(documents)
+    _validate_phase_roles(benchmarks, metadata)
+    _validate_formal_replay_identity(documents, benchmarks)
+    _validate_phase_quality(benchmarks, metadata)
+    _validate_phase_instrumentation(benchmarks, metadata[0])
+    _validate_phase_semantics(benchmarks, expected)
+
+
+def _benchmark(document: Mapping[str, Any]) -> Mapping[str, Any]:
+    benchmark = document.get("benchmark") if isinstance(document, Mapping) else None
+    if not isinstance(benchmark, Mapping):
+        raise ConfigurationError(
+            "Resolved phase set lacks a benchmark mapping", "invalid_benchmark_view"
+        )
+    return benchmark
+
+
+def _validate_shared_envelope(documents: tuple[Mapping[str, Any], ...]) -> None:
+    envelopes = []
+    for document in documents:
+        projected = copy.deepcopy(dict(document))
+        projected.pop("benchmark", None)
+        apex = projected.get("apex")
+        if not isinstance(apex, Mapping):
+            raise _phase_set_changed()
+        projected["apex"] = dict(apex)
+        projected["apex"].pop("benchmark_view", None)
+        envelopes.append(projected)
+    if any(value != envelopes[0] for value in envelopes[1:]):
+        raise _phase_set_changed()
+
+
+def _validate_phase_metadata(
+    metadata: tuple[Mapping[str, Any], ...], expected: str
+) -> None:
+    common: Mapping[str, Any] | None = None
+    for observed, kind in zip(
+        metadata, ("measurement", "diagnostic", "replay"), strict=True
+    ):
+        original = observed.get("original_sha256")
+        valid = (
+            observed.get("kind") == kind
+            and isinstance(original, str)
+            and bool(_SHA256.fullmatch(original))
+            and observed.get("workload_semantics_sha256") == expected
+        )
+        _dependency_metadata(observed)
+        _quality_metadata(observed)
+        normalized = copy.deepcopy(dict(observed))
+        normalized.pop("kind", None)
+        normalized.pop("quality_contract", None)
+        if not valid or (common is not None and normalized != common):
+            raise _phase_set_changed()
+        common = normalized
+
+
+def _validate_phase_roles(
+    benchmarks: tuple[Mapping[str, Any], ...],
+    metadata: tuple[Mapping[str, Any], ...],
+) -> None:
+    for benchmark, view_metadata, pass_type in zip(
+        benchmarks, metadata, _PHASE_PASSES, strict=True
+    ):
+        _validate_view_kind(view_metadata, pass_type)
+        _validate_run_kind(benchmark, pass_type)
+        _validate_quality_contract(benchmark, view_metadata, pass_type)
+        _validate_evaluator_policy(benchmark, view_metadata)
+
+
+def _validate_formal_replay_identity(
+    documents: tuple[Mapping[str, Any], ...],
+    benchmarks: tuple[Mapping[str, Any], ...],
+) -> None:
+    images = tuple(benchmark.get("docker_image") for benchmark in benchmarks)
+    if any(not isinstance(image, str) or not image.strip() for image in images):
+        raise _phase_set_changed()
+    if images[0] != images[1]:
+        raise _phase_set_changed()
+    formal = _formal_document_projection(documents[0])
+    replay = _formal_document_projection(documents[2])
+    if formal != replay:
+        raise _phase_set_changed()
+
+
+def _formal_document_projection(document: Mapping[str, Any]) -> dict[str, Any]:
+    projected = copy.deepcopy(dict(document))
+    projected["benchmark"].pop("docker_image", None)
+    projected["apex"]["benchmark_view"]["kind"] = "measurement"
+    return projected
+
+
+def _validate_phase_quality(
+    benchmarks: tuple[Mapping[str, Any], ...],
+    metadata: tuple[Mapping[str, Any], ...],
+) -> None:
+    measurement, diagnostic, replay = benchmarks
+    qualities = tuple(_quality_metadata(value) for value in metadata)
+    formal, diagnosed, replayed = qualities
+    if formal != replayed:
+        raise _phase_set_changed()
+    framework = str(measurement.get("framework", "")).strip().lower()
+    if framework not in SERVING_FRAMEWORKS:
+        expected = {
+            "required": True,
+            "kind": "framework_quality_gate",
+            "tasks": "",
+            "evaluator_policy": None,
+        }
+        if formal != expected or diagnosed != formal:
+            raise _phase_set_changed()
+        return
+    expected_diagnostic = dict(formal)
+    expected_diagnostic.update({"required": False, "kind": "trace_only"})
+    runtime = measurement.get("lm_eval_runtime")
+    valid = (
+        diagnosed == expected_diagnostic
+        and isinstance(runtime, Mapping)
+        and "lm_eval_runtime" not in diagnostic
+        and replay.get("lm_eval_runtime") == runtime
+    )
+    if not valid:
+        raise _phase_set_changed()
+
+
+def _validate_phase_instrumentation(
+    benchmarks: tuple[Mapping[str, Any], ...],
+    measurement_metadata: Mapping[str, Any],
+) -> None:
+    dependencies = _dependency_metadata(measurement_metadata)
+    tracelens = dependencies["tracelens"]
+    tracelens_root = Path(str(tracelens["root"])).resolve()
+    for benchmark, pass_type in zip(
+        benchmarks, _PHASE_PASSES, strict=True
+    ):
+        _validate_instrumentation(benchmark, pass_type, tracelens_root)
+
+
+def _validate_phase_semantics(
+    benchmarks: tuple[Mapping[str, Any], ...], expected: str
+) -> None:
+    measurement, diagnostic, replay = benchmarks
+    formal = _workload_projection(measurement)
+    diagnosed = _workload_projection(diagnostic)
+    replayed = _workload_projection(replay)
+    framework = str(measurement.get("framework", "")).strip().lower()
+    if framework in SERVING_FRAMEWORKS:
+        formal_envs = formal.get("envs")
+        diagnostic_envs = diagnosed.get("envs")
+        if not isinstance(formal_envs, Mapping) or not isinstance(
+            diagnostic_envs, dict
+        ):
+            raise _phase_set_changed()
+        diagnostic_envs["RUN_EVAL"] = formal_envs["RUN_EVAL"]
+        diagnosed["lm_eval_runtime"] = copy.deepcopy(formal["lm_eval_runtime"])
+    if any(sha256_json(value) != expected for value in (formal, diagnosed, replayed)):
+        raise _phase_set_changed()
+
+
+def _workload_projection(benchmark: Mapping[str, Any]) -> dict[str, Any]:
+    projected = copy.deepcopy(dict(benchmark))
+    for key in ("profiler", "gap_analysis", "docker_image", "run_kind"):
+        projected.pop(key, None)
+    return projected
+
+
+def _phase_set_changed() -> IntegrityError:
+    return IntegrityError(
+        "Resolved benchmark phase set changed workload or phase semantics",
+        "benchmark_semantics_changed",
+    )
 
 
 def validate_view_contract(
@@ -70,12 +283,7 @@ def _validate_dependency_identity(
     tracelens_root: Path,
     tracelens_commit: str,
 ) -> None:
-    dependencies = metadata.get("dependencies")
-    if not isinstance(dependencies, Mapping):
-        raise ConfigurationError(
-            "Benchmark view lacks dependency receipt identity",
-            "benchmark_dependency_mismatch",
-        )
+    dependencies = _dependency_metadata(metadata)
     magpie = dependencies.get("magpie")
     tracelens = dependencies.get("tracelens")
     inferencex = dependencies.get("inferencex")
@@ -98,6 +306,53 @@ def _validate_dependency_identity(
             "Benchmark view dependency identity differs from the runtime receipt",
             "benchmark_dependency_mismatch",
         )
+
+
+def _dependency_metadata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    dependencies = metadata.get("dependencies")
+    components = (
+        dependencies.get("magpie") if isinstance(dependencies, Mapping) else None,
+        dependencies.get("tracelens") if isinstance(dependencies, Mapping) else None,
+        dependencies.get("inferencex") if isinstance(dependencies, Mapping) else None,
+    )
+    valid = (
+        isinstance(dependencies, Mapping)
+        and isinstance(dependencies.get("receipt_schema"), str)
+        and bool(dependencies.get("receipt_schema"))
+        and isinstance(dependencies.get("lock_sha256"), str)
+        and bool(_SHA256.fullmatch(str(dependencies.get("lock_sha256"))))
+        and _absolute_locator(dependencies.get("python"))
+        and all(_valid_dependency_component(value) for value in components)
+    )
+    if not valid:
+        raise ConfigurationError(
+            "Benchmark view lacks complete dependency receipt metadata",
+            "benchmark_dependency_mismatch",
+        )
+    return dependencies
+
+
+def _valid_dependency_component(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and _absolute_locator(value.get("root"))
+        and isinstance(value.get("commit"), str)
+        and _COMMIT.fullmatch(str(value.get("commit")))
+    )
+
+
+def _absolute_locator(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and Path(value).is_absolute()
+
+
+def _quality_metadata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    quality = metadata.get("quality_contract")
+    if not isinstance(quality, Mapping) or set(quality) != _QUALITY_FIELDS:
+        raise ConfigurationError(
+            "Benchmark view lacks a complete quality contract",
+            "quality_contract_missing",
+        )
+    return quality
 
 
 def _validate_quality_contract(
@@ -146,6 +401,29 @@ def _validate_evaluator_policy(
     policy = quality.get("evaluator_policy") if isinstance(quality, Mapping) else None
     if policy is None:
         return
+    if not isinstance(policy, Mapping) or set(policy) != _POLICY_FIELDS:
+        raise ConfigurationError(
+            "Benchmark evaluator policy metadata is incomplete",
+            "benchmark_evaluator_policy_mismatch",
+        )
+    try:
+        typed = EvaluatorPolicy(
+            policy_id=policy["policy_id"],
+            tasks=policy["tasks"],
+            primary_metric=policy["primary_metric"],
+            max_length=policy["max_length"],
+            max_gen_tokens=policy["max_gen_tokens"],
+        )
+    except (ConfigurationError, TypeError, ValueError) as error:
+        raise ConfigurationError(
+            "Benchmark evaluator policy metadata is invalid",
+            "benchmark_evaluator_policy_mismatch",
+        ) from error
+    if dict(policy) != typed.to_dict():
+        raise ConfigurationError(
+            "Benchmark evaluator policy digest is invalid",
+            "benchmark_evaluator_policy_mismatch",
+        )
     envs = benchmark.get("envs")
     expected = {
         "MAGPIE_EVAL_POLICY_ID": policy.get("policy_id"),
@@ -217,9 +495,7 @@ def _validate_semantics_identity(
     pass_type: BenchmarkPass,
     receipt: DependencyReceipt,
 ) -> None:
-    projected = copy.deepcopy(dict(benchmark))
-    for key in ("profiler", "gap_analysis", "docker_image", "run_kind"):
-        projected.pop(key, None)
+    projected = _workload_projection(benchmark)
     if (
         pass_type is BenchmarkPass.DIAGNOSTIC
         and str(benchmark.get("framework", "")).strip().lower() in SERVING_FRAMEWORKS
@@ -319,4 +595,4 @@ def _disabled(value: Any) -> bool:
     }
 
 
-__all__ = ["validate_view_contract"]
+__all__ = ["validate_phase_set_contract", "validate_view_contract"]
