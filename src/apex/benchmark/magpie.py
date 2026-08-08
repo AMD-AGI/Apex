@@ -20,6 +20,10 @@ from apex.runtime import DependencyReceipt
 from .config_views import validate_resolved_view
 from .results import NormalizedBenchmarkResult, empty_result, parse_benchmark_report
 
+MAGPIE_HOST_RUNTIME_ENVIRONMENT_KEYS = (
+    "MAGPIE_PROTECT_BENCHMARK_CONTAINER",
+)
+
 
 def _lm_eval_expectation(
     benchmark: Mapping[str, object],
@@ -56,6 +60,7 @@ class MagpieBenchmarkAdapter:
                 *GPU_RUNTIME_ENVIRONMENT_KEYS,
                 *HF_RUNTIME_ENVIRONMENT_KEYS,
                 *DOCKER_RUNTIME_ENVIRONMENT_KEYS,
+                *MAGPIE_HOST_RUNTIME_ENVIRONMENT_KEYS,
             ),
             allow_override_secrets=HF_CREDENTIAL_ENVIRONMENT_KEYS,
             fixed={

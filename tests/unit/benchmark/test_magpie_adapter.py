@@ -286,6 +286,7 @@ def test_adapter_uses_receipt_python_argv_and_normalizes_result(
     monkeypatch.setenv("DOCKER_AUTH_CONFIG", "registry-secret")
     monkeypatch.setenv("DOCKER_HOST", "unix:///run/user/1000/docker.sock")
     monkeypatch.setenv("DOCKER_CONFIG", "/home/test/.docker")
+    monkeypatch.setenv("MAGPIE_PROTECT_BENCHMARK_CONTAINER", "true")
     adapter = MagpieBenchmarkAdapter(receipt, supervisor)
     request = BenchmarkRequest(
         run_id="baseline",
@@ -318,6 +319,9 @@ def test_adapter_uses_receipt_python_argv_and_normalizes_result(
         "unix:///run/user/1000/docker.sock"
     )
     assert supervisor.call["environment"]["DOCKER_CONFIG"] == "/home/test/.docker"
+    assert supervisor.call["environment"][
+        "MAGPIE_PROTECT_BENCHMARK_CONTAINER"
+    ] == "true"
     assert supervisor.call["environment"]["ROCR_VISIBLE_DEVICES"] == "2"
     assert supervisor.call["environment"]["HF_HOME"] == "/model-cache"
     assert supervisor.call["environment"]["HF_TOKEN"] == "explicit-hf-token"
