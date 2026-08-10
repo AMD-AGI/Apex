@@ -10,6 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .magpie_corpus import (
+    load_magpie_corpus_manifest,
+    verify_magpie_corpus_manifest,
+)
+from .magpie_compatibility import (
+    load_magpie_compatibility_ledger,
+    verify_magpie_compatibility_ledger,
+)
 from .repositories import (
     BootstrapError,
     RepositoryResolver,
@@ -59,6 +67,8 @@ class DependencyLock:
     receipt_schema: str
     dependencies: tuple[LockedDependency, ...]
     sha256: str
+    magpie_corpus_manifest: Path
+    magpie_compatibility_ledger: Path
 
 
 @dataclass(frozen=True)
@@ -198,11 +208,28 @@ def load_lock(path: Path) -> DependencyLock:
     parsed = tuple(
         _parse_dependency(key, value) for key, value in dependencies.items()
     )
+    if "magpie" not in dependencies:
+        raise BootstrapError("dependencies must include magpie")
+    manifest_relative = _safe_relative(
+        raw.get("magpie_corpus_manifest"), "magpie_corpus_manifest"
+    )
+    manifest_candidate = path.parent / manifest_relative
+    if manifest_candidate.is_symlink() or not manifest_candidate.is_file():
+        raise BootstrapError("magpie_corpus_manifest must be a regular file")
+    manifest_path = manifest_candidate.resolve()
+    ledger_relative = _safe_relative(
+        raw.get("magpie_compatibility_ledger"), "magpie_compatibility_ledger"
+    )
+    ledger_candidate = path.parent / ledger_relative
+    if ledger_candidate.is_symlink() or not ledger_candidate.is_file():
+        raise BootstrapError("magpie_compatibility_ledger must be a regular file")
     return DependencyLock(
         path=path.resolve(),
         receipt_schema=receipt_schema,
         dependencies=parsed,
         sha256=hashlib.sha256(payload).hexdigest(),
+        magpie_corpus_manifest=manifest_path,
+        magpie_compatibility_ledger=ledger_candidate.resolve(),
     )
 
 
@@ -469,13 +496,41 @@ class DependencyBootstrapper:
                         + "; ".join(mismatches)
                     )
                 probes[dependency.key] = probe
-        return self._result(
+        result = self._result(
             "verified",
             repositories,
             venv_action=venv_action,
             package_actions=actions,
             probes=probes,
         )
+        result["magpie_corpus"] = self._verify_magpie_corpus(repositories)
+        result["magpie_compatibility"] = self._verify_magpie_compatibility()
+        return result
+
+    def _verify_magpie_corpus(
+        self, repositories: Mapping[str, ResolvedRepository]
+    ) -> Mapping[str, Any]:
+        dependency = next(item for item in self.lock.dependencies if item.key == "magpie")
+        manifest = load_magpie_corpus_manifest(self.lock.magpie_corpus_manifest)
+        verified = dict(
+            verify_magpie_corpus_manifest(
+                manifest,
+                repositories["magpie"].root,
+                repository=dependency.repository,
+                commit=dependency.commit,
+            )
+        )
+        verified["path"] = str(self.lock.magpie_corpus_manifest)
+        return verified
+
+    def _verify_magpie_compatibility(self) -> Mapping[str, Any]:
+        corpus = load_magpie_corpus_manifest(self.lock.magpie_corpus_manifest)
+        ledger = load_magpie_compatibility_ledger(
+            self.lock.magpie_compatibility_ledger
+        )
+        verified = dict(verify_magpie_compatibility_ledger(ledger, corpus))
+        verified["path"] = str(self.lock.magpie_compatibility_ledger)
+        return verified
 
     def _result(
         self,

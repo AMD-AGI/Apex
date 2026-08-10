@@ -12,7 +12,13 @@ from apex.core import ConfigurationError, IntegrityError
 from apex.ports import BenchmarkPass
 
 from .inferencex_runtime import InferenceXRuntimeEvidence
+from .local_runtime import LocalRuntimeEvidence
 from .lm_eval_runtime import LmEvalRuntimeEvidence
+from .magpie_attestation import (
+    MagpieExecutionAttestation,
+    expected_attestation_path,
+    load_magpie_execution_attestation,
+)
 from .model_revision import ModelRevisionEvidence
 from .quality import QualityEvidence, QualityMetric, parse_quality_evidence
 from .result_evidence import (
@@ -79,6 +85,20 @@ class NormalizedBenchmarkResult:
     )
     serving_runtime: ServingRuntimeEvidence = ServingRuntimeEvidence(
         False, True, None, None, None, None, None, None, None
+    )
+    local_runtime: LocalRuntimeEvidence = LocalRuntimeEvidence(
+        required=False,
+        passed=True,
+        lifecycle=None,
+        source_root=None,
+        source_commit=None,
+        source_tree=None,
+        benchmark_pid=None,
+        runtime_process_count=None,
+        gpu_lease_digest=None,
+        server_source_generation_sha256=None,
+        server_generation_sha256=None,
+        quiescence_verified=None,
     )
 
     def metric_mapping(self) -> Mapping[str, float | int | str | None]:
@@ -176,8 +196,9 @@ def _normalized_result(
     errors: tuple[str, ...],
     command_exit_code: int | None,
     timed_out: bool,
+    execution_attestation: MagpieExecutionAttestation,
 ) -> NormalizedBenchmarkResult:
-    model, inferencex, lm_eval, serving = attestations
+    model, inferencex, lm_eval, serving, local = attestations
     return NormalizedBenchmarkResult(
         schema_version=1,
         run_id=run_id,
@@ -196,12 +217,15 @@ def _normalized_result(
         model_revision=model,
         inferencex_runtime=inferencex,
         artifacts=_artifact_paths(report, report_path.resolve(), quality)
-        + evidence_artifacts(attestations),
+        + evidence_artifacts(attestations)
+        + execution_attestation.imported_artifact_paths(workspace)
+        + (execution_attestation.source_path,),
         errors=errors,
         command_exit_code=command_exit_code,
         timed_out=timed_out,
         lm_eval_runtime=lm_eval,
         serving_runtime=serving,
+        local_runtime=local,
     )
 
 
@@ -209,68 +233,80 @@ def _report_quality(
     report: Mapping[str, Any],
     workspace: Path,
     report_path: Path,
-    framework: str,
     required: bool,
     evaluator_policy: Mapping[str, Any] | None,
+    quality_kind: str | None,
+    lm_eval_runtime: LmEvalRuntimeReceipt | None,
 ) -> QualityEvidence:
     return parse_quality_evidence(
         report,
         workspace,
         report_path.resolve(),
-        framework,
         required,
         evaluator_policy,
+        quality_kind,
+        lm_eval_runtime.runtime_sha256 if lm_eval_runtime else None,
+        (
+            lm_eval_runtime.identity.get("base_image_repo_digest")
+            if lm_eval_runtime
+            else None
+        ),
+    )
+
+
+def _benchmark_metrics(
+    report: Mapping[str, Any],
+) -> tuple[ThroughputMetrics, LatencyMetrics]:
+    return (
+        _throughput_metrics(report.get("throughput")),
+        _latency_metrics(report.get("latency")),
     )
 
 
 def parse_benchmark_report(
-    report_path: Path, *, run_id: str,
-    pass_type: BenchmarkPass,
-    quality_required: bool,
+    report_path: Path, *, run_id: str, pass_type: BenchmarkPass,
+    quality_required: bool, expected_quality_kind: str | None = None,
     command_exit_code: int | None = 0, timed_out: bool = False,
     expected_model: str | None = None, expected_model_revision: str | None = None,
-    expected_inferencex_root: Path | None = None,
-    expected_inferencex_commit: str | None = None,
-    expected_inferencex_tree: str | None = None,
-    expected_lm_eval_runtime: LmEvalRuntimeReceipt | None = None,
-    expected_lm_eval_execution_mode: str | None = None,
-    expected_evaluator_policy: Mapping[str, Any] | None = None,
-    expected_config_sha256: str | None = None,
-    expected_requested_image: str | None = None,
-    expected_execution_mode: str | None = None,
-    allow_tracelens_derivation: bool = False,
-    expected_tracelens_commit: str | None = None,
-    expected_tracelens_tree: str | None = None,
+    expected_inferencex_root: Path | None = None, expected_inferencex_commit: str | None = None, expected_inferencex_tree: str | None = None,
+    expected_lm_eval_runtime: LmEvalRuntimeReceipt | None = None, expected_lm_eval_execution_mode: str | None = None,
+    expected_evaluator_policy: Mapping[str, Any] | None = None, expected_config_sha256: str | None = None,
+    expected_gpu_lease_digest: str | None = None, expected_requested_image: str | None = None,
+    expected_execution_mode: str | None = None, expected_lifecycle: str | None = None, allow_tracelens_derivation: bool = False,
+    expected_tracelens_commit: str | None = None, expected_tracelens_tree: str | None = None, execution_attestation_path: Path | None = None,
 ) -> NormalizedBenchmarkResult:
     """Parse one Magpie report plus its protected quality side artifacts."""
-
     report = _load_report(report_path)
-    workspace = _report_workspace(report, report_path)
-    throughput = _throughput_metrics(report.get("throughput"))
-    latency = _latency_metrics(report.get("latency"))
+    attestation = load_magpie_execution_attestation(
+        execution_attestation_path or expected_attestation_path(report_path),
+        report_path=report_path,
+        report=report,
+        expected_config_sha256=expected_config_sha256,
+        expected_run_id=run_id,
+        expected_pass_type=pass_type,
+        command_exit_code=command_exit_code,
+        timed_out=timed_out,
+    )
+    workspace = _report_workspace(report, report_path, attestation)
+    evaluator_evidence = attestation.evaluator_evidence(report)
+    throughput, latency = _benchmark_metrics(report)
     framework = str(report.get("framework", "")).strip().lower()
     quality = _report_quality(
-        report, workspace, report_path, framework,
-        quality_required, expected_evaluator_policy,
-    )
-    run_kind = str(report.get("run_kind", "")).strip().lower()
-    reward_eligible = report.get("reward_eligible") is True
-    profiling_enabled = report.get("profiling_enabled") is True
-    attestations = parse_attestations(
-        report,
-        report_path,
-        expected_model,
-        expected_model_revision,
-        expected_inferencex_root,
-        expected_inferencex_commit,
-        expected_inferencex_tree,
+        evaluator_evidence, workspace, report_path,
+        quality_required, expected_evaluator_policy, expected_quality_kind,
         expected_lm_eval_runtime,
-        expected_lm_eval_execution_mode,
-        expected_config_sha256,
-        expected_requested_image,
-        expected_execution_mode,
-        allow_tracelens_derivation,
-        expected_tracelens_commit,
+    )
+    run_kind, reward_eligible = attestation.run_kind, attestation.reward_eligible
+    profiling_enabled = attestation.profiling_enabled
+    attestations = parse_attestations(
+        evaluator_evidence, report_path, expected_model, expected_model_revision,
+        expected_inferencex_root, expected_inferencex_commit,
+        expected_inferencex_tree, expected_lm_eval_runtime,
+        expected_lm_eval_execution_mode, expected_config_sha256,
+        expected_gpu_lease_digest,
+        expected_requested_image, expected_execution_mode,
+        expected_lifecycle, attestation.dependencies.get("receipts"),
+        allow_tracelens_derivation, expected_tracelens_commit,
         expected_tracelens_tree,
     )
     success, errors = _benchmark_verdict(
@@ -283,6 +319,8 @@ def parse_benchmark_report(
         profiling_enabled=profiling_enabled,
         command_exit_code=command_exit_code,
         timed_out=timed_out,
+        attestation_errors=attestation.verdict_errors(),
+        official_profiling_enabled=report.get("profiling_enabled"),
     )
     return _normalized_result(
         report=report,
@@ -302,6 +340,7 @@ def parse_benchmark_report(
         errors=errors,
         command_exit_code=command_exit_code,
         timed_out=timed_out,
+        execution_attestation=attestation,
     )
 
 
@@ -316,6 +355,8 @@ def _benchmark_verdict(
     profiling_enabled: bool,
     command_exit_code: int | None,
     timed_out: bool,
+    attestation_errors: tuple[str, ...],
+    official_profiling_enabled: object,
 ) -> tuple[bool, tuple[str, ...]]:
     lane_errors = _evidence_lane_errors(
         pass_type=pass_type,
@@ -323,10 +364,10 @@ def _benchmark_verdict(
         reward_eligible=reward_eligible,
         profiling_enabled=profiling_enabled,
     )
-    base_errors = (
-        _result_errors(report, quality, command_exit_code, timed_out)
-        + lane_errors
-    )
+    if official_profiling_enabled is not profiling_enabled:
+        lane_errors += ("benchmark_report_profiling_attestation_mismatch",)
+    base_errors = _result_errors(report, quality, command_exit_code, timed_out)
+    base_errors += lane_errors + attestation_errors
     return result_verdict(
         report,
         quality_passed=quality.passed,
@@ -360,19 +401,24 @@ def _load_report(report_path: Path) -> Mapping[str, Any]:
     return report
 
 
-def _report_workspace(report: Mapping[str, Any], report_path: Path) -> Path:
+def _report_workspace(
+    report: Mapping[str, Any],
+    report_path: Path,
+    attestation: MagpieExecutionAttestation,
+) -> Path:
     workspace_raw = report.get("workspace_dir")
     workspace = (
         Path(workspace_raw).resolve()
         if isinstance(workspace_raw, str) and workspace_raw
         else report_path.parent.resolve()
     )
-    if workspace != report_path.parent.resolve():
+    local = report_path.parent.resolve()
+    if workspace != local and attestation.imported_workspace_origin != workspace:
         raise IntegrityError(
             "Magpie report workspace_dir does not match its containing workspace",
             "benchmark_workspace_mismatch",
         )
-    return workspace
+    return local
 
 
 def _throughput_metrics(value: Any) -> ThroughputMetrics:
@@ -426,13 +472,13 @@ def _evidence_lane_errors(
     )
     errors: tuple[str, ...] = ()
     if run_kind != expected_kind:
-        errors += ("benchmark_report_run_kind_mismatch",)
+        errors += ("execution_attestation_pass_type_mismatch",)
     expected_eligible = pass_type is BenchmarkPass.MEASUREMENT
     if reward_eligible is not expected_eligible:
-        errors += ("benchmark_report_reward_eligibility_mismatch",)
+        errors += ("execution_attestation_reward_eligibility_mismatch",)
     expected_profiling = pass_type is BenchmarkPass.DIAGNOSTIC
     if profiling_enabled is not expected_profiling:
-        errors += ("benchmark_report_profiling_lane_mismatch",)
+        errors += ("execution_attestation_profiling_lane_mismatch",)
     return errors
 
 
@@ -447,14 +493,11 @@ def empty_result(
     expected_lm_eval_runtime: LmEvalRuntimeReceipt | None = None,
     expected_lm_eval_execution_mode: str | None = None,
     expected_config_sha256: str | None = None,
+    expected_gpu_lease_digest: str | None = None,
     expected_requested_image: str | None = None,
     expected_execution_mode: str | None = None,
 ) -> NormalizedBenchmarkResult:
     empty = LatencyDistribution(None, None, None, None)
-    lm_eval_required = (
-        expected_lm_eval_runtime is not None
-        or expected_lm_eval_execution_mode in {"docker", "local"}
-    )
     return NormalizedBenchmarkResult(
         schema_version=1,
         run_id=run_id,
@@ -480,38 +523,59 @@ def empty_result(
         errors=(error,),
         command_exit_code=command_exit_code,
         timed_out=timed_out,
-        lm_eval_runtime=LmEvalRuntimeEvidence(
-            required=lm_eval_required,
-            passed=not lm_eval_required,
-            runtime_sha256=(
-                expected_lm_eval_runtime.runtime_sha256
-                if expected_lm_eval_runtime
-                else None
-            ),
-            identity=(
-                dict(expected_lm_eval_runtime.identity)
-                if expected_lm_eval_runtime
-                else None
-            ),
-            manifest_path=None,
-            receipt_path=None,
-            execution_mode=(
-                expected_lm_eval_execution_mode if lm_eval_required else None
-            ),
-            read_only_mount=None,
-            error=error if lm_eval_required else None,
+        lm_eval_runtime=_empty_lm_eval(
+            expected_lm_eval_runtime, expected_lm_eval_execution_mode, error
         ),
-        serving_runtime=ServingRuntimeEvidence(
-            required=expected_execution_mode == "docker",
-            passed=expected_execution_mode != "docker",
-            input_config_sha256=expected_config_sha256,
-            requested_image=expected_requested_image,
-            resolved_image_id=None,
-            container_name=None,
-            docker_argv_sha256=None,
-            process_succeeded=False if expected_execution_mode == "docker" else None,
-            error=error if expected_execution_mode == "docker" else None,
+        serving_runtime=_empty_serving(
+            expected_execution_mode, expected_config_sha256,
+            expected_requested_image, error,
         ),
+        local_runtime=_empty_local(
+            expected_execution_mode, expected_gpu_lease_digest, error
+        ),
+    )
+
+
+def _empty_lm_eval(
+    expected: LmEvalRuntimeReceipt | None, mode: str | None, error: str
+) -> LmEvalRuntimeEvidence:
+    required = expected is not None or mode in {"docker", "local"}
+    return LmEvalRuntimeEvidence(
+        required=required,
+        passed=not required,
+        runtime_sha256=expected.runtime_sha256 if expected else None,
+        identity=dict(expected.identity) if expected else None,
+        manifest_path=None,
+        receipt_path=None,
+        execution_mode=mode if required else None,
+        read_only_mount=None,
+        error=error if required else None,
+    )
+
+
+def _empty_serving(
+    mode: str | None, config: str | None, image: str | None, error: str
+) -> ServingRuntimeEvidence:
+    required = mode == "docker"
+    return ServingRuntimeEvidence(
+        required=required, passed=not required, input_config_sha256=config,
+        requested_image=image, resolved_image_id=None, container_name=None,
+        container_spec_sha256=None,
+        process_succeeded=False if required else None,
+        error=error if required else None,
+    )
+
+
+def _empty_local(
+    mode: str | None, lease_digest: str | None, error: str
+) -> LocalRuntimeEvidence:
+    required = mode == "local"
+    return LocalRuntimeEvidence(
+        required=required, passed=not required, lifecycle=None, source_root=None,
+        source_commit=None, source_tree=None, benchmark_pid=None,
+        runtime_process_count=None, gpu_lease_digest=lease_digest,
+        server_source_generation_sha256=None, server_generation_sha256=None,
+        quiescence_verified=None, error=error if required else None,
     )
 
 

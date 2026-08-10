@@ -4,14 +4,36 @@ import json
 import hashlib
 from pathlib import Path
 
+import pytest
 import yaml
 
-from apex.benchmark import MagpieBenchmarkAdapter, build_config_views
-from apex.core import sha256_file
+from apex.benchmark import MagpieBenchmarkAdapter
+from apex.benchmark import build_config_views as _build_config_views
+from apex.benchmark.evaluator_artifact_receipt import EvaluatorArtifactReceipt
+from apex.benchmark.evaluator_execution import LmEvalExecutionReceipt
+from apex.core import sha256_file, sha256_json
 from apex.execution import ProcessResult
-from apex.ports import BenchmarkPass, BenchmarkRequest
+from apex.ports import (
+    BenchmarkPass,
+    BenchmarkRequest,
+    MagpieAttestationRequest,
+    MagpieFormalMeasurementSupport,
+    MagpieReportLocation,
+)
 from apex.runtime import DependencyReceipt, LmEvalRuntimeReceipt
 from apex.benchmark.magpie import _lm_eval_expectation
+from apex.benchmark.quality import PRIMARY_METRICS
+from tests.support.magpie_contract import resolved_contract
+
+
+def build_config_views(source: Path, output: Path, **kwargs):
+    receipt = kwargs["dependency_receipt"]
+    return _build_config_views(
+        source,
+        output,
+        resolved_contract=resolved_contract(source, receipt),
+        **kwargs,
+    )
 
 
 def _receipt(tmp_path: Path) -> DependencyReceipt:
@@ -94,7 +116,7 @@ def _serving_runtime(config_path: Path) -> dict[str, object]:
     ]
     resolved = requested if requested.startswith("sha256:") else "sha256:" + "d" * 64
     return {
-        "schema": "magpie.serving-runtime-receipt/v2",
+        "schema": "apex.magpie-serving-runtime-observation/v3",
         "execution_mode": "docker",
         "input_config_sha256": sha256_file(config_path),
         "input_image": requested,
@@ -120,7 +142,7 @@ def _serving_runtime(config_path: Path) -> dict[str, object]:
             "verified": True,
         },
         "container_name": "magpie-benchmark-test",
-        "docker_argv_sha256": "e" * 64,
+        "container_spec_sha256": "e" * 64,
         "process_succeeded": True,
         "verified": True,
         "errors": [],
@@ -140,7 +162,7 @@ def _tracelens_serving_runtime(
     requested = "magpie-tracelens-vllm:test"
     derived_id = "sha256:" + "9" * 64
     return {
-        "schema": "magpie.serving-runtime-receipt/v2",
+        "schema": "apex.magpie-serving-runtime-observation/v3",
         "execution_mode": "docker",
         "input_config_sha256": sha256_file(config_path),
         "input_image": input_image,
@@ -173,11 +195,235 @@ def _tracelens_serving_runtime(
             "verified": True,
         },
         "container_name": "magpie-benchmark-test",
-        "docker_argv_sha256": "e" * 64,
+        "container_spec_sha256": "e" * 64,
         "process_succeeded": True,
         "verified": True,
         "errors": [],
     }
+
+
+def _formal_quality_gate(
+    workspace: Path,
+    policy: dict[str, object],
+    runtime: LmEvalRuntimeReceipt,
+) -> dict[str, object]:
+    results = workspace / "lm_eval" / "results.json"
+    samples = workspace / "lm_eval" / "samples_gsm8k.jsonl"
+    result_receipts = [
+        {
+            "path": "lm_eval/results.json",
+            "size_bytes": results.stat().st_size,
+            "sha256": sha256_file(results),
+        }
+    ]
+    sample_receipts = [
+        {
+            "path": "lm_eval/samples_gsm8k.jsonl",
+            "size_bytes": samples.stat().st_size,
+            "sha256": sha256_file(samples),
+        }
+    ]
+    outcomes = {
+        "gsm8k": {
+            "metric": "exact_match,strict-match",
+            "value": 1.0,
+            "source": "lm_eval/results.json",
+        }
+    }
+    sample_digest = sha256_json(
+        {"schema": "magpie.lm-eval-sample-set/v1", "artifacts": sample_receipts}
+    )
+    outcome_digest = sha256_json(
+        {
+            "schema": "magpie.lm-eval-outcomes/v1",
+            "primary_metric_policy": list(PRIMARY_METRICS),
+            "outcomes": outcomes,
+            "result_artifacts": result_receipts,
+            "sample_set_digest": sample_digest,
+        }
+    )
+    execution = LmEvalExecutionReceipt(
+        contract_sha256="1" * 64,
+        config_sha256="6" * 64,
+        policy_sha256=str(policy["sha256"]),
+        policy_lock_sha256="7" * 64,
+        task_definition_sha256=str(policy["task_definition_sha256"]),
+        effective_task_definition_sha256="8" * 64,
+        task_materialization_receipt_sha256="9" * 64,
+        dataset_receipt_sha256="2" * 64,
+        dataset_revision=str(policy["dataset_revision"]),
+        runtime_sha256=runtime.runtime_sha256,
+        runtime_manifest_sha256=runtime.manifest_sha256,
+        runtime_lock_sha256=runtime.lock_sha256,
+        launcher_sha256="1" * 64,
+        image_repo_digest=runtime.identity["base_image_repo_digest"],
+        image_id=runtime.identity["base_image_id"],
+        container_id="3" * 64,
+        listener_receipt_sha256="4" * 64,
+        sidecar_spec_sha256="6" * 64,
+        created_observation_sha256="7" * 64,
+        exited_observation_sha256="8" * 64,
+        broker_receipt_sha256="9" * 64,
+        container_cleanup_sha256="a" * 64,
+        runtime_probe_sha256="5" * 64,
+        runtime_publication_sha256="b" * 64,
+        result_artifacts=(EvaluatorArtifactReceipt.from_mapping(result_receipts[0]),),
+        sample_artifacts=(EvaluatorArtifactReceipt.from_mapping(sample_receipts[0]),),
+    )
+    return {
+        "requested": True,
+        "status": "passed",
+        "passed": True,
+        "evidence_present": True,
+        "evaluator_execution_receipt": execution.to_dict(),
+        "primary_metric_policy": list(PRIMARY_METRICS),
+        "primary_outcomes": outcomes,
+        "result_artifact_receipts": result_receipts,
+        "sample_artifact_receipts": sample_receipts,
+        "outcome_digest": outcome_digest,
+        "sample_set_digest": sample_digest,
+        "task_count": 1,
+        "tasks_truncated": False,
+        "result_artifact_count": 1,
+        "result_artifacts_truncated": False,
+        "errors": [],
+        "error_count": 0,
+        "errors_truncated": False,
+    }
+
+
+def _write_execution_attestation(
+    *,
+    output_root: Path,
+    report: Path,
+    config_path: Path,
+    profiling_enabled: bool,
+    runtime: dict[str, object | None],
+    quality_gate: dict[str, object] | None,
+) -> None:
+    evaluator = output_root / "evaluator"
+    evaluator.mkdir()
+    value = {
+        "schema": "apex.magpie-execution-attestation/v1",
+        "authority": "apex_evaluator",
+        "official_report_path": report.relative_to(output_root).as_posix(),
+        "official_report_size_bytes": report.stat().st_size,
+        "report_sha256": sha256_file(report),
+        "config_sha256": sha256_file(config_path),
+        "run_id": output_root.parent.name,
+        "pass_type": output_root.name,
+        "lane_verified": True,
+        "reward_eligible": output_root.name == "measurement",
+        "profiling_enabled": profiling_enabled,
+        "process": {
+            "schema": "apex.magpie-process-attestation/v1",
+            "argv_sha256": "f" * 64,
+            "exit_code": 0,
+            "timed_out": False,
+            "succeeded": True,
+            "verified": True,
+        },
+        "dependencies": {
+            "schema": "apex.magpie-dependency-attestation/v1",
+            "verified": True,
+            "receipts": {
+                "lock_sha256": "a" * 64,
+                "dependencies": {
+                    name: {
+                        "root": f"/dependencies/{name}",
+                        "commit": "b" * 40,
+                        "tree": "c" * 40,
+                    }
+                    for name in ("magpie", "tracelens", "inferencex")
+                },
+            },
+        },
+        "runtime": {
+            "schema": "apex.magpie-runtime-attestation/v1",
+            "verified": True,
+            **runtime,
+        },
+        "gpu_engagement": {
+            "schema": "apex.magpie-gpu-engagement/v1",
+            "verified": True,
+            "devices": [
+                {"rsmi_index": 0, "unique_id": "GPU-0000000000000001"}
+            ],
+            "processes": [{
+                "pid": 123,
+                "uid": 1000,
+                "start_time_ticks": 456,
+                "cmdline_sha256": "d" * 64,
+                "rsmi_device_indices": [0],
+            }],
+        },
+        "quality_gate": {
+            "schema": "apex.magpie-quality-attestation/v1",
+            "verified": True,
+            "receipt": quality_gate,
+        },
+        "errors": [],
+    }
+    (evaluator / "execution_attestation.json").write_text(
+        json.dumps(value), encoding="utf-8"
+    )
+
+
+class FakeExecutionAttestor:
+    is_available = True
+
+    def __init__(self) -> None:
+        self.prepared: MagpieAttestationRequest | None = None
+        self.aborted: str | None = None
+
+    @staticmethod
+    def supports(execution_mode: str, lifecycle: str) -> bool:
+        return execution_mode == "docker" and lifecycle == "one_shot"
+
+    def formal_measurement_support(
+        self, execution_mode: str, lifecycle: str
+    ) -> MagpieFormalMeasurementSupport:
+        del execution_mode, lifecycle
+        return MagpieFormalMeasurementSupport(True, None, "test")
+
+    def prepare(self, request: MagpieAttestationRequest) -> object:
+        self.prepared = request
+        return request.run_root
+
+    def launch_argv(self, session: object) -> tuple[str, ...]:
+        assert Path(session).is_absolute()
+        assert self.prepared is not None
+        return self.prepared.benchmark_argv
+
+    def abort(self, session: object, *, reason: str) -> None:
+        assert self.prepared is not None
+        assert session == self.prepared.run_root
+        self.aborted = reason
+
+    def locate_report(self, session: object) -> MagpieReportLocation:
+        root = Path(session)
+        reports = tuple(root.rglob("benchmark_report.json"))
+        if len(reports) != 1:
+            return MagpieReportLocation(None, "benchmark_report_missing")
+        return MagpieReportLocation(reports[0].resolve())
+
+    def complete(
+        self,
+        session: object,
+        *,
+        report_path: Path | None,
+        command_exit_code: int | None,
+        timed_out: bool,
+    ) -> Path | None:
+        assert self.prepared is not None
+        assert session == self.prepared.run_root
+        assert command_exit_code == 0
+        assert timed_out is False
+        return (
+            report_path.parent.parent / "evaluator" / "execution_attestation.json"
+            if report_path
+            else None
+        )
 
 
 class FakeSupervisor:
@@ -264,7 +510,16 @@ class FakeSupervisor:
             json.dumps({"results": {"gsm8k": {"exact_match,strict-match": 1.0}}}),
             encoding="utf-8",
         )
-        (workspace / "benchmark_report.json").write_text(
+        (workspace / "lm_eval" / "samples_gsm8k.jsonl").write_text(
+            '{"doc_id": 1, "exact_match": true}\n', encoding="utf-8"
+        )
+        report_path = workspace / "benchmark_report.json"
+        resolved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        policy = resolved["apex"]["benchmark_view"]["quality_contract"][
+            "evaluator_policy"
+        ]
+        quality_gate = _formal_quality_gate(workspace, policy, runtime)
+        report_path.write_text(
             json.dumps(
                 {
                     "success": True,
@@ -272,11 +527,6 @@ class FakeSupervisor:
                     "model": "Qwen/example",
                     "workspace_dir": str(workspace),
                     "profiling_enabled": False,
-                    "run_kind": "measurement",
-                    "reward_eligible": True,
-                    "inferencex_runtime_receipt": inferencex_receipt,
-                    "lm_eval_runtime_receipt": lm_eval_runtime_evidence,
-                    "serving_runtime_receipt": _serving_runtime(config_path),
                     "throughput": {"output_throughput": 10.0},
                     "latency": {
                         "ttft": {"p99_ms": 3.0},
@@ -286,6 +536,19 @@ class FakeSupervisor:
                 }
             ),
             encoding="utf-8",
+        )
+        _write_execution_attestation(
+            output_root=output_root,
+            report=report_path,
+            config_path=config_path,
+            profiling_enabled=False,
+            runtime={
+                "model_revision_receipt": None,
+                "inferencex_runtime_receipt": inferencex_receipt,
+                "lm_eval_runtime_receipt": lm_eval_runtime_evidence,
+                "serving_runtime_receipt": _serving_runtime(config_path),
+            },
+            quality_gate=quality_gate,
         )
         return ProcessResult(
             argv=tuple(argv),
@@ -355,21 +618,30 @@ class FakeDiagnosticSupervisor:
             "model": "Qwen/example",
             "workspace_dir": str(workspace),
             "profiling_enabled": True,
-            "run_kind": "diagnostic",
-            "reward_eligible": False,
-            "inferencex_runtime_receipt": inferencex_receipt,
-            "lm_eval_runtime_receipt": not_requested,
-            "serving_runtime_receipt": _tracelens_serving_runtime(
-                config_path,
-                self.receipt,
-                source_commit=self.tracelens_commit,
-            ),
             "throughput": {"output_throughput": 9.0},
             "latency": {},
             "errors": [],
         }
-        (workspace / "benchmark_report.json").write_text(
+        report_path = workspace / "benchmark_report.json"
+        report_path.write_text(
             json.dumps(report), encoding="utf-8"
+        )
+        _write_execution_attestation(
+            output_root=output_root,
+            report=report_path,
+            config_path=config_path,
+            profiling_enabled=True,
+            runtime={
+                "model_revision_receipt": None,
+                "inferencex_runtime_receipt": inferencex_receipt,
+                "lm_eval_runtime_receipt": not_requested,
+                "serving_runtime_receipt": _tracelens_serving_runtime(
+                    config_path,
+                    self.receipt,
+                    source_commit=self.tracelens_commit,
+                ),
+            },
+            quality_gate=None,
         )
         return ProcessResult(
             argv=tuple(argv), exit_code=0, timed_out=False,
@@ -393,7 +665,8 @@ def test_adapter_uses_receipt_python_argv_and_normalizes_result(
     monkeypatch.setenv("DOCKER_HOST", "unix:///run/user/1000/docker.sock")
     monkeypatch.setenv("DOCKER_CONFIG", "/home/test/.docker")
     monkeypatch.setenv("MAGPIE_PROTECT_BENCHMARK_CONTAINER", "true")
-    adapter = MagpieBenchmarkAdapter(receipt, supervisor)
+    attestor = FakeExecutionAttestor()
+    adapter = MagpieBenchmarkAdapter(receipt, supervisor, attestor)
     request = BenchmarkRequest(
         run_id="baseline",
         config_path=_config(tmp_path, receipt),
@@ -406,6 +679,7 @@ def test_adapter_uses_receipt_python_argv_and_normalizes_result(
     result = adapter.run(request)
 
     assert result.succeeded
+    assert attestor.prepared is not None
     assert result.metrics["output_throughput"] == 10.0
     assert supervisor.call is not None
     assert supervisor.call["argv"][:4] == (
@@ -444,7 +718,9 @@ def test_adapter_runs_serving_diagnostic_without_lm_eval_runtime(
     receipt = _receipt(tmp_path)
     measurement = _config(tmp_path, receipt)
     diagnostic = measurement.parent / "benchmark.diagnostic.resolved.yaml"
-    adapter = MagpieBenchmarkAdapter(receipt, FakeDiagnosticSupervisor(receipt))
+    adapter = MagpieBenchmarkAdapter(
+        receipt, FakeDiagnosticSupervisor(receipt), FakeExecutionAttestor()
+    )
     request = BenchmarkRequest(
         run_id="diagnostic",
         config_path=diagnostic,
@@ -475,6 +751,7 @@ def test_adapter_rejects_diagnostic_with_unpinned_tracelens_lineage(
     adapter = MagpieBenchmarkAdapter(
         receipt,
         FakeDiagnosticSupervisor(receipt, tracelens_commit="8" * 40),
+        FakeExecutionAttestor(),
     )
     request = BenchmarkRequest(
         run_id="diagnostic",
@@ -503,3 +780,96 @@ def test_lm_eval_evidence_is_required_only_for_lm_eval_quality(tmp_path: Path) -
     assert _lm_eval_expectation(
         benchmark, {"required": True, "kind": "lm_eval"}, receipt
     ) == (receipt.lm_eval_runtime, "docker")
+
+
+def test_adapter_fails_before_supervisor_without_attestor(tmp_path: Path) -> None:
+    receipt = _receipt(tmp_path)
+    supervisor = FakeSupervisor(receipt)
+    adapter = MagpieBenchmarkAdapter(receipt, supervisor)
+    request = BenchmarkRequest(
+        run_id="no-attestor",
+        config_path=_config(tmp_path, receipt),
+        output_dir=tmp_path / "runs",
+        pass_type=BenchmarkPass.MEASUREMENT,
+    )
+
+    result = adapter.run_normalized(request)
+
+    assert not result.succeeded
+    assert result.errors == ("magpie_execution_attestor_unavailable",)
+    assert supervisor.call is None
+    assert not (tmp_path / "runs").exists()
+
+
+def test_formal_measurement_support_requires_the_same_execution_lane(
+    tmp_path: Path,
+) -> None:
+    adapter = MagpieBenchmarkAdapter(
+        _receipt(tmp_path), execution_attestor=FakeExecutionAttestor()
+    )
+
+    assert adapter.formal_measurement_support("docker", "one_shot").available
+    unsupported = adapter.formal_measurement_support("local", "one_shot")
+    assert not unsupported.available
+    assert unsupported.reason_code == "magpie_execution_attestor_unavailable"
+
+
+class _InvalidLaunchAttestor(FakeExecutionAttestor):
+    def __init__(self, failure: str) -> None:
+        super().__init__()
+        self.failure = failure
+
+    def launch_argv(self, session: object) -> tuple[str, ...]:
+        canonical = super().launch_argv(session)
+        if self.failure == "raise":
+            raise RuntimeError("launch projection failed")
+        return ("/wrong/python", *canonical[1:])
+
+
+class _RaisingSupervisor:
+    def run(self, *args, **kwargs):
+        del args, kwargs
+        raise OSError("cannot start Magpie")
+
+
+@pytest.mark.parametrize("failure", ["raise", "drift"])
+def test_adapter_aborts_attestor_when_launch_projection_fails(
+    tmp_path: Path, failure: str
+) -> None:
+    receipt = _receipt(tmp_path)
+    attestor = _InvalidLaunchAttestor(failure)
+    adapter = MagpieBenchmarkAdapter(receipt, FakeSupervisor(receipt), attestor)
+    request = BenchmarkRequest(
+        run_id=f"launch-{failure}",
+        config_path=_config(tmp_path, receipt),
+        output_dir=tmp_path / "runs",
+        pass_type=BenchmarkPass.MEASUREMENT,
+    )
+
+    result = adapter.run_normalized(request)
+
+    assert not result.succeeded
+    assert result.errors[0].startswith("magpie_execution_attestor_prepare_failed:")
+    assert attestor.aborted == result.errors[0]
+
+
+def test_adapter_aborts_attestor_when_supervisor_cannot_start(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    attestor = FakeExecutionAttestor()
+    adapter = MagpieBenchmarkAdapter(receipt, _RaisingSupervisor(), attestor)
+    request = BenchmarkRequest(
+        run_id="process-start-failure",
+        config_path=_config(tmp_path, receipt),
+        output_dir=tmp_path / "runs",
+        pass_type=BenchmarkPass.MEASUREMENT,
+    )
+
+    result = adapter.run_normalized(request)
+
+    assert not result.succeeded
+    assert result.errors == (
+        "magpie_process_start_failed:OSError:cannot start Magpie",
+    )
+    assert attestor.aborted == result.errors[0]

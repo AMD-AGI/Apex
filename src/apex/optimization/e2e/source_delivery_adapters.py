@@ -2,27 +2,29 @@
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from apex.benchmark import NormalizedBenchmarkResult
-from apex.core import ContractError, IntegrityError, canonical_json_bytes, sha256_file, sha256_json
+from apex.core import ContractError, IntegrityError, sha256_file, sha256_json
 from apex.delivery import (
     CleanReplayReceipt,
     EngagementRequest,
     LoadedByteEngagementReceipt,
+    ReplayArtifactReceipt,
     ReplayRequest,
     SourceBuildReceipt,
     SourceBuildRequest,
 )
 from apex.evaluation import (
     E2EAcceptancePolicy,
-    E2EMeasurement,
+    E2EObservation,
+    E2EPairedMeasurement,
+    E2EPairedWindow,
     evaluate_current_anchor,
     evaluate_no_regression,
+    evaluate_paired_current_anchor,
 )
 from apex.intake import RegressionGates
 from apex.ports import BenchmarkPass, BenchmarkRequest
@@ -30,10 +32,15 @@ from apex.ports import BenchmarkPass, BenchmarkRequest
 from .benchmarking import BenchmarkAdapter, measurement_from_result
 from .overlay_config import derive_overlay_configs
 from .source_delivery_models import PrimarySourceBuildOutput, PrimarySourceBuildRequest
+from .source_delivery_receipts import (
+    PRIMARY_BENCHMARK_SCHEMA,
+    acceptance_policy_from_mapping,
+    load_primary_benchmark,
+    measurement_from_mapping as stored_measurement_from_mapping,
+    primary_runtime_identity,
+    write_primary_receipt,
+)
 from .source_image_runtime import SourceImageBuild
-
-
-_PRIMARY_BENCHMARK_SCHEMA = "apex.qwen-primary-benchmark/v1"
 
 
 class SourceImagePort(Protocol):
@@ -56,7 +63,7 @@ class FormalMeasurementPolicy:
 class _PrimaryEvidence:
     build: SourceImageBuild
     engagement: LoadedByteEngagementReceipt
-    measurement: E2EMeasurement
+    measurement: E2EObservation
     result: NormalizedBenchmarkResult
     configs: Any
     current_verdict: Any
@@ -64,7 +71,7 @@ class _PrimaryEvidence:
     policy: FormalMeasurementPolicy
 
 
-class QwenPrimarySourceBuilder:
+class SourceImagePrimaryBuilder:
     """Build and benchmark the first immutable source-baked image."""
 
     def __init__(
@@ -106,6 +113,7 @@ class QwenPrimarySourceBuilder:
         )
         return PrimarySourceBuildOutput(
             environment_id,
+            _runtime_identity(evidence.result, build.image.image_digest),
             request.source_stack_sha256,
             build.image,
             build.sbom_path,
@@ -147,14 +155,16 @@ class QwenPrimarySourceBuilder:
             )
         )
         measurement = _measurement(result, request.baseline.protocol_hash)
-        current = evaluate_current_anchor(
-            request.baseline, measurement, self.policy.acceptance
+        policy = FormalMeasurementPolicy(
+            request.acceptance_policy,
+            self.policy.overlay_parity_noise_pct,
         )
+        current = evaluate_current_anchor(request.baseline, measurement, policy.acceptance)
         parity = evaluate_no_regression(
             request.overlay_final,
             measurement,
-            self.policy.acceptance,
-            throughput_noise_pct=self.policy.overlay_parity_noise_pct,
+            policy.acceptance,
+            throughput_noise_pct=policy.overlay_parity_noise_pct,
         )
         return _PrimaryEvidence(
             build,
@@ -164,11 +174,11 @@ class QwenPrimarySourceBuilder:
             configs,
             current,
             parity,
-            self.policy,
+            policy,
         )
 
 
-class QwenIndependentSourceBuild:
+class IndependentSourceImageBuild:
     """Rebuild the same source layer from the verifier's fresh worktrees."""
 
     def __init__(self, images: SourceImagePort) -> None:
@@ -200,7 +210,7 @@ class QwenIndependentSourceBuild:
         )
 
 
-class QwenIndependentEngagement:
+class IndependentSourceImageEngagement:
     """Import every changed module from the independently rebuilt image."""
 
     def __init__(self, images: SourceImagePort, cwd: Path) -> None:
@@ -221,7 +231,7 @@ class QwenIndependentEngagement:
         )
 
 
-class QwenIndependentReplay:
+class IndependentCleanReplay:
     """Run unchanged Magpie measurement in a second fresh container."""
 
     def __init__(
@@ -235,51 +245,124 @@ class QwenIndependentReplay:
     def replay(self, request: ReplayRequest) -> CleanReplayReceipt:
         if request.output_dir is None or request.primary_receipts is None:
             raise ContractError("Replay evidence roots are missing", "invalid_replay_receipt")
-        primary = _load_primary_benchmark(
+        primary = load_primary_benchmark(
             request.primary_receipts.get("primary_benchmark_receipt")
         )
-        baseline = _measurement_from_mapping(primary.get("baseline"))
-        first = _measurement_from_mapping(primary.get("source_rebuild"))
-        result = self.benchmark.run_normalized(
-            BenchmarkRequest(
-                run_id=f"replay-{request.bundle_digest[:20]}",
-                config_path=request.replay_config,
-                output_dir=request.output_dir,
-                pass_type=BenchmarkPass.MEASUREMENT,
-                timeout_seconds=7200,
+        first = stored_measurement_from_mapping(primary.get("source_rebuild"))
+        acceptance = acceptance_policy_from_mapping(primary.get("acceptance_policy"))
+        measurement, results = self._measure_windows(request, acceptance)
+        verdict = evaluate_paired_current_anchor(
+            measurement, acceptance
+        )
+        candidates = tuple(
+            observation
+            for window in measurement.windows
+            for observation in (
+                window.candidate_forward,
+                window.candidate_reverse,
             )
         )
-        replay = _measurement(result, request.config_receipt.workload_semantics_sha256)
-        current = evaluate_current_anchor(baseline, replay, self.policy.acceptance)
-        parity = evaluate_no_regression(
-            first,
-            replay,
-            self.policy.acceptance,
-            throughput_noise_pct=self.policy.overlay_parity_noise_pct,
+        parity = tuple(
+            evaluate_no_regression(
+                first,
+                candidate,
+                acceptance,
+                throughput_noise_pct=self.policy.overlay_parity_noise_pct,
+            )
+            for candidate in candidates
         )
-        accuracy = _accuracy_passed(current, parity) and result.quality.passed
-        latency = _latency_passed(current, parity, self.policy.acceptance)
+        accuracy = verdict.accuracy_regression_pct <= 0.0 and all(
+            item.accuracy_regression_pct <= 0.0 for item in parity
+        )
+        latency = verdict.reason_code not in {
+            "ttft_p99_regression",
+            "tpot_p99_regression",
+        } and all(_latency_passed(item, item, acceptance) for item in parity)
+        all_quality = all(result.quality.passed for result in results)
+        all_normal = all(_normal_measurement(result) for result in results)
+        runtime_identities = tuple(
+            _runtime_identity(
+                result,
+                request.expected_image.image_digest
+                if index % 4 in {1, 2}
+                else None,
+            )
+            for index, result in enumerate(results)
+        )
         return CleanReplayReceipt(
-            request.bundle_digest,
-            request.primary_environment_id,
-            f"independent-{request.expected_image.image_digest[7:23]}-"
-            f"{replay.measurement_receipt[:16]}",
-            request.expected_image.image_digest,
-            sha256_file(request.replay_config),
-            replay.measurement_receipt,
-            request.source_stack_sha256,
-            bool(request.repository_receipts)
-            and all(item.verified for item in request.repository_receipts),
-            True,
-            _normal_measurement(result),
-            result.quality.passed,
-            accuracy,
-            latency,
-            current.keep,
+            bundle_digest=request.bundle_digest,
+            primary_environment_id=request.primary_environment_id,
+            replay_environment_id=(
+                f"independent-{request.expected_image.image_digest[7:23]}-"
+                f"{measurement.digest[:16]}"
+            ),
+            image_digest=request.expected_image.image_digest,
+            replay_config_sha256=sha256_file(request.replay_config),
+            benchmark_receipt_sha256=measurement.digest,
+            source_stack_sha256=request.source_stack_sha256,
+            source_materialization_sha256=sha256_json(
+                [item.to_dict() for item in request.repository_receipts]
+            ),
+            primary_runtime_identity_sha256=primary_runtime_identity(primary),
+            replay_runtime_identity_sha256s=runtime_identities,
+            normal_runtime_measurement=all_normal,
+            quality_passed=all_quality,
+            accuracy_passed=accuracy and all_quality,
+            latency_gates_passed=latency,
+            objective_improved=verdict.keep,
+            paired_measurement=measurement.to_dict(),
+            paired_verdict=verdict.to_dict(),
+            raw_artifacts=_replay_artifacts(request, measurement, results),
+        )
+
+    def _measure_windows(
+        self, request: ReplayRequest, acceptance: E2EAcceptancePolicy
+    ) -> tuple[E2EPairedMeasurement, tuple[NormalizedBenchmarkResult, ...]]:
+        observations: list[E2EObservation] = []
+        results: list[NormalizedBenchmarkResult] = []
+        order = ("anchor", "candidate", "candidate", "anchor")
+        slots = ("ab-anchor", "ab-candidate", "ba-candidate", "ba-anchor")
+        prefix = f"replay-{request.bundle_digest[:20]}"
+        for window in range(acceptance.min_paired_windows):
+            for position, side in enumerate(order):
+                result = self.benchmark.run_normalized(
+                    BenchmarkRequest(
+                        run_id=f"{prefix}-{window}-{slots[position]}",
+                        config_path=(
+                            request.baseline_config
+                            if side == "anchor"
+                            else request.replay_config
+                        ),
+                        output_dir=request.output_dir,
+                        pass_type=BenchmarkPass.MEASUREMENT,
+                        timeout_seconds=7200,
+                    )
+                )
+                results.append(result)
+                observations.append(
+                    _measurement(result, request.config_receipt.workload_semantics_sha256)
+                )
+        windows = tuple(
+            E2EPairedWindow(
+                f"terminal-window-{index}",
+                observations[offset],
+                observations[offset + 1],
+                observations[offset + 2],
+                observations[offset + 3],
+            )
+            for index, offset in enumerate(range(0, len(observations), 4))
+        )
+        return (
+            E2EPairedMeasurement(
+                windows,
+                acceptance.digest,
+                acceptance.min_paired_windows,
+            ),
+            tuple(results),
         )
 
 
-def _measurement(result: NormalizedBenchmarkResult, protocol_hash: str) -> E2EMeasurement:
+def _measurement(result: NormalizedBenchmarkResult, protocol_hash: str) -> E2EObservation:
     if (
         not _normal_measurement(result)
         or result.report_path is None
@@ -290,9 +373,96 @@ def _measurement(result: NormalizedBenchmarkResult, protocol_hash: str) -> E2EMe
     return measurement_from_result(
         result,
         protocol_hash,
-        quality_receipt=sha256_file(result.quality.source_paths[0]),
-        measurement_receipt=sha256_file(result.report_path),
+        quality_receipt=sha256_json(
+            {"run_id": result.run_id, "sha256": sha256_file(result.quality.source_paths[0])}
+        ),
+        measurement_receipt=sha256_json(
+            {"run_id": result.run_id, "sha256": sha256_file(result.report_path)}
+        ),
     )
+
+
+def _replay_artifacts(
+    request: ReplayRequest,
+    measurement: E2EPairedMeasurement,
+    results: tuple[NormalizedBenchmarkResult, ...],
+) -> tuple[ReplayArtifactReceipt, ...]:
+    root = request.output_dir
+    if root is None:
+        raise IntegrityError("Clean replay output root is missing", "invalid_replay_receipt")
+    observations = tuple(
+        item for window in measurement.windows for item in window.observations
+    )
+    if len(observations) != len(results):
+        raise IntegrityError("Clean replay result count differs", "invalid_replay_receipt")
+    artifacts: list[ReplayArtifactReceipt] = []
+    for observation, result in zip(observations, results, strict=True):
+        report = result.report_path
+        quality = result.quality.source_paths[0] if result.quality.source_paths else None
+        if report is None or quality is None:
+            raise IntegrityError("Clean replay raw evidence is missing", "invalid_replay_receipt")
+        if observation.measurement_receipt != sha256_json(
+            {"run_id": result.run_id, "sha256": sha256_file(report)}
+        ) or observation.quality_receipt != sha256_json(
+            {"run_id": result.run_id, "sha256": sha256_file(quality)}
+        ):
+            raise IntegrityError("Clean replay raw identity differs", "invalid_replay_receipt")
+        paths = (
+            ("benchmark_report", report),
+            ("execution_attestation", _execution_attestation_path(result)),
+            *(("quality_result", path) for path in result.quality.source_paths),
+            *(
+                (
+                    "quality_sample"
+                    if path.name.startswith("samples")
+                    else "quality_raw_artifact",
+                    path,
+                )
+                for path in result.quality.raw_artifact_paths
+            ),
+        )
+        for role, path in paths:
+            artifacts.append(
+                _replay_artifact(root, result.run_id, observation, role, path)
+            )
+    return tuple(artifacts)
+
+
+def _replay_artifact(
+    root: Path,
+    run_id: str,
+    observation: E2EObservation,
+    role: str,
+    path: Path,
+) -> ReplayArtifactReceipt:
+    resolved = path.resolve(strict=True)
+    try:
+        relative = resolved.relative_to(root.resolve(strict=True)).as_posix()
+    except ValueError as error:
+        raise IntegrityError(
+            "Clean replay artifact escapes its output root", "invalid_replay_receipt"
+        ) from error
+    if path.is_symlink() or not resolved.is_file():
+        raise IntegrityError("Clean replay artifact is unsafe", "invalid_replay_receipt")
+    return ReplayArtifactReceipt(
+        role,
+        run_id,
+        observation.measurement_receipt,
+        observation.quality_receipt,
+        relative,
+        sha256_file(resolved),
+        resolved.stat().st_size,
+        _media_type(resolved),
+    )
+
+
+def _media_type(path: Path) -> str:
+    return {
+        ".json": "application/json",
+        ".jsonl": "application/x-ndjson",
+        ".yaml": "application/yaml",
+        ".yml": "application/yaml",
+    }.get(path.suffix.lower(), "application/octet-stream")
 
 
 def _primary_gates(evidence: _PrimaryEvidence) -> dict[str, bool]:
@@ -309,6 +479,50 @@ def _primary_gates(evidence: _PrimaryEvidence) -> dict[str, bool]:
         "objective_improved": evidence.current_verdict.keep,
         "overlay_rebuild_parity_passed": evidence.parity_verdict.keep,
     }
+
+
+def _execution_attestation_path(result: NormalizedBenchmarkResult) -> Path:
+    matches = tuple(
+        path
+        for path in result.artifacts
+        if path.name == "execution_attestation.json"
+    )
+    if len(matches) != 1:
+        raise IntegrityError(
+            "Formal benchmark lacks one protected execution attestation",
+            "source_delivery_benchmark_failed",
+        )
+    return matches[0]
+
+
+def _runtime_identity(
+    result: NormalizedBenchmarkResult, expected_image_id: str | None
+) -> str:
+    runtime = result.serving_runtime
+    attestation = _execution_attestation_path(result)
+    if (
+        runtime.required is not True
+        or runtime.passed is not True
+        or not runtime.container_name
+        or not runtime.container_spec_sha256
+        or not runtime.resolved_image_id
+        or expected_image_id is not None
+        and runtime.resolved_image_id != expected_image_id
+    ):
+        raise IntegrityError(
+            "Formal benchmark runtime identity is unavailable",
+            "source_delivery_runtime_unverified",
+        )
+    return sha256_json(
+        {
+            "schema": "apex.e2e-runtime-identity/v1",
+            "run_id": result.run_id,
+            "container_name": runtime.container_name,
+            "container_spec_sha256": runtime.container_spec_sha256,
+            "resolved_image_id": runtime.resolved_image_id,
+            "execution_attestation_sha256": sha256_file(attestation),
+        }
+    )
 
 
 def _normal_measurement(result: NormalizedBenchmarkResult) -> bool:
@@ -344,11 +558,15 @@ def _write_primary_receipts(
         "primary_build_receipt": evidence.build.build_document,
         "primary_engagement_receipt": evidence.engagement.to_dict(),
         "primary_benchmark_receipt": {
-            "schema": _PRIMARY_BENCHMARK_SCHEMA,
+            "schema": PRIMARY_BENCHMARK_SCHEMA,
             "source_stack_sha256": request.source_stack_sha256,
             "baseline": request.baseline.to_dict(),
             "overlay_final": request.overlay_final.to_dict(),
             "source_rebuild": evidence.measurement.to_dict(),
+            "runtime_identity_sha256": _runtime_identity(
+                evidence.result, evidence.build.image.image_digest
+            ),
+            "acceptance_policy": evidence.policy.acceptance.to_dict(),
             "current_verdict": evidence.current_verdict.to_dict(),
             "overlay_parity_verdict": evidence.parity_verdict.to_dict(),
             "gates": gates,
@@ -363,46 +581,16 @@ def _write_primary_receipts(
     paths = {}
     for role, document in documents.items():
         path = (root / f"{role}.json").resolve()
-        _write_json(path, document)
+        write_primary_receipt(path, document)
         paths[role] = path
     return paths
 
 
-def _load_primary_benchmark(path: Path | None) -> Mapping[str, Any]:
-    if path is None or path.is_symlink() or not path.is_file():
-        raise IntegrityError("Primary benchmark receipt is missing", "missing_primary_receipt")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise IntegrityError("Primary benchmark receipt is invalid", "missing_primary_receipt") from error
-    if not isinstance(value, Mapping) or value.get("schema") != _PRIMARY_BENCHMARK_SCHEMA:
-        raise IntegrityError("Primary benchmark schema is invalid", "missing_primary_receipt")
-    return value
-
-
-def _measurement_from_mapping(value: object) -> E2EMeasurement:
-    if not isinstance(value, Mapping):
-        raise IntegrityError("Stored E2E measurement is invalid", "missing_primary_receipt")
-    try:
-        return E2EMeasurement(**dict(value))
-    except (TypeError, ValueError) as error:
-        raise IntegrityError("Stored E2E measurement is invalid", "missing_primary_receipt") from error
-
-
-def _write_json(path: Path, value: Mapping[str, Any]) -> None:
-    if path.exists() or path.is_symlink():
-        raise IntegrityError("Primary receipt already exists", "immutable_delivery_artifact")
-    with path.open("xb") as output:
-        output.write(canonical_json_bytes(value) + b"\n")
-        output.flush()
-        os.fsync(output.fileno())
-
-
 __all__ = [
     "FormalMeasurementPolicy",
-    "QwenIndependentEngagement",
-    "QwenIndependentReplay",
-    "QwenIndependentSourceBuild",
-    "QwenPrimarySourceBuilder",
+    "IndependentCleanReplay",
+    "IndependentSourceImageBuild",
+    "IndependentSourceImageEngagement",
+    "SourceImagePrimaryBuilder",
     "SourceImagePort",
 ]

@@ -21,6 +21,7 @@ from .e2e_models import (
     BuildStep,
     BundleProvenanceLock,
     DerivedImageIdentity,
+    SourceComponentCapability,
     SourceFileChange,
     SourceRepositoryLock,
 )
@@ -28,6 +29,7 @@ from .e2e_receipts import (
     BuiltArtifact,
     BuildStepReceipt,
     CleanReplayReceipt,
+    ReplayArtifactReceipt,
     DeliveryVerificationResult,
     LoadedArtifact,
     LoadedByteEngagementReceipt,
@@ -50,6 +52,11 @@ from .e2e_verify import (
     TerminalDeliveryVerdict,
     delivery_terminal_policy,
 )
+from .e2e_router import (
+    E2EBundleVerificationPort,
+    E2EBundleVerifierRouter,
+    E2EVerifierProfile,
+)
 from .git_patch import (
     CapturedRepositoryPatch,
     CleanPatchMaterializer,
@@ -58,6 +65,16 @@ from .git_patch import (
     validate_lock_order,
 )
 from .result import TaskResult, write_task_result
+from .portable_bundle import (
+    PortableBundleEvidence,
+    PortableBundleVerification,
+    capture_portable_bundle,
+    verify_portable_bundle,
+)
+from .reproduction import (
+    e2e_reproduction_declaration,
+    kernel_reproduction_declaration,
+)
 
 __all__ = [
     "BuildRecipeLock",
@@ -70,10 +87,14 @@ __all__ = [
     "CapturedRepositoryPatch",
     "CleanPatchMaterializer",
     "CleanReplayReceipt",
+    "ReplayArtifactReceipt",
     "CleanReplayBackend",
     "DeliveryVerificationResult",
     "DerivedImageIdentity",
     "E2EBundleVerifier",
+    "E2EBundleVerificationPort",
+    "E2EBundleVerifierRouter",
+    "E2EVerifierProfile",
     "E2EPatchBundle",
     "EngagementRequest",
     "EngagementBackend",
@@ -82,12 +103,15 @@ __all__ = [
     "LoadedArtifact",
     "LoadedByteEngagementReceipt",
     "PrimaryVerificationEvidence",
+    "PortableBundleEvidence",
+    "PortableBundleVerification",
     "ReplayConfigInvariantReceipt",
     "ReplayRequest",
     "RepositoryApplyReceipt",
     "SourceBuildReceipt",
     "SourceBuildBackend",
     "SourceBuildRequest",
+    "SourceComponentCapability",
     "SourceFileChange",
     "SourceRepositoryLock",
     "SupervisedRecipeBuildBackend",
@@ -97,15 +121,19 @@ __all__ = [
     "build_kernel_bundle",
     "apply_verified_kernel_bundle",
     "capture_repository_patch",
+    "capture_portable_bundle",
     "compute_e2e_bundle_digest",
     "compute_bundle_digest",
     "detect_bundle_kind",
     "delivery_terminal_policy",
+    "e2e_reproduction_declaration",
     "finalize_verified_e2e_bundle",
     "load_and_verify_e2e_bundle",
     "load_and_verify_kernel_bundle",
+    "kernel_reproduction_declaration",
     "source_stack_digest",
     "verify_replay_config_invariants",
+    "verify_portable_bundle",
     "validate_lock_order",
     "write_task_result",
 ]

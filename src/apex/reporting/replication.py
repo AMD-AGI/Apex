@@ -5,10 +5,11 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
 
 from apex.core import canonical_json_bytes, sha256_bytes
-from apex.rl import EpisodeGraph
+from apex.rl import EpisodeEvent, EpisodeGraph
 
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -28,6 +29,7 @@ _CREDENTIAL_OPTION = re.compile(
 _SECRET_KEY = re.compile(
     r"(?:api[_-]?key|authorization|password|secret|access[_-]?token)$", re.I
 )
+_PRIVATE_PATH = re.compile(r"(?<![A-Za-z0-9_.-])/(?:home|tmp|var/tmp)/[^\s\"']+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,20 +53,7 @@ class ReplicationProjection:
 def build_replication_guide(graph: EpisodeGraph) -> ReplicationProjection:
     """Never invent a command: only render argv committed in canonical events."""
 
-    declarations = [
-        event.payload["replication"]
-        for event in graph.parent.events
-        if isinstance(event.payload.get("replication"), Mapping)
-    ]
-    problems: list[str] = []
-    if not declarations:
-        declaration: Mapping[str, Any] = {}
-        problems.append("replication_declaration_missing")
-    elif len(declarations) > 1 and any(item != declarations[0] for item in declarations[1:]):
-        declaration = {}
-        problems.append("replication_declaration_conflict")
-    else:
-        declaration = declarations[-1]
+    declaration, declaration_event, problems = _select_declaration(graph)
 
     dependencies = _mapping_list(declaration.get("dependency_receipts"))
     sources = _mapping_list(declaration.get("source_commits"))
@@ -86,20 +75,28 @@ def build_replication_guide(graph: EpisodeGraph) -> ReplicationProjection:
         problems.append("source_commits_missing")
     for item in sources:
         commit = _text(item.get("commit"))
-        if commit is None or not _COMMIT.fullmatch(commit):
+        tree = _text(item.get("tree"))
+        if (
+            commit is None
+            or not _COMMIT.fullmatch(commit)
+            or tree is None
+            or not _COMMIT.fullmatch(tree)
+        ):
             problems.append("source_commit_invalid")
-    if parent_image is None or not _IMAGE.fullmatch(parent_image):
-        problems.append("parent_image_digest_invalid")
     if not commands:
         problems.append("replication_commands_missing")
     kept = any(child.verdict == "keep" for child in graph.children)
     if kept:
-        if derived_image is None or not _IMAGE.fullmatch(derived_image):
-            problems.append("derived_image_digest_invalid")
-        names = {item["name"] for item in commands}
-        for required in ("apply_bundle", "build_image", "clean_replay"):
-            if required not in names:
-                problems.append(f"{required}_command_missing")
+        problems.extend(
+            _task_kind_problems(
+                graph,
+                declaration,
+                declaration_event,
+                commands,
+                parent_image,
+                derived_image,
+            )
+        )
     problems = sorted(set(problems))
     document = {
         "schema_name": "apex.replication_guide",
@@ -125,6 +122,89 @@ def build_replication_guide(graph: EpisodeGraph) -> ReplicationProjection:
     return ReplicationProjection(document, _render(document))
 
 
+def _select_declaration(
+    graph: EpisodeGraph,
+) -> tuple[Mapping[str, Any], EpisodeEvent | None, list[str]]:
+    events = (
+        *graph.parent.events,
+        *(event for child in graph.children for event in child.events),
+    )
+    declarations = tuple(
+        (event, event.payload["replication"])
+        for event in events
+        if isinstance(event.payload.get("replication"), Mapping)
+    )
+    if not declarations:
+        return {}, None, ["replication_declaration_missing"]
+    if len(declarations) != 1:
+        return {}, None, ["replication_declaration_conflict"]
+    event, declaration = declarations[0]
+    problems = []
+    if declaration.get("schema") != "apex.replication-declaration/v1":
+        problems.append("replication_declaration_schema_invalid")
+    if declaration.get("task_kind") != graph.parent.kind:
+        problems.append("replication_task_kind_mismatch")
+    return declaration, event, problems
+
+
+def _task_kind_problems(
+    graph: EpisodeGraph,
+    declaration: Mapping[str, Any],
+    event: EpisodeEvent | None,
+    commands: Sequence[Mapping[str, Any]],
+    parent_image: str | None,
+    derived_image: str | None,
+) -> list[str]:
+    problems = _bundle_problems(graph, declaration, event)
+    names = {str(item["name"]) for item in commands}
+    if graph.parent.kind == "single_kernel":
+        if parent_image is not None and not _IMAGE.fullmatch(parent_image):
+            problems.append("parent_image_digest_invalid")
+        if derived_image is not None:
+            problems.append("unexpected_derived_image_digest")
+        required = ("verify_bundle", "apply_bundle", "compile", "correctness", "performance")
+    elif graph.parent.kind == "e2e_kernel_only":
+        if parent_image is None or not _IMAGE.fullmatch(parent_image):
+            problems.append("parent_image_digest_invalid")
+        if derived_image is None or not _IMAGE.fullmatch(derived_image):
+            problems.append("derived_image_digest_invalid")
+        configs = _mapping_list(declaration.get("benchmark_config_receipts"))
+        if not configs or any(
+            not re.fullmatch(r"[0-9a-f]{64}", str(item.get("digest", "")))
+            for item in configs
+        ):
+            problems.append("benchmark_config_receipts_invalid")
+        required = ("verify_bundle", "build_image", "clean_replay")
+    else:
+        return [*problems, "replication_task_kind_unsupported"]
+    problems.extend(f"{name}_command_missing" for name in required if name not in names)
+    return problems
+
+
+def _bundle_problems(
+    graph: EpisodeGraph,
+    declaration: Mapping[str, Any],
+    event: EpisodeEvent | None,
+) -> list[str]:
+    value = declaration.get("bundle_receipt")
+    if not isinstance(value, Mapping) or event is None:
+        return ["bundle_receipt_missing"]
+    expected_kind = "kernel" if graph.parent.kind == "single_kernel" else "e2e"
+    digest = _text(value.get("digest"))
+    evidence = _text(value.get("evidence_receipt"))
+    verification = _text(value.get("verification_receipt"))
+    roles = {item.role: item.receipt.digest for item in event.artifacts}
+    valid = all(
+        (
+            value.get("kind") == expected_kind,
+            digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest),
+            evidence == roles.get("winner_bundle"),
+            verification == roles.get("bundle_verification"),
+        )
+    )
+    return [] if valid else ["bundle_receipt_mismatch"]
+
+
 def _commands(value: object) -> tuple[list[dict[str, Any]], list[str]]:
     if not isinstance(value, (list, tuple)):
         return [], []
@@ -141,6 +221,8 @@ def _commands(value: object) -> tuple[list[dict[str, Any]], list[str]]:
             problems.append("replication_command_invalid")
             continue
         args = [str(item) for item in argv]
+        cwd = str(raw.get("cwd", "."))
+        environment = raw.get("env", {})
         if name is not None and _SECRET.search(name):
             problems.append("replication_command_contains_secret")
             name = _SECRET.sub("[REDACTED]", name)
@@ -150,9 +232,50 @@ def _commands(value: object) -> tuple[list[dict[str, Any]], list[str]]:
         if _argv_contains_secret(args):
             problems.append("replication_command_contains_secret")
             args = _redact_argv(args)
+        if any(_PRIVATE_PATH.search(item) for item in args):
+            problems.append("replication_command_contains_private_path")
+            args = [_PRIVATE_PATH.sub("[REDACTED_PATH]", item) for item in args]
+        if not _safe_cwd(cwd):
+            problems.append("replication_command_cwd_invalid")
+            cwd = "[REDACTED_PATH]"
+        normalized_env, env_problems = _command_environment(environment)
+        problems.extend(env_problems)
         names.add(name)
-        commands.append({"name": name, "argv": args})
+        commands.append(
+            {"name": name, "argv": args, "cwd": cwd, "env": normalized_env}
+        )
     return commands, problems
+
+
+def _safe_cwd(value: str) -> bool:
+    path = PurePosixPath(value)
+    return bool(
+        value
+        and not path.is_absolute()
+        and ".." not in path.parts
+        and not _PRIVATE_PATH.search(value)
+    )
+
+
+def _command_environment(value: object) -> tuple[dict[str, str], list[str]]:
+    if not isinstance(value, Mapping):
+        return {}, ["replication_command_env_invalid"]
+    result: dict[str, str] = {}
+    problems: list[str] = []
+    for raw_key, raw_value in sorted(value.items(), key=lambda item: str(item[0])):
+        key, item = str(raw_key), str(raw_value)
+        if not key or "\x00" in key or "\x00" in item:
+            problems.append("replication_command_env_invalid")
+            continue
+        if _SECRET_KEY.search(key) or _SECRET.search(item) or _SECRET_ASSIGNMENT.search(item):
+            problems.append("replication_command_contains_secret")
+            result[key] = "[REDACTED]"
+        elif _PRIVATE_PATH.search(item):
+            problems.append("replication_command_contains_private_path")
+            result[key] = _PRIVATE_PATH.sub("[REDACTED_PATH]", item)
+        else:
+            result[key] = item
+    return result, problems
 
 
 def _render(document: Mapping[str, Any]) -> str:

@@ -5,12 +5,24 @@ from pathlib import Path
 import pytest
 import yaml
 
-from apex.benchmark import build_config_views, validate_resolved_view
+from apex.benchmark import build_config_views as _build_config_views
+from apex.benchmark import validate_resolved_view
 from apex.core import ConfigurationError, IntegrityError
 from apex.delivery import verify_replay_config_invariants
 from apex.optimization.e2e.overlay_config import derive_overlay_configs
 from apex.ports import BenchmarkPass
 from apex.runtime import DependencyReceipt, LmEvalRuntimeReceipt
+from tests.support.magpie_contract import resolved_contract
+
+
+def build_config_views(source: Path, output: Path, **kwargs):
+    receipt = kwargs["dependency_receipt"]
+    return _build_config_views(
+        source,
+        output,
+        resolved_contract=resolved_contract(source, receipt),
+        **kwargs,
+    )
 
 
 def _receipt(tmp_path: Path) -> DependencyReceipt:
@@ -139,18 +151,29 @@ def test_builds_trace_only_diagnostic_and_formal_measurement_views(
     assert measurement["benchmark"]["run_kind"] == "measurement"
     assert replay["benchmark"]["run_kind"] == "measurement"
     assert diagnostic["benchmark"]["run_kind"] == "diagnostic"
+    policy = measurement["apex"]["benchmark_view"]["quality_contract"][
+        "evaluator_policy"
+    ]
+    assert policy["policy_id"] == "apex-lm-eval-gsm8k-v2"
+    assert policy["task_definition_sha256"] == (
+        "c0e109ed6dc356e082aea80cd775c12d64dada787b88c602408a3b960e0b04a1"
+    )
+    assert policy["dataset_revision"] == "740312add88f781978c0658806c59bc2815b9866"
+    assert policy["primary_metric"] == "exact_match,strict-match"
+    assert policy["max_length"] == 2248
+    assert policy["max_gen_tokens"] == 480
     assert diagnostic["apex"]["benchmark_view"]["quality_contract"] == {
         "required": False,
         "kind": "trace_only",
         "tasks": "gsm8k",
-        "evaluator_policy": None,
+        "evaluator_policy": policy,
     }
     for document in (measurement, replay):
         assert document["apex"]["benchmark_view"]["quality_contract"] == {
             "required": True,
             "kind": "lm_eval",
             "tasks": "gsm8k",
-            "evaluator_policy": None,
+            "evaluator_policy": policy,
         }
     assert not any(
         value.get("enabled")
@@ -252,6 +275,49 @@ def test_refuses_to_replace_an_immutable_view(tmp_path: Path) -> None:
             dependency_receipt=receipt,
             replay_image="second:image",
         )
+
+
+@pytest.mark.parametrize("run_mode", ("local", "ray"))
+def test_non_docker_views_do_not_require_a_docker_image(
+    tmp_path: Path, run_mode: str
+) -> None:
+    source = _source(tmp_path)
+    document = _load(source)
+    document["benchmark"]["run_mode"] = run_mode
+    document["benchmark"].pop("docker_image")
+    if run_mode == "ray":
+        document["benchmark"]["ray_config"] = {"address": "ray://cluster"}
+    source.write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+
+    views = build_config_views(
+        source, tmp_path / "views", dependency_receipt=_receipt(tmp_path)
+    )
+
+    for path in (views.measurement, views.diagnostic, views.replay):
+        benchmark = _load(path)["benchmark"]
+        assert benchmark["run_mode"] == run_mode
+        assert "docker_image" not in benchmark
+
+
+def test_replay_image_is_rejected_for_non_docker_workload(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    document = _load(source)
+    document["benchmark"].update({"run_mode": "local", "docker_image": ""})
+    source.write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigurationError) as caught:
+        build_config_views(
+            source,
+            tmp_path / "views",
+            dependency_receipt=_receipt(tmp_path),
+            replay_image="derived@sha256:" + "f" * 64,
+        )
+
+    assert caught.value.reason_code == "replay_image_not_applicable"
 
 
 def test_explicitly_disabled_quality_contract_is_rejected(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ def transcript_metadata(result: AgentResult) -> dict[str, object]:
         "discarded_stdout_lines": result.discarded_stdout_lines,
         "discarded_stdout_bytes": result.discarded_stdout_bytes,
         "discarded_stdout_sha256": result.discarded_stdout_sha256,
+        "credential_redaction_count": result.credential_redaction_count,
         "observed_turns": result.observed_turns,
         "invocation": result.invocation.to_dict() if result.invocation else None,
         "transcript_event_count": len(result.events),

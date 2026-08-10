@@ -15,10 +15,11 @@ from apex.evaluation import E2ERewardPolicy, replay_e2e_reward
 from apex.storage import ArtifactReceipt, ArtifactStore, EventRecord
 
 from .e2e_measurement_validation import validate_measured_e2e_evidence
+from .e2e_hard_gate_validation import validate_quality_gate_e2e_evidence
 from .models import CandidateEpisode, EpisodeArtifact, EpisodeEvent, EpisodeGraph
 
 
-E2E_REWARD_POLICY_ID = "e2e_kernel_candidate_v1"
+E2E_REWARD_POLICY_ID = "e2e_throughput_qos_v1"
 MEASURED_E2E_ARTIFACT_ROLES = frozenset(
     {
         "benchmark_config",
@@ -61,6 +62,8 @@ def explicit_attempt_id(record: EventRecord) -> str | None:
     value = record.payload.get("attempt_id")
     if value is None and "attempt_id" not in record.payload:
         normalized = record.event_type.replace(".", "_")
+        if normalized == "reward_committed" and record.payload.get("scope") == "task_terminal":
+            return None
         required = (
             "candidate_id" in record.payload
             or normalized == "reward_committed"
@@ -118,6 +121,15 @@ def e2e_completion_reasons(
             if e2e_decision_count == 0
             else "multiple_decision_events"
         )
+    if verdict == "needs_more_measurement":
+        if reward_count != 0:
+            reasons.add("unexpected_reward_for_untrainable_attempt")
+        if "candidate_manifest" not in roles:
+            reasons.add("candidate_manifest_receipt_missing")
+        if opportunity_id is None:
+            reasons.add("opportunity_id_missing")
+        reasons.add("reward_null")
+        return reasons
     if reward_count != 1:
         reasons.add("reward_missing" if reward_count == 0 else "multiple_reward_events")
     if "candidate_manifest" not in roles:
@@ -226,7 +238,7 @@ def validate_e2e_export_reward(
             "reward_replay_mismatch",
         )
     _, policy_document = _read_single_json(child, artifacts, "reward_policy")
-    _, grade_document = _read_single_json(child, artifacts, "e2e_grade")
+    _, grade_document = _read_single_json(child, artifacts, "e2e_reward_vector")
     decision_receipt, decision_document = _read_single_json(
         child, artifacts, "decision_evidence"
     )
@@ -246,7 +258,13 @@ def validate_e2e_export_reward(
         manifest_receipt,
         manifest_document,
     )
-    if vector.get("verdict") in {"keep", "revert"}:
+    if vector.get("performance_skipped") == "quality_gate":
+        validate_quality_gate_e2e_evidence(
+            child,
+            artifacts,
+            decision_document,
+        )
+    elif vector.get("verdict") in {"keep", "revert"}:
         validate_measured_e2e_evidence(
             graph,
             child,
@@ -402,6 +420,18 @@ def _validate_decision_values(
             "E2E decision artifact and reward reason differ",
             "e2e_reward_artifact_mismatch",
         )
+    if vector.get("performance_skipped") == "quality_gate":
+        if (
+            verdict != "revert"
+            or reason != "quality_gate_failed"
+            or decision.get("performance_skipped") != "quality_gate"
+            or "measurement_verdict" in decision
+        ):
+            raise IntegrityError(
+                "Quality-gate decision semantics differ from the reward grade",
+                "e2e_reward_artifact_mismatch",
+            )
+        return
     measured = decision.get("measurement_verdict")
     if verdict not in {"keep", "revert"}:
         return
@@ -416,11 +446,24 @@ def _validate_decision_values(
             "e2e_reward_artifact_mismatch",
         )
     metrics = vector.get("metrics")
-    if not isinstance(metrics, Mapping) or any(
-        measured.get(key) != value for key, value in metrics.items()
-    ):
+    measured_metrics = measured.get("metrics")
+    measured_values = (
+        {
+            **dict(measured_metrics),
+            "anchor_measurement_id": measured.get("anchor_measurement_id"),
+            "candidate_measurement_id": measured.get("candidate_measurement_id"),
+        }
+        if isinstance(measured_metrics, Mapping)
+        else None
+    )
+    if not isinstance(metrics, Mapping) or measured_values != dict(metrics):
         raise IntegrityError(
             "Measured E2E decision metrics differ from the reward grade",
+            "e2e_reward_artifact_mismatch",
+        )
+    if measured.get("ratios") != vector.get("ratios"):
+        raise IntegrityError(
+            "Measured E2E decision ratios differ from the reward grade",
             "e2e_reward_artifact_mismatch",
         )
 

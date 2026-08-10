@@ -9,10 +9,10 @@ from typing import Any, Mapping
 from apex.core import IntegrityError, sha256_file, sha256_json
 from apex.evaluation import (
     E2EAcceptancePolicy,
-    E2EVerdict,
-    e2e_comparison_selection_policy,
-    evaluate_current_anchor,
-    select_conservative_e2e_verdict,
+    E2EPairedMeasurement,
+    E2EPairedVerdict,
+    E2EPairedWindow,
+    evaluate_paired_current_anchor,
 )
 from apex.storage import ArtifactReceipt, EventRecord
 
@@ -21,14 +21,10 @@ from .recovery_artifacts import read_json_object, recover_measurement
 from .recovery_bindings import unique_role, verify_benchmark_event
 from .run_record import E2ERunRecord
 from .services import CandidateDeployment
-
-
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _GPU_UUID = re.compile(r"GPU-[0-9a-f]{16}")
 _ORDER = ("anchor", "candidate", "candidate", "anchor")
 _SLOTS = ("ab-anchor", "ab-candidate", "ba-candidate", "ba-anchor")
-
-
 def recover_matched_promotion(
     record: E2ERunRecord,
     *,
@@ -42,7 +38,7 @@ def recover_matched_promotion(
 ) -> MatchedPromotion:
     """Recover one complete pair; partial windows deliberately have no pair event."""
 
-    receipt = _required_role(pair_event, "matched_promotion_pair")
+    receipt = _required_role(pair_event, "paired_promotion")
     lease_receipt = _required_role(pair_event, "promotion_gpu_lease")
     value = read_json_object(record, receipt, label="matched promotion")
     identity = _identity(
@@ -60,15 +56,13 @@ def recover_matched_promotion(
         pair_event=pair_event,
         protocol_hash=protocol_hash,
     )
-    comparisons = _comparisons(observations, policy)
-    selected = select_conservative_e2e_verdict(comparisons)
-    verdict = comparisons[selected]
-    _verify_derived(value, observations, comparisons, selected, verdict)
+    measurement = _paired_measurement(value, observations, policy)
+    verdict = evaluate_paired_current_anchor(measurement, policy)
+    _verify_derived(value, observations, measurement, verdict)
     return MatchedPromotion(
         *identity,
         observations,
-        comparisons,
-        selected,
+        measurement,
         verdict,
         receipt,
     )
@@ -112,7 +106,7 @@ def validate_promotion_context(
 def verify_promotion_reward_binding(
     event: EventRecord, promotion: MatchedPromotion
 ) -> None:
-    receipt = _required_role(event, "matched_promotion_pair")
+    receipt = _required_role(event, "paired_promotion")
     vector = event.payload.get("reward_vector")
     metrics = vector.get("metrics") if isinstance(vector, Mapping) else None
     if (
@@ -134,17 +128,17 @@ def _identity(
     opportunity_id: str,
 ) -> tuple[Any, ...]:
     if (
-        value.get("schema") != "apex.e2e-matched-promotion/v2"
+        value.get("schema") != "apex.e2e-paired-promotion/v1"
         or value.get("attempt_id") != attempt_id
         or value.get("candidate_id") != candidate_id
         or value.get("opportunity_id") != opportunity_id
-        or value.get("order") != list(_ORDER)
+        or value.get("window_order") != list(_ORDER)
     ):
         raise IntegrityError("Matched pair identity differs", "promotion_lineage_mismatch")
     anchor_generation = _integer(value.get("anchor_generation"), "anchor generation")
     return (
         _text(value.get("pair_id"), "pair id"),
-        _text(value.get("window_id"), "window id"),
+        _window_ids(value.get("window_ids")),
         attempt_id,
         candidate_id,
         opportunity_id,
@@ -168,7 +162,8 @@ def _observations(
     protocol_hash: str,
 ) -> tuple[PromotionObservation, ...]:
     raw = value.get("observations")
-    if not isinstance(raw, list) or len(raw) != 4:
+    window_ids = _window_ids(value.get("window_ids"))
+    if not isinstance(raw, list) or len(raw) != len(_ORDER) * len(window_ids):
         raise IntegrityError("Matched observations are incomplete", "promotion_lineage_mismatch")
     observations = tuple(
         _observation(
@@ -199,10 +194,12 @@ def _observation(
     events_by_key: Mapping[str, EventRecord],
     protocol_hash: str,
 ) -> PromotionObservation:
-    side = _ORDER[position]
-    window_id = _text(pair.get("window_id"), "window id")
+    local_position = position % len(_ORDER)
+    side = _ORDER[local_position]
+    window_ids = _window_ids(pair.get("window_ids"))
+    window_id = window_ids[position // len(_ORDER)]
     attempt_id = _text(pair.get("attempt_id"), "attempt id")
-    action_id = f"promotion-{attempt_id}-{window_id}-{_SLOTS[position]}"
+    action_id = f"promotion-{attempt_id}-{window_id}-{_SLOTS[local_position]}"
     if (
         item.get("position") != position
         or item.get("side") != side
@@ -303,32 +300,37 @@ def _runtime_identity(
     return requested, resolved
 
 
-def _comparisons(
-    observations: tuple[PromotionObservation, ...], policy: E2EAcceptancePolicy
-) -> tuple[E2EVerdict, E2EVerdict]:
-    return (
-        evaluate_current_anchor(
-            observations[0].measurement, observations[1].measurement, policy
-        ),
-        evaluate_current_anchor(
-            observations[3].measurement, observations[2].measurement, policy
-        ),
+def _paired_measurement(
+    value: Mapping[str, Any],
+    observations: tuple[PromotionObservation, ...],
+    policy: E2EAcceptancePolicy,
+) -> E2EPairedMeasurement:
+    window_ids = _window_ids(value.get("window_ids"))
+    windows = tuple(
+        E2EPairedWindow(
+            window_id,
+            observations[offset].measurement,
+            observations[offset + 1].measurement,
+            observations[offset + 2].measurement,
+            observations[offset + 3].measurement,
+        )
+        for offset, window_id in zip(
+            range(0, len(observations), len(_ORDER)), window_ids, strict=True
+        )
     )
+    return E2EPairedMeasurement(windows, policy.digest, policy.min_paired_windows)
 
 
 def _verify_derived(
     value: Mapping[str, Any],
     observations: tuple[PromotionObservation, ...],
-    comparisons: tuple[E2EVerdict, E2EVerdict],
-    selected: int,
-    verdict: E2EVerdict,
+    measurement: E2EPairedMeasurement,
+    verdict: E2EPairedVerdict,
 ) -> None:
     anchor = tuple(item for item in observations if item.side == "anchor")
     candidate = tuple(item for item in observations if item.side == "candidate")
     if (
-        value.get("comparisons") != [item.to_dict() for item in comparisons]
-        or value.get("selection_policy") != e2e_comparison_selection_policy()
-        or value.get("selected_comparison") != selected
+        value.get("measurement") != measurement.to_dict()
         or value.get("verdict") != verdict.to_dict()
         or value.get("anchor_config_sha256") != anchor[0].config.digest
         or value.get("candidate_config_sha256") != candidate[0].config.digest
@@ -352,14 +354,17 @@ def _verify_pair_event(
         "anchor_id": value.get("anchor_id"),
         "anchor_generation": value.get("anchor_generation"),
         "pair_id": value.get("pair_id"),
-        "window_id": value.get("window_id"),
+        "window_ids": value.get("window_ids"),
+        "paired_measurement_id": sha256_json(
+            dict(_mapping(value.get("measurement"), "paired measurement"))
+        ),
         "gpu_lease_digest": value.get("gpu_lease_digest"),
-        "order": value.get("order"),
+        "window_order": value.get("window_order"),
         "verdict": value.get("verdict"),
     }
     if any(event.payload.get(name) != observed for name, observed in expected.items()):
         raise IntegrityError("Matched pair event differs", "promotion_lineage_mismatch")
-    if _required_role(event, "matched_promotion_pair").digest != receipt.digest:
+    if _required_role(event, "paired_promotion").digest != receipt.digest:
         raise IntegrityError("Matched pair receipt differs", "promotion_receipt_mismatch")
     _verify_pair_observation_bindings(event, value)
 
@@ -368,11 +373,15 @@ def _verify_pair_observation_bindings(
     event: EventRecord, value: Mapping[str, Any]
 ) -> None:
     observations = value.get("observations")
-    if not isinstance(observations, list) or len(observations) != 4:
+    window_ids = _window_ids(value.get("window_ids"))
+    if (
+        not isinstance(observations, list)
+        or len(observations) != len(_ORDER) * len(window_ids)
+    ):
         raise IntegrityError("Matched pair bindings are absent", "promotion_receipt_mismatch")
     for position, raw in enumerate(observations):
         item = _mapping(raw, "promotion observation")
-        side = _ORDER[position]
+        side = _ORDER[position % len(_ORDER)]
         for kind, field in (
             ("normalized", "normalized_receipt"),
             ("quality", "quality_receipt"),
@@ -390,10 +399,11 @@ def _verify_lease(
 ) -> None:
     lease = read_json_object(record, receipt, label="promotion GPU lease")
     ownership = _mapping(lease.get("ownership"), "GPU ownership")
+    doctor = _mapping(lease.get("doctor"), "GPU doctor")
     if (
         receipt.digest != value.get("gpu_lease_digest")
         or sha256_json(dict(lease)) != receipt.digest
-        or lease.get("schema_version") != 2
+        or lease.get("schema_version") != 3
         or lease.get("run_id") != record.run_id
         or lease.get("execution_scope") != value.get("gpu_device_scope")
         or not isinstance(lease.get("physical_scope"), str)
@@ -404,13 +414,15 @@ def _verify_lease(
         or ownership.get("policy_id")
         != "clean_hsa_kfd_rsmi_process_gpu_map_v2"
         or ownership.get("foreign_owners") != []
+        or doctor.get("status") != "ready"
+        or doctor.get("formal_measurement_ready") is not True
+        or doctor.get("ownership_receipt_sha256") != sha256_json(dict(ownership))
+        or doctor.get("rocm_health_status") != "healthy"
         or not _valid_gpu_inventory_binding(ownership)
         or _execution_scope(ownership) != lease.get("execution_scope")
         or _physical_scope(ownership) != lease.get("physical_scope")
     ):
         raise IntegrityError("Matched GPU lease differs", "promotion_lease_mismatch")
-
-
 def _physical_scope(ownership: Mapping[str, Any]) -> str:
     devices = ownership.get("selected_devices")
     if not isinstance(devices, list) or not devices:
@@ -421,8 +433,6 @@ def _physical_scope(ownership: Mapping[str, Any]) -> str:
             return ""
         identities.append(raw["unique_id"])
     return "amd-gpu-unique-id-set=" + ",".join(sorted(identities))
-
-
 def _execution_scope(ownership: Mapping[str, Any]) -> str:
     devices = ownership.get("selected_devices")
     if not isinstance(devices, list) or not devices:
@@ -571,6 +581,15 @@ def _sha256(value: Any, label: str) -> str:
     if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
         raise IntegrityError(f"{label} is invalid", "promotion_lineage_mismatch")
     return text
+
+
+def _window_ids(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) < 3:
+        raise IntegrityError("Window IDs are invalid", "promotion_lineage_mismatch")
+    result = tuple(_text(item, "window id") for item in value)
+    if len(set(result)) != len(result):
+        raise IntegrityError("Window IDs are duplicated", "promotion_lineage_mismatch")
+    return result
 
 
 __all__ = [

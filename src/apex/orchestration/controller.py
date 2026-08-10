@@ -11,6 +11,7 @@ from apex.core import (
 )
 
 from .atomic import AtomicJournalPort, ProposedEvent, append_reduced_transaction
+from .e2e_reward_validation import validate_e2e_reward_payload
 from .replay import replay_workload_state
 from .state import E2ESearchState, RunPhase, WorkloadState
 from .transitions import DOMAIN_EVENT_TYPES, EventLike, reduce_event
@@ -399,7 +400,7 @@ class RunController:
                 "Reward claims a candidate for a source-free decision",
                 "candidate_id_mismatch",
             )
-        _validate_e2e_reward_payload(
+        validate_e2e_reward_payload(
             reward,
             verdict=verdict,
             reason=reason,
@@ -408,13 +409,41 @@ class RunController:
         attempt = str(lineage["attempt_id"])
         return self._record_transaction(
             (
+                ("reward_committed", reward, f"e2e.attempt.{attempt}.reward"),
                 (
                     "e2e.candidate_decided",
                     payload,
                     f"e2e.attempt.{attempt}.decision",
                 ),
-                ("reward_committed", reward, f"e2e.attempt.{attempt}.reward"),
             )
+        )
+
+    def decide_e2e_untrainable(
+        self,
+        *,
+        candidate_id: str,
+        receipt: str,
+        reason: str,
+        decision_artifacts: Sequence[Mapping[str, Any]] = (),
+    ) -> WorkloadState:
+        """Commit an inconclusive decision without fabricating a reward event."""
+
+        search = self._e2e()
+        attempt = str(self._active_attempt_payload(search)["attempt_id"])
+        return self._record(
+            "e2e.candidate_decided",
+            {
+                **self._active_attempt_payload(search),
+                "candidate_id": candidate_id,
+                "receipt": receipt,
+                "verdict": "needs_more_measurement",
+                "reason": reason,
+                "trainability": "untrainable",
+                "untrainable_reason": reason,
+                **self._generation_payload(search),
+                "artifacts": [dict(item) for item in decision_artifacts],
+            },
+            f"e2e.attempt.{attempt}.decision",
         )
 
     def commit_e2e_reprofile(
@@ -557,38 +586,4 @@ class RunController:
             "attempt_id": search.active_attempt_id,
             "opportunity_id": search.active_opportunity_id,
         }
-
-
-def _validate_e2e_reward_payload(
-    reward: Mapping[str, Any],
-    *,
-    verdict: str,
-    reason: str,
-    candidate_present: bool,
-) -> None:
-    vector = reward.get("reward_vector")
-    if not isinstance(vector, Mapping):
-        raise ContractError(
-            "E2E reward vector is missing",
-            "e2e_reward_decision_mismatch",
-        )
-    pairs = (
-        (reward.get("verdict"), verdict),
-        (reward.get("reason_code"), reason),
-        (vector.get("verdict"), verdict),
-        (vector.get("reason_code"), reason),
-        (vector.get("candidate_present"), candidate_present),
-        (vector.get("policy_id"), reward.get("policy_id")),
-        (vector.get("policy_digest"), reward.get("policy_digest")),
-        (vector.get("scalar_reward"), reward.get("scalar_reward")),
-    )
-    if reward.get("evidence_class") != "derived" or any(
-        observed != expected for observed, expected in pairs
-    ):
-        raise ContractError(
-            "E2E reward conflicts with its decision or grade vector",
-            "e2e_reward_decision_mismatch",
-        )
-
-
 __all__ = ["JournalPort", "RunController", "SnapshotLike", "SnapshotPort"]

@@ -44,8 +44,9 @@ LAYER = {
     "rl": 5,
     "reporting": 6,
     "optimization": 7,
-    "bootstrap": 8,
-    "cli": 9,
+    "mcp": 8,
+    "bootstrap": 9,
+    "cli": 10,
 }
 
 
@@ -332,3 +333,51 @@ def test_clean_cut_deletion_inventory_and_zero_reference_gate() -> None:
         for path in (*_python_files(), ROOT / "main.py")
     )
     assert not [token for token in forbidden if token in production]
+
+
+def test_e2e_production_has_no_model_filename_or_literal_config_hash_routing() -> None:
+    """Keep workload identity opaque; behavior comes from resolved capabilities."""
+
+    model_markers = (
+        "qwen",
+        "deepseek",
+        "glm",
+        "kimi",
+        "minimax",
+        "mini-max",
+        "gpt-oss",
+    )
+    forbidden_names = {"QWEN_CONFIG_SHA256", "QWEN_MODEL_ID", "QWEN_MODEL_REVISION"}
+    violations: list[str] = []
+    for path in _python_files():
+        tree = _tree(path)
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        for name in sorted(names & forbidden_names):
+            violations.append(f"{path.relative_to(ROOT)}: legacy routing name {name}")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            rendered = ast.unparse(node).lower()
+            strings = tuple(
+                item.value.lower()
+                for item in ast.walk(node)
+                if isinstance(item, ast.Constant) and isinstance(item.value, str)
+            )
+            if any(marker in value for marker in model_markers for value in strings):
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno}: model-name comparison"
+                )
+            if any("benchmark_" in value and value.endswith((".yaml", ".yml")) for value in strings):
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno}: benchmark-filename comparison"
+                )
+            literal_digests = tuple(
+                value
+                for value in strings
+                if len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+            )
+            if "config" in rendered and literal_digests:
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno}: literal config-hash comparison"
+                )
+    assert not violations, "\n" + "\n".join(sorted(violations))

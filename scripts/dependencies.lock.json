@@ -2,11 +2,13 @@
   "schema": "apex.dependencies.lock",
   "version": 1,
   "receipt_schema": "apex.dependencies.receipt/v1",
+  "magpie_corpus_manifest": "magpie_corpus_manifest.json",
+  "magpie_compatibility_ledger": "magpie_compatibility_ledger.json",
   "dependencies": {
     "magpie": {
       "name": "Magpie",
       "repository": "https://github.com/AMD-AGI/Magpie.git",
-      "commit": "210513b31b2f3607920be4000d37fc51f14c5711",
+      "commit": "12896a49a731ad72c791b7a23abcef7a0d6c4487",
       "sibling": "Magpie",
       "managed_checkout": "magpie",
       "root_env": "MAGPIE_ROOT",

@@ -7,14 +7,18 @@ import pytest
 from apex.core import ContractError, sha256_json
 from apex.runtime import (
     GpuDeviceIdentity,
+    GpuLeaseOwnerIdentity,
     GpuOwnershipReceipt,
     HsaGpuIdentity,
     HsaInventoryEvidence,
     LocalGpuLeaseManager,
     RsmiDeviceIdentity,
     resolve_gpu_device_scope,
+    require_gpu_measurement_guard,
+    require_gpu_lease_heartbeat,
 )
 from apex.runtime.gpu_topology import capture_selector_request, resolve_gpu_selection
+from tests.support.gpu_evidence import StaticGpuDoctorInspector
 
 
 _DEVICES = (
@@ -76,7 +80,9 @@ def _manager(
 ) -> LocalGpuLeaseManager:
     return LocalGpuLeaseManager(
         lock_root=tmp_path / "leases",
-        ownership_inspector=inspector or _FakeOwnershipInspector(),
+        doctor_inspector=StaticGpuDoctorInspector(
+            inspector or _FakeOwnershipInspector()
+        ),
     )
 
 
@@ -220,3 +226,121 @@ def test_gpu_scope_rejects_split_brain_or_invalid_visibility(
 
 def test_selector_validation_preserves_order() -> None:
     assert resolve_gpu_device_scope("1,0") == "amd-gpu-set=1,0"
+
+
+class _Clock:
+    def __init__(self, value: float = 100.0) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _owner(start: int = 77) -> GpuLeaseOwnerIdentity:
+    return GpuLeaseOwnerIdentity(123, 1000, start, "d" * 64)
+
+
+def test_gpu_lease_heartbeat_and_measurement_bracket_are_identity_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_visibility(monkeypatch)
+    clock = _Clock()
+    manager = LocalGpuLeaseManager(
+        lock_root=tmp_path / "leases",
+        doctor_inspector=StaticGpuDoctorInspector(_FakeOwnershipInspector()),
+        ttl_seconds=30.0,
+        clock=clock,
+        owner_identity_provider=_owner,
+    )
+
+    with manager.acquire("run") as lease:
+        acquired = lease.heartbeat("manual")
+        clock.value = 110.0
+        with lease.measurement("formal-measurement") as guard:
+            clock.value = 120.0
+        bracket = guard.receipt
+
+    assert acquired.sequence == 2
+    assert bracket.pre.sequence == 3
+    assert bracket.post.sequence == 4
+    assert bracket.action_id == "formal-measurement"
+    assert bracket.lease_digest == lease.receipt.digest
+    assert bracket.pre.owner == bracket.post.owner == _owner()
+    assert bracket.finished_unix_seconds <= bracket.pre.valid_until_unix_seconds
+
+
+def test_gpu_lease_expiry_cannot_be_renewed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_visibility(monkeypatch)
+    clock = _Clock()
+    manager = LocalGpuLeaseManager(
+        lock_root=tmp_path / "leases",
+        doctor_inspector=StaticGpuDoctorInspector(_FakeOwnershipInspector()),
+        ttl_seconds=5.0,
+        clock=clock,
+        owner_identity_provider=_owner,
+    )
+
+    with manager.acquire("run") as lease:
+        clock.value = 106.0
+        with pytest.raises(ContractError) as raised:
+            lease.heartbeat()
+
+    assert raised.value.reason_code == "gpu_lease_expired"
+
+
+def test_gpu_lease_owner_pid_reuse_identity_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_visibility(monkeypatch)
+    current = [_owner()]
+    manager = LocalGpuLeaseManager(
+        lock_root=tmp_path / "leases",
+        doctor_inspector=StaticGpuDoctorInspector(_FakeOwnershipInspector()),
+        owner_identity_provider=lambda: current[0],
+    )
+
+    with manager.acquire("run") as lease:
+        current[0] = _owner(start=78)
+        with pytest.raises(ContractError) as raised:
+            lease.heartbeat()
+
+    assert raised.value.reason_code == "gpu_lease_owner_changed"
+
+
+def test_gpu_lease_device_drift_fails_before_post_measurement_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_visibility(monkeypatch)
+    inspector = _FakeOwnershipInspector()
+    manager = LocalGpuLeaseManager(
+        lock_root=tmp_path / "leases",
+        doctor_inspector=StaticGpuDoctorInspector(inspector),
+        owner_identity_provider=_owner,
+    )
+
+    with manager.acquire("run") as lease:
+        guard = lease.measurement("formal-measurement")
+        guard.__enter__()
+        inspector.reverse_devices = True
+        with pytest.raises(ContractError) as raised:
+            guard.__exit__(None, None, None)
+
+    assert raised.value.reason_code in {
+        "gpu_physical_mapping_changed",
+        "gpu_lease_device_identity_changed",
+    }
+    assert not hasattr(guard, "receipt")
+
+
+def test_formal_measurement_rejects_legacy_lease_without_lifecycle() -> None:
+    with pytest.raises(ContractError) as raised:
+        require_gpu_measurement_guard(object(), "measurement")
+
+    assert raised.value.reason_code == "gpu_lease_lifecycle_unavailable"
+
+    with pytest.raises(ContractError) as heartbeat:
+        require_gpu_lease_heartbeat(object())
+
+    assert heartbeat.value.reason_code == "gpu_lease_lifecycle_unavailable"

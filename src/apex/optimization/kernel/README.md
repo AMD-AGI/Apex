@@ -10,20 +10,56 @@ fresh bounded `ContextPacket`, invokes a fresh stateless backend process, freeze
 the declared source bytes, and independently verifies that candidate. The
 original workspace is never modified.
 
+Before a GPU lease, the use case resolves Git repository identity and freezes
+an evaluator-owned Evaluation Contract. Missing or mismatched authority returns
+an unverified machine result without invoking an agent. The
+`preview_evaluation_contract` method performs the same discovery without
+execution and supports the CLI's exact digest-confirmation handshake.
+`KernelCampaignDraftUseCase` is the descriptor-free capability bridge: it
+accepts agent-discovered typed task fields, injects the caller-fixed workspace
+and results roots, resolves and hashes the baseline, and records an explicitly
+unverified contract in canonical journal/CAS. It performs no agent, GPU,
+evaluation, or reward work. The later formal command must re-resolve the same
+draft digest under explicit user or reviewed-template authority.
+`FormalKernelCampaign` and `KernelFormalEvaluator` implement that later
+chat-to-formal bridge without starting a second optimization loop. They recover
+the draft from canonical events/CAS, require its original Git identity to have
+been and remain clean, keep agent edits in a persistent results-scoped candidate
+projection, and reconstruct every evaluator phase from frozen baseline, harness, and
+candidate receipts. `kernel.measure` records raw capture only; `kernel.grade`
+alone recomputes and commits reward, and missing authority/evidence is an
+explicit unverified result rather than a failed coding session.
+`stop_formal_campaign` is the standalone user-stop boundary. It closes pending
+work and derives the terminal grade only from evidence already in the journal;
+it cannot select or deliver a candidate.
+
 The bundle is the standalone deliverable for AKA or another external evaluator.
 Apex's local command evidence is provisional and never grants itself an external
-score. V1 executes Python and Triton tasks only. HIP descriptors fail at intake
-with `hip_execution_unavailable`, including descriptors with a fixed recipe,
-because this use case does not yet execute or evidence the recipe's build, deploy,
-and loaded-byte engagement phases.
+score. Ordinary V1 tasks execute Python and Triton only. Unknown HIP descriptors
+fail with `hip_execution_unavailable`, including descriptors with a claimed
+fixed recipe. The narrowly scoped template-bound lane can create an internal HIP
+TaskSpec only after packaged-registry admission, immutable image/source
+materialization, an Apex-owned evaluator recipe, and a non-replayable authority
+receipt. No checked-in template currently satisfies those gates.
 
 ## Public API
 
 The supported API is the set exported by `apex.optimization.kernel.__all__`:
-`KernelOptimizeRequest`, `KernelOptimizeUseCase`, `CandidateVerifier`,
-`CommandEvidence`, `candidate_source_digest`, `CandidateWorkspace`, and the
+`KernelOptimizeRequest`, `KernelOptimizeUseCase`, `KernelCampaignDraftUseCase`,
+`KernelCampaignDraft`, `FormalKernelCampaign`, `KernelFormalEvaluator`,
+`KernelFormalCapabilityUseCase`, `FormalEvaluationAuthorityProvider`,
+`OneShotEvaluationAuthorityProvider`, `FormalEvaluatorResult`, `FormalStopResult`,
+`stop_formal_campaign`, `CandidateVerifier`,
+`CommandEvidence`, `ExecutableIdentity`, `candidate_source_digest`,
+`CandidateWorkspace`, and the
 context/run-record contracts. External callers should normally use only the
 request and use-case types.
+
+`KernelOptimizeRequest.campaign_baseline` carries the receipt already rebuilt by
+the formal CLI. When present, the use case records it through the shared CAS/event
+writer before any kernel attempt. CPU/direct callers may omit it for isolated
+contract tests, but the public non-dry-run CLI does not. A blocked or self-digest-
+tampered document is rejected and cannot become run provenance.
 
 ## Invariants
 
@@ -34,7 +70,7 @@ agent exits
   -> candidate source freeze
   -> compile
   -> correctness
-  -> safety
+  -> optional external safety-receipt validation
   -> normal, uninstrumented performance qualification
   -> trusted evaluator measurement port
      OR explicit external-evaluator recipe deferral
@@ -44,6 +80,37 @@ agent exits
   -> deterministic best-candidate selection
   -> one source-only bundle
 ```
+
+For a chat-started formal attempt the same order is split across typed tools;
+each invocation replays canonical state and rematerializes the candidate. The
+local MCP process supplies evaluator execution authority, while a trusted local
+composition boundary supplies one non-replayable receipt bound to the exact run
+and draft. `confirmed_draft_digest` only detects mismatch and cannot mint
+authority. The frozen release baseline is rebuilt before the first evaluator or
+GPU action. None of these authorities can be inferred from agent text.
+`KernelFormalCapabilityUseCase` records the
+typed request and response as CAS-backed tool events around the evaluator
+operation; these diagnostic events never grant reward authority.
+
+Standalone scoring runs normal performance and raw capture inside one typed GPU
+measurement bracket. Apex commits the bracket before any measurement grade,
+reward, verified-attempt decision, or delivery. The bracket rechecks the same
+lease holder and physical inventory before and after timing; an expired lease,
+missing lifecycle implementation, PID reuse, or device/owner drift leaves the
+attempt without measured reward or delivery. Offline RL validation reconstructs
+this bracket before treating a kernel reward as trainable.
+
+The current chat-started formal bridge cannot attest termination of the
+external chat agent's process tree, credential revocation, tool-channel
+revocation, or concealment of the evaluator report directory. It records those
+four isolation facts as false and records only the locally verified read-only
+candidate freeze as true. The safety preflight therefore returns
+`phase_isolation_incomplete`; `kernel.measure` stops before its measurement GPU
+lease, normal performance command, raw timing capture, reward, or delivery.
+Compile and correctness receipts produced before that boundary remain
+provisional. A future trusted isolation authority must supply real evidence for
+all required facts before this formal lane can measure; agent text or a no-tool
+safety policy cannot supply it.
 
 “Agent exits” includes a controlled exact-turn-boundary checkpoint. Apex stops
 the structured stream exactly at `max_turns`; if the invocation receipt names
@@ -56,6 +123,13 @@ turn overrun, invalid stream, timeout, truncation, or cleanup failure is rejecte
 before freeze. The canonical `agent_completed` event and v3 transcript retain
 the exact termination/capture evidence.
 
+Before each formal backend call, `agent_request.py` requires the verified
+Evaluation Contract and issues an `apex.agent-execution-authority/v1` receipt
+bound to its exact digest, source anchor, attempt, backend, candidate workspace,
+and editable files. All three formal adapters carry prompts over stdin and only
+their own credential through the controlled environment. Missing/mismatched
+authority or a credential echo is rejected before candidate freeze and reward.
+
 The agent-mutated workspace is never used as an evaluator cwd. After containment
 and allowlist validation, `CandidateWorkspace` rechecks the pristine anchor,
 copies it into a new evaluator-owned projection, and overlays only content whose
@@ -64,11 +138,16 @@ other ignored agent artifacts are absent. Compile, correctness, safety, normal
 performance, and delivery use this projection; source is rehashed while copied
 to reject a freeze race.
 
+For chat-started formal work, that mutable tree is the persistent
+`formal-work/candidate-projection/editable` directory under the run results, not
+the source checkout. Its pristine anchor and edits survive handler restarts;
+each evaluator phase receives a separate persistent frozen projection.
+
 - Attempts never inherit mutable source, build output, timing reports, backend
   process state, or evaluator workspaces from an earlier attempt. Later agents
   see only bounded typed outcomes rebuilt from the append-only event journal.
-- Compile, correctness, safety, and performance run in that order on every
-  attempt. An earlier gate failure is recorded and may inform a later attempt;
+- Compile, correctness, optional external safety validation, and performance run
+  in that order on every attempt. An earlier gate failure is recorded and may inform a later attempt;
   it does not silently consume the rest of the search.
 - Candidate selection is not last-write-wins. Candidates with trusted grades
   are ordered by `Srobust`, then reward, then stable attempt order. If the caller
@@ -83,9 +162,11 @@ to reject a freeze race.
 - Each normally closed attempt has exactly one semantic
   KEEP/REVERT/REJECT/NEEDS_MORE_MEASUREMENT decision and at most one
   evaluator-owned reward. Integrity-fatal attempts terminate as typed failures.
-  Final selection never recomputes or duplicates an attempt reward.
-- A compile or correctness failure ends the attempt before safety or performance.
-- A confirmed safety finding, or an incomplete required safety check, ends the
+  Final selection never aggregates attempt rewards; task finalization records a
+  separate, uniquely scoped terminal reward.
+- A trusted compile or correctness failure ends the attempt before safety or
+  performance and records the formula-defined attempt reward (`0` or `20`).
+- A confirmed exact-lineage external finding, or an incomplete required external safety check, ends the
   attempt before normal performance.
 - Advisory incomplete safety may continue, but the result is explicitly
   `safety_certified=false`.
@@ -103,7 +184,16 @@ to reject a freeze race.
   safe `CommandSpec.env` entries. Shell/Python/loader injection and credentials
   are rejected before the command starts; agent credentials never cross into
   evaluator-owned compile, correctness, or performance processes.
-- Safety artifacts are diagnostic-only. Their instrumented bytes and timing are
+- Before each verifier phase, Apex resolves `argv[0]` through the evaluator
+  `PATH` (or the phase `cwd` for a relative path), replaces it with one canonical
+  absolute regular-file path, and freezes its path, size, SHA-256, device,
+  inode, mode, and timestamps. `CommandSpec.env` cannot override `PATH`.
+  Successful command evidence records that identity and proves it was hashed
+  and revalidated after process-tree teardown; byte or filesystem-identity
+  drift fails the phase. Generic executables do not have a reliable common
+  version command, so Apex does not execute an untrusted `--version` probe or
+  substitute version text for the byte identity.
+- Externally supplied safety artifacts are diagnostic-only. Their instrumented bytes and timing are
   forbidden inputs to normal performance evidence.
 - The standalone `performance` command is only a normal-runtime qualification
   gate. Its stdout, workspace files, and self-reported scores are untrusted. A
@@ -132,9 +222,17 @@ to reject a freeze race.
 - The event chain distinguishes `performance_command_result` (the command
   completed) from evaluator-owned `measurement_result` (raw report parsed and
   grade recomputed). Both measurement and reward events bind the raw report,
-  execution receipt, and protected harness. Only a valid measured grade emits
-  `reward_committed`.
+  execution receipt, and protected harness. A valid timing grade emits a
+  measurement-stage `reward_committed`; trusted compile/correctness failures emit
+  gate-stage rewards without pretending timing evidence exists.
   Missing or insufficient p99 cannot be promoted to a speedup or reward.
+- Formal task finalization emits one `scope=task_terminal` reward independent of
+  the number of attempts. A selected candidate reuses its raw-replayed grade; a
+  measured no-op is `Srobust=1` and reward `120`; trusted compile/correctness
+  terminal failures are `0`/`20`. Missing or invalid measurement authority is
+  `task_reward=null` with an explicit `untrainable_reason`. The terminal event
+  binds the frozen EvaluationContract, source identity, commands, harness,
+  execution receipt, raw report, attempt policy, and recomputed grade.
 - Before invocation, `KernelContextBuilder` records source/harness receipts,
   bounded knowledge selection (including typed unavailability), prompt, and
 context packet in CAS and the append-only event chain.
@@ -154,9 +252,12 @@ context packet in CAS and the append-only event chain.
 The package depends inward on `apex.core`, `apex.context`, `apex.intake`,
 `apex.knowledge`, orchestration/storage primitives, agent and safety ports, and
 the delivery bundle contract. It does not import AKA, an E2E optimizer, or a
-concrete sanitizer implementation. Concrete agents and safety runtimes are
-injected through ports. `safety_bridge.py` owns the translation from standalone
-kernel state to generic safety contracts; it does not execute a concrete tool.
+concrete sanitizer implementation. Concrete agents are injected through ports;
+safety input is either the explicit no-tool default or a receipt from an
+independent trusted evaluator. `safety_bridge.py` translates standalone kernel
+state to generic safety contracts and does not execute a tool. Normal
+measurement always uses fresh uninstrumented runtime bytes. See the
+[primary safety contract](../../evaluation/safety/README.md).
 
 ## Failure semantics
 
@@ -177,8 +278,10 @@ for external scoring and host application. An explicit external-evaluator
 candidate uses `candidate_deferred_to_external_evaluator`, carries no Apex
 reward, and remains subject to the caller's central
 compile/correctness/performance score.
-Standalone HIP fails before a run, GPU lease, agent invocation, or evaluator
-command with the stable `hip_execution_unavailable` reason.
+Unknown or caller-authored HIP fails before a run, GPU lease, agent invocation,
+or evaluator command with the stable `hip_execution_unavailable` reason. A
+copied/recomputed manifest cannot bypass this: only an exact packaged reviewed
+registry entry can enter the fixed template-bound image-kernel lane.
 The result binds its run ID, baseline resolution/file hashes, internal verdict
 event, verification-summary receipts, event-journal head, artifact-store
 receipts, and any typed terminal error; these references do not alter the bundle
@@ -200,12 +303,16 @@ writer/harness/method receipt mismatch, 299-versus-300 sample boundary,
 three-attempt robust best selection, compile-failure retry, exact iteration
 bounds, fresh-workspace/report isolation, canonical typed context history,
 canonical agent transcripts, original-workspace immutability, and verifier
-environment isolation. Intake coverage additionally proves HIP fails closed both
-with and without a complete fixed recipe.
+environment isolation. Intake coverage additionally proves caller-authored HIP
+fails closed both with and without a complete fixed recipe; template coverage
+proves pending/unregistered manifests never reach Docker.
+The MCP formal-evaluator suite additionally proves that missing chat-agent phase
+isolation blocks performance, raw capture, reward, and delivery; non-editable
+workspace drift and missing evaluation authority also fail closed before GPU
+evaluation.
 
 ## Provenance
 
-This implementation is Apex-native. The generic safety boundary it calls is
-documented in `apex.evaluation.safety`, including the exact upstream design input
-and license notice. No AKA task adapter, scorer, manager, worker, or sanitizer
-runtime is copied into this package.
+This implementation is Apex-native. The generic external-receipt safety boundary
+is documented in `apex.evaluation.safety`. No AKA task adapter, scorer, manager,
+worker, or sanitizer runtime is copied into this package.

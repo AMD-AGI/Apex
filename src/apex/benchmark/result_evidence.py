@@ -12,6 +12,7 @@ from .inferencex_runtime import (
     parse_inferencex_runtime_evidence,
 )
 from .lm_eval_runtime import LmEvalRuntimeEvidence, parse_lm_eval_runtime_evidence
+from .local_runtime import LocalRuntimeEvidence, parse_local_runtime_evidence
 from .model_revision import ModelRevisionEvidence, parse_model_revision_evidence
 from .serving_runtime import (
     ServingRuntimeEvidence,
@@ -24,6 +25,7 @@ Attestations = tuple[
     InferenceXRuntimeEvidence,
     LmEvalRuntimeEvidence,
     ServingRuntimeEvidence,
+    LocalRuntimeEvidence,
 ]
 
 
@@ -38,8 +40,11 @@ def parse_attestations(
     expected_lm_eval_runtime: LmEvalRuntimeReceipt | None,
     expected_lm_eval_execution_mode: str | None,
     expected_config_sha256: str | None,
+    expected_gpu_lease_digest: str | None,
     expected_requested_image: str | None,
     expected_execution_mode: str | None,
+    expected_lifecycle: str | None,
+    dependency_receipts: Mapping[str, Any] | None,
     allow_tracelens_derivation: bool = False,
     expected_tracelens_commit: str | None = None,
     expected_tracelens_tree: str | None = None,
@@ -53,12 +58,13 @@ def parse_attestations(
         expected_model=expected_model,
         expected_revision=expected_model_revision,
     )
+    local_mode = expected_execution_mode == "local"
     inferencex = parse_inferencex_runtime_evidence(
         report,
         resolved,
-        expected_source_root=expected_inferencex_root,
-        expected_commit=expected_inferencex_commit,
-        expected_tree=expected_inferencex_tree,
+        expected_source_root=None if local_mode else expected_inferencex_root,
+        expected_commit=None if local_mode else expected_inferencex_commit,
+        expected_tree=None if local_mode else expected_inferencex_tree,
     )
     lm_eval = parse_lm_eval_runtime_evidence(
         report,
@@ -75,7 +81,18 @@ def parse_attestations(
         expected_tracelens_commit=expected_tracelens_commit,
         expected_tracelens_tree=expected_tracelens_tree,
     )
-    return model, inferencex, lm_eval, serving
+    local = parse_local_runtime_evidence(
+        report,
+        expected_execution_mode=expected_execution_mode,
+        expected_lifecycle=expected_lifecycle,
+        expected_config_sha256=expected_config_sha256,
+        expected_gpu_lease_digest=expected_gpu_lease_digest,
+        expected_inferencex_root=expected_inferencex_root,
+        expected_inferencex_commit=expected_inferencex_commit,
+        expected_inferencex_tree=expected_inferencex_tree,
+        dependency_receipts=dependency_receipts,
+    )
+    return model, inferencex, lm_eval, serving, local
 
 
 def result_verdict(
@@ -110,7 +127,7 @@ def result_verdict(
 def evidence_artifacts(attestations: Attestations) -> tuple[Path, ...]:
     """Return every independently rehashed side artifact for persistence."""
 
-    model, inferencex, lm_eval, _serving = attestations
+    model, inferencex, lm_eval, _serving, _local = attestations
     paths: tuple[Path, ...] = ()
     if model.source_path:
         paths += (model.source_path,)

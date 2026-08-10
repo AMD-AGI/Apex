@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from apex.core import IntegrityError
-from apex.evaluation import E2ERewardGrade
+from apex.evaluation import E2ERewardVector
 from apex.knowledge import ExperienceIdentity, ExperienceOutcome
 from apex.storage import ArtifactReceipt, EventRecord
 
@@ -23,7 +23,7 @@ def record_e2e_learning(
     decision: ArtifactReceipt,
     verdict: str,
     reason: str,
-    grade: E2ERewardGrade,
+    grade: E2ERewardVector,
 ) -> None:
     """Append replayable learning facts after the atomic decision/reward commit."""
 
@@ -135,7 +135,7 @@ def _frozen_lineage(
     return common
 
 
-def _experience_outcome(grade: E2ERewardGrade) -> ExperienceOutcome:
+def _experience_outcome(grade: E2ERewardVector) -> ExperienceOutcome:
     if grade.outcome_class == "accepted":
         return ExperienceOutcome.SUCCESS
     if grade.outcome_class == "hard_gate_regression" or (

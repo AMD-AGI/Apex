@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from apex.benchmark import (
     InferenceXRuntimeEvidence,
@@ -15,15 +15,17 @@ from apex.benchmark import (
     QualityMetric,
     ServingRuntimeEvidence,
     ThroughputMetrics,
+    expected_attestation_path,
 )
 from apex.core import ValidationLevel, canonical_json_bytes, sha256_file, sha256_json
 from apex.evaluation import (
     E2EAcceptancePolicy,
+    E2EPairedMeasurement,
+    E2EPairedWindow,
+    E2ERewardContract,
     E2ERewardPolicy,
-    e2e_comparison_selection_policy,
-    evaluate_current_anchor,
+    evaluate_paired_current_anchor,
     grade_e2e_outcome,
-    select_conservative_e2e_verdict,
 )
 from apex.intake import RegressionGates
 from apex.optimization.e2e.benchmark_artifacts import persist_benchmark_evidence
@@ -46,6 +48,10 @@ from .conftest import (
     append_event_transaction,
     artifact_binding,
     make_packet,
+)
+from tests.support.gpu_evidence import (
+    SyntheticGpuMeasurementGuard,
+    clean_gpu_doctor,
 )
 
 
@@ -70,6 +76,8 @@ def build_measured_run(
     objective_hash_matches_request: bool = True,
     reward_opportunity_id: str = "opportunity-1",
     add_legacy_raw_role: bool = False,
+    official_private_fields: bool = False,
+    attestation_run_id_drift: bool = False,
     tamper: str | None = None,
 ) -> dict[str, object]:
     run_id = "run-e2e-measured"
@@ -84,31 +92,25 @@ def build_measured_run(
         100.0,
         0.8,
         _BASE_IMAGE,
+        official_private_fields=official_private_fields,
+        attestation_run_id_drift=attestation_run_id_drift,
     )
-    legs = (
-        _benchmark(root, artifacts, "ab-anchor", 100.0, 0.8, _BASE_IMAGE),
-        _benchmark(
+    legs = tuple(
+        bundle
+        for window in range(3)
+        for bundle in _window_bundles(
             root,
             artifacts,
-            "ab-candidate",
-            candidate_throughputs[0],
-            0.81,
+            window,
+            candidate_throughputs,
             runtime_image,
-            lane=candidate_lane,
-            raw_accuracy=raw_candidate_accuracy,
-            report_throughput=report_candidate_throughput,
-            ttft_p99_ms=candidate_ttft_p99_ms,
-        ),
-        _benchmark(
-            root,
-            artifacts,
-            "ba-candidate",
-            candidate_throughputs[1],
-            0.81,
-            runtime_image,
-            ttft_p99_ms=candidate_ttft_p99_ms,
-        ),
-        _benchmark(root, artifacts, "ba-anchor", 100.0, 0.8, _BASE_IMAGE),
+            candidate_lane,
+            raw_candidate_accuracy,
+            report_candidate_throughput,
+            candidate_ttft_p99_ms,
+            official_private_fields,
+            attestation_run_id_drift,
+        )
     )
     packet = make_packet(run_id)
     packet_receipt = artifacts.put_bytes(packet.canonical_bytes, media_type="application/json")
@@ -138,7 +140,7 @@ def build_measured_run(
             else baseline["config_path"]
         ),
     )
-    pair, pair_receipt, lease, comparisons, selected = _matched_pair(
+    pair, pair_receipt, lease, verdict = _matched_pair(
         artifacts,
         run_id=run_id,
         attempt_id=attempt_id,
@@ -148,7 +150,6 @@ def build_measured_run(
         decision_candidate_throughput=decision_candidate_throughput,
         tamper=tamper,
     )
-    verdict = comparisons[selected]
     decision_name = "keep" if verdict.keep else "revert"
     grade = grade_e2e_outcome(
         verdict=decision_name,
@@ -173,7 +174,7 @@ def build_measured_run(
         "micro_receipt": micro.digest,
         "safety_receipt": safety.digest,
         "delivery_receipt": delivery.digest,
-        "promotion_pair_receipt": decision_pair_receipt.digest,
+        "paired_promotion_receipt": decision_pair_receipt.digest,
     }
     if tamper == "legacy_benchmark_receipt":
         decision_doc["benchmark_receipt"] = legs[1]["evidence"].normalized.digest
@@ -202,6 +203,16 @@ def build_measured_run(
         ),
         media_type="application/json",
     )
+    reward_contract = artifacts.put_bytes(
+        canonical_json_bytes(
+            E2ERewardContract(
+                run_id,
+                _PROTOCOL,
+                E2EAcceptancePolicy(acceptance_gates),
+            ).to_dict()
+        ),
+        media_type="application/json",
+    )
     _append_history(
         journal,
         run_id,
@@ -210,6 +221,7 @@ def build_measured_run(
         packet,
         packet_receipt,
         run_request,
+        reward_contract,
         goal,
         objective_hash_matches_request,
         source,
@@ -262,8 +274,58 @@ def build_measured_run(
         "pair": pair,
         "pair_receipt": pair_receipt,
         "legs": legs,
-        "selected_comparison": selected,
+        "paired_measurement": pair["measurement"],
     }
+
+
+def _window_bundles(
+    root: Path,
+    artifacts: ArtifactStore,
+    window: int,
+    throughputs: tuple[float, float],
+    runtime_image: str,
+    candidate_lane: BenchmarkPass,
+    raw_accuracy: float,
+    report_throughput: float | None,
+    ttft_p99_ms: float,
+    official_private_fields: bool,
+    attestation_run_id_drift: bool,
+) -> tuple[dict[str, object], ...]:
+    prefix = f"window-{window}"
+    return (
+        _benchmark(
+            root,
+            artifacts,
+            f"{prefix}-ab-anchor",
+            100.0,
+            0.8,
+            _BASE_IMAGE,
+            official_private_fields=official_private_fields and window == 0,
+            attestation_run_id_drift=attestation_run_id_drift and window == 0,
+        ),
+        _benchmark(
+            root,
+            artifacts,
+            f"{prefix}-ab-candidate",
+            throughputs[0],
+            0.81,
+            runtime_image,
+            lane=candidate_lane,
+            raw_accuracy=raw_accuracy,
+            report_throughput=report_throughput,
+            ttft_p99_ms=ttft_p99_ms,
+        ),
+        _benchmark(
+            root,
+            artifacts,
+            f"{prefix}-ba-candidate",
+            throughputs[1],
+            0.81,
+            runtime_image,
+            ttft_p99_ms=ttft_p99_ms,
+        ),
+        _benchmark(root, artifacts, f"{prefix}-ba-anchor", 100.0, 0.8, _BASE_IMAGE),
+    )
 
 
 def _matched_pair(
@@ -278,26 +340,37 @@ def _matched_pair(
     tamper: str | None,
 ):
     measurements = tuple(_measurement(item) for item in legs)
-    decision_candidates = (measurements[1], measurements[2])
+    decision_measurements = measurements
     if decision_candidate_throughput is not None:
-        decision_candidates = tuple(
-            measurement_from_result(
-                _result_for_decision(legs[position]["result"], decision_candidate_throughput),
-                _PROTOCOL,
-                quality_receipt=legs[position]["evidence"].quality.digest,
-                measurement_receipt=legs[position]["evidence"].normalized.digest,
+        decision_measurements = tuple(
+            (
+                measurement_from_result(
+                    _result_for_decision(item["result"], decision_candidate_throughput),
+                    _PROTOCOL,
+                    quality_receipt=item["evidence"].quality.digest,
+                    measurement_receipt=item["evidence"].normalized.digest,
+                )
+                if position % 4 in (1, 2)
+                else measurements[position]
             )
-            for position in (1, 2)
+            for position, item in enumerate(legs)
         )
     acceptance = E2EAcceptancePolicy(acceptance_gates)
-    comparisons = (
-        evaluate_current_anchor(measurements[0], decision_candidates[0], acceptance),
-        evaluate_current_anchor(measurements[3], decision_candidates[1], acceptance),
+    window_ids = tuple(f"window-attempt-measured-10-{index}" for index in range(3))
+    windows = tuple(
+        E2EPairedWindow(
+            window_id,
+            decision_measurements[offset],
+            decision_measurements[offset + 1],
+            decision_measurements[offset + 2],
+            decision_measurements[offset + 3],
+        )
+        for offset, window_id in zip(range(0, 12, 4), window_ids, strict=True)
     )
-    selected = select_conservative_e2e_verdict(comparisons)
-    if tamper == "selected_comparison":
-        selected = 1 - selected
-    lease_document = _gpu_lease_document(run_id)
+    paired = E2EPairedMeasurement(windows, acceptance.digest, 3)
+    verdict = evaluate_paired_current_anchor(paired, acceptance)
+    lease_value = _gpu_lease(run_id)
+    lease_document = lease_value.to_dict()
     if tamper == "gpu_inventory":
         lease_document["ownership"]["device_inventory"][0]["unique_id"] = (
             "GPU-ffffffffffffffff"
@@ -305,10 +378,36 @@ def _matched_pair(
     lease = artifacts.put_bytes(
         canonical_json_bytes(lease_document), media_type="application/json"
     )
-    window_id = "window-attempt-measured-10"
+    for position, bundle in enumerate(legs):
+        if tamper == "missing_measurement_bracket" and position == 0:
+            continue
+        action_id = _promotion_action(window_ids[position // 4], position)
+        guard = SyntheticGpuMeasurementGuard(lease_value, action_id)
+        with guard:
+            pass
+        bracket = artifacts.put_bytes(
+            canonical_json_bytes(guard.receipt.to_dict()),
+            media_type="application/json",
+        )
+        evidence = bundle["evidence"]
+        bundle["evidence"] = replace(
+            evidence,
+            bindings=(
+                *evidence.bindings,
+                artifact_binding("gpu_measurement_bracket", bracket),
+            ),
+            receipts=(*evidence.receipts, bracket),
+            measurement_bracket=bracket,
+        )
     observations = [
-        _promotion_observation(position, side, window_id, legs[position], measurements[position])
-        for position, side in enumerate(("anchor", "candidate", "candidate", "anchor"))
+        _promotion_observation(
+            position,
+            ("anchor", "candidate", "candidate", "anchor")[position % 4],
+            window_ids[position // 4],
+            legs[position],
+            measurements[position],
+        )
+        for position in range(12)
     ]
     if tamper == "observation":
         observations[1] = dict(observations[1])
@@ -319,12 +418,12 @@ def _matched_pair(
         observations[2]["action_id"] += "-tampered"
     pair = {
         "schema": (
-            "apex.e2e-matched-promotion/v1"
+            "apex.e2e-paired-promotion/v0"
             if tamper == "pair_schema"
-            else "apex.e2e-matched-promotion/v2"
+            else "apex.e2e-paired-promotion/v1"
         ),
         "pair_id": "pair-attempt-measured-20",
-        "window_id": window_id,
+        "window_ids": list(window_ids),
         "attempt_id": attempt_id,
         "candidate_id": candidate_id,
         "opportunity_id": "opportunity-1",
@@ -336,27 +435,24 @@ def _matched_pair(
             if tamper == "gpu_scope"
             else lease_document["execution_scope"]
         ),
-        "order": ["anchor", "candidate", "candidate", "anchor"],
+        "window_order": ["anchor", "candidate", "candidate", "anchor"],
         "anchor_config_sha256": legs[0]["evidence"].config.digest,
         "candidate_config_sha256": legs[1]["evidence"].config.digest,
         "anchor_image": _bundle_image(legs[0]),
         "candidate_image": _bundle_image(legs[1]),
         "observations": observations,
-        "comparisons": [item.to_dict() for item in comparisons],
-        "selection_policy": (
-            {**e2e_comparison_selection_policy(), "policy_id": "tampered"}
-            if tamper == "selection_policy"
-            else e2e_comparison_selection_policy()
-        ),
-        "selected_comparison": selected,
-        "verdict": comparisons[selected].to_dict(),
+        "measurement": paired.to_dict(),
+        "verdict": verdict.to_dict(),
     }
+    if tamper in {"selection_policy", "selected_comparison"}:
+        pair["measurement"] = dict(pair["measurement"])
+        pair["measurement"]["acceptance_policy_digest"] = "9" * 64
     if tamper == "pair_extra_field":
         pair["unexpected"] = True
     receipt = artifacts.put_bytes(
         canonical_json_bytes(pair), media_type="application/json"
     )
-    return pair, receipt, lease, comparisons, selected
+    return pair, receipt, lease, verdict
 
 
 def _promotion_observation(position, side, window_id, bundle, measurement):
@@ -383,10 +479,10 @@ def _bundle_image(bundle):
 
 def _promotion_action(window_id: str, position: int) -> str:
     slots = ("ab-anchor", "ab-candidate", "ba-candidate", "ba-anchor")
-    return f"promotion-attempt-measured-{window_id}-{slots[position]}"
+    return f"promotion-attempt-measured-{window_id}-{slots[position % 4]}"
 
 
-def _gpu_lease_document(run_id: str) -> dict[str, Any]:
+def _gpu_lease(run_id: str) -> GpuLeaseReceipt:
     unique_id = "GPU-0123456789abcdef"
     hsa_device = HsaGpuIdentity(0, 2, 2, 1, 0, unique_id)
     hsa = HsaInventoryEvidence(
@@ -417,7 +513,7 @@ def _gpu_lease_document(run_id: str) -> dict[str, Any]:
         (),
     )
     lease = GpuLeaseReceipt(
-        2,
+        3,
         run_id,
         ownership.execution_scope,
         ownership.physical_scope,
@@ -425,8 +521,9 @@ def _gpu_lease_document(run_id: str) -> dict[str, Any]:
         1.0,
         "/tmp/apex-gpu-leases/GPU-0123456789abcdef.lock",
         ownership,
+        clean_gpu_doctor(ownership),
     )
-    return lease.to_dict()
+    return lease
 
 
 def _benchmark(
@@ -441,8 +538,10 @@ def _benchmark(
     raw_accuracy: float | None = None,
     report_throughput: float | None = None,
     ttft_p99_ms: float = 1.0,
+    official_private_fields: bool = False,
+    attestation_run_id_drift: bool = False,
 ) -> dict[str, object]:
-    workspace = root / label
+    workspace = root / label / "benchmark"
     workspace.mkdir(parents=True)
     config = workspace / "benchmark.yaml"
     config.write_text(f"benchmark:\n  serving:\n    image: {image_id}\n", encoding="utf-8")
@@ -464,15 +563,35 @@ def _benchmark(
     sample = workspace / "samples_gsm8k.jsonl"
     sample.write_text('{"doc_id":0,"target":"42"}\n', encoding="utf-8")
     report = workspace / "benchmark_report.json"
-    report.write_text(
+    report_document = _report_document(
+        workspace,
+        throughput if report_throughput is None else report_throughput,
+        lane,
+        ttft_p99_ms,
+    )
+    if official_private_fields:
+        report_document["run_kind"] = lane.value
+        report_document["reward_eligible"] = lane is BenchmarkPass.MEASUREMENT
+    report.write_text(json.dumps(report_document), encoding="utf-8")
+    serving_observation = _serving_observation(
+        label,
+        image_id,
+        sha256_file(config),
+    )
+    attestation = expected_attestation_path(report)
+    attestation.parent.mkdir()
+    attestation.write_text(
         json.dumps(
-            _report_document(
-                workspace,
-                throughput if report_throughput is None else report_throughput,
-                image_id,
-                sha256_file(config),
-                lane,
-                ttft_p99_ms,
+            _execution_attestation(
+                report,
+                config_sha256=sha256_file(config),
+                run_id=(
+                    "different-run"
+                    if attestation_run_id_drift
+                    else f"{label}-run"
+                ),
+                lane=lane,
+                serving=serving_observation,
             )
         ),
         encoding="utf-8",
@@ -508,7 +627,7 @@ def _benchmark(
         lane is BenchmarkPass.MEASUREMENT,
         ModelRevisionEvidence(False, True, None, None, None),
         InferenceXRuntimeEvidence(False, True, None, None, None, None, None),
-        (report, result_path, sample),
+        (report, result_path, sample, attestation),
         (),
         0,
         False,
@@ -518,7 +637,7 @@ def _benchmark(
             sha256_file(config),
             image_id,
             image_id,
-            f"magpie-benchmark-{label}",
+            serving_observation["container_name"],
             "f" * 64,
             True,
             None,
@@ -538,8 +657,6 @@ def _benchmark(
 def _report_document(
     workspace: Path,
     throughput: float,
-    image_id: str,
-    config_digest: str,
     lane: BenchmarkPass,
     ttft_p99_ms: float,
 ) -> dict[str, object]:
@@ -552,8 +669,6 @@ def _report_document(
         "model": "Qwen/example",
         "workspace_dir": str(workspace),
         "profiling_enabled": lane is BenchmarkPass.DIAGNOSTIC,
-        "run_kind": lane.value,
-        "reward_eligible": lane is BenchmarkPass.MEASUREMENT,
         "throughput": {
             "request_throughput": 1.0,
             "output_throughput": throughput,
@@ -562,21 +677,108 @@ def _report_document(
             "duration_seconds": 1.0,
         },
         "latency": {"ttft": ttft, "tpot": tpot},
-        "serving_runtime_receipt": {
-            "schema": "magpie.serving-runtime-receipt/v2",
-            "execution_mode": "docker",
-            "input_config_sha256": config_digest,
-            "input_image": image_id,
-            "input_image_id": image_id,
-            "requested_image": image_id,
-            "resolved_image_id": image_id,
-            "image_derivation": _direct_image_derivation(image_id),
-            "container_name": f"magpie-benchmark-{workspace.name}",
-            "docker_argv_sha256": "f" * 64,
-            "process_succeeded": True,
+    }
+
+
+def _serving_observation(
+    label: str, image_id: str, config_digest: str
+) -> dict[str, object]:
+    return {
+        "schema": "apex.magpie-serving-runtime-observation/v3",
+        "execution_mode": "docker",
+        "input_config_sha256": config_digest,
+        "input_image": image_id,
+        "input_image_id": image_id,
+        "requested_image": image_id,
+        "resolved_image_id": image_id,
+        "image_derivation": _direct_image_derivation(image_id),
+        "container_name": f"magpie-benchmark-{label}",
+        "container_spec_sha256": "f" * 64,
+        "process_succeeded": True,
+        "verified": True,
+        "errors": [],
+    }
+
+
+def _execution_attestation(
+    report: Path,
+    *,
+    config_sha256: str,
+    run_id: str,
+    lane: BenchmarkPass,
+    serving: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "schema": "apex.magpie-execution-attestation/v1",
+        "authority": "apex_evaluator",
+        "official_report_path": report.relative_to(report.parent.parent).as_posix(),
+        "official_report_size_bytes": report.stat().st_size,
+        "report_sha256": sha256_file(report),
+        "config_sha256": config_sha256,
+        "run_id": run_id,
+        "pass_type": lane.value,
+        "lane_verified": True,
+        "reward_eligible": lane is BenchmarkPass.MEASUREMENT,
+        "profiling_enabled": lane is BenchmarkPass.DIAGNOSTIC,
+        "process": {
+            "schema": "apex.magpie-process-attestation/v1",
+            "argv_sha256": "a" * 64,
+            "exit_code": 0,
+            "timed_out": False,
+            "succeeded": True,
             "verified": True,
-            "errors": [],
         },
+        "dependencies": {
+            "schema": "apex.magpie-dependency-attestation/v1",
+            "verified": True,
+            "receipts": _dependency_attestation_receipt(),
+        },
+        "runtime": {
+            "schema": "apex.magpie-runtime-attestation/v1",
+            "verified": True,
+            "model_revision_receipt": None,
+            "inferencex_runtime_receipt": None,
+            "lm_eval_runtime_receipt": None,
+            "serving_runtime_receipt": dict(serving),
+        },
+        "gpu_engagement": {
+            "schema": "apex.magpie-gpu-engagement/v1",
+            "verified": True,
+            "devices": [
+                {"rsmi_index": 0, "unique_id": "GPU-0000000000000001"}
+            ],
+            "processes": [_gpu_process_attestation()],
+        },
+        "quality_gate": {
+            "schema": "apex.magpie-quality-attestation/v1",
+            "verified": True,
+            "receipt": {"status": "passed", "passed": True},
+        },
+        "errors": [],
+    }
+
+
+def _dependency_attestation_receipt() -> dict[str, object]:
+    return {
+        "lock_sha256": "b" * 64,
+        "dependencies": {
+            name: {
+                "root": f"/dependencies/{name}",
+                "commit": "c" * 40,
+                "tree": "d" * 40,
+            }
+            for name in ("magpie", "tracelens", "inferencex")
+        },
+    }
+
+
+def _gpu_process_attestation() -> dict[str, object]:
+    return {
+        "pid": 123,
+        "uid": 1000,
+        "start_time_ticks": 456,
+        "cmdline_sha256": "e" * 64,
+        "rsmi_device_indices": [0],
     }
 
 
@@ -690,6 +892,7 @@ def _append_history(
     packet,
     packet_receipt,
     run_request,
+    reward_contract,
     goal,
     objective_hash_matches_request,
     source,
@@ -727,7 +930,10 @@ def _append_history(
         "dependency_verified",
         {
             "kind": "resolved_e2e_run_request",
-            "artifacts": [artifact_binding("run_request", run_request)],
+            "artifacts": [
+                artifact_binding("run_request", run_request),
+                artifact_binding("e2e_reward_contract", reward_contract),
+            ],
         },
         "run-request",
     )
@@ -797,12 +1003,14 @@ def _append_history(
         },
         "attempt-delivery",
     )
-    order = (0, 2, 1, 3) if tamper == "leg_order" else (0, 1, 2, 3)
+    order = tuple(range(12))
+    if tamper == "leg_order":
+        order = (0, 2, 1, *range(3, 12))
     if tamper == "pair_before_final_leg":
-        for position in order[:3]:
+        for position in order[:-1]:
             _append_leg(journal, run_id, common, legs, pair, position)
         _append_pair(journal, run_id, common, legs, pair, pair_receipt, lease, tamper)
-        _append_leg(journal, run_id, common, legs, pair, order[3])
+        _append_leg(journal, run_id, common, legs, pair, order[-1])
         return
     for position in order:
         if tamper == "missing_leg" and position == 2:
@@ -864,13 +1072,14 @@ def _append_pair(
     event_key="attempt-promotion-pair",
 ):
     artifacts = [
-        artifact_binding("matched_promotion_pair", pair_receipt),
+        artifact_binding("paired_promotion", pair_receipt),
         artifact_binding("promotion_gpu_lease", lease),
     ]
     if tamper == "aggregate_extra_role":
         artifacts.append(artifact_binding("unexpected_pair_artifact", lease))
     sides = ("anchor", "candidate", "candidate", "anchor")
-    for position, side in enumerate(sides):
+    for position in range(12):
+        side = sides[position % 4]
         evidence = legs[position]["evidence"]
         normalized = (
             legs[0]["evidence"].normalized
@@ -893,11 +1102,12 @@ def _append_pair(
             **common,
             "anchor_id": pair["anchor_id"],
             "anchor_generation": pair["anchor_generation"],
-            "measurement_kind": "matched_promotion_ab_ba",
+            "measurement_kind": "paired_promotion_abba",
             "pair_id": pair["pair_id"],
-            "window_id": pair["window_id"],
+            "window_ids": pair["window_ids"],
+            "paired_measurement_id": sha256_json(pair["measurement"]),
             "gpu_lease_digest": pair["gpu_lease_digest"],
-            "order": pair["order"],
+            "window_order": pair["window_order"],
             "verdict": pair["verdict"],
             "artifacts": artifacts,
         },
@@ -930,6 +1140,11 @@ def _benchmark_payload(bundle, lineage):
         "config_sha256": evidence.config.digest,
         "normalized_benchmark_receipt": evidence.normalized.digest,
         "quality_receipt": evidence.quality.digest,
+        "gpu_measurement_bracket_digest": (
+            evidence.measurement_bracket.digest
+            if evidence.measurement_bracket is not None
+            else None
+        ),
         "artifacts": [dict(item) for item in evidence.bindings],
     }
 
@@ -963,7 +1178,7 @@ def _append_outcome(
     }
     reward_artifacts = [
         artifact_binding("decision_evidence", decision),
-        artifact_binding("e2e_grade", grade_receipt),
+        artifact_binding("e2e_reward_vector", grade_receipt),
         artifact_binding("reward_policy", policy),
         artifact_binding("candidate_manifest", manifest),
         artifact_binding("candidate_source", source),
@@ -972,7 +1187,7 @@ def _append_outcome(
         artifact_binding("primary_delivery", delivery),
     ]
     if tamper != "reward_pair_missing":
-        reward_artifacts.append(artifact_binding("matched_promotion_pair", pair_receipt))
+        reward_artifacts.append(artifact_binding("paired_promotion", pair_receipt))
     if add_legacy_raw_role:
         reward_artifacts.append(artifact_binding("raw_measurement", pair_receipt))
     append_event_transaction(
@@ -995,6 +1210,8 @@ def _append_outcome(
                 "reward_committed",
                 {
                     **common,
+                    "scope": "attempt",
+                    "task_kind": "e2e_kernel_only",
                     "opportunity_id": reward_opportunity_id,
                     "verdict": verdict,
                     "reason_code": reason,

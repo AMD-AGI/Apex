@@ -91,6 +91,47 @@ class CandidateWorkspace:
             allowed_files=resolved.task.editable_files,
         )
 
+    @classmethod
+    def resume(
+        cls,
+        resolved: ResolvedTaskSpec,
+        *,
+        root: Path,
+        anchor: Path,
+    ) -> "CandidateWorkspace":
+        """Reopen a persistent projection only while its clean anchor still matches."""
+
+        if root.is_symlink() or anchor.is_symlink():
+            raise IntegrityError(
+                "candidate projection cannot traverse symlinks",
+                "workspace_symlink",
+            )
+        source = resolved.workspace.resolve(strict=True)
+        resolved_anchor = anchor.resolve(strict=True)
+        resolved_root = root.resolve(strict=True)
+        if resolved_anchor != anchor.absolute() or resolved_root != root.absolute():
+            raise IntegrityError(
+                "candidate projection cannot traverse symlinks",
+                "workspace_symlink",
+            )
+        baseline = _fingerprint_tree(source)
+        if _fingerprint_tree(resolved_anchor) != baseline:
+            raise IntegrityError(
+                "candidate projection anchor differs from the clean repository",
+                "candidate_anchor_drift",
+            )
+        if not resolved_root.is_dir():
+            raise IntegrityError(
+                "candidate projection is missing",
+                "candidate_projection_missing",
+            )
+        return cls(
+            root=resolved_root,
+            anchor=resolved_anchor,
+            baseline=baseline,
+            allowed_files=resolved.task.editable_files,
+        )
+
     def freeze(self, *, destination: Path | None = None) -> CandidateFreeze:
         agent_root = self.root
         candidate = _fingerprint_tree(agent_root)
@@ -166,3 +207,20 @@ class CandidateWorkspace:
         if projected != expected:
             raise IntegrityError("candidate projection differs from frozen source", "candidate_projection_mismatch")
         return projected
+
+
+def candidate_file_bytes(
+    root: Path, relative_paths: tuple[str, ...]
+) -> dict[str, bytes]:
+    return {
+        relative: root.joinpath(*relative.split("/")).read_bytes()
+        for relative in relative_paths
+    }
+
+
+__all__ = [
+    "CandidateFreeze",
+    "CandidateWorkspace",
+    "FileFingerprint",
+    "candidate_file_bytes",
+]

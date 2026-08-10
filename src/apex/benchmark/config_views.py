@@ -14,17 +14,21 @@ import yaml
 
 from apex.core import ConfigurationError, IntegrityError, sha256_bytes, sha256_json
 from apex.ports import BenchmarkPass
-from apex.runtime import DependencyReceipt
+from apex.runtime import DependencyReceipt, MagpieConfigContract
 
 from .config_validation import validate_phase_set_contract, validate_view_contract
-from .evaluator_policy import EvaluatorPolicy, resolve_evaluator_policy
+from .evaluator_policy import EvaluatorPolicy, evaluator_policy_from_scoring
+from .resolved_view import (
+    resolved_scoring_document,
+    validate_resolved_binding,
+    validated_source_roots,
+)
 from .runtime_inputs import pin_runtime_inputs
 
 
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_VIEW_SCHEMA = "apex.benchmark-view.v1"
-_SERVING_FRAMEWORKS = frozenset({"vllm", "sglang", "atom"})
+_VIEW_SCHEMA = "apex.benchmark-view.v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,23 +103,22 @@ def _enabled(value: Any) -> bool:
 def _freeze_quality_contract(
     benchmark: dict[str, Any], policy: EvaluatorPolicy | None
 ) -> str:
-    framework = str(benchmark.get("framework", "")).strip().lower()
     envs = benchmark.setdefault("envs", {})
     if not isinstance(envs, dict):
         raise ConfigurationError(
             "benchmark.envs must be a mapping", "invalid_benchmark_config"
         )
-    if framework not in _SERVING_FRAMEWORKS:
+    if "RUN_EVAL" not in envs:
         return ""
 
     configured = envs.get("RUN_EVAL")
-    if configured is not None and not _enabled(configured):
+    if not _enabled(configured):
         raise ConfigurationError(
             "Serving E2E optimization requires RUN_EVAL=true; the source config "
             "explicitly disables it",
             "quality_contract_disabled",
         )
-    tasks = envs.get("MAGPIE_EVAL_TASKS", "gsm8k")
+    tasks = envs.get("MAGPIE_EVAL_TASKS")
     if not isinstance(tasks, str) or not tasks.strip():
         raise ConfigurationError(
             "MAGPIE_EVAL_TASKS must be a non-empty comma-separated string",
@@ -126,9 +129,7 @@ def _freeze_quality_contract(
         raise ConfigurationError(
             "MAGPIE_EVAL_TASKS contains no task", "invalid_quality_contract"
         )
-    envs["RUN_EVAL"] = "true"
     envs["MAGPIE_EVAL_TASKS"] = tasks
-    envs.setdefault("MAGPIE_EVAL_BATCH_SIZE", "auto")
     if policy is not None:
         for name, expected in policy.env().items():
             observed = envs.get(name)
@@ -230,6 +231,7 @@ def _metadata(
     receipt: DependencyReceipt,
     quality_tasks: str,
     evaluator_policy: EvaluatorPolicy | None,
+    resolved: MagpieConfigContract,
     diagnostic_trace_only: bool = False,
 ) -> dict[str, Any]:
     return {
@@ -238,6 +240,20 @@ def _metadata(
             "kind": kind,
             "original_sha256": original_sha256,
             "workload_semantics_sha256": semantics_sha256,
+            "magpie_config_resolution": {
+                "plan_schema": resolved.plan["schema"],
+                "plan_sha256": resolved.plan["plan_sha256"],
+                "capability_schema": resolved.capability_receipt["schema"],
+                "capability_receipt_sha256": resolved.capability_receipt[
+                    "receipt_sha256"
+                ],
+                "effective_config_sha256": resolved.plan[
+                    "effective_config_sha256"
+                ],
+                "scoring_config_sha256": resolved.plan["scoring_config_sha256"],
+                "phase_views_sha256": resolved.plan["phase_views_sha256"],
+                "resolution_method_sha256": resolved.resolution_method_sha256,
+            },
             "dependencies": {
                 "receipt_schema": binding.receipt_schema,
                 "lock_sha256": binding.lock_sha256,
@@ -341,6 +357,7 @@ def _measurement_document(
     binding: TraceLensBinding,
     receipt: DependencyReceipt,
     evaluator_policy: EvaluatorPolicy | None,
+    resolved: MagpieConfigContract,
 ) -> tuple[dict[str, Any], str, str]:
     result = copy.deepcopy(dict(document))
     benchmark = result["benchmark"]
@@ -358,6 +375,7 @@ def _measurement_document(
             receipt=receipt,
             quality_tasks=quality_tasks,
             evaluator_policy=evaluator_policy,
+            resolved=resolved,
         ),
     )
     return result, quality_tasks, semantics_sha256
@@ -372,6 +390,7 @@ def _diagnostic_document(
     receipt: DependencyReceipt,
     source_repository_roots: Sequence[Path],
     evaluator_policy: EvaluatorPolicy | None,
+    resolved: MagpieConfigContract,
 ) -> dict[str, Any]:
     result = copy.deepcopy(dict(document))
     _freeze_quality_contract(result["benchmark"], evaluator_policy)
@@ -391,6 +410,7 @@ def _diagnostic_document(
             receipt=receipt,
             quality_tasks=quality_tasks,
             evaluator_policy=evaluator_policy,
+            resolved=resolved,
             diagnostic_trace_only=diagnostic_trace_only,
         ),
     )
@@ -406,12 +426,19 @@ def _replay_document(
     binding: TraceLensBinding,
     receipt: DependencyReceipt,
     evaluator_policy: EvaluatorPolicy | None,
+    resolved: MagpieConfigContract,
 ) -> dict[str, Any]:
     result = copy.deepcopy(dict(measurement))
     if replay_image is not None:
         if not isinstance(replay_image, str) or not replay_image.strip():
             raise ConfigurationError(
                 "Replay image locator must be non-empty", "invalid_replay_image"
+            )
+        run_mode = str(result["benchmark"].get("run_mode", "docker")).lower()
+        if run_mode != "docker":
+            raise ConfigurationError(
+                "A derived replay image applies only to Magpie Docker workloads",
+                "replay_image_not_applicable",
             )
         result["benchmark"]["docker_image"] = replay_image.strip()
     metadata = _metadata(
@@ -422,6 +449,7 @@ def _replay_document(
         receipt=receipt,
         quality_tasks=quality_tasks,
         evaluator_policy=evaluator_policy,
+        resolved=resolved,
     )
     result["apex"]["benchmark_view"] = metadata["benchmark_view"]
     return result
@@ -464,6 +492,7 @@ def build_config_views(
     output_dir: Path,
     *,
     dependency_receipt: DependencyReceipt,
+    resolved_contract: MagpieConfigContract,
     replay_image: str | None = None,
     source_repository_roots: Sequence[Path] = (),
     model_revision: str | None = None,
@@ -474,14 +503,16 @@ def build_config_views(
     """Create immutable phase-specific benchmark configuration views."""
 
     source, destination = _prepare_view_paths(original_config, output_dir)
-    source_roots = _validated_source_roots(source_repository_roots)
+    source_roots = validated_source_roots(source_repository_roots)
     binding = TraceLensBinding.from_receipt(dependency_receipt)
     original_bytes = source.read_bytes()
     original_sha256 = sha256_bytes(original_bytes)
-    document = _load_yaml(original_bytes, source=source)
-    evaluator_policy = resolve_evaluator_policy(
-        original_sha256, document["benchmark"]
+    validate_resolved_binding(
+        source, original_sha256, dependency_receipt, resolved_contract
     )
+    original_document = _load_yaml(original_bytes, source=source)
+    document = resolved_scoring_document(original_document, resolved_contract)
+    evaluator_policy = evaluator_policy_from_scoring(document["benchmark"])
     pin_runtime_inputs(
         document["benchmark"],
         dependency_receipt,
@@ -491,7 +522,8 @@ def build_config_views(
         hf_offline=hf_offline,
     )
     measurement, quality_tasks, semantics_sha256 = _measurement_document(
-        document, original_sha256, binding, dependency_receipt, evaluator_policy
+        document, original_sha256, binding, dependency_receipt, evaluator_policy,
+        resolved_contract,
     )
     diagnostic = _diagnostic_document(
         document,
@@ -502,6 +534,7 @@ def build_config_views(
         dependency_receipt,
         source_roots,
         evaluator_policy,
+        resolved_contract,
     )
     replay = _replay_document(
         measurement,
@@ -512,6 +545,7 @@ def build_config_views(
         binding,
         dependency_receipt,
         evaluator_policy,
+        resolved_contract,
     )
     validate_phase_set_contract(
         measurement, diagnostic, replay, semantics_sha256
@@ -527,29 +561,12 @@ def build_config_views(
     return paths
 
 
-def _validated_source_roots(values: Sequence[Path]) -> tuple[Path, ...]:
-    roots: list[Path] = []
-    for value in values:
-        if not value.is_absolute() or value.is_symlink():
-            raise ConfigurationError(
-                "Diagnostic source repository roots must be absolute directories",
-                "invalid_source_repository",
-            )
-        resolved = value.resolve(strict=True)
-        if not resolved.is_dir() or resolved in roots:
-            raise ConfigurationError(
-                "Diagnostic source repository roots must be unique directories",
-                "invalid_source_repository",
-            )
-        roots.append(resolved)
-    return tuple(roots)
-
-
 def validate_resolved_view(
     path: Path,
     *,
     pass_type: BenchmarkPass,
     dependency_receipt: DependencyReceipt,
+    expected_resolved: MagpieConfigContract | None = None,
 ) -> Mapping[str, Any]:
     """Fail before execution when a resolved view violates phase isolation."""
 
@@ -561,6 +578,7 @@ def validate_resolved_view(
         receipt=dependency_receipt,
         tracelens_root=binding.root,
         tracelens_commit=binding.commit,
+        expected_resolved=expected_resolved,
     )
     return document
 

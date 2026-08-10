@@ -15,12 +15,18 @@ from .agent_containment import (
     AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentProcessContainmentReceipt,
 )
+from .agent_authority import AgentExecutionAuthorityReceipt
 
 
 _SEMANTIC_EVENT_KINDS = {"agent_message", "tool_called", "tool_result"}
 _CURRENCY = re.compile(r"[A-Z]{3,8}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 STRUCTURED_TURN_CHECKPOINT_POLICY = "structured_agent_turn_checkpoint_v2"
+_BACKEND_CREDENTIAL_KEYS = {
+    "codex": "OPENAI_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+    "cursor": "CURSOR_API_KEY",
+}
 
 
 class AgentTerminationKind(str, Enum):
@@ -40,6 +46,7 @@ class AgentCaptureStatus(str, Enum):
     COMPLETE = "complete"
     OUTPUT_TRUNCATED = "output_truncated"
     CLEANUP_FAILED = "cleanup_failed"
+    CREDENTIAL_REDACTED = "credential_redacted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +202,7 @@ class AgentRequest:
     prompt: str
     workspace: Path
     allowed_files: tuple[str, ...]
+    execution_authority: AgentExecutionAuthorityReceipt | None
     model: str | None = None
     effort: str | None = None
     max_turns: int = 25
@@ -203,6 +211,12 @@ class AgentRequest:
     runtime_closure_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        if self.execution_authority is not None and not isinstance(
+            self.execution_authority, AgentExecutionAuthorityReceipt
+        ):
+            raise ContractError(
+                "Agent execution authority receipt is invalid", "invalid_agent_invocation"
+            )
         if (
             isinstance(self.max_turns, bool)
             or not isinstance(self.max_turns, int)
@@ -235,6 +249,8 @@ class AgentInvocationReceipt:
     argv: tuple[str, ...]
     workspace: str
     prompt_transport: str
+    execution_authority: AgentExecutionAuthorityReceipt
+    credential_environment_key: str
     requested_allowed_files: tuple[str, ...]
     allowed_files_enforced_by_cli: bool
     max_turns: int
@@ -251,6 +267,7 @@ class AgentInvocationReceipt:
             self.resolved_executable_path,
             self.workspace,
             self.prompt_transport,
+            self.credential_environment_key,
             self.turn_policy,
             self.process_containment_policy_id,
         )
@@ -266,6 +283,23 @@ class AgentInvocationReceipt:
         ):
             raise ContractError(
                 "Agent runtime closure digest is invalid", "invalid_agent_invocation"
+            )
+        if not isinstance(self.execution_authority, AgentExecutionAuthorityReceipt):
+            raise ContractError(
+                "Agent execution authority receipt is invalid", "invalid_agent_invocation"
+            )
+        authority = self.execution_authority
+        if (
+            authority.workspace != self.workspace
+            or authority.allowed_files != self.requested_allowed_files
+            or authority.prompt_transport_policy_id != "stdin_only_v1"
+            or self.prompt_transport != "stdin"
+            or _BACKEND_CREDENTIAL_KEYS.get(authority.backend)
+            != self.credential_environment_key
+        ):
+            raise ContractError(
+                "Agent invocation differs from its execution authority",
+                "invalid_agent_invocation",
             )
         if not self.argv or any(not isinstance(value, str) or not value for value in self.argv):
             raise ContractError("Agent argv is invalid", "invalid_agent_invocation")
@@ -294,7 +328,7 @@ class AgentInvocationReceipt:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema": "apex.agent-invocation/v3",
+            "schema": "apex.agent-invocation/v4",
             "cli_name": self.cli_name,
             "cli_version": self.cli_version,
             "executable_path": self.executable_path,
@@ -304,6 +338,9 @@ class AgentInvocationReceipt:
             "argv": list(self.argv),
             "workspace": self.workspace,
             "prompt_transport": self.prompt_transport,
+            "execution_authority": self.execution_authority.to_dict(),
+            "execution_authority_sha256": self.execution_authority.digest,
+            "credential_environment_key": self.credential_environment_key,
             "requested_allowed_files": list(self.requested_allowed_files),
             "allowed_files_enforced_by_cli": self.allowed_files_enforced_by_cli,
             "max_turns": self.max_turns,
@@ -339,6 +376,7 @@ class AgentResult:
     discarded_stdout_lines: int = 0
     discarded_stdout_bytes: int = 0
     discarded_stdout_sha256: str | None = None
+    credential_redaction_count: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.termination_kind, AgentTerminationKind):
@@ -398,6 +436,18 @@ class AgentResult:
             raise ContractError("Agent discarded-tail digest is invalid", "invalid_agent_result")
         if self.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY:
             self._validate_exact_boundary()
+        if (
+            isinstance(self.credential_redaction_count, bool)
+            or not isinstance(self.credential_redaction_count, int)
+            or self.credential_redaction_count < 0
+            or (
+                self.capture_status is AgentCaptureStatus.CREDENTIAL_REDACTED
+            )
+            != (self.credential_redaction_count > 0)
+        ):
+            raise ContractError(
+                "Agent credential redaction evidence is invalid", "invalid_agent_result"
+            )
 
     def _validate_exact_boundary(self) -> None:
         invocation = self.invocation
@@ -435,6 +485,8 @@ class AgentResult:
             return "agent_process_cleanup_failed"
         if self.capture_status is AgentCaptureStatus.OUTPUT_TRUNCATED:
             return "agent_output_truncated"
+        if self.capture_status is AgentCaptureStatus.CREDENTIAL_REDACTED:
+            return "agent_credential_leak_redacted"
         if (
             self.process_containment is None
             or not self.process_containment.namespace_empty_verified

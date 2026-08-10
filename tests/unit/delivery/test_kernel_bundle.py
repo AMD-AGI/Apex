@@ -9,8 +9,15 @@ from pathlib import Path
 import pytest
 
 from apex.core import ContractError, IntegrityError, canonical_json_bytes
-from apex.delivery import build_kernel_bundle, detect_bundle_kind, load_and_verify_kernel_bundle
+from apex.delivery import (
+    build_kernel_bundle,
+    capture_portable_bundle,
+    detect_bundle_kind,
+    load_and_verify_kernel_bundle,
+    verify_portable_bundle,
+)
 from apex.intake import TaskResolver, TaskSpec
+from apex.storage import ArtifactStore
 
 
 def _resolved_task(tmp_path: Path):
@@ -64,6 +71,59 @@ def test_build_and_verify_bundle_matches_aka_digest_contract(tmp_path: Path) -> 
     assert verified.manifest["delivery"] == {"mode": "bundle", "applied": False}
     assert detect_bundle_kind(bundle.path) == "kernel"
     assert "return x.contiguous()" in (bundle.path / bundle.manifest["patches"][0]["path"]).read_text()
+
+
+def test_portable_bundle_reconstructs_and_runs_official_loader(tmp_path: Path) -> None:
+    resolved = _resolved_task(tmp_path)
+    bundle = build_kernel_bundle(
+        resolved,
+        candidate_root=_candidate(resolved, tmp_path),
+        bundle_dir=tmp_path / "bundle",
+    )
+    artifacts = ArtifactStore(tmp_path / "cas")
+    portable = capture_portable_bundle(
+        artifacts,
+        bundle.path,
+        bundle_kind="kernel",
+        expected_digest=bundle.digest,
+    )
+
+    verified = verify_portable_bundle(
+        artifacts, portable.evidence_receipt, portable.verification_receipt
+    )
+
+    assert verified.bundle_digest == bundle.digest
+    assert verified.bundle_kind == "kernel"
+    assert verified.file_count == 2
+    assert [item["role"] for item in portable.artifact_bindings()[:2]] == [
+        "winner_bundle",
+        "bundle_verification",
+    ]
+
+
+def test_portable_bundle_fails_when_cas_file_bytes_change(tmp_path: Path) -> None:
+    resolved = _resolved_task(tmp_path)
+    bundle = build_kernel_bundle(
+        resolved,
+        candidate_root=_candidate(resolved, tmp_path),
+        bundle_dir=tmp_path / "bundle",
+    )
+    artifacts = ArtifactStore(tmp_path / "cas")
+    portable = capture_portable_bundle(
+        artifacts,
+        bundle.path,
+        bundle_kind="kernel",
+        expected_digest=bundle.digest,
+    )
+    receipt = portable.files[-1][1]
+    (artifacts.root / receipt.relative_path).write_bytes(b"tampered")
+
+    with pytest.raises(IntegrityError) as raised:
+        verify_portable_bundle(
+            artifacts, portable.evidence_receipt, portable.verification_receipt
+        )
+
+    assert raised.value.reason_code == "artifact_digest_mismatch"
 
 
 def test_no_change_does_not_create_winner_bundle(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from apex.core import ContractError
-from apex.evaluation import E2EMeasurement, evaluate_current_anchor, evaluate_no_regression
+from apex.evaluation import E2EObservation, evaluate_current_anchor, evaluate_no_regression
 
 
 def _measurement(
@@ -13,8 +13,8 @@ def _measurement(
     tpot: float = 10,
     accuracy: float = 0.8,
     protocol: str = "a" * 64,
-) -> E2EMeasurement:
-    return E2EMeasurement(
+) -> E2EObservation:
+    return E2EObservation(
         throughput,
         ttft,
         tpot,
@@ -43,7 +43,7 @@ def test_current_anchor_keep_requires_gain_and_all_hard_gates() -> None:
         (_measurement(throughput=100.49), "insufficient_throughput_gain"),
     ],
 )
-def test_regressions_and_noise_are_reverted(candidate: E2EMeasurement, reason: str) -> None:
+def test_regressions_and_noise_are_reverted(candidate: E2EObservation, reason: str) -> None:
     verdict = evaluate_current_anchor(_measurement(), candidate)
     assert not verdict.keep
     assert verdict.reason_code == reason
@@ -57,7 +57,7 @@ def test_protocol_mismatch_is_not_comparable() -> None:
 
 def test_diagnostic_measurement_is_never_rewardable() -> None:
     with pytest.raises(ContractError) as failure:
-        E2EMeasurement(100, 10, 2, 0.8, 100, "a" * 64, "q", "m", "diagnostic")
+        E2EObservation(100, 10, 2, 0.8, 100, "a" * 64, "q", "m", "diagnostic")
     assert failure.value.reason_code == "diagnostic_not_rewardable"
 
 

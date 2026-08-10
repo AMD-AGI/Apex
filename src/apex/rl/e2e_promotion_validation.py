@@ -1,4 +1,4 @@
-"""Offline replay of four-leg matched E2E promotion evidence."""
+"""Offline replay of multi-window paired E2E promotion evidence."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from typing import Any, Mapping, Sequence
 
 from apex.evaluation import (
     E2EAcceptancePolicy,
-    E2EVerdict,
-    e2e_comparison_selection_policy,
-    evaluate_current_anchor,
-    select_conservative_e2e_verdict,
+    E2EPairedMeasurement,
+    E2EPairedVerdict,
+    E2EPairedWindow,
+    evaluate_paired_current_anchor,
 )
 from apex.storage import ArtifactReceipt, ArtifactStore
 
@@ -26,7 +26,10 @@ from .e2e_benchmark_validation import (
     single_event_receipt,
     validate_candidate_runtime,
 )
-from .e2e_gpu_lease_validation import validate_gpu_lease
+from .e2e_gpu_lease_validation import (
+    validate_gpu_lease,
+    validate_measurement_bracket,
+)
 from .models import CandidateEpisode, EpisodeEvent
 
 
@@ -37,7 +40,7 @@ _PAIR_FIELDS = frozenset(
     {
         "schema",
         "pair_id",
-        "window_id",
+        "window_ids",
         "attempt_id",
         "candidate_id",
         "opportunity_id",
@@ -45,15 +48,13 @@ _PAIR_FIELDS = frozenset(
         "anchor_generation",
         "gpu_lease_digest",
         "gpu_device_scope",
-        "order",
+        "window_order",
         "anchor_config_sha256",
         "candidate_config_sha256",
         "anchor_image",
         "candidate_image",
         "observations",
-        "comparisons",
-        "selection_policy",
-        "selected_comparison",
+        "measurement",
         "verdict",
     }
 )
@@ -61,12 +62,11 @@ _PAIR_FIELDS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class MatchedPromotionReplay:
-    """A v2 pair reconstructed independently from its four raw measurements."""
+    """A paired promotion reconstructed independently from all raw observations."""
 
     receipt: ArtifactReceipt
-    comparisons: tuple[E2EVerdict, E2EVerdict]
-    selected_comparison: int
-    verdict: E2EVerdict
+    measurement: E2EPairedMeasurement
+    verdict: E2EPairedVerdict
 
 
 def replay_matched_promotion(
@@ -79,43 +79,22 @@ def replay_matched_promotion(
     delivery: DeliveryEvidence,
     decision: Mapping[str, Any],
 ) -> MatchedPromotionReplay:
-    """Validate every v2 pair edge and recompute its conservative verdict."""
+    """Validate every paired edge and recompute the point/confidence verdict."""
 
     pair_event = _pair_event(child)
-    pair_receipt = single_event_receipt(pair_event, "matched_promotion_pair")
+    pair_receipt = single_event_receipt(pair_event, "paired_promotion")
     pair = read_json(artifacts, pair_receipt, canonical=True)
-    _validate_pair_identity(pair_event, pair, pair_receipt, child)
+    window_ids = _validate_pair_identity(pair_event, pair, pair_receipt, child)
     observations = _load_observations(
-        child,
-        pair_event,
-        pair,
-        artifacts,
-        protocol_hash,
+        run_id, child, pair_event, pair, window_ids, artifacts, protocol_hash
     )
     _validate_side_identity(pair, observations, delivery)
-    validate_gpu_lease(
-        run_id=run_id,
-        event=pair_event,
-        pair=pair,
-        artifacts=artifacts,
-    )
-    comparisons = (
-        evaluate_current_anchor(
-            observations[0].measurement,
-            observations[1].measurement,
-            acceptance_policy,
-        ),
-        evaluate_current_anchor(
-            observations[3].measurement,
-            observations[2].measurement,
-            acceptance_policy,
-        ),
-    )
-    selected = select_conservative_e2e_verdict(comparisons)
-    verdict = comparisons[selected]
-    _validate_derived_pair(pair_event, pair, comparisons, selected, verdict)
+    validate_gpu_lease(run_id=run_id, event=pair_event, pair=pair, artifacts=artifacts)
+    measurement = _measurement(window_ids, observations, acceptance_policy)
+    verdict = evaluate_paired_current_anchor(measurement, acceptance_policy)
+    _validate_derived_pair(pair_event, pair, measurement, verdict)
     _validate_decision(child, decision, delivery, pair_receipt, verdict)
-    return MatchedPromotionReplay(pair_receipt, comparisons, selected, verdict)
+    return MatchedPromotionReplay(pair_receipt, measurement, verdict)
 
 
 def _pair_event(child: CandidateEpisode) -> EpisodeEvent:
@@ -123,10 +102,10 @@ def _pair_event(child: CandidateEpisode) -> EpisodeEvent:
         event
         for event in child.events
         if event.event_type.replace(".", "_") == "measurement_result"
-        and event.payload.get("measurement_kind") == "matched_promotion_ab_ba"
+        and event.payload.get("measurement_kind") == "paired_promotion_abba"
     )
     if len(events) != 1:
-        reject("E2E attempt has no unique matched-promotion v2 event")
+        reject("E2E attempt has no unique paired-promotion event")
     return events[0]
 
 
@@ -135,102 +114,111 @@ def _validate_pair_identity(
     pair: Mapping[str, Any],
     receipt: ArtifactReceipt,
     child: CandidateEpisode,
-) -> None:
+) -> tuple[str, ...]:
     if child.candidate_id is None or child.opportunity_id is None:
-        reject("Matched promotion has incomplete child lineage")
+        reject("Paired promotion has incomplete child lineage")
+    window_ids = _window_ids(pair.get("window_ids"))
     expected = {
         "attempt_id": child.attempt_id,
         "candidate_id": child.candidate_id,
         "opportunity_id": child.opportunity_id,
     }
     if (
-        pair.get("schema") != "apex.e2e-matched-promotion/v2"
+        pair.get("schema") != "apex.e2e-paired-promotion/v1"
         or set(pair) != _PAIR_FIELDS
-        or pair.get("order") != list(_ORDER)
+        or pair.get("window_order") != list(_ORDER)
         or any(pair.get(key) != value for key, value in expected.items())
         or pair.get("anchor_generation") != child.anchor_generation
-        or pair.get("selection_policy") != e2e_comparison_selection_policy()
         or not _text(pair.get("pair_id"))
-        or not _text(pair.get("window_id"))
         or not _text(pair.get("anchor_id"))
         or not _digest(pair.get("gpu_lease_digest"))
         or not _text(pair.get("gpu_device_scope"))
         or not _digest(pair.get("anchor_config_sha256"))
         or not _digest(pair.get("candidate_config_sha256"))
     ):
-        reject("Matched-promotion v2 identity or policy differs")
+        reject("Paired-promotion identity differs")
+    measurement = mapping(pair.get("measurement"), "paired measurement")
     event_expected = {
         **expected,
         "anchor_id": pair.get("anchor_id"),
         "anchor_generation": pair.get("anchor_generation"),
-        "measurement_kind": "matched_promotion_ab_ba",
+        "measurement_kind": "paired_promotion_abba",
         "pair_id": pair.get("pair_id"),
-        "window_id": pair.get("window_id"),
+        "window_ids": list(window_ids),
+        "paired_measurement_id": _json_digest(measurement),
         "gpu_lease_digest": pair.get("gpu_lease_digest"),
-        "order": list(_ORDER),
+        "window_order": list(_ORDER),
     }
     if any(event.payload.get(key) != value for key, value in event_expected.items()):
-        reject("Matched-promotion event targets another pair")
-    if single_event_receipt(event, "matched_promotion_pair") != receipt:
-        reject("Matched-promotion pair receipt differs")
-    expected_roles = {"matched_promotion_pair", "promotion_gpu_lease"}
-    expected_roles.update(
-        f"promotion_{position}_{side}_{kind}"
-        for position, side in enumerate(_ORDER)
+        reject("Paired-promotion event targets another measurement")
+    if single_event_receipt(event, "paired_promotion") != receipt:
+        reject("Paired-promotion receipt differs")
+    _validate_aggregate_roles(event, window_ids)
+    return window_ids
+
+
+def _validate_aggregate_roles(event: EpisodeEvent, window_ids: tuple[str, ...]) -> None:
+    expected = {"paired_promotion", "promotion_gpu_lease"}
+    expected.update(
+        f"promotion_{position}_{_ORDER[position % 4]}_{kind}"
+        for position in range(len(window_ids) * len(_ORDER))
         for kind in ("normalized", "quality", "config")
     )
     roles = tuple(item.role for item in event.artifacts)
-    if len(roles) != len(expected_roles) or set(roles) != expected_roles:
-        reject("Matched-promotion aggregate artifact roles differ")
+    if len(roles) != len(expected) or set(roles) != expected:
+        reject("Paired-promotion aggregate artifact roles differ")
 
 
 def _load_observations(
+    run_id: str,
     child: CandidateEpisode,
     pair_event: EpisodeEvent,
     pair: Mapping[str, Any],
+    window_ids: tuple[str, ...],
     artifacts: ArtifactStore,
     protocol_hash: str,
 ) -> tuple[BenchmarkBundle, ...]:
     raw = pair.get("observations")
-    if not isinstance(raw, list) or len(raw) != 4:
-        reject("Matched-promotion observations are incomplete")
-    prefix = f"promotion-{pair.get('attempt_id')}-{pair.get('window_id')}-"
-    window_events = tuple(
-        event
-        for event in child.events
-        if event.event_type.replace(".", "_") == "measurement_result"
-        and isinstance(event.payload.get("action_id"), str)
-        and event.payload["action_id"].startswith(prefix)
-    )
-    if len(window_events) != 4:
-        reject("Matched-promotion window does not contain exactly four legs")
+    expected_count = len(window_ids) * len(_ORDER)
+    if not isinstance(raw, list) or len(raw) != expected_count:
+        reject("Paired-promotion observations are incomplete")
     bundles: list[BenchmarkBundle] = []
     sequences: list[int] = []
-    for position, side in enumerate(_ORDER):
+    for position in range(expected_count):
+        side = _ORDER[position % len(_ORDER)]
         observation = mapping(raw[position], "promotion observation")
-        action_id = _action_id(pair, position)
+        action_id = _action_id(pair, window_ids, position)
         event = _leg_event(child, action_id)
         _validate_leg_lineage(event, pair, action_id)
+        validate_measurement_bracket(
+            run_id=run_id,
+            action_id=action_id,
+            lease_digest=str(pair.get("gpu_lease_digest")),
+            event=event,
+            artifacts=artifacts,
+        )
         bundle = load_benchmark_bundle(event, artifacts, protocol_hash)
-        expected = _observation_document(position, side, action_id, bundle)
-        if dict(observation) != expected:
-            reject("Matched-promotion observation differs from raw CAS evidence")
+        if dict(observation) != _observation_document(position, side, action_id, bundle):
+            reject("Paired-promotion observation differs from raw CAS evidence")
         _validate_pair_bindings(pair_event, position, side, bundle)
         bundles.append(bundle)
         sequences.append(event.sequence)
-    if sequences != sorted(sequences) or len(set(sequences)) != 4:
-        reject("Matched-promotion leg order is ambiguous")
+    if sequences != sorted(sequences) or len(set(sequences)) != expected_count:
+        reject("Paired-promotion leg order is ambiguous")
     if sequences[-1] >= pair_event.sequence:
-        reject("Matched-promotion pair was recorded before its final leg")
+        reject("Paired-promotion was recorded before its final leg")
     return tuple(bundles)
 
 
-def _action_id(pair: Mapping[str, Any], position: int) -> str:
+def _action_id(
+    pair: Mapping[str, Any], window_ids: tuple[str, ...], position: int
+) -> str:
     attempt_id = _text(pair.get("attempt_id"))
-    window_id = _text(pair.get("window_id"))
-    if attempt_id is None or window_id is None:
-        reject("Matched-promotion action identity is invalid")
-    return f"promotion-{attempt_id}-{window_id}-{_SLOTS[position]}"
+    if attempt_id is None:
+        reject("Paired-promotion action identity is invalid")
+    local = position % len(_ORDER)
+    window_id = window_ids[position // len(_ORDER)]
+    return f"promotion-{attempt_id}-{window_id}-{_SLOTS[local]}"
 
 
 def _leg_event(child: CandidateEpisode, action_id: str) -> EpisodeEvent:
@@ -241,14 +229,12 @@ def _leg_event(child: CandidateEpisode, action_id: str) -> EpisodeEvent:
         and event.payload.get("action_id") == action_id
     )
     if len(events) != 1:
-        reject("Matched-promotion leg is missing or duplicated")
+        reject("Paired-promotion leg is missing or duplicated")
     return events[0]
 
 
 def _validate_leg_lineage(
-    event: EpisodeEvent,
-    pair: Mapping[str, Any],
-    action_id: str,
+    event: EpisodeEvent, pair: Mapping[str, Any], action_id: str
 ) -> None:
     expected = {
         "action_id": action_id,
@@ -258,14 +244,11 @@ def _validate_leg_lineage(
         "anchor_generation": pair.get("anchor_generation"),
     }
     if any(event.payload.get(key) != value for key, value in expected.items()):
-        reject("Matched-promotion leg lineage differs")
+        reject("Paired-promotion leg lineage differs")
 
 
 def _observation_document(
-    position: int,
-    side: str,
-    action_id: str,
-    bundle: BenchmarkBundle,
+    position: int, side: str, action_id: str, bundle: BenchmarkBundle
 ) -> dict[str, Any]:
     serving = mapping(bundle.normalized.get("serving_runtime"), "serving runtime")
     return {
@@ -293,8 +276,8 @@ def _validate_pair_bindings(
         f"{prefix}_quality": bundle.quality_receipt,
         f"{prefix}_config": bundle.config,
     }
-    if any(single_event_receipt(event, role) != receipt for role, receipt in expected.items()):
-        reject("Matched-promotion aggregate bindings differ from a leg")
+    if any(single_event_receipt(event, role) != value for role, value in expected.items()):
+        reject("Paired-promotion aggregate bindings differ from a leg")
 
 
 def _validate_side_identity(
@@ -302,8 +285,10 @@ def _validate_side_identity(
     observations: Sequence[BenchmarkBundle],
     delivery: DeliveryEvidence,
 ) -> None:
-    anchors = (observations[0], observations[3])
-    candidates = (observations[1], observations[2])
+    anchors = tuple(item for index, item in enumerate(observations) if _ORDER[index % 4] == "anchor")
+    candidates = tuple(
+        item for index, item in enumerate(observations) if _ORDER[index % 4] == "candidate"
+    )
     if (
         len({item.config.digest for item in anchors}) != 1
         or len({item.config.digest for item in candidates}) != 1
@@ -314,9 +299,73 @@ def _validate_side_identity(
         or len({_image_tuple(item) for item in anchors}) != 1
         or len({_image_tuple(item) for item in candidates}) != 1
     ):
-        reject("Matched-promotion side config or image identity differs")
+        reject("Paired-promotion side config or image identity differs")
     for candidate in candidates:
         validate_candidate_runtime(candidate, delivery)
+
+
+def _measurement(
+    window_ids: tuple[str, ...],
+    observations: tuple[BenchmarkBundle, ...],
+    policy: E2EAcceptancePolicy,
+) -> E2EPairedMeasurement:
+    windows = tuple(
+        E2EPairedWindow(
+            window_id,
+            observations[offset].measurement,
+            observations[offset + 1].measurement,
+            observations[offset + 2].measurement,
+            observations[offset + 3].measurement,
+        )
+        for offset, window_id in zip(
+            range(0, len(observations), len(_ORDER)), window_ids, strict=True
+        )
+    )
+    return E2EPairedMeasurement(windows, policy.digest, policy.min_paired_windows)
+
+
+def _validate_derived_pair(
+    event: EpisodeEvent,
+    pair: Mapping[str, Any],
+    measurement: E2EPairedMeasurement,
+    verdict: E2EPairedVerdict,
+) -> None:
+    if (
+        pair.get("measurement") != measurement.to_dict()
+        or pair.get("verdict") != verdict.to_dict()
+        or event.payload.get("paired_measurement_id") != measurement.digest
+        or event.payload.get("verdict") != verdict.to_dict()
+    ):
+        reject("Paired-promotion verdict differs from raw replay")
+
+
+def _validate_decision(
+    child: CandidateEpisode,
+    decision: Mapping[str, Any],
+    delivery: DeliveryEvidence,
+    pair_receipt: ArtifactReceipt,
+    verdict: E2EPairedVerdict,
+) -> None:
+    expected = {
+        "micro_receipt": single_child_receipt(child, "micro_qualification").digest,
+        "safety_receipt": single_child_receipt(child, "safety_qualification").digest,
+        "delivery_receipt": delivery.receipt.digest,
+        "paired_promotion_receipt": pair_receipt.digest,
+        "measurement_verdict": verdict.to_dict(),
+    }
+    if (
+        any(decision.get(key) != value for key, value in expected.items())
+        or "benchmark_receipt" in decision
+        or single_child_receipt(child, "paired_promotion") != pair_receipt
+    ):
+        reject("Decision does not bind the replayed paired promotion")
+    rewards = tuple(
+        event
+        for event in child.events
+        if event.event_type.replace(".", "_") == "reward_committed"
+    )
+    if len(rewards) != 1 or single_event_receipt(rewards[0], "paired_promotion") != pair_receipt:
+        reject("Reward does not bind the replayed paired promotion")
 
 
 def _image(bundle: BenchmarkBundle) -> dict[str, Any]:
@@ -332,54 +381,19 @@ def _image_tuple(bundle: BenchmarkBundle) -> tuple[Any, Any]:
     return value["requested_image"], value["resolved_image_id"]
 
 
-def _validate_derived_pair(
-    event: EpisodeEvent,
-    pair: Mapping[str, Any],
-    comparisons: tuple[E2EVerdict, E2EVerdict],
-    selected: int,
-    verdict: E2EVerdict,
-) -> None:
-    expected_comparisons = [item.to_dict() for item in comparisons]
-    if (
-        pair.get("comparisons") != expected_comparisons
-        or pair.get("selection_policy") != e2e_comparison_selection_policy()
-        or pair.get("selected_comparison") != selected
-        or pair.get("verdict") != verdict.to_dict()
-        or event.payload.get("verdict") != verdict.to_dict()
-    ):
-        reject("Matched-promotion selected verdict differs from conservative replay")
+def _window_ids(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) < 3:
+        reject("Paired-promotion window IDs are invalid")
+    result = tuple(item for item in value if _text(item) is not None)
+    if len(result) != len(value) or len(set(result)) != len(result):
+        reject("Paired-promotion window IDs are invalid")
+    return result
 
 
-def _validate_decision(
-    child: CandidateEpisode,
-    decision: Mapping[str, Any],
-    delivery: DeliveryEvidence,
-    pair_receipt: ArtifactReceipt,
-    verdict: E2EVerdict,
-) -> None:
-    expected = {
-        "micro_receipt": single_child_receipt(child, "micro_qualification").digest,
-        "safety_receipt": single_child_receipt(child, "safety_qualification").digest,
-        "delivery_receipt": delivery.receipt.digest,
-        "promotion_pair_receipt": pair_receipt.digest,
-        "measurement_verdict": verdict.to_dict(),
-    }
-    if (
-        any(decision.get(key) != value for key, value in expected.items())
-        or "benchmark_receipt" in decision
-        or single_child_receipt(child, "matched_promotion_pair") != pair_receipt
-    ):
-        reject("Decision does not bind the replayed matched-promotion pair")
-    rewards = tuple(
-        event
-        for event in child.events
-        if event.event_type.replace(".", "_") == "reward_committed"
-    )
-    if (
-        len(rewards) != 1
-        or single_event_receipt(rewards[0], "matched_promotion_pair") != pair_receipt
-    ):
-        reject("Reward does not bind the replayed matched-promotion pair")
+def _json_digest(value: Mapping[str, Any]) -> str:
+    from apex.core import sha256_json
+
+    return sha256_json(dict(value))
 
 
 def _text(value: Any) -> str | None:

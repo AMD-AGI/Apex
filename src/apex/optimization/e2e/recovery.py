@@ -5,26 +5,26 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from apex.benchmark import BenchmarkConfigViews, QualityMetric
 from apex.core import ContractError, IntegrityError, canonical_json_bytes, sha256_file
-from apex.evaluation import E2EMeasurement
+from apex.evaluation import E2EAcceptancePolicy, E2EObservation, E2ERewardContract
 from apex.intake import E2EOptimizeSpec
 from apex.orchestration import RunController
 from apex.ports import TraceDiagnosticEvidence
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal, SnapshotStore
 
-from .kernel_lane import KernelOpportunity, KernelOpportunityPlan
+from .kernel_lane import KernelOpportunityPlan
+from .recovery_plan import plan_dict, plan_from_mapping
 from .run_record import E2ERunRecord
 
 
 RUN_REQUEST_SCHEMA = "apex.e2e-run-request/v1"
 ACTION_COMPLETION_SCHEMA = "apex.e2e-action-completion/v1"
 DIAGNOSIS_SCHEMA = "apex.e2e-diagnosis/v2"
-
 
 @dataclass(frozen=True, slots=True)
 class RecoveredRunRequest:
@@ -36,7 +36,6 @@ class RecoveredRunRequest:
     correctness_oracle_policy_sha256: str | None
     gpu_device_scope: str
     request_receipt: ArtifactReceipt
-
 
 def persist_run_request(
     record: E2ERunRecord,
@@ -59,17 +58,24 @@ def persist_run_request(
         "views": _views_dict(views),
     }
     receipt = record.put_json(payload)
+    contract = E2ERewardContract(
+        record.run_id, views.workload_semantics_sha256,
+        E2EAcceptancePolicy(spec.goal.gates),
+    )
+    reward_contract = record.put_json(contract.to_dict())
     _write_immutable_json(record.root / "run.request.json", payload)
     record.controller.record_domain_event(
         "dependency_verified",
         {
             "kind": "resolved_e2e_run_request",
-            "artifacts": [{"role": "run_request", "receipt": receipt.to_dict()}],
+            "artifacts": [
+                {"role": "run_request", "receipt": receipt.to_dict()},
+                {"role": "e2e_reward_contract", "receipt": reward_contract.to_dict()},
+            ],
         },
         idempotency_key="run.request.persisted",
     )
     return receipt
-
 
 def load_run_request(root: Path) -> RecoveredRunRequest:
     resolved = root.expanduser().resolve(strict=True)
@@ -123,13 +129,17 @@ def _bound_run_request_receipt(root: Path, run_id: str) -> ArtifactReceipt:
     if event.payload.get("kind") != "resolved_e2e_run_request":
         raise IntegrityError("Run request event kind is invalid", "invalid_run_request")
     artifacts = event.payload.get("artifacts")
-    if not isinstance(artifacts, list) or len(artifacts) != 1:
+    if not isinstance(artifacts, list):
         raise IntegrityError("Run request event is incomplete", "invalid_run_request")
-    binding = _mapping(artifacts[0], "run request binding")
-    if binding.get("role") != "run_request":
+    matches = tuple(
+        _mapping(item, "run request binding")
+        for item in artifacts
+        if isinstance(item, Mapping) and item.get("role") == "run_request"
+    )
+    if len(matches) != 1:
         raise IntegrityError("Run request event role is invalid", "invalid_run_request")
     return ArtifactReceipt.from_dict(
-        dict(_mapping(binding.get("receipt"), "run request receipt"))
+        dict(_mapping(matches[0].get("receipt"), "run request receipt"))
     )
 
 
@@ -141,7 +151,7 @@ def recover_record(request: RecoveredRunRequest) -> E2ERunRecord:
         journal,
         SnapshotStore(root / "state.snapshot.json"),
     )
-    return E2ERunRecord(
+    record = E2ERunRecord(
         request.run_id,
         root,
         ArtifactStore(root / "artifacts"),
@@ -150,6 +160,9 @@ def recover_record(request: RecoveredRunRequest) -> E2ERunRecord:
         request.spec.dataset_split,
         request.spec.data_visibility,
     )
+    from .server_lineage import replay_local_server_lineage
+    replay_local_server_lineage(record.iter_events(), record.artifacts)
+    return record
 
 
 def write_action_completion(
@@ -180,7 +193,7 @@ def persist_diagnosis(
     plan: KernelOpportunityPlan,
     trace_diagnostic_evidence: TraceDiagnosticEvidence,
 ) -> ArtifactReceipt:
-    plan_receipt = record.put_json(_plan_dict(plan))
+    plan_receipt = record.put_json(plan_dict(plan))
     lineage = record.put_json(
         {
             "schema": DIAGNOSIS_SCHEMA,
@@ -190,6 +203,7 @@ def persist_diagnosis(
             "correctness_oracle_policy_sha256": getattr(
                 plan, "correctness_oracle_policy_sha256", None
             ),
+            "planning_coverage": plan.coverage.to_dict(),
         }
     )
     record.controller.record_domain_event(
@@ -202,6 +216,7 @@ def persist_diagnosis(
             "correctness_oracle_policy_sha256": getattr(
                 plan, "correctness_oracle_policy_sha256", None
             ),
+            "planning_coverage": plan.coverage.to_dict(),
             "artifacts": [
                 {"role": "opportunity_plan", "receipt": plan_receipt.to_dict()},
                 {"role": "diagnosis_lineage", "receipt": lineage.to_dict()},
@@ -334,7 +349,7 @@ def _diagnosis_from_lineage(
         dict(_mapping(lineage.get("opportunity_plan"), "opportunity_plan"))
     )
     record.artifacts.verify(evidence)
-    plan = _plan_from_mapping(
+    plan = plan_from_mapping(
         _mapping(json.loads(record.artifacts.read_bytes(plan_receipt)), "plan")
     )
     if getattr(plan, "correctness_oracle_policy_sha256", None) != lineage.get(
@@ -366,7 +381,7 @@ def _diagnosis_from_lineage(
     )
 
 
-def recover_baseline(record: E2ERunRecord) -> E2EMeasurement:
+def recover_baseline(record: E2ERunRecord) -> E2EObservation:
     search = record.controller.state.e2e
     if search is None or search.baseline_receipt is None:
         raise ContractError("Baseline is not committed", "baseline_not_committed")
@@ -395,7 +410,7 @@ def recover_baseline(record: E2ERunRecord) -> E2EMeasurement:
     tpot = _mapping(latency.get("tpot"), "tpot")
     total = throughput.get("total_tokens_per_second")
     selected = total if total is not None else throughput.get("output_tokens_per_second")
-    return E2EMeasurement(
+    return E2EObservation(
         float(selected),
         float(ttft["p99_ms"]),
         float(tpot["p99_ms"]),
@@ -486,45 +501,6 @@ def _views_from_mapping(value: Mapping[str, Any], root: Path) -> BenchmarkConfig
         quality_tasks=str(value.get("quality_tasks", "")),
         evaluator_policy_sha256=_optional_text(value.get("evaluator_policy_sha256")),
     )
-
-
-def _plan_dict(plan: KernelOpportunityPlan) -> dict[str, Any]:
-    opportunities = []
-    for item in plan.opportunities:
-        value = asdict(item)
-        for name in ("source_path", "source_root", "test_file"):
-            value[name] = str(value[name]) if value[name] else None
-        opportunities.append(value)
-    return {
-        "schema": "apex.kernel-opportunity-plan/v1",
-        "opportunities": opportunities,
-        "measured_order": list(plan.measured_order),
-        "recoverable_order": list(plan.recoverable_order),
-        "correctness_oracle_policy_sha256": getattr(
-            plan, "correctness_oracle_policy_sha256", None
-        ),
-    }
-
-
-def _plan_from_mapping(value: Mapping[str, Any]) -> KernelOpportunityPlan:
-    if value.get("schema") != "apex.kernel-opportunity-plan/v1":
-        raise IntegrityError("Opportunity plan schema is invalid", "invalid_diagnosis")
-    opportunities = []
-    for raw in value.get("opportunities", ()):
-        item = dict(_mapping(raw, "opportunity"))
-        for name in ("source_path", "source_root", "test_file"):
-            item[name] = Path(item[name]) if item.get(name) else None
-        opportunities.append(KernelOpportunity(**item))
-    kwargs: dict[str, Any] = {
-        "opportunities": tuple(opportunities),
-        "measured_order": tuple(value.get("measured_order", ())),
-        "recoverable_order": tuple(value.get("recoverable_order", ())),
-    }
-    if "correctness_oracle_policy_sha256" in KernelOpportunityPlan.__dataclass_fields__:
-        kwargs["correctness_oracle_policy_sha256"] = _optional_text(
-            value.get("correctness_oracle_policy_sha256")
-        )
-    return KernelOpportunityPlan(**kwargs)
 
 
 def _write_immutable_json(path: Path, value: Mapping[str, Any]) -> None:

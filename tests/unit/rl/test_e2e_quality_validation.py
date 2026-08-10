@@ -80,6 +80,7 @@ def _normalized_quality() -> dict[str, object]:
         "required": True,
         "kind": "lm_eval",
         "passed": True,
+        "hard_failure": False,
         "metrics": [metric],
         "primary_metrics": [metric],
         "error": None,

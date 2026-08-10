@@ -8,9 +8,11 @@ from dataclasses import replace
 from pathlib import Path
 
 import yaml
+import pytest
 
 from apex.core import (
     AgentBackendName,
+    ContractError,
     TaskStatus,
     ValidationLevel,
     sha256_bytes,
@@ -27,10 +29,19 @@ from apex.delivery import (
     E2EBundleVerifier,
     LoadedArtifact,
     LoadedByteEngagementReceipt,
+    ReplayArtifactReceipt,
     SourceBuildReceipt,
     load_and_verify_e2e_bundle,
+    verify_portable_bundle,
 )
-from apex.evaluation import E2EMeasurement
+from apex.evaluation import (
+    E2EAcceptancePolicy,
+    E2EObservation,
+    E2EPairedMeasurement,
+    E2EPairedWindow,
+    evaluate_paired_current_anchor,
+)
+from apex.execution import ProcessResult
 from apex.optimization.e2e.candidate import E2ECandidate, FrozenCandidateSource
 from apex.optimization.e2e.kernel_lane import KernelOpportunity
 from apex.optimization.e2e.services import (
@@ -50,12 +61,79 @@ from apex.optimization.e2e.source_delivery_models import (
     FormalSourceDeliveryProfile,
     PrimarySourceBuildOutput,
 )
+from apex.optimization.e2e.source_delivery_sources import CumulativeSourceMaterializer
+from apex.optimization.e2e.run_record import E2ERunRecord
 from apex.ports import AgentResult
-from apex.runtime import ContainerIdentity, RepositoryLock, RunProvenance
+from apex.runtime import (
+    ComponentSourceLockSet,
+    ContainerIdentity,
+    RepositoryLock,
+    RunProvenance,
+)
+from apex.storage import ArtifactReceipt
 
 
 PARENT = "sha256:" + "a" * 64
 DERIVED = "sha256:" + "b" * 64
+
+
+class _EnvironmentSupervisor:
+    def __init__(self) -> None:
+        self.environments: list[dict[str, str]] = []
+
+    def run(self, argv, *, cwd, environment, timeout_seconds, stdin_text=None):
+        self.environments.append(dict(environment))
+        return ProcessResult(tuple(argv), 0, False, "ok\n", "", False, False, 0.01)
+
+
+def test_source_materializer_git_child_revokes_agent_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-secret")
+    monkeypatch.setenv("CURSOR_API_KEY", "cursor-test-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-test-secret")
+    supervisor = _EnvironmentSupervisor()
+
+    output = CumulativeSourceMaterializer(supervisor)._git(tmp_path, "status")
+
+    assert output == "ok"
+    environment = supervisor.environments[0]
+    assert all(
+        key not in environment
+        for key in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CURSOR_API_KEY",
+            "HF_TOKEN",
+        )
+    )
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def _paired_replay(keep: bool) -> tuple[dict, dict]:
+    policy = E2EAcceptancePolicy()
+    windows = []
+    for window in range(3):
+        observations = []
+        for position, candidate in enumerate((False, True, True, False)):
+            receipt = f"{window}-{position}"
+            observations.append(
+                E2EObservation(
+                    101.0 if candidate and keep else 100.0,
+                    10.0,
+                    1.0,
+                    1.0,
+                    10,
+                    "a" * 64,
+                    f"quality-{receipt}",
+                    f"measurement-{receipt}",
+                )
+            )
+        windows.append(E2EPairedWindow(f"window-{window}", *observations))
+    measurement = E2EPairedMeasurement(tuple(windows), policy.digest, 3)
+    verdict = evaluate_paired_current_anchor(measurement, policy)
+    return measurement.to_dict(), verdict.to_dict()
 
 
 def _git(root: Path, *args: str) -> str:
@@ -243,8 +321,8 @@ def _candidate(
     )
 
 
-def _measurement(throughput: float, protocol: str, receipt: str) -> E2EMeasurement:
-    return E2EMeasurement(throughput, 10.0, 2.0, 1.0, 32, protocol, receipt, receipt)
+def _measurement(throughput: float, protocol: str, receipt: str) -> E2EObservation:
+    return E2EObservation(throughput, 10.0, 2.0, 1.0, 32, protocol, receipt, receipt)
 
 
 class PrimaryBuilder:
@@ -301,6 +379,7 @@ class PrimaryBuilder:
             receipts[role] = path
         return PrimarySourceBuildOutput(
             "primary-clean-environment",
+            "d" * 64,
             request.source_stack_sha256,
             image,
             sbom.resolve(),
@@ -401,22 +480,65 @@ class FakeReplay:
         self.objective_improved = objective_improved
 
     def replay(self, request):
+        measurement, verdict = _paired_replay(self.objective_improved)
         return CleanReplayReceipt(
-            request.bundle_digest,
-            request.primary_environment_id,
-            "independent-clean-environment",
-            request.expected_image.image_digest,
-            request.config_receipt.replay_config_sha256,
-            "c" * 64,
-            request.source_stack_sha256,
-            True,
-            True,
-            True,
-            True,
-            True,
-            True,
-            self.objective_improved,
+            bundle_digest=request.bundle_digest,
+            primary_environment_id=request.primary_environment_id,
+            replay_environment_id="independent-clean-environment",
+            image_digest=request.expected_image.image_digest,
+            replay_config_sha256=request.config_receipt.replay_config_sha256,
+            benchmark_receipt_sha256="c" * 64,
+            source_stack_sha256=request.source_stack_sha256,
+            source_materialization_sha256=sha256_json(
+                [item.to_dict() for item in request.repository_receipts]
+            ),
+            primary_runtime_identity_sha256="d" * 64,
+            replay_runtime_identity_sha256s=tuple(
+                sha256_json({"runtime": index})
+                for index in range(len(measurement["raw_measurement_receipts"]))
+            ),
+            normal_runtime_measurement=True,
+            quality_passed=True,
+            accuracy_passed=True,
+            latency_gates_passed=True,
+            objective_improved=self.objective_improved,
+            paired_measurement=measurement,
+            paired_verdict=verdict,
+            raw_artifacts=_raw_replay_artifacts(request, measurement),
         )
+
+
+def _raw_replay_artifacts(request, measurement: dict) -> tuple[ReplayArtifactReceipt, ...]:
+    root = request.output_dir
+    assert root is not None
+    root.mkdir(parents=True, exist_ok=True)
+    values = []
+    observations = [
+        item
+        for window in measurement["windows"]
+        for item in window["observations"]
+    ]
+    for index, observation in enumerate(observations):
+        for role in (
+            "benchmark_report",
+            "execution_attestation",
+            "quality_result",
+        ):
+            path = root / f"{index}-{role}.json"
+            path.write_text(json.dumps({"index": index, "role": role}), encoding="utf-8")
+            values.append(
+                ReplayArtifactReceipt(
+                    role,
+                    f"run-{index}",
+                    observation["measurement_receipt"],
+                    observation["quality_receipt"],
+                    path.relative_to(root).as_posix(),
+                    sha256_file(path),
+                    path.stat().st_size,
+                    "application/json",
+                )
+            )
+    return tuple(values)
 
 
 def _fixture(tmp_path: Path, *, replay_gain: bool = True):
@@ -444,16 +566,16 @@ def _fixture(tmp_path: Path, *, replay_gain: bool = True):
     )
     lock = RepositoryLock("vllm", str(root), str(root), commit, tree, True)
     provenance = RunProvenance(
-        1,
+        2,
         str(configs["original"]),
         sha256_file(configs["original"]),
         "vllm",
         "Qwen/test",
         "1" * 40,
         "gfx950",
+        "docker",
         ContainerIdentity(PARENT, PARENT, (), ()),
-        ("vllm",),
-        (lock,),
+        ComponentSourceLockSet(("vllm",), (lock,)),
         "partial",
         ("runtime_loaded_bytes",),
     )
@@ -470,6 +592,9 @@ def _fixture(tmp_path: Path, *, replay_gain: bool = True):
     verifier = E2EBundleVerifier(
         trusted_recipes={recipe.computed_sha256: recipe},
         trusted_source_urls={"vllm": str(root)},
+        trusted_recipe_capabilities={
+            recipe.computed_sha256: profile.component_capabilities
+        },
         build_backend=FakeBuild(),
         engagement_backend=FakeEngagement(),
         replay_backend=FakeReplay(objective_improved=replay_gain),
@@ -488,6 +613,7 @@ def _fixture(tmp_path: Path, *, replay_gain: bool = True):
         configs["replay"],
         _measurement(100.0, semantics, "baseline"),
         _measurement(103.0, semantics, "final"),
+        E2EAcceptancePolicy(),
         (tmp_path / "results" / "formal-delivery").resolve(),
         "codex",
         "gpt-test",
@@ -496,6 +622,46 @@ def _fixture(tmp_path: Path, *, replay_gain: bool = True):
         "6" * 64,
     )
     return root, profile, binding, builder, request
+
+
+@pytest.mark.parametrize("component", ("sglang", "atom", "flydsl"))
+def test_formal_repository_profiles_are_component_capability_driven(
+    component: str,
+) -> None:
+    profile = FormalRepositoryProfile(
+        component,
+        component,
+        f"https://example.invalid/{component}.git",
+        (f"{component}/",),
+        source_languages=("python", "triton"),
+        engagement_kind="python_import",
+    )
+
+    assert profile.repository_id == component
+    assert profile.source_languages == ("python", "triton")
+
+
+def test_native_engagement_capability_requires_build_id_strategy() -> None:
+    profile = FormalRepositoryProfile(
+        "toolchain",
+        "runtime",
+        "https://example.invalid/toolchain.git",
+        ("python/",),
+        engagement_kind="linker_build_id",
+        build_id_required=True,
+    )
+
+    assert profile.build_id_required is True
+    with pytest.raises(ContractError) as failure:
+        FormalRepositoryProfile(
+            "toolchain",
+            "runtime",
+            "https://example.invalid/toolchain.git",
+            ("python/",),
+            engagement_kind="python_import",
+            build_id_required=True,
+        )
+    assert failure.value.reason_code == "invalid_source_delivery_profile"
 
 
 def test_formal_delivery_accumulates_source_and_requires_second_clean_replay(
@@ -526,6 +692,29 @@ def test_formal_delivery_accumulates_source_and_requires_second_clean_replay(
         request.artifact_root
         / "independent-verification/worktrees/vllm/vllm/kernels/op_a.py"
     ).is_file()
+
+    record = E2ERunRecord.create(
+        run_id="e2e-delivery-record",
+        root=tmp_path / "recorded-delivery",
+        initial_anchor_id="anchor-e2e-delivery",
+        dataset_split="train",
+        data_visibility="public",
+    )
+    record.record_final_delivery(result)
+    event = record.iter_events()[-1]
+    bindings = {
+        item["role"]: ArtifactReceipt.from_dict(item["receipt"])
+        for item in event.payload["artifacts"]
+    }
+    portable = verify_portable_bundle(
+        record.artifacts,
+        bindings["winner_bundle"],
+        bindings["bundle_verification"],
+    )
+    assert portable.bundle_kind == "e2e"
+    assert portable.bundle_digest == result.bundle_digest
+    assert event.payload["replication"]["task_kind"] == "e2e_kernel_only"
+    assert event.payload["replication"]["derived_image_digest"] == DERIVED
 
 
 def test_formal_delivery_uses_frozen_bytes_after_workspace_mutation(

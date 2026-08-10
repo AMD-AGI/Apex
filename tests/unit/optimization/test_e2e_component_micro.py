@@ -5,9 +5,12 @@ from pathlib import Path
 import pytest
 
 from apex.core import AgentBackendName, ContractError
+from apex.optimization.e2e import (
+    ComponentMicroBinding,
+    ComponentMicroQualifierRegistry,
+)
 from apex.optimization.e2e.candidate import E2ECandidate
 from apex.optimization.e2e.kernel_lane import KernelOpportunity
-from apex.optimization.e2e.qwen_qualification import QwenCompositeMicroQualifier
 from apex.optimization.e2e.services import MicroQualification, MicroQualificationRequest
 from apex.ports import AgentResult
 
@@ -77,39 +80,79 @@ def _request(tmp_path: Path, library: str) -> MicroQualificationRequest:
     )
 
 
-def test_composite_routes_vllm_to_strict_oracle_lane(tmp_path: Path) -> None:
+def _registry(vllm: _Qualifier, aiter: _Qualifier) -> ComponentMicroQualifierRegistry:
+    downstream = ("quality", "performance")
+    return ComponentMicroQualifierRegistry(
+        (
+            ComponentMicroBinding("vllm", "strict-oracle", vllm, downstream),
+            ComponentMicroBinding("aiter", "source-deferred", aiter, downstream),
+        )
+    )
+
+
+def test_registry_routes_by_component_and_preserves_delegate_truth(tmp_path: Path) -> None:
     vllm = _Qualifier("oracle", "vllm")
     aiter = _Qualifier("deferred", "aiter")
-    qualifier = QwenCompositeMicroQualifier(vllm=vllm, aiter=aiter)
+    qualifier = _registry(vllm, aiter)
 
     result = qualifier.verify(_request(tmp_path, "vllm"))
 
     assert vllm.calls == ["vllm"] and aiter.calls == []
     assert result.evidence["delegate"] == "oracle"
-    assert result.evidence["qwen_composite_qualification"]["route"] == (
-        "reviewed_vllm_docker_oracle"
+    assert result.evidence["component_micro_qualification"] == {
+        "schema": "apex.component-micro-qualification/v1",
+        "source_component": "vllm",
+        "route_id": "strict-oracle",
+        "downstream_authorities": ["quality", "performance"],
+    }
+    assert qualifier.supported_components == frozenset({"vllm", "aiter"})
+
+
+def test_registry_keeps_deferred_result_rewardless(tmp_path: Path) -> None:
+    qualifier = _registry(
+        _Qualifier("oracle", "vllm"), _Qualifier("deferred", "aiter")
     )
-
-
-def test_composite_routes_aiter_to_deferred_lane_without_reward(tmp_path: Path) -> None:
-    vllm = _Qualifier("oracle", "vllm")
-    aiter = _Qualifier("deferred", "aiter")
-    qualifier = QwenCompositeMicroQualifier(vllm=vllm, aiter=aiter)
 
     result = qualifier.verify(_request(tmp_path, "aiter"))
 
-    assert aiter.calls == ["aiter"] and vllm.calls == []
     assert result.grade is None and result.kernel_reward_available is False
-    assert result.evidence["qwen_composite_qualification"]["route"] == (
-        "frozen_source_deferred"
+    assert result.evidence["component_micro_qualification"]["route_id"] == (
+        "source-deferred"
     )
 
 
-def test_composite_rejects_unreviewed_source_library(tmp_path: Path) -> None:
-    qualifier = QwenCompositeMicroQualifier(
-        vllm=_Qualifier("oracle", "vllm"),
-        aiter=_Qualifier("deferred", "aiter"),
+def test_registry_rejects_unowned_or_duplicate_components(tmp_path: Path) -> None:
+    vllm = _Qualifier("oracle", "vllm")
+    qualifier = ComponentMicroQualifierRegistry(
+        (ComponentMicroBinding("vllm", "strict-oracle", vllm),)
     )
 
-    with pytest.raises(ContractError, match="No Qwen qualification lane"):
+    with pytest.raises(ContractError) as unsupported:
         qualifier.verify(_request(tmp_path, "other"))
+    assert unsupported.value.reason_code == "micro_qualification_unsupported"
+
+    with pytest.raises(ContractError) as duplicate:
+        ComponentMicroQualifierRegistry(
+            (
+                ComponentMicroBinding("vllm", "strict-oracle", vllm),
+                ComponentMicroBinding(
+                    "vllm", "second-oracle", _Qualifier("other", "vllm")
+                ),
+            )
+        )
+    assert duplicate.value.reason_code == "duplicate_component_micro_binding"
+
+
+def test_registry_capability_receipt_contains_no_model_identity() -> None:
+    qualifier = _registry(
+        _Qualifier("oracle", "vllm"), _Qualifier("deferred", "aiter")
+    )
+
+    receipt = qualifier.capability_receipt()
+
+    assert receipt["schema"] == "apex.component-micro-registry/v1"
+    assert "model" not in str(receipt).lower()
+    assert [item["source_component"] for item in receipt["bindings"]] == [
+        "vllm",
+        "aiter",
+    ]

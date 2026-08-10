@@ -10,17 +10,23 @@ from typing import Protocol
 from apex.benchmark import NormalizedBenchmarkResult, QualityMetric
 from apex.core import ContractError, sha256_file
 from apex.diagnostics import TraceEvidence
-from apex.evaluation import E2EMeasurement
+from apex.evaluation import E2EObservation
 from apex.ports import (
     BenchmarkPass,
     BenchmarkRequest,
+    MagpieFormalMeasurementSupport,
     DiagnosticsRequest,
     DiagnosticsResult,
     TraceComparisonPort,
     TraceComparisonRequest,
     TraceDiagnosticEvidence,
 )
-from apex.runtime import RunProvenance
+from apex.runtime import (
+    GpuLease,
+    RunProvenance,
+    require_gpu_lease_heartbeat,
+    require_gpu_measurement_guard,
+)
 from apex.storage import ArtifactReceipt
 
 from .kernel_lane import KernelOpportunityPlan, build_kernel_opportunity_plan
@@ -28,10 +34,16 @@ from .oracles import CorrectnessOracleRegistry
 from .recovery import persist_diagnosis, write_action_completion
 from .benchmark_artifacts import BenchmarkEvidenceReceipts
 from .run_record import E2ERunRecord
+from .server_lineage import require_resumable_server_lineage
 from .trace_inputs import build_trace_diagnostic_evidence
+from .gpu_recording import record_gpu_lease_heartbeat
 
 
 class BenchmarkAdapter(Protocol):
+    def formal_measurement_support(
+        self, execution_mode: str, lifecycle: str
+    ) -> MagpieFormalMeasurementSupport: ...
+
     def run_normalized(self, request: BenchmarkRequest) -> NormalizedBenchmarkResult: ...
 
 
@@ -88,6 +100,7 @@ class E2EBenchmarkSession:
         protocol_hash: str,
         max_kernels: int,
         trace_comparison: TraceComparisonPort,
+        gpu_lease: GpuLease,
         correctness_oracles: CorrectnessOracleRegistry | None = None,
     ) -> None:
         self._benchmark = benchmark
@@ -97,7 +110,19 @@ class E2EBenchmarkSession:
         self.protocol_hash = protocol_hash
         self.max_kernels = max_kernels
         self.trace_comparison = trace_comparison
+        self.gpu_lease = gpu_lease
         self.correctness_oracles = correctness_oracles
+        require_resumable_server_lineage(
+            record.iter_events(), record.artifacts, gpu_lease.receipt.digest
+        )
+
+    def verify_lease(self, action_id: str) -> ArtifactReceipt:
+        """Record a live typed renewal before terminal reward or delivery."""
+
+        heartbeat = require_gpu_lease_heartbeat(self.gpu_lease)
+        return record_gpu_lease_heartbeat(
+            self.record, heartbeat, action_id=action_id
+        )
 
     def action(
         self,
@@ -108,17 +133,27 @@ class E2EBenchmarkSession:
         attempt_id: str | None = None,
         candidate_id: str | None = None,
         opportunity_id: str | None = None,
+        server_owner_kind: str = "anchor",
+        server_owner_id: str | None = None,
     ) -> tuple[NormalizedBenchmarkResult, BenchmarkEvidenceReceipts]:
         self.record.begin_action(action_id, f"benchmark-{pass_type.value}")
-        result = self._benchmark.run_normalized(
-            BenchmarkRequest(
-                run_id=action_id,
-                config_path=config,
-                output_dir=self.record.root / "benchmarks",
-                pass_type=pass_type,
-                timeout_seconds=7200,
-            )
+        request = BenchmarkRequest(
+            run_id=action_id,
+            config_path=config,
+            output_dir=self.record.root / "benchmarks",
+            pass_type=pass_type,
+            timeout_seconds=7200,
+            gpu_lease=self.gpu_lease.receipt.to_dict(),
         )
+        bracket_receipt = None
+        if pass_type is BenchmarkPass.MEASUREMENT:
+            with require_gpu_measurement_guard(
+                self.gpu_lease, action_id
+            ) as bracket:
+                result = self._benchmark.run_normalized(request)
+            bracket_receipt = bracket.receipt
+        else:
+            result = self._benchmark.run_normalized(request)
         evidence = self.record.record_benchmark(
             action_id,
             result,
@@ -126,6 +161,9 @@ class E2EBenchmarkSession:
             attempt_id=attempt_id,
             candidate_id=candidate_id,
             opportunity_id=opportunity_id,
+            measurement_bracket=bracket_receipt,
+            server_owner_kind=server_owner_kind,
+            server_owner_id=server_owner_id,
         )
         write_action_completion(
             self.record,
@@ -144,7 +182,7 @@ class E2EBenchmarkSession:
         attempt_id: str | None = None,
         candidate_id: str | None = None,
         opportunity_id: str | None = None,
-    ) -> tuple[NormalizedBenchmarkResult, E2EMeasurement | None, ArtifactReceipt]:
+    ) -> tuple[NormalizedBenchmarkResult, E2EObservation | None, ArtifactReceipt]:
         result, evidence = self.action(
             action_id,
             config,
@@ -292,19 +330,15 @@ def measurement_from_result(
     *,
     quality_receipt: str,
     measurement_receipt: str,
-) -> E2EMeasurement:
-    throughput = (
-        result.throughput.total_tokens_per_second
-        if result.throughput.total_tokens_per_second is not None
-        else result.throughput.output_tokens_per_second
-    )
+) -> E2EObservation:
+    throughput = result.throughput.total_tokens_per_second
     ttft = result.latency.ttft.p99_ms
     tpot = result.latency.tpot.p99_ms
     completed = result.throughput.completed_requests
     quality = primary_quality(result.quality.metrics)
     if throughput is None or ttft is None or tpot is None or completed is None or quality is None:
         raise ContractError("Benchmark lacks required E2E metrics", "e2e_metrics_missing")
-    return E2EMeasurement(
+    return E2EObservation(
         float(throughput),
         float(ttft),
         float(tpot),
@@ -337,7 +371,7 @@ def primary_quality(metrics: tuple[QualityMetric, ...]) -> QualityMetric | None:
     return eligible[0] if eligible else None
 
 
-def measurement_metrics(value: E2EMeasurement) -> dict[str, float]:
+def measurement_metrics(value: E2EObservation) -> dict[str, float]:
     return {
         "throughput": value.throughput,
         "ttft_p99_ms": value.ttft_p99_ms,

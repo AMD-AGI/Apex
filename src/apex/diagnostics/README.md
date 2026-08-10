@@ -78,7 +78,10 @@ exported by `apex.diagnostics`.
 ## Invariants
 
 Every shard, sentinel, counter, receipt, and hash chain validates before events
-reach planning; joins use exact runtime symbols and preserve unmatched evidence.
+reach planning. The Magpie semantic-quality summary is also recomputed against
+loss accounting: record fraction, complete-semantics counts, missing-field
+counts, join eligibility, resolution verdict, and unresolved reasons must agree.
+Joins use exact runtime symbols and preserve unmatched evidence.
 
 ## Dependencies
 
@@ -89,8 +92,10 @@ call time.
 
 ## Failure semantics
 
-Incomplete traces, ambiguous symbols, checksum drift, path escape, source-digest
-disagreement, or missing targeted evidence fail closed.
+Incomplete traces, contradictory semantic-quality claims, ambiguous symbols,
+checksum drift, path escape, source-digest disagreement, or missing targeted
+evidence fail closed. Valid but unresolved semantic evidence remains diagnostic
+and carries explicit recapture reasons into the E2E planning gate.
 
 ## Tests
 

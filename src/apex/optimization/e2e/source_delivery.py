@@ -24,6 +24,7 @@ from apex.delivery import (
     verify_replay_config_invariants,
 )
 from apex.execution import SubprocessSupervisor
+from apex.evaluation import load_e2e_paired_measurement
 
 from .candidate import validate_frozen_sources
 from .services import FinalDeliveryRequest, FinalDeliveryResult
@@ -110,8 +111,9 @@ class SourceRebuildFinalDelivery:
             )
 
     def _finalize(self, request: FinalDeliveryRequest) -> FinalDeliveryResult:
-        changed_ids = _validate_accepted_stack(request)
+        changed_ids = _accepted_components(request)
         binding = self._select_binding(request, changed_ids)
+        _validate_accepted_stack(request, binding.profile)
         provenance = self._provenance.lock(request)
         _validate_provenance_lock(request, provenance, binding.profile)
         root = _new_artifact_root(request.artifact_root)
@@ -179,7 +181,7 @@ class SourceRebuildFinalDelivery:
             )
         return matches[0]
 
-def _validate_accepted_stack(request: FinalDeliveryRequest) -> frozenset[str]:
+def _accepted_components(request: FinalDeliveryRequest) -> frozenset[str]:
     if not request.accepted:
         raise ContractError("Formal delivery rejects config-only output", "config_only_candidate")
     identities = {
@@ -196,9 +198,17 @@ def _validate_accepted_stack(request: FinalDeliveryRequest) -> frozenset[str]:
             "Accepted candidates lack one exact agent identity",
             "source_provenance_unresolved",
         )
-    changed: set[str] = set()
+    return frozenset(item.opportunity.origin_library for item in request.accepted)
+
+
+def _validate_accepted_stack(
+    request: FinalDeliveryRequest, profile: FormalSourceDeliveryProfile
+) -> None:
+    repositories = {item.repository_id: item for item in profile.repositories}
     for item in request.accepted:
         candidate = item.candidate
+        repository = repositories.get(item.opportunity.origin_library)
+        changed_paths = candidate.changed_files
         if (
             request.safety_policy_sha256 is not None
             and item.safety.evidence.get("policy_fingerprint")
@@ -209,21 +219,30 @@ def _validate_accepted_stack(request: FinalDeliveryRequest) -> frozenset[str]:
                 "safety_policy_mismatch",
             )
         if (
-            item.opportunity.origin_library not in {"vllm", "aiter"}
-            or item.opportunity.language not in {"python", "triton"}
+            repository is None
+            or item.opportunity.language not in repository.source_languages
             or not candidate.succeeded
             or not candidate.candidate_id
-        or not candidate.candidate_source_sha256
-        or not item.deployment.qualified
-        or item.deployment.deployed_source_sha256
-        != candidate.candidate_source_sha256
-            or candidate.changed_files != candidate.editable_files
-            or not candidate.changed_files
+            or not candidate.candidate_source_sha256
+            or not item.deployment.qualified
+            or item.deployment.deployed_source_sha256
+            != candidate.candidate_source_sha256
+            or changed_paths != candidate.editable_files
+            or not changed_paths
+            or any(
+                not _matches_allowlist(path, repository.editable_allowlist)
+                for path in changed_paths
+            )
         ):
             raise ContractError("Accepted source stack is not deliverable", "unsupported_delivery")
         validate_frozen_sources(candidate)
-        changed.add(item.opportunity.origin_library)
-    return frozenset(changed)
+
+
+def _matches_allowlist(path: str, allowlist: Sequence[str]) -> bool:
+    return any(
+        path.startswith(item) if item.endswith("/") else path == item
+        for item in allowlist
+    )
 
 
 def _primary_request(request, profile, worktrees, patches, stack_sha, root):
@@ -239,6 +258,7 @@ def _primary_request(request, profile, worktrees, patches, stack_sha, root):
         request.benchmark_replay,
         request.baseline,
         request.final,
+        request.acceptance_policy,
         root / "primary-source-build",
     )
 
@@ -254,6 +274,7 @@ def _validate_primary_output(request, profile, primary, stack_sha):
     )
     if (
         not primary.environment_id
+        or not primary.runtime_identity_sha256
         or primary.source_stack_sha256 != stack_sha
         or primary.derived_image.parent_digest != profile.recipe.parent_image_digest
         or not all(gates)
@@ -292,6 +313,7 @@ def _validate_primary_output(request, profile, primary, stack_sha):
     }
     evidence = PrimaryVerificationEvidence(
         environment_id=primary.environment_id,
+        runtime_identity_sha256=primary.runtime_identity_sha256,
         source_stack_sha256=stack_sha,
         build_receipt_sha256=receipt_hashes["primary_build_receipt"],
         engagement_receipt_sha256=receipt_hashes["primary_engagement_receipt"],
@@ -339,6 +361,13 @@ def _delivery_result(candidate_path: Path, outcome: Any) -> FinalDeliveryResult:
     result = outcome.result
     verified = outcome.verified_bundle
     if result.verified and verified is not None:
+        if result.replay_receipt is None:
+            raise IntegrityError(
+                "Verified delivery lacks paired replay", "second_clean_replay_failed"
+            )
+        terminal = load_e2e_paired_measurement(
+            result.replay_receipt.paired_measurement
+        )
         return FinalDeliveryResult(
             True,
             TaskStatus.SUCCEEDED,
@@ -352,6 +381,18 @@ def _delivery_result(candidate_path: Path, outcome: Any) -> FinalDeliveryResult:
                 "candidate_bundle": str(candidate_path),
                 "verification": result.to_dict(),
             },
+            terminal,
+            tuple(
+                {
+                    **item.to_dict(),
+                    "path": str(
+                        outcome.result_path.parent
+                        / "clean-replay"
+                        / item.relative_path
+                    ),
+                }
+                for item in result.replay_receipt.raw_artifacts
+            ),
         )
     return FinalDeliveryResult(
         False,

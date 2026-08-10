@@ -6,14 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
 
-from apex.core import ContractError
+from apex.core import ContractError, validate_identifier
 from apex.delivery import (
     BuildRecipeLock,
     BundleProvenanceLock,
     DerivedImageIdentity,
     SourceRepositoryLock,
 )
-from apex.evaluation import E2EMeasurement
+from apex.delivery.e2e_models import SourceComponentCapability
+from apex.evaluation import E2EAcceptancePolicy, E2EObservation
 
 from .services import FinalDeliveryRequest
 
@@ -28,13 +29,13 @@ class FormalRepositoryProfile:
     editable_allowlist: tuple[str, ...]
     dependencies: tuple[str, ...] = ()
     license_id: str = "Apache-2.0"
+    source_languages: tuple[str, ...] = ("python", "triton")
+    engagement_kind: str = "python_import"
+    build_id_required: bool = False
 
     def __post_init__(self) -> None:
-        if self.repository_id not in {"vllm", "aiter"}:
-            raise ContractError(
-                "Formal Python/Triton delivery supports vllm or aiter",
-                "unsupported_delivery",
-            )
+        validate_identifier(self.repository_id, field_name="repository_id")
+        validate_identifier(self.runtime_component, field_name="runtime_component")
         if (
             not self.runtime_component.strip()
             or not self.trusted_url.strip()
@@ -45,6 +46,28 @@ class FormalRepositoryProfile:
                 "Formal repository profile is incomplete",
                 "invalid_source_delivery_profile",
             )
+        if (
+            not self.source_languages
+            or len(set(self.source_languages)) != len(self.source_languages)
+            or any(item not in {"python", "triton"} for item in self.source_languages)
+            or self.engagement_kind
+            not in {"python_import", "process_map", "linker_build_id"}
+            or self.build_id_required
+            and self.engagement_kind == "python_import"
+        ):
+            raise ContractError(
+                "Formal component engagement capability is invalid",
+                "invalid_source_delivery_profile",
+            )
+
+    @property
+    def component_capability(self) -> SourceComponentCapability:
+        return SourceComponentCapability(
+            self.repository_id,
+            self.runtime_component,
+            self.engagement_kind,
+            self.build_id_required,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +103,10 @@ class FormalSourceDeliveryProfile:
     def repository_ids(self) -> frozenset[str]:
         return frozenset(item.repository_id for item in self.repositories)
 
+    @property
+    def component_capabilities(self) -> tuple[SourceComponentCapability, ...]:
+        return tuple(item.component_capability for item in self.repositories)
+
 
 @dataclass(frozen=True, slots=True)
 class PrimarySourceBuildRequest:
@@ -94,8 +121,9 @@ class PrimarySourceBuildRequest:
     benchmark_measurement: Path
     benchmark_diagnostic: Path
     benchmark_replay: Path
-    baseline: E2EMeasurement
-    overlay_final: E2EMeasurement
+    baseline: E2EObservation
+    overlay_final: E2EObservation
+    acceptance_policy: E2EAcceptancePolicy
     artifact_root: Path
 
 
@@ -104,6 +132,7 @@ class PrimarySourceBuildOutput:
     """Evaluator-owned evidence from the first clean source-built environment."""
 
     environment_id: str
+    runtime_identity_sha256: str
     source_stack_sha256: str
     derived_image: DerivedImageIdentity
     image_sbom: Path

@@ -243,7 +243,15 @@ def _comparison_function(module: ModuleType) -> ReportComparator:
     value = getattr(module, "generate_compare_perf_reports_pytorch", None)
     if not callable(value):
         raise ImportError("TraceLens report comparison function is unavailable")
+    # The public TraceLens helper prints progress. This module is loaded under a
+    # run-unique private name, so replacing only its global `print` prevents
+    # stdio MCP protocol corruption without redirecting process-global stdout.
+    module.__dict__["print"] = _discard_dependency_output
     return value
+
+
+def _discard_dependency_output(*_args: object, **_kwargs: object) -> None:
+    return None
 
 
 def _validated_diagnostic(

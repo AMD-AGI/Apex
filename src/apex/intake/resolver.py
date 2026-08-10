@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
-import yaml
-
 from apex.core import AgentBackendName, ContractError, sha256_file, sha256_json
 
+from .descriptor_loader import load_mapping_document
 from .task_intent import NaturalLanguageRequest
 from .task_spec import ResolvedTaskSpec, TaskSpec
 
@@ -191,12 +189,12 @@ class NaturalLanguageTaskResolver:
             )
         safe: list[Path] = []
         for path in sorted(candidates):
-            if not path.is_file() or path.is_symlink():
-                continue
             try:
-                path.resolve(strict=True).relative_to(workspace)
-            except ValueError:
+                path.lstat()
+            except FileNotFoundError:
                 continue
+            except OSError:
+                pass
             safe.append(path)
         return tuple(safe)
 
@@ -206,15 +204,11 @@ class NaturalLanguageTaskResolver:
         request: NaturalLanguageRequest,
         backend: AgentBackendName,
     ) -> TaskSpec:
-        try:
-            text = path.read_text(encoding="utf-8")
-            value = yaml.safe_load(text) if path.suffix in {".yaml", ".yml"} else json.loads(text)
-        except (OSError, UnicodeDecodeError, yaml.YAMLError, json.JSONDecodeError) as error:
-            raise ContractError(
-                f"Cannot decode task descriptor: {path}", "invalid_task_descriptor"
-            ) from error
-        if not isinstance(value, Mapping):
-            raise ContractError("Task descriptor must be an object", "invalid_task_descriptor")
+        value = load_mapping_document(
+            path,
+            reason_code="invalid_task_descriptor",
+            document_name="task descriptor",
+        )
         data: dict[str, Any] = dict(value)
         declared_workspace = data.get("workspace")
         if declared_workspace not in {None, ".", str(request.workspace), str(request.workspace.resolve())}:

@@ -41,7 +41,6 @@ class ClaudeBackend:
             argv.extend(["--model", request.model])
         if request.effort:
             argv.extend(["--effort", request.effort])
-        argv.append(request.prompt)
         environment = invocation_environment(
             request.environment,
             credential_key="ANTHROPIC_API_KEY",
@@ -54,7 +53,8 @@ class ClaudeBackend:
             executable=executable,
             argv=argv,
             environment=environment,
-            prompt_transport="argv",
+            credential_environment_key="ANTHROPIC_API_KEY",
+            prompt_transport="stdin",
             isolation={
                 "approval": "dontAsk",
                 "customizations": "bare_and_safe_mode",
@@ -66,4 +66,5 @@ class ClaudeBackend:
                 "session": "not_persisted",
             },
             effort=request.effort,
+            stdin_text=request.prompt,
         )

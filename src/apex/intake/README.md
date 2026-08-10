@@ -14,6 +14,13 @@ Descriptors are discovered at the workspace root (`apex-task.*` or
 `<source>.apex.yaml|json`. Missing or ambiguous trusted oracles fail before an
 agent or GPU process starts.
 
+Both direct `TaskSpec.from_file` imports and natural-language discovery use the
+same strict descriptor loader. It accepts only a nonempty, bounded, regular file
+with one link, verifies descriptor identity and exact bytes before and after
+parsing, and rejects replacement or mutation races. JSON and YAML both reject
+duplicate or non-string keys, excessive values and nesting; YAML additionally
+rejects every alias and excessive parser events.
+
 ## Contract and public API
 
 The public API is the exact `apex.intake.__all__` list. `TaskScope` carries
@@ -25,12 +32,24 @@ controls for fair external comparisons. An optional
 backend runtime closure; it is provenance supplied by that controller, not an
 Apex measurement claim. Codex is the default backend and bundle delivery never
 modifies the caller workspace.
-The E2E spec carries the same explicit `agent_model` and `agent_effort` identity;
-an empty value is invalid rather than an implicit backend-specific guess.
+`E2EOptimizeSpec` is an internal run request built from the caller's raw Magpie
+config locator plus CLI budgets; it is not a second user-authored workload
+document and does not duplicate model/image/shape semantics. It carries the same
+explicit `agent_model` and `agent_effort` identity; an empty value is invalid
+rather than an implicit backend-specific guess.
 `dataset_split` and `data_visibility` are frozen before execution and copied to
 every candidate event. Defaults are `train/public`; `heldout_private` is valid
 only with the `heldout` split, and the RL exporter excludes private episodes
 from train exports.
+
+`load_kernel_template` verifies an attributed `apex.kernel-template/v1`
+manifest, its self-digest, exact upstream Git/file receipts, license/notice
+snapshots, immutable runtime identity, in-image source identity, and protected
+evaluator contract. A template may be recorded as `pending` with explicit
+blockers, but `require_materializable()` then fails before any agent, container,
+GPU, or measurement execution. The checked-in AgentKernelArena-derived inputs
+are currently pending; their YAML files are provenance snapshots, never
+TaskSpecs or evaluator authority.
 
 `KernelMeasurementSpec` optionally names a trusted evaluator adapter, the exact
 protected harness files, a frozen measurement-method SHA-256, a fixed-argv
@@ -59,9 +78,12 @@ agents, or write workspaces. It rejects shell strings, path escape,
 symlink/hardlink editable sources, and config-only E2E scope using stable reason
 codes. Standalone HIP is deliberately fail-closed in V1 with
 `hip_execution_unavailable`, even when a descriptor includes a complete trusted
-fixed recipe. `TaskRecipe(kind="fixed_hip")` remains reserved parser vocabulary;
-it does not authorize execution until the kernel use case binds and verifies its
-build, deploy, and loaded-byte engagement phases.
+fixed recipe. Caller-authored `TaskRecipe(kind="fixed_hip")` remains inert parser
+vocabulary; only the internal reviewed-template materializer can bind it to
+immutable image/source and evaluator authority.
+The only intended exception is an exact reviewed template-bound image-kernel
+contract. Unknown HIP/C++ workspaces never acquire that authority from a copied
+manifest or a mutable image tag.
 
 ## Tests
 
@@ -75,8 +97,8 @@ caller-neutral task contracts before any agent or command executes.
 
 ## Public API
 
-Use the task/E2E spec dataclasses, `NaturalLanguageRequest`, and `TaskResolver`
-interfaces exported from `apex.intake`.
+Use the task/E2E spec dataclasses, `NaturalLanguageRequest`, `TaskResolver`, and
+the fail-closed `load_kernel_template` interface exported from `apex.intake`.
 
 ## Invariants
 
@@ -101,3 +123,11 @@ fall back to self-reported timing.
 
 Resolved specs retain the original request plus normalized scope, framework,
 version, oracle, budget, delivery, and raw-measurement contract.
+
+`E2EOptimizeSpec.campaign_baseline_receipt` is optional only for CPU preview and
+direct contract fixtures. A formal CLI run supplies the already reconstructed
+`apex.release-candidate-receipt/v2`; intake rechecks its canonical self-digest,
+`baseline_status=ready`, and empty `baseline_blockers`, then preserves the full
+path-free document in `run.request.json` for exact resume comparison. Intake does
+not upgrade final release status or substitute this receipt for workload/image/GPU
+provenance.

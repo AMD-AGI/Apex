@@ -302,6 +302,7 @@ def test_config_only_submodule_symlink_and_shell_recipe_are_rejected() -> None:
 def test_primary_safety_and_overlay_lineage_mismatch_are_rejected() -> None:
     common = {
         "environment_id": "primary",
+        "runtime_identity_sha256": "0" * 64,
         "source_stack_sha256": "1" * 64,
         "build_receipt_sha256": "2" * 64,
         "engagement_receipt_sha256": "3" * 64,

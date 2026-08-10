@@ -6,26 +6,32 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+
+from apex.evaluation import E2EAcceptancePolicy
 import yaml
 
 import apex.bootstrap as application_bootstrap
 import apex.optimization.e2e.candidate_snapshot as candidate_snapshot
+from apex.benchmark import EvaluatorPolicy
 from apex.core import AgentBackendName, ContractError, IntegrityError, TaskStatus, ValidationLevel
 from apex.core import sha256_bytes, sha256_file, sha256_json
-from apex.delivery import E2EBundleVerifier
+from apex.delivery import E2EBundleVerifierRouter
+from apex.optimization.e2e import (
+    CandidateDeploymentRegistry,
+    ComponentMicroQualifierRegistry,
+    SourceRebuildFinalDelivery,
+)
 from apex.optimization.e2e.candidate import (
     AgentCandidateWorker,
     E2ECandidate,
     FrozenCandidateSource,
 )
 from apex.optimization.e2e.deferred import E2EDeferredMicroQualifier
-from apex.optimization.e2e.oracle_preflight import DockerOracleMicroQualifier
-from apex.optimization.e2e.qwen_qualification import QwenCompositeMicroQualifier
 from apex.optimization.e2e.docker_overlay import (
     DockerOverlayDeployment,
+    GitSourceLockVerifier,
     OverlayOnlyFinalDelivery,
 )
-from apex.optimization.e2e.source_delivery import SourceRebuildFinalDelivery
 from apex.optimization.e2e.kernel_lane import KernelOpportunity
 from apex.optimization.e2e.overlay_config import derive_overlay_configs
 from apex.optimization.e2e.overlay_runtime import (
@@ -48,6 +54,7 @@ from apex.optimization.e2e.services import (
 )
 from apex.ports import AgentResult
 from apex.runtime import (
+    ComponentSourceLockSet,
     ContainerIdentity,
     DependencyReceipt,
     RepositoryLock,
@@ -69,6 +76,42 @@ class FakeLockVerifier:
     def verify(self, lock, *, expected_root):
         assert Path(lock.path) == expected_root
         return {"name": lock.name, "commit": lock.commit, "tree": lock.tree, "clean": True}
+
+
+class RecordingGitSupervisor:
+    def __init__(self) -> None:
+        self.environments: list[dict[str, str]] = []
+
+    def run(self, argv, *, cwd, environment, timeout_seconds, stdin_text=None):
+        self.environments.append(dict(environment))
+        return ProcessResult(tuple(argv), 0, False, "value\n", "", False, False, 0.01)
+
+
+def test_source_lock_git_verifier_revokes_agent_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-secret")
+    monkeypatch.setenv("CURSOR_API_KEY", "cursor-test-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-test-secret")
+    supervisor = RecordingGitSupervisor()
+
+    output = GitSourceLockVerifier(supervisor)._git(
+        tmp_path, ("git", "rev-parse", "HEAD")
+    )
+
+    assert output == "value"
+    environment = supervisor.environments[0]
+    assert all(
+        key not in environment
+        for key in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CURSOR_API_KEY",
+            "HF_TOKEN",
+        )
+    )
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
 
 
 class FakeEngine:
@@ -166,11 +209,13 @@ class FakeDockerSupervisor:
         self.mutate_context_after_failure = mutate_context_after_failure
         self.built_image_id = built_image_id
         self.argv: list[tuple[str, ...]] = []
+        self.environments: list[dict[str, str]] = []
         self.build_calls = 0
 
     def run(self, argv, *, cwd, environment, timeout_seconds, stdin_text=None):
         command = tuple(argv)
         self.argv.append(command)
+        self.environments.append(dict(environment))
         stdout = ""
         stderr = ""
         exit_code = 0
@@ -379,16 +424,16 @@ def _provenance(source_root: Path, library: str) -> RunProvenance:
         True,
     )
     return RunProvenance(
-        1,
+        2,
         "/benchmark.yaml",
         "e" * 64,
         "vllm",
         "Qwen/example",
         None,
         "gfx950",
+        "docker",
         ContainerIdentity("example:v1", PARENT_ID, (PARENT_REPO_DIGEST,), ()),
-        (library,),
-        (lock,),
+        ComponentSourceLockSet((library,), (lock,)),
         "partial",
         ("model_revision", "runtime_loaded_bytes"),
     )
@@ -426,6 +471,12 @@ def _trace_only_views(tmp_path: Path):
         },
         "gap_analysis": {"enabled": False},
     }
+    policy = EvaluatorPolicy(
+        "apex-lm-eval-gsm8k-v2", "gsm8k", "utils/evals/gsm8k.yaml",
+        "c" * 64, "openai/gsm8k", "main", "d" * 40,
+        "exact_match,strict-match", 2248, 480,
+    )
+    benchmark["envs"].update(policy.env())
     projected = copy.deepcopy(benchmark)
     for key in ("docker_image", "run_kind", "profiler", "gap_analysis"):
         projected.pop(key)
@@ -437,7 +488,7 @@ def _trace_only_views(tmp_path: Path):
             "required": True,
             "kind": "lm_eval",
             "tasks": "gsm8k",
-            "evaluator_policy": None,
+            "evaluator_policy": policy.to_dict(),
         }
         if kind == "diagnostic":
             selected["run_kind"] = "diagnostic"
@@ -454,13 +505,13 @@ def _trace_only_views(tmp_path: Path):
                 "required": False,
                 "kind": "trace_only",
                 "tasks": "gsm8k",
-                "evaluator_policy": None,
+                "evaluator_policy": policy.to_dict(),
             }
         document = {
             "benchmark": selected,
             "apex": {
                 "benchmark_view": {
-                    "schema": "apex.benchmark-view.v1",
+                    "schema": "apex.benchmark-view.v2",
                     "kind": kind,
                     "original_sha256": "d" * 64,
                     "workload_semantics_sha256": semantics,
@@ -477,6 +528,16 @@ def _trace_only_views(tmp_path: Path):
                             "root": "/inferencex",
                             "commit": "3" * 40,
                         },
+                    },
+                    "magpie_config_resolution": {
+                        "plan_schema": "apex.magpie-main-resolved-plan/v1",
+                        "plan_sha256": "4" * 64,
+                        "capability_schema": "apex.magpie-main-capability-receipt/v1",
+                        "capability_receipt_sha256": "5" * 64,
+                        "effective_config_sha256": "6" * 64,
+                        "scoring_config_sha256": "7" * 64,
+                        "phase_views_sha256": "8" * 64,
+                        "resolution_method_sha256": "9" * 64,
                     },
                     "quality_contract": quality,
                 }
@@ -511,7 +572,7 @@ def test_deferred_qualification_makes_no_micro_truth_or_reward_claim(tmp_path: P
     assert result.evidence["correctness_oracle"]["executed"] is False
 
 
-def test_production_composition_injects_reviewed_qwen_source_delivery(
+def test_production_composition_keeps_optimizer_model_neutral(
     monkeypatch, tmp_path
 ):
     magpie = tmp_path / "Magpie"
@@ -580,18 +641,27 @@ def test_production_composition_injects_reviewed_qwen_source_delivery(
     )
 
     assert application.e2e_optimizer is not None
-    assert isinstance(application.e2e_bundle_verifier, E2EBundleVerifier)
+    assert isinstance(application.e2e_bundle_verifier, E2EBundleVerifierRouter)
+    assert application.e2e_bundle_verifier.profile_ids == (
+        "qwen3-next-80b-fp8-v1",
+    )
     assert isinstance(application.e2e_optimizer._candidate_worker, AgentCandidateWorker)
-    assert isinstance(application.e2e_optimizer._micro, QwenCompositeMicroQualifier)
-    assert isinstance(application.e2e_optimizer._micro._vllm, DockerOracleMicroQualifier)
-    assert isinstance(application.e2e_optimizer._micro._aiter, E2EDeferredMicroQualifier)
-    assert isinstance(application.e2e_optimizer._deployments, DockerOverlayDeployment)
-    assert isinstance(application.e2e_optimizer._final_delivery, SourceRebuildFinalDelivery)
-    for binding in application.e2e_optimizer._final_delivery._bindings:
-        assert binding.verification_source_overrides == {
-            name: {"vllm": vllm, "aiter": aiter}[name]
-            for name in binding.profile.repository_ids
-        }
+    assert isinstance(
+        application.e2e_optimizer._micro, ComponentMicroQualifierRegistry
+    )
+    assert isinstance(
+        application.e2e_optimizer._deployments, CandidateDeploymentRegistry
+    )
+    assert application.e2e_optimizer._deployments.supported_components == frozenset(
+        {"vllm", "aiter"}
+    )
+    assert isinstance(
+        application.e2e_optimizer._final_delivery, SourceRebuildFinalDelivery
+    )
+    assert application.e2e_optimizer._correctness_oracles is not None
+    assert application.e2e_optimizer._provenance.__class__.__name__ == (
+        "QwenAcceptanceProvenanceResolver"
+    )
 
 
 def test_production_composition_uses_explicit_trusted_final_delivery(
@@ -855,7 +925,15 @@ def test_overlay_uses_tag_repository_to_select_one_allowed_digest(tmp_path: Path
     )
 
 
-def test_docker_engine_uses_fixed_argv_and_immutable_parent(tmp_path: Path):
+def test_docker_engine_uses_fixed_argv_and_immutable_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "agent-test-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "agent-test-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-test-secret")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///tmp/apex-test-docker.sock")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "3")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/untrusted-python")
     candidate = tmp_path / "candidate.py"
     candidate.write_text("VALUE = 2\n", encoding="utf-8")
     supervisor = FakeDockerSupervisor(sha256_file(candidate), build_failures=1)
@@ -891,6 +969,15 @@ def test_docker_engine_uses_fixed_argv_and_immutable_parent(tmp_path: Path):
     assert all(command[0] == "docker" for command in supervisor.argv)
     assert all("sh" not in command and "bash" not in command for command in supervisor.argv)
     assert all("--volume" not in command and "-v" not in command for command in supervisor.argv)
+    assert all(
+        environment["DOCKER_HOST"] == "unix:///tmp/apex-test-docker.sock"
+        and environment["ROCR_VISIBLE_DEVICES"] == "3"
+        and "OPENAI_API_KEY" not in environment
+        and "ANTHROPIC_API_KEY" not in environment
+        and "HF_TOKEN" not in environment
+        and "PYTHONPATH" not in environment
+        for environment in supervisor.environments
+    )
     dockerfile = (tmp_path / "build" / "context" / "Dockerfile").read_text()
     assert dockerfile.startswith(f"FROM {PARENT_REPO_DIGEST}\n")
     assert target.container_path in dockerfile
@@ -1345,7 +1432,11 @@ def test_overlay_config_preserves_trace_only_diagnostic_semantics(tmp_path: Path
         "required": False,
         "kind": "trace_only",
         "tasks": "gsm8k",
-        "evaluator_policy": None,
+        "evaluator_policy": EvaluatorPolicy(
+            "apex-lm-eval-gsm8k-v2", "gsm8k", "utils/evals/gsm8k.yaml",
+            "c" * 64, "openai/gsm8k", "main", "d" * 40,
+            "exact_match,strict-match", 2248, 480,
+        ).to_dict(),
     }
     for source_path, observed in zip(paths, documents, strict=True):
         original = yaml.safe_load(source_path.read_text(encoding="utf-8"))
@@ -1365,9 +1456,9 @@ def test_overlay_config_preserves_trace_only_diagnostic_semantics(tmp_path: Path
         lambda document: document["apex"]["benchmark_view"].update(
             {"kind": "measurement"}
         ),
-        lambda document: document["apex"]["benchmark_view"].update(
-            {"schema": "apex.benchmark-view.v2"}
-        ),
+            lambda document: document["apex"]["benchmark_view"].update(
+                {"schema": "apex.benchmark-view.v3"}
+            ),
     ),
 )
 def test_overlay_config_rejects_trace_only_contract_drift(
@@ -1430,6 +1521,7 @@ def test_overlay_final_delivery_never_claims_source_rebuild(tmp_path: Path):
             tmp_path / "replay",
             None,  # type: ignore[arg-type]
             None,  # type: ignore[arg-type]
+            E2EAcceptancePolicy(),
             tmp_path / "artifacts",
         )
     )

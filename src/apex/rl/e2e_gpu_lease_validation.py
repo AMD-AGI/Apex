@@ -9,12 +9,16 @@ from apex.core import ContractError, IntegrityError
 from apex.runtime import (
     GpuDeviceIdentity,
     GpuLeaseReceipt,
+    GpuLeaseHeartbeatReceipt,
+    GpuLeaseOwnerIdentity,
+    GpuMeasurementBracketReceipt,
     GpuOwnershipReceipt,
     GpuProcessIdentity,
     GpuSelectorRequest,
     HsaGpuIdentity,
     HsaInventoryEvidence,
     RsmiDeviceIdentity,
+    load_gpu_doctor_receipt,
 )
 from apex.storage import ArtifactStore
 
@@ -52,8 +56,38 @@ def validate_gpu_lease(
         reject("Matched-promotion GPU lease differs from its declared scope")
 
 
+def validate_measurement_bracket(
+    *,
+    run_id: str,
+    action_id: str,
+    lease_digest: str,
+    event: EpisodeEvent,
+    artifacts: ArtifactStore,
+) -> None:
+    """Rebuild one formal pre/post lease bracket from its leg event."""
+
+    receipt = single_event_receipt(event, "gpu_measurement_bracket")
+    document = read_json(artifacts, receipt, canonical=True)
+    try:
+        bracket = load_measurement_bracket(document)
+    except (ContractError, KeyError, TypeError, ValueError) as error:
+        raise _lease_error() from error
+    if (
+        bracket.to_dict() != dict(document)
+        or bracket.digest != receipt.digest
+        or bracket.run_id != run_id
+        or bracket.action_id != action_id
+        or bracket.lease_digest != lease_digest
+        or event.payload.get("gpu_measurement_bracket_digest") != receipt.digest
+    ):
+        reject("Formal measurement GPU bracket differs from its action")
+
+
 def _lease(value: Mapping[str, Any]) -> GpuLeaseReceipt:
     ownership = _ownership(mapping(value["ownership"], "GPU ownership"))
+    doctor = load_gpu_doctor_receipt(
+        mapping(value["doctor"], "GPU doctor"), ownership=ownership
+    )
     return GpuLeaseReceipt(
         _integer(value["schema_version"], positive=True),
         _text(value["run_id"]),
@@ -63,10 +97,50 @@ def _lease(value: Mapping[str, Any]) -> GpuLeaseReceipt:
         _number(value["acquired_unix_seconds"]),
         _text(value["lock_path"]),
         ownership,
+        doctor,
         _text_tuple(value["lock_paths"]),
     )
 
 
+def load_measurement_bracket(
+    value: Mapping[str, Any],
+) -> GpuMeasurementBracketReceipt:
+    return GpuMeasurementBracketReceipt(
+        _integer(value["schema_version"], positive=True),
+        _text(value["run_id"]),
+        _text(value["action_id"]),
+        _text(value["lease_digest"]),
+        _number(value["started_unix_seconds"]),
+        _number(value["finished_unix_seconds"]),
+        load_gpu_heartbeat(mapping(value["pre"], "pre GPU lease heartbeat")),
+        load_gpu_heartbeat(mapping(value["post"], "post GPU lease heartbeat")),
+    )
+
+
+def load_gpu_heartbeat(value: Mapping[str, Any]) -> GpuLeaseHeartbeatReceipt:
+    ownership = _ownership(mapping(value["ownership"], "GPU ownership"))
+    doctor = load_gpu_doctor_receipt(
+        mapping(value["doctor"], "GPU doctor"), ownership=ownership
+    )
+    owner = mapping(value["owner"], "GPU lease owner")
+    return GpuLeaseHeartbeatReceipt(
+        _integer(value["schema_version"], positive=True),
+        _text(value["run_id"]),
+        _text(value["lease_digest"]),
+        _integer(value["sequence"], positive=True),
+        _text(value["reason"]),
+        _number(value["observed_unix_seconds"]),
+        _number(value["valid_until_unix_seconds"]),
+        _number(value["ttl_seconds"]),
+        GpuLeaseOwnerIdentity(
+            _integer(owner["pid"], positive=True),
+            _integer(owner["uid"]),
+            _integer(owner["start_time_ticks"], positive=True),
+            _text(owner["cmdline_sha256"]),
+        ),
+        ownership,
+        doctor,
+    )
 def _ownership(value: Mapping[str, Any]) -> GpuOwnershipReceipt:
     selector = mapping(value["selector_inputs"], "GPU selector inputs")
     return GpuOwnershipReceipt(
@@ -198,4 +272,9 @@ def _lease_error():
     )
 
 
-__all__ = ["validate_gpu_lease"]
+__all__ = [
+    "load_measurement_bracket",
+    "load_gpu_heartbeat",
+    "validate_gpu_lease",
+    "validate_measurement_bracket",
+]

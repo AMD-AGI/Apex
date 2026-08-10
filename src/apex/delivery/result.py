@@ -38,6 +38,7 @@ _MEASUREMENT_STATUSES = {
     "invalid",
     "error",
 }
+_EVALUATION_CONTRACT_STATUSES = {"not_frozen", "verified", "unverified"}
 
 
 def _is_digest(value: str) -> bool:
@@ -64,6 +65,11 @@ class TaskResult:
     artifact_store_ref: Mapping[str, Any] | None = None
     gpu_lease: Mapping[str, Any] | None = None
     gpu_lease_receipt_digest: str | None = None
+    evaluation_contract_status: str = "not_frozen"
+    evaluation_contract_receipt_digest: str | None = None
+    evaluation_contract_unverified_reason: str | None = None
+    evaluation_authority_id: str | None = None
+    evaluation_authority_kind: str | None = None
     error: Mapping[str, Any] | None = None
     validation_level: ValidationLevel = ValidationLevel.NONE
     safety_status: str = "not_run"
@@ -92,13 +98,25 @@ class TaskResult:
     worst_case_pass: bool | None = None
     promotion_eligible: bool | None = None
     promotion_reason_code: str | None = None
+    task_reward: float | None = None
+    task_reward_vector: Mapping[str, Any] | None = None
+    reward_policy_id: str | None = None
+    reward_policy_digest: str | None = None
+    reward_source_receipt: str | None = None
+    raw_measurement_receipts: tuple[str, ...] = ()
+    task_trainability: str = "unscored"
+    untrainable_reason: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "changed_files", tuple(self.changed_files))
         object.__setattr__(
             self, "verification_summary_refs", tuple(self.verification_summary_refs)
         )
+        object.__setattr__(
+            self, "raw_measurement_receipts", tuple(self.raw_measurement_receipts)
+        )
         self._validate_lineage()
+        self._validate_evaluation_contract()
         if self.safety_status not in _SAFETY_STATUSES:
             raise ValueError(f"unsupported safety_status: {self.safety_status}")
         for field_name, digest in (
@@ -125,6 +143,71 @@ class TaskResult:
         if self.safety_status == "certified" and not self.safety_certified:
             raise ValueError("certified safety status requires safety_certified=true")
         self._validate_measurement()
+        self._validate_task_reward()
+
+    def _validate_task_reward(self) -> None:
+        if self.task_trainability not in {"unscored", "trainable", "untrainable"}:
+            raise ValueError("unsupported task_trainability")
+        receipts = self.raw_measurement_receipts
+        if any(not _is_digest(item) for item in receipts):
+            raise ValueError("raw measurement receipt is invalid")
+        identities = (
+            self.reward_policy_id,
+            self.reward_policy_digest,
+            self.reward_source_receipt,
+        )
+        if self.task_trainability == "unscored":
+            if (
+                self.task_reward is not None
+                or self.task_reward_vector is not None
+                or any(identities)
+                or receipts
+                or self.untrainable_reason is not None
+            ):
+                raise ValueError("unscored task cannot carry terminal reward evidence")
+            return
+        if not self.reward_policy_id or not _is_digest(self.reward_policy_digest or ""):
+            raise ValueError("terminal task requires reward policy identity")
+        if self.task_trainability == "untrainable":
+            if (
+                self.task_reward is not None
+                or self.task_reward_vector is not None
+                or self.reward_source_receipt is not None
+                or receipts
+                or not self.untrainable_reason
+            ):
+                raise ValueError("untrainable task reward is incoherent")
+            return
+        if (
+            self.task_reward is None
+            or not math.isfinite(self.task_reward)
+            or self.task_reward_vector is None
+            or not _is_digest(self.reward_source_receipt or "")
+            or self.untrainable_reason is not None
+        ):
+            raise ValueError("trainable task requires complete terminal reward evidence")
+
+    def _validate_evaluation_contract(self) -> None:
+        status = self.evaluation_contract_status
+        digest = self.evaluation_contract_receipt_digest
+        reason = self.evaluation_contract_unverified_reason
+        authority = (self.evaluation_authority_id, self.evaluation_authority_kind)
+        if status not in _EVALUATION_CONTRACT_STATUSES:
+            raise ValueError(f"unsupported evaluation_contract_status: {status}")
+        if status == "not_frozen":
+            if digest is not None or reason is not None or any(authority):
+                raise ValueError("unfrozen evaluation contract cannot carry evidence")
+            return
+        if not isinstance(digest, str) or not _is_digest(digest):
+            raise ValueError("frozen evaluation contract requires its receipt digest")
+        if status == "verified" and reason is not None:
+            raise ValueError("verified evaluation contract cannot carry a failure reason")
+        if status == "verified" and any(not item for item in authority):
+            raise ValueError("verified evaluation contract requires authority identity")
+        if status == "unverified" and not reason:
+            raise ValueError("unverified evaluation contract requires a failure reason")
+        if status == "unverified" and any(authority):
+            raise ValueError("unverified evaluation contract cannot carry authority identity")
 
     def _validate_lineage(self) -> None:
         validate_identifier(self.run_id, field_name="run_id")
@@ -166,10 +249,11 @@ class TaskResult:
         ):
             raise ValueError("GPU lease receipt requires its SHA-256 identity")
         lease = dict(self.gpu_lease)
+        doctor = lease.get("doctor")
         owner_pid = lease.get("owner_pid")
         acquired = lease.get("acquired_unix_seconds")
         if (
-            lease.get("schema_version") != 2
+            lease.get("schema_version") != 3
             or lease.get("run_id") != self.run_id
             or not isinstance(lease.get("execution_scope"), str)
             or not lease["execution_scope"]
@@ -184,6 +268,12 @@ class TaskResult:
             or acquired <= 0
             or not isinstance(lease.get("lock_path"), str)
             or not Path(lease["lock_path"]).is_absolute()
+            or not isinstance(doctor, Mapping)
+            or doctor.get("status") != "ready"
+            or doctor.get("formal_measurement_ready") is not True
+            or doctor.get("ownership_receipt_sha256")
+            != sha256_json(lease.get("ownership"))
+            or doctor.get("rocm_health_status") != "healthy"
         ):
             raise ValueError("GPU lease receipt is invalid")
         if sha256_json(lease) != self.gpu_lease_receipt_digest:
@@ -307,6 +397,7 @@ class TaskResult:
         value["validation_level"] = self.validation_level.value
         value["changed_files"] = list(self.changed_files)
         value["verification_summary_refs"] = list(self.verification_summary_refs)
+        value["raw_measurement_receipts"] = list(self.raw_measurement_receipts)
         return value
 
 

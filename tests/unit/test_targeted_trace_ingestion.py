@@ -244,6 +244,12 @@ def _write_fixture(
         "pid": 22,
         "issues": [],
     }
+    lossless = coverage["seen"] > 0 and coverage["dropped"] == 0
+    unresolved_reasons = [
+        f"dropped:{reason}"
+        for reason, count in sorted(coverage["dropped_by_reason"].items())
+        if count
+    ]
     summary = {
         "schema_name": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -251,6 +257,27 @@ def _write_fixture(
         "valid": True,
         "streaming": True,
         "coverage": coverage,
+        "evidence_quality": {
+            "evidence_class": "diagnostic_only",
+            "resolution_status": "resolved" if lossless else "unresolved",
+            "semantic_coverage_claimed": lossless,
+            "record_coverage_fraction": (
+                coverage["written"] / coverage["seen"] if coverage["seen"] else 0.0
+            ),
+            "lossless_record_coverage": lossless,
+            "records_evaluated": coverage["written"],
+            "records_with_complete_semantics": coverage["written"],
+            "missing_by_field": {
+                "phase": 0,
+                "source": 0,
+                "grid": 0,
+                "shape": 0,
+                "correlation": 0,
+            },
+            "cross_event_join": "not_performed",
+            "join_eligible_records": coverage["written"],
+            "unresolved_reasons": unresolved_reasons,
+        },
         "events": {"by_target": {"workload-kernels": len(events)}},
         "integrity_failures_by_reason": {},
         "shards": [summary_shard],
@@ -356,6 +383,7 @@ def test_sampling_drop_uses_magpie_coverage_semantics(tmp_path: Path) -> None:
     )[0]
     assert record.evidence.coverage.to_dict() == coverage
     assert "targeted_drop:sampling:1" in record.evidence.warnings
+    assert "semantic_coverage_unresolved:dropped:sampling" in record.evidence.warnings
 
 
 def test_unknown_additive_manifest_field_is_hash_preserved_and_warned(tmp_path: Path) -> None:
@@ -500,6 +528,8 @@ def test_resolved_launch_source_receipt_is_verified(tmp_path: Path) -> None:
         ("report_coverage", "coverage_mismatch"),
         ("schema", "unsupported_schema"),
         ("extra_shard", "targeted_shard_set_mismatch"),
+        ("semantic_quality", "invalid_targeted_summary"),
+        ("semantic_forgery", "invalid_targeted_summary"),
     ],
 )
 def test_integrity_failures_are_fail_closed(
@@ -534,6 +564,23 @@ def test_integrity_failures_are_fail_closed(
         _rewrite_json(paths["manifest"], lambda value: value.update(schema_version="2.0.0"))
     elif mutation == "extra_shard":
         (paths["shard"].parent / "unexpected.jsonl").write_text("{}\n", encoding="utf-8")
+    elif mutation == "semantic_quality":
+        _rewrite_json(
+            paths["summary"],
+            lambda value: value["evidence_quality"].update(
+                semantic_coverage_claimed=False
+            ),
+        )
+    elif mutation == "semantic_forgery":
+        def forge(value):
+            quality = value["evidence_quality"]
+            quality["resolution_status"] = "unresolved"
+            quality["semantic_coverage_claimed"] = False
+            quality["records_with_complete_semantics"] = 0
+            quality["missing_by_field"]["source"] = 1
+            quality["unresolved_reasons"] = ["missing:source"]
+
+        _rewrite_json(paths["summary"], forge)
 
     with pytest.raises(IntegrityError) as captured:
         TraceEvidenceNormalizer().from_benchmark_report(

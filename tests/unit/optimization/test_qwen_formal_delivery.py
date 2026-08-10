@@ -5,12 +5,13 @@ import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 import pytest
 
-import apex.optimization.e2e.qwen_profile as qwen_profile
 from apex.benchmark import (
+    EvaluatorPolicy,
     InferenceXRuntimeEvidence,
     LatencyDistribution,
     LatencyMetrics,
@@ -18,6 +19,7 @@ from apex.benchmark import (
     NormalizedBenchmarkResult,
     QualityEvidence,
     QualityMetric,
+    ServingRuntimeEvidence,
     ThroughputMetrics,
 )
 from apex.core import ContractError, sha256_file, sha256_json
@@ -34,12 +36,9 @@ from apex.delivery import (
     SourceBuildRequest,
 )
 from apex.delivery.git_patch import RepositoryApplyReceipt
-from apex.evaluation import E2EMeasurement
+from apex.evaluation import E2EAcceptancePolicy, E2EObservation
 from apex.execution import ProcessResult, SubprocessSupervisor
 from apex.optimization.e2e.qwen_profile import (
-    QWEN_CONFIG_SHA256,
-    QWEN_MODEL_ID,
-    QWEN_MODEL_REVISION,
     QWEN_PARENT_IMAGE_ID,
     QWEN_PARENT_LOCATOR,
     QWEN_PARENT_REFERENCE,
@@ -51,9 +50,9 @@ from apex.optimization.e2e.qwen_profile import (
     build_qwen_correctness_oracles,
 )
 from apex.optimization.e2e.source_delivery_adapters import (
-    QwenIndependentReplay,
-    QwenIndependentSourceBuild,
-    QwenPrimarySourceBuilder,
+    IndependentCleanReplay,
+    IndependentSourceImageBuild,
+    SourceImagePrimaryBuilder,
 )
 from apex.optimization.e2e.source_delivery_models import PrimarySourceBuildRequest
 from apex.optimization.e2e.source_image_runtime import (
@@ -61,7 +60,12 @@ from apex.optimization.e2e.source_image_runtime import (
     SourceImageBuild,
 )
 from apex.ports import BenchmarkPass
-from apex.runtime import ContainerIdentity, RepositoryLock, RunProvenance
+from apex.runtime import (
+    ComponentSourceLockSet,
+    ContainerIdentity,
+    RepositoryLock,
+    RunProvenance,
+)
 
 
 DERIVED = "sha256:" + "d" * 64
@@ -70,19 +74,9 @@ VLLM_COMMIT = "b1388b1fbf5aaef47937fabe98931211684666a6"
 VLLM_TREE = "33b782e425e42d42851a33f7876e97a8deeabb29"
 AITER_COMMIT = "c3708fb7445899c14cdc6e8055953ee02ed78ddf"
 AITER_TREE = "a30409ac03524781f175cbb03e82eefcafd52af1"
-
-
-def test_reviewed_qwen_config_hash_matches_pinned_magpie_checkout() -> None:
-    apex_root = Path(__file__).resolve().parents[3]
-    config = (
-        apex_root.parent
-        / "Magpie"
-        / "examples"
-        / "benchmarks"
-        / "benchmark_vllm_qwen3_next_80b_fp8.yaml"
-    )
-    assert config.is_file(), "the pinned Magpie checkout is required for this contract test"
-    assert sha256_file(config) == QWEN_CONFIG_SHA256
+MODEL_ID = "Qwen/example"
+MODEL_REVISION = "c5f5f263bdd5cc134092897864e8905d8fe7b928"
+CONFIG_SHA256 = "f" * 64
 
 
 def _process(argv, *, stdout: str = "") -> ProcessResult:
@@ -237,36 +231,39 @@ def test_source_image_is_reproducible_and_uses_fixed_networkless_argv(
 
 def _run_provenance(roots: dict[str, Path]) -> RunProvenance:
     return RunProvenance(
-        1,
+        2,
         "/immutable/qwen.yaml",
-        QWEN_CONFIG_SHA256,
+        CONFIG_SHA256,
         "vllm",
-        QWEN_MODEL_ID,
-        QWEN_MODEL_REVISION,
+        MODEL_ID,
+        MODEL_REVISION,
         "gfx950",
+        "docker",
         ContainerIdentity(
             QWEN_PARENT_REFERENCE,
             QWEN_PARENT_IMAGE_ID,
             (f"vllm/vllm-openai-rocm@{QWEN_PARENT_REPO_DIGEST}",),
             (),
         ),
-        ("vllm", "aiter"),
-        (
-            RepositoryLock(
+        ComponentSourceLockSet(
+            ("vllm", "aiter"),
+            (
+                RepositoryLock(
                 "vllm",
                 str(roots["vllm"]),
                 "https://github.com/vllm-project/vllm.git",
                 VLLM_COMMIT,
                 VLLM_TREE,
                 True,
-            ),
-            RepositoryLock(
-                "aiter",
-                str(roots["aiter"]),
-                "https://github.com/ROCm/aiter.git",
-                AITER_COMMIT,
-                AITER_TREE,
-                True,
+                ),
+                RepositoryLock(
+                    "aiter",
+                    str(roots["aiter"]),
+                    "https://github.com/ROCm/aiter.git",
+                    AITER_COMMIT,
+                    AITER_TREE,
+                    True,
+                ),
             ),
         ),
         "resolved",
@@ -274,7 +271,9 @@ def _run_provenance(roots: dict[str, Path]) -> RunProvenance:
     )
 
 
-def test_qwen_profile_accepts_only_the_reviewed_identity(tmp_path: Path) -> None:
+def test_source_profile_is_model_and_config_neutral_but_runtime_strict(
+    tmp_path: Path,
+) -> None:
     roots = {"vllm": tmp_path / "vllm", "aiter": tmp_path / "aiter"}
     for path in roots.values():
         path.mkdir()
@@ -282,9 +281,10 @@ def test_qwen_profile_accepts_only_the_reviewed_identity(tmp_path: Path) -> None
     guard = QwenAcceptanceProvenance(roots)
 
     guard._validate_run(provenance)
+    guard._validate_run(replace(provenance, benchmark_config_sha256="0" * 64))
+    guard._validate_run(replace(provenance, model_id="other/model"))
+    guard._validate_run(replace(provenance, model_revision="other-revision"))
     for drifted in (
-        replace(provenance, benchmark_config_sha256="0" * 64),
-        replace(provenance, model_revision="other"),
         replace(provenance, gpu_arch="gfx942"),
         replace(
             provenance,
@@ -296,7 +296,7 @@ def test_qwen_profile_accepts_only_the_reviewed_identity(tmp_path: Path) -> None
         except ContractError:
             pass
         else:
-            raise AssertionError("reviewed Qwen provenance accepted identity drift")
+            raise AssertionError("reviewed source profile accepted runtime drift")
 
     profiles = _profiles()
     assert [item.repository_ids for item in profiles] == [
@@ -369,32 +369,43 @@ class FakeProvenanceResolver:
         self.observed = observed
         self.hints = None
 
-    def resolve(self, config_path, *, gpu_arch, hints=None):
+    def resolve(self, resolved, *, gpu_arch, hints=None):
         self.hints = hints
         return replace(
             self.observed,
-            benchmark_config_path=str(config_path),
-            benchmark_config_sha256=sha256_file(config_path),
+            benchmark_config_path=str(resolved.config_path),
+            benchmark_config_sha256=resolved.config_sha256,
             gpu_arch=gpu_arch,
         )
 
 
-def test_exact_config_injects_reviewed_source_and_model_locks(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_matching_capabilities_inject_reviewed_source_locks(tmp_path: Path) -> None:
     config = tmp_path / "qwen.yaml"
     config.write_text("benchmark: exact-qwen-test\n", encoding="utf-8")
     roots = {"vllm": tmp_path / "vllm", "aiter": tmp_path / "aiter"}
     for path in roots.values():
         path.mkdir()
     delegate = FakeProvenanceResolver(_run_provenance(roots))
-    monkeypatch.setattr(qwen_profile, "QWEN_CONFIG_SHA256", sha256_file(config))
     resolver = QwenAcceptanceProvenanceResolver(roots, delegate)
+    resolved = SimpleNamespace(
+        config_path=config.resolve(),
+        config_sha256=sha256_file(config),
+        requested_components=("vllm", "aiter"),
+        plan={
+            "identity": {"framework": "vllm", "run_mode": "docker"},
+            "source_runtime": {
+                "requested_image": QWEN_PARENT_REFERENCE,
+                "requested_components": ["vllm", "aiter"],
+            },
+        },
+    )
 
-    observed = resolver.resolve(config, gpu_arch="gfx950")
+    observed = resolver.resolve(
+        resolved, gpu_arch="gfx950", hints={"model_revision": "runtime-observed"}
+    )
 
-    assert observed.model_revision == QWEN_MODEL_REVISION
-    assert delegate.hints["model_revision"] == QWEN_MODEL_REVISION
+    assert observed.model_revision == MODEL_REVISION
+    assert delegate.hints["model_revision"] == "runtime-observed"
     assert {
         item["name"]: (item["path"], item["commit"])
         for item in delegate.hints["source_repositories"]
@@ -402,12 +413,90 @@ def test_exact_config_injects_reviewed_source_and_model_locks(
         "vllm": (str(roots["vllm"].resolve()), VLLM_COMMIT),
         "aiter": (str(roots["aiter"].resolve()), AITER_COMMIT),
     }
-    with pytest.raises(ContractError, match="revision override"):
+    with pytest.raises(ContractError, match="override drifted"):
         resolver.resolve(
-            config,
+            resolved,
             gpu_arch="gfx950",
-            hints={"model_revision": "mutable-main"},
+            hints={
+                "source_repositories": [
+                    {
+                        "name": "vllm",
+                        "path": str(roots["vllm"]),
+                        "commit": "0" * 40,
+                    },
+                    {
+                        "name": "aiter",
+                        "path": str(roots["aiter"]),
+                        "commit": AITER_COMMIT,
+                    },
+                ]
+            },
         )
+
+    unsupported = SimpleNamespace(
+        config_path=config.resolve(),
+        config_sha256="0" * 64,
+        plan={
+            "identity": {"framework": "vllm", "run_mode": "docker"},
+            "source_runtime": {
+                "requested_image": "other/runtime@sha256:" + "1" * 64,
+                "requested_components": ["vllm"],
+            },
+        },
+    )
+    resolver.resolve(unsupported, gpu_arch="gfx950", hints={"opaque": "kept"})
+    assert delegate.hints == {"opaque": "kept"}
+
+
+def test_profile_injects_only_active_sources_and_delegates_local_lifecycle(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "workload.yaml"
+    config.write_text("benchmark: published-main\n", encoding="utf-8")
+    roots = {"vllm": tmp_path / "vllm", "aiter": tmp_path / "aiter"}
+    for path in roots.values():
+        path.mkdir()
+    full = _run_provenance(roots)
+    vllm_lock = full.component_sources.lock_for("vllm")
+    assert vllm_lock is not None
+    single = replace(
+        full,
+        component_sources=ComponentSourceLockSet(("vllm",), (vllm_lock,)),
+    )
+    delegate = FakeProvenanceResolver(single)
+    resolver = QwenAcceptanceProvenanceResolver(roots, delegate)
+    docker = SimpleNamespace(
+        config_path=config.resolve(),
+        config_sha256=sha256_file(config),
+        requested_components=("vllm",),
+        plan={
+            "identity": {"framework": "vllm", "run_mode": "docker"},
+            "source_runtime": {
+                "requested_image": QWEN_PARENT_REFERENCE,
+                "requested_components": ["vllm"],
+            },
+        },
+    )
+
+    resolver.resolve(docker, gpu_arch="gfx950")
+
+    assert [
+        item["name"] for item in delegate.hints["source_repositories"]
+    ] == ["vllm"]
+
+    local = SimpleNamespace(
+        config_path=config.resolve(),
+        config_sha256=sha256_file(config),
+        plan={
+            "identity": {"framework": "vllm", "run_mode": "local"},
+            "source_runtime": {
+                "requested_image": QWEN_PARENT_REFERENCE,
+                "requested_components": ["vllm"],
+            },
+        },
+    )
+    resolver.resolve(local, gpu_arch="gfx950", hints={"lifecycle": "cleanup"})
+    assert delegate.hints == {"lifecycle": "cleanup"}
 
 
 def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
@@ -415,7 +504,7 @@ def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
     tracelens.mkdir(exist_ok=True)
     benchmark = {
         "framework": "vllm",
-        "model": QWEN_MODEL_ID,
+        "model": MODEL_ID,
         "docker_image": QWEN_PARENT_REFERENCE,
         "envs": {"RUN_EVAL": "true", "MAGPIE_EVAL_TASKS": "gsm8k"},
         "lm_eval_runtime": {
@@ -433,6 +522,12 @@ def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
         },
         "gap_analysis": {"enabled": False},
     }
+    policy = EvaluatorPolicy(
+        "apex-lm-eval-gsm8k-v2", "gsm8k", "utils/evals/gsm8k.yaml",
+        "c" * 64, "openai/gsm8k", "main", "d" * 40,
+        "exact_match,strict-match", 2248, 480,
+    )
+    benchmark["envs"].update(policy.env())
     projected = copy.deepcopy(benchmark)
     for field in ("docker_image", "profiler", "gap_analysis"):
         projected.pop(field)
@@ -447,7 +542,7 @@ def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
             "required": True,
             "kind": "lm_eval",
             "tasks": "gsm8k",
-            "evaluator_policy": None,
+            "evaluator_policy": policy.to_dict(),
         }
         if role == "diagnostic":
             benchmark_view["envs"]["RUN_EVAL"] = "false"
@@ -463,13 +558,13 @@ def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
                 "required": False,
                 "kind": "trace_only",
                 "tasks": "gsm8k",
-                "evaluator_policy": None,
+                "evaluator_policy": policy.to_dict(),
             }
         document = {
             "benchmark": benchmark_view,
             "apex": {
                 "benchmark_view": {
-                    "schema": "apex.benchmark-view.v1",
+                    "schema": "apex.benchmark-view.v2",
                     "kind": role,
                     "original_sha256": "a" * 64,
                     "workload_semantics_sha256": semantics,
@@ -487,6 +582,16 @@ def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
                             "commit": "3" * 40,
                         },
                     },
+                    "magpie_config_resolution": {
+                        "plan_schema": "apex.magpie-main-resolved-plan/v1",
+                        "plan_sha256": "4" * 64,
+                        "capability_schema": "apex.magpie-main-capability-receipt/v1",
+                        "capability_receipt_sha256": "5" * 64,
+                        "effective_config_sha256": "6" * 64,
+                        "scoring_config_sha256": "7" * 64,
+                        "phase_views_sha256": "8" * 64,
+                        "resolution_method_sha256": "9" * 64,
+                    },
                     "quality_contract": quality,
                 }
             },
@@ -499,8 +604,9 @@ def _configs(tmp_path: Path) -> tuple[dict[str, Path], str]:
 
 
 class FakeBenchmark:
-    def __init__(self, throughput: float) -> None:
+    def __init__(self, throughput: float, baseline_throughput: float = 100.0) -> None:
         self.throughput = throughput
+        self.baseline_throughput = baseline_throughput
         self.calls = []
 
     def run_normalized(self, request) -> NormalizedBenchmarkResult:
@@ -511,17 +617,32 @@ class FakeBenchmark:
         report.write_text('{"source":"magpie"}\n', encoding="utf-8")
         quality = workspace / "quality.json"
         quality.write_text('{"accuracy":1.0}\n', encoding="utf-8")
+        attestation = workspace / "execution_attestation.json"
+        attestation.write_text(
+            json.dumps({"run_id": request.run_id}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         distribution = LatencyDistribution(1.0, 1.0, 10.0, 0.0)
+        throughput = (
+            self.baseline_throughput
+            if "original" in request.config_path.name
+            else self.throughput
+        )
+        image_id = (
+            QWEN_PARENT_IMAGE_ID
+            if "original" in request.config_path.name
+            else DERIVED
+        )
         return NormalizedBenchmarkResult(
             schema_version=1,
             run_id=request.run_id,
             pass_type=request.pass_type,
             succeeded=True,
             framework="vllm",
-            model=QWEN_MODEL_ID,
+            model=MODEL_ID,
             workspace_path=workspace,
             report_path=report,
-            throughput=ThroughputMetrics(1.0, self.throughput, self.throughput, 32, 1.0),
+            throughput=ThroughputMetrics(1.0, throughput, throughput, 32, 1.0),
             latency=LatencyMetrics(distribution, distribution, distribution, distribution),
             quality=QualityEvidence(
                 True,
@@ -536,8 +657,8 @@ class FakeBenchmark:
             model_revision=ModelRevisionEvidence(
                 True,
                 True,
-                QWEN_MODEL_REVISION,
-                QWEN_MODEL_REVISION,
+                MODEL_REVISION,
+                MODEL_REVISION,
                 None,
             ),
             inferencex_runtime=InferenceXRuntimeEvidence(
@@ -549,9 +670,23 @@ class FakeBenchmark:
                 None,
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             ),
-            artifacts=(report, quality),
+            artifacts=(report, quality, attestation),
             errors=(),
             command_exit_code=0,
+            serving_runtime=ServingRuntimeEvidence(
+                True,
+                True,
+                sha256_file(request.config_path),
+                image_id,
+                image_id,
+                f"magpie-benchmark-{len(self.calls)}",
+                sha256_json({"run_id": request.run_id, "image": image_id}),
+                True,
+                None,
+                image_id,
+                image_id,
+                {"kind": "direct"},
+            ),
         )
 
 
@@ -588,7 +723,7 @@ class FakeImages:
             sbom.resolve(),
             (artifact,),
             (receipt,),
-            {"schema": "apex.qwen-source-build/v1"},
+            {"schema": "apex.e2e-python-source-build/v1"},
             {"verified": True},
         )
 
@@ -612,8 +747,8 @@ class FakeImages:
         )
 
 
-def _measurement(throughput: float, protocol: str, receipt: str) -> E2EMeasurement:
-    return E2EMeasurement(throughput, 10.0, 10.0, 1.0, 32, protocol, receipt, receipt)
+def _measurement(throughput: float, protocol: str, receipt: str) -> E2EObservation:
+    return E2EObservation(throughput, 10.0, 10.0, 1.0, 32, protocol, receipt, receipt)
 
 
 def _repository_receipt() -> RepositoryApplyReceipt:
@@ -638,7 +773,7 @@ def test_primary_build_and_independent_replay_require_real_receipts(
     configs, protocol = _configs(tmp_path)
     images = FakeImages()
     primary_benchmark = FakeBenchmark(102.0)
-    primary = QwenPrimarySourceBuilder(images, primary_benchmark)
+    primary = SourceImagePrimaryBuilder(images, primary_benchmark)
     request = PrimarySourceBuildRequest(
         "formal-run",
         STACK,
@@ -651,6 +786,7 @@ def test_primary_build_and_independent_replay_require_real_receipts(
         configs["replay"],
         _measurement(100.0, protocol, "baseline"),
         _measurement(101.0, protocol, "overlay"),
+        E2EAcceptancePolicy(),
         (tmp_path / "primary").resolve(),
     )
 
@@ -671,7 +807,7 @@ def test_primary_build_and_independent_replay_require_real_receipts(
     }
 
     repository_receipt = _repository_receipt()
-    independent = QwenIndependentSourceBuild(images).build(
+    independent = IndependentSourceImageBuild(images).build(
         SourceBuildRequest(
             "b" * 64,
             STACK,
@@ -691,12 +827,13 @@ def test_primary_build_and_independent_replay_require_real_receipts(
         output.derived_image.locator,
         True,
     )
-    replay = QwenIndependentReplay(FakeBenchmark(102.1)).replay(
+    replay = IndependentCleanReplay(FakeBenchmark(102.1)).replay(
         ReplayRequest(
             "b" * 64,
             STACK,
             output.environment_id,
             output.derived_image,
+            configs["original"],
             output.benchmark_replay,
             config_receipt,
             images.engage(

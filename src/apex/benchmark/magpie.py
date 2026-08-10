@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from apex.core import ContractError, sha256_file, validate_identifier
+from apex.core import ContractError, sha256_file, sha256_json, validate_identifier
 from apex.execution import (
     DOCKER_RUNTIME_ENVIRONMENT_KEYS,
     GPU_RUNTIME_ENVIRONMENT_KEYS,
@@ -16,10 +16,23 @@ from apex.execution import (
     SubprocessSupervisor,
     build_subprocess_environment,
 )
-from apex.ports import BenchmarkPass, BenchmarkRequest, BenchmarkResult
+from apex.ports import (
+    BenchmarkPass,
+    BenchmarkRequest,
+    BenchmarkResult,
+    MagpieAttestationRequest,
+    MagpieExecutionAttestor,
+    MagpieFormalMeasurementSupport,
+    RayExecutionContract,
+)
 from apex.runtime import DependencyReceipt, LmEvalRuntimeReceipt
 
 from .config_views import validate_resolved_view
+from .magpie_execution_lifecycle import (
+    prepare_magpie_execution,
+    run_magpie_execution,
+)
+from .magpie_attestation import UnavailableMagpieExecutionAttestor
 from .results import NormalizedBenchmarkResult, empty_result, parse_benchmark_report
 
 MAGPIE_HOST_RUNTIME_ENVIRONMENT_KEYS = (
@@ -30,9 +43,12 @@ MAGPIE_HOST_RUNTIME_ENVIRONMENT_KEYS = (
 @dataclass(frozen=True, slots=True)
 class _EvidenceExpectations:
     quality_required: bool
+    quality_kind: str
     evaluator_policy: Mapping[str, Any] | None
     config_sha256: str
+    gpu_lease_digest: str | None
     execution_mode: str
+    lifecycle: str
     requested_image: str | None
     lm_eval_runtime: LmEvalRuntimeReceipt | None
     lm_eval_mode: str | None
@@ -42,6 +58,50 @@ class _EvidenceExpectations:
     allow_tracelens_derivation: bool
     tracelens_commit: str | None
     tracelens_tree: str | None
+    ray_contract: RayExecutionContract | None
+    evaluator_endpoint_port: int
+    evaluator_concurrent_requests: int
+
+
+def _ray_contract(benchmark: Mapping[str, object]) -> RayExecutionContract | None:
+    if str(benchmark.get("run_mode", "docker")).strip().lower() != "ray":
+        return None
+    raw = benchmark.get("ray_config")
+    if not isinstance(raw, Mapping):
+        raise ContractError("Ray config is missing", "invalid_magpie_ray_config")
+    address = raw.get("cluster_address", "auto")
+    shared = raw.get("shared_storage_path")
+    multi_node = raw.get("multi_node", False)
+    num_nodes = raw.get("num_nodes", 1)
+    total_gpus = raw.get("total_num_gpus", 8)
+    per_node = raw.get("gpus_per_node", 8)
+    integers = (num_nodes, total_gpus, per_node)
+    valid_integers = all(
+        not isinstance(value, bool) and isinstance(value, int) and value > 0
+        for value in integers
+    )
+    if (
+        not isinstance(address, str)
+        or not address
+        or len(address) > 2048
+        or any(character.isspace() for character in address)
+        or not isinstance(shared, str)
+        or not Path(shared).is_absolute()
+        or Path(shared) == Path("/")
+        or not isinstance(multi_node, bool)
+        or not valid_integers
+        or (not multi_node and num_nodes != 1)
+    ):
+        raise ContractError("Ray config is invalid", "invalid_magpie_ray_config")
+    return RayExecutionContract(
+        address,
+        Path(shared),
+        sha256_json(dict(raw)),
+        multi_node,
+        num_nodes,
+        total_gpus,
+        per_node,
+    )
 
 
 def _lm_eval_expectation(
@@ -56,7 +116,7 @@ def _lm_eval_expectation(
     if not required or kind != "lm_eval":
         return None, None
     mode = str(benchmark.get("run_mode", "docker")).strip().lower()
-    return receipt.lm_eval_runtime, mode
+    return receipt.lm_eval_runtime, "local" if mode == "ray" else mode
 
 
 def _dependency_tree(receipt: DependencyReceipt, name: str) -> str | None:
@@ -68,6 +128,31 @@ def _dependency_tree(receipt: DependencyReceipt, name: str) -> str | None:
         return None
     tree = dependency.get("tree")
     return tree if isinstance(tree, str) else None
+
+
+def _enabled(value: object) -> bool:
+    return value is True or value == 1 or (
+        isinstance(value, str)
+        and value.strip().lower() in {"1", "true", "yes", "on"}
+    )
+
+
+def _positive_int(value: object, *, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ContractError("Evaluator integer input is invalid", "invalid_evaluator_policy")
+    text = str(value)
+    if not text.isdigit() or text.startswith("0"):
+        raise ContractError("Evaluator integer input is invalid", "invalid_evaluator_policy")
+    return int(text)
+
+
+def _lifecycle(benchmark: Mapping[str, object]) -> str:
+    value = benchmark.get("server_lifecycle")
+    if not isinstance(value, Mapping) or not _enabled(value.get("enabled")):
+        return "one_shot"
+    return "cleanup" if _enabled(value.get("cleanup")) else "reuse"
 
 
 def _allows_tracelens_derivation(
@@ -104,11 +189,44 @@ class MagpieBenchmarkAdapter:
         self,
         dependency_receipt: DependencyReceipt,
         supervisor: SubprocessSupervisor | None = None,
+        execution_attestor: MagpieExecutionAttestor | None = None,
     ) -> None:
         self._receipt = dependency_receipt
         self._magpie_root = dependency_receipt.root("magpie").resolve()
         self._tracelens_root = dependency_receipt.root("tracelens").resolve()
         self._supervisor = supervisor or SubprocessSupervisor()
+        self._execution_attestor = (
+            execution_attestor or UnavailableMagpieExecutionAttestor()
+        )
+
+    @property
+    def execution_available(self) -> bool:
+        """Whether preflight has a trusted observer that can permit execution."""
+
+        return self._execution_attestor.is_available
+
+    def supports_execution(self, execution_mode: str, lifecycle: str) -> bool:
+        supports = getattr(self._execution_attestor, "supports", None)
+        return bool(
+            self.execution_available
+            and (supports(execution_mode, lifecycle) if supports else True)
+        )
+
+    def formal_measurement_support(
+        self, execution_mode: str, lifecycle: str
+    ) -> MagpieFormalMeasurementSupport:
+        """Return observer-owned support for quality plus normal measurement."""
+
+        if not self.supports_execution(execution_mode, lifecycle):
+            return MagpieFormalMeasurementSupport(
+                False,
+                "magpie_execution_attestor_unavailable",
+                None,
+                ("magpie_execution_attestor_unavailable",),
+            )
+        return self._execution_attestor.formal_measurement_support(
+            execution_mode, lifecycle
+        )
 
     def _environment(self, overrides: Mapping[str, str]) -> dict[str, str]:
         return build_subprocess_environment(
@@ -148,17 +266,15 @@ class MagpieBenchmarkAdapter:
             ) from error
         return run_root.resolve()
 
-    @staticmethod
-    def _find_report(run_root: Path) -> tuple[Path | None, str | None]:
-        reports = tuple(sorted(run_root.rglob("benchmark_report.json")))
-        if not reports:
-            return None, "benchmark_report_missing"
-        if len(reports) != 1:
-            return None, "ambiguous_benchmark_reports"
-        report = reports[0]
-        if report.is_symlink():
-            return None, "unsafe_benchmark_report"
-        return report.resolve(), None
+    def _find_report(self, session: object) -> tuple[Path | None, str | None]:
+        try:
+            location = self._execution_attestor.locate_report(session)
+        except Exception as error:
+            return (
+                None,
+                f"magpie_report_location_failed:{type(error).__name__}:{error}",
+            )
+        return location.path, location.error
 
     def _benchmark_argv(
         self, request: BenchmarkRequest, run_root: Path
@@ -196,13 +312,20 @@ class MagpieBenchmarkAdapter:
         )
         return _EvidenceExpectations(
             quality_required=bool(quality.get("required", True)),
+            quality_kind=str(quality.get("kind", "")),
             evaluator_policy=(
                 evaluator_policy
                 if isinstance(evaluator_policy, Mapping)
                 else None
             ),
             config_sha256=sha256_file(request.config_path),
+            gpu_lease_digest=(
+                sha256_json(request.gpu_lease)
+                if mode in {"local", "ray"} and isinstance(request.gpu_lease, Mapping)
+                else None
+            ),
             execution_mode=mode,
+            lifecycle=_lifecycle(benchmark),
             requested_image=(
                 str(image)
                 if mode == "docker" and isinstance(image, str)
@@ -228,6 +351,15 @@ class MagpieBenchmarkAdapter:
                 if allow_tracelens_derivation
                 else None
             ),
+            ray_contract=_ray_contract(benchmark),
+            evaluator_endpoint_port=_positive_int(
+                envs.get("PORT") if isinstance(envs, Mapping) else None,
+                default=8888,
+            ),
+            evaluator_concurrent_requests=_positive_int(
+                envs.get("CONC") if isinstance(envs, Mapping) else None,
+                default=64,
+            ),
         )
 
     @staticmethod
@@ -248,6 +380,7 @@ class MagpieBenchmarkAdapter:
             expected_lm_eval_runtime=expectations.lm_eval_runtime,
             expected_lm_eval_execution_mode=expectations.lm_eval_mode,
             expected_config_sha256=expectations.config_sha256,
+            expected_gpu_lease_digest=expectations.gpu_lease_digest,
             expected_requested_image=expectations.requested_image,
             expected_execution_mode=expectations.execution_mode,
         )
@@ -258,6 +391,7 @@ class MagpieBenchmarkAdapter:
         expectations: _EvidenceExpectations,
         process: ProcessResult,
         report: Path,
+        execution_attestation_path: Path,
     ) -> NormalizedBenchmarkResult:
         if sha256_file(request.config_path) != expectations.config_sha256:
             return self._empty(
@@ -272,6 +406,7 @@ class MagpieBenchmarkAdapter:
             run_id=request.run_id,
             pass_type=request.pass_type,
             quality_required=expectations.quality_required,
+            expected_quality_kind=expectations.quality_kind,
             command_exit_code=process.exit_code,
             timed_out=process.timed_out,
             expected_model=expectations.model,
@@ -283,40 +418,146 @@ class MagpieBenchmarkAdapter:
             expected_lm_eval_execution_mode=expectations.lm_eval_mode,
             expected_evaluator_policy=expectations.evaluator_policy,
             expected_config_sha256=expectations.config_sha256,
+            expected_gpu_lease_digest=expectations.gpu_lease_digest,
             expected_requested_image=expectations.requested_image,
             expected_execution_mode=expectations.execution_mode,
+            expected_lifecycle=expectations.lifecycle,
             allow_tracelens_derivation=expectations.allow_tracelens_derivation,
             expected_tracelens_commit=expectations.tracelens_commit,
             expected_tracelens_tree=expectations.tracelens_tree,
+            execution_attestation_path=execution_attestation_path,
         )
+
+    @staticmethod
+    def _not_started() -> ProcessResult:
+        return ProcessResult(
+            argv=(),
+            exit_code=None,
+            timed_out=False,
+            stdout="",
+            stderr="",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            duration_seconds=0.0,
+        )
+
+    def _prepare_attestor(
+        self,
+        request: BenchmarkRequest,
+        expectations: _EvidenceExpectations,
+        run_root: Path,
+        argv: tuple[str, ...],
+    ) -> object:
+        return self._execution_attestor.prepare(
+            MagpieAttestationRequest(
+                run_id=request.run_id,
+                pass_type=request.pass_type,
+                config_path=request.config_path.resolve(),
+                run_root=run_root,
+                benchmark_argv=argv,
+                config_sha256=expectations.config_sha256,
+                execution_mode=expectations.execution_mode,
+                lifecycle=expectations.lifecycle,
+                requested_image=expectations.requested_image,
+                gpu_lease=request.gpu_lease,
+                ray_contract=expectations.ray_contract,
+                evaluator_policy=expectations.evaluator_policy,
+                evaluator_policy_lock=(
+                    self._receipt.evaluator_policy.to_dict()
+                    if self._receipt.evaluator_policy is not None
+                    else None
+                ),
+                lm_eval_runtime=(
+                    expectations.lm_eval_runtime.to_dict()
+                    if expectations.lm_eval_runtime is not None
+                    else None
+                ),
+                model=expectations.model,
+                evaluator_endpoint_port=expectations.evaluator_endpoint_port,
+                evaluator_concurrent_requests=(
+                    expectations.evaluator_concurrent_requests
+                ),
+                evaluator_timeout_seconds=min(request.timeout_seconds, 3600),
+            )
+        )
+
+    def _execution_inputs(
+        self, request: BenchmarkRequest
+    ) -> tuple[Path, tuple[str, ...]]:
+        run_root = self._run_root(request)
+        return run_root, self._benchmark_argv(request, run_root)
 
     def run_normalized(self, request: BenchmarkRequest) -> NormalizedBenchmarkResult:
         """Run Magpie and return the typed result used by E2E policy."""
         document = validate_resolved_view(
-            request.config_path,
-            pass_type=request.pass_type,
+            request.config_path, pass_type=request.pass_type,
             dependency_receipt=self._receipt,
         )
         expectations = self._expectations(request, document)
-        run_root = self._run_root(request)
-        process = self._supervisor.run(
-            self._benchmark_argv(request, run_root),
+        if not self._execution_attestor.is_available:
+            return self._empty(
+                request, expectations, self._not_started(),
+                request.output_dir / request.run_id / request.pass_type.value,
+                "magpie_execution_attestor_unavailable",
+            )
+        run_root, argv = self._execution_inputs(request)
+        attestor_session, launch_argv, preparation_error = prepare_magpie_execution(
+            self._execution_attestor,
+            lambda: self._prepare_attestor(request, expectations, run_root, argv),
+            argv,
+        )
+        if preparation_error is not None:
+            return self._empty(
+                request, expectations, self._not_started(), run_root,
+                preparation_error,
+            )
+        assert attestor_session is not None and launch_argv is not None
+        process, launch_error = run_magpie_execution(
+            self._execution_attestor,
+            self._supervisor,
+            attestor_session,
+            launch_argv,
             cwd=self._magpie_root,
             environment=self._environment(request.environment),
             timeout_seconds=request.timeout_seconds,
         )
-        report, discovery_error = self._find_report(run_root)
+        if process is None:
+            assert launch_error is not None
+            return self._empty(
+                request, expectations, self._not_started(), run_root, launch_error
+            )
+        report, discovery_error = self._find_report(attestor_session)
+        try:
+            execution_attestation_path = self._execution_attestor.complete(
+                attestor_session,
+                report_path=report,
+                command_exit_code=process.exit_code,
+                timed_out=process.timed_out,
+            )
+        except Exception as error:
+            return self._empty(
+                request,
+                expectations,
+                process,
+                report.parent if report else run_root,
+                f"magpie_execution_attestor_complete_failed:{type(error).__name__}:{error}",
+            )
         if report is None:
             error = discovery_error or "benchmark_report_missing"
             if process.timed_out:
                 error = "benchmark_process_timeout"
             elif process.exit_code not in (0, None):
                 error = f"benchmark_process_exit_{process.exit_code}"
+            return self._empty(request, expectations, process, run_root, error)
+        if execution_attestation_path is None:
             return self._empty(
-                request, expectations, process, run_root, error
+                request, expectations, process, report.parent,
+                "magpie_execution_attestation_missing",
             )
         try:
-            return self._parse_report(request, expectations, process, report)
+            return self._parse_report(
+                request, expectations, process, report, execution_attestation_path,
+            )
         except Exception as error:
             return self._empty(
                 request,

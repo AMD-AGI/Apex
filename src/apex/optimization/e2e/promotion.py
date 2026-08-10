@@ -11,11 +11,11 @@ from apex.benchmark import NormalizedBenchmarkResult
 from apex.core import ContractError, IntegrityError, sha256_file
 from apex.evaluation import (
     E2EAcceptancePolicy,
-    E2EMeasurement,
-    E2EVerdict,
-    e2e_comparison_selection_policy,
-    evaluate_current_anchor,
-    select_conservative_e2e_verdict,
+    E2EObservation,
+    E2EPairedMeasurement,
+    E2EPairedVerdict,
+    E2EPairedWindow,
+    evaluate_paired_current_anchor,
 )
 from apex.runtime import GpuLeaseReceipt
 from apex.storage import ArtifactReceipt
@@ -39,7 +39,7 @@ class PromotionObservation:
     position: int
     side: str
     action_id: str
-    measurement: E2EMeasurement
+    measurement: E2EObservation
     normalized: ArtifactReceipt
     quality: ArtifactReceipt
     config: ArtifactReceipt
@@ -62,10 +62,10 @@ class PromotionObservation:
 
 @dataclass(frozen=True, slots=True)
 class MatchedPromotion:
-    """Evaluator-owned AB/BA comparison and its canonical CAS identity."""
+    """Evaluator-owned multi-window ABBA comparison and canonical CAS identity."""
 
     pair_id: str
-    window_id: str
+    window_ids: tuple[str, ...]
     attempt_id: str
     candidate_id: str
     opportunity_id: str
@@ -78,20 +78,19 @@ class MatchedPromotion:
     anchor_image: Mapping[str, str | None]
     candidate_image: Mapping[str, str | None]
     observations: tuple[PromotionObservation, ...]
-    comparisons: tuple[E2EVerdict, E2EVerdict]
-    selected_comparison: int
-    verdict: E2EVerdict
+    measurement: E2EPairedMeasurement
+    verdict: E2EPairedVerdict
     receipt: ArtifactReceipt
 
     @property
-    def primary_measurement(self) -> E2EMeasurement:
-        return self.observations[1 if self.selected_comparison == 0 else 2].measurement
+    def primary_measurement(self) -> E2EObservation:
+        return next(item.measurement for item in reversed(self.observations) if item.side == "candidate")
 
     def document(self) -> dict[str, Any]:
         return {
-            "schema": "apex.e2e-matched-promotion/v2",
+            "schema": "apex.e2e-paired-promotion/v1",
             "pair_id": self.pair_id,
-            "window_id": self.window_id,
+            "window_ids": list(self.window_ids),
             "attempt_id": self.attempt_id,
             "candidate_id": self.candidate_id,
             "opportunity_id": self.opportunity_id,
@@ -99,15 +98,13 @@ class MatchedPromotion:
             "anchor_generation": self.anchor_generation,
             "gpu_lease_digest": self.gpu_lease_digest,
             "gpu_device_scope": self.gpu_device_scope,
-            "order": list(_ORDER),
+            "window_order": list(_ORDER),
             "anchor_config_sha256": self.anchor_config_sha256,
             "candidate_config_sha256": self.candidate_config_sha256,
             "anchor_image": dict(self.anchor_image),
             "candidate_image": dict(self.candidate_image),
             "observations": [item.to_dict() for item in self.observations],
-            "comparisons": [item.to_dict() for item in self.comparisons],
-            "selection_policy": e2e_comparison_selection_policy(),
-            "selected_comparison": self.selected_comparison,
+            "measurement": self.measurement.to_dict(),
             "verdict": self.verdict.to_dict(),
         }
 
@@ -133,7 +130,7 @@ class _WindowRequest:
 
 
 class MatchedPromotionRunner:
-    """Run one counterbalanced matched window under the caller-held GPU lease."""
+    """Run frozen counterbalanced matched windows under one caller-held GPU lease."""
 
     def __init__(
         self,
@@ -171,14 +168,21 @@ class MatchedPromotionRunner:
             state.anchor_generation,
         )
         sequence = state.sequence
-        window_id = f"window-{attempt_id}-{sequence}"
+        window_ids = tuple(
+            f"window-{attempt_id}-{sequence}-{index}"
+            for index in range(self.policy.min_paired_windows)
+        )
         observations: list[PromotionObservation] = []
-        for position, side in enumerate(_ORDER):
-            observed = self._observe(request, window_id, position, side)
-            if isinstance(observed, PromotionRunResult):
-                return observed
-            observations.append(observed)
-        promotion = self._complete(request, window_id, tuple(observations))
+        for window_id in window_ids:
+            for local_position, side in enumerate(_ORDER):
+                position = len(observations)
+                observed = self._observe(
+                    request, window_id, position, local_position, side
+                )
+                if isinstance(observed, PromotionRunResult):
+                    return observed
+                observations.append(observed)
+        promotion = self._complete(request, window_ids, tuple(observations))
         return PromotionRunResult(promotion, promotion.receipt, promotion.verdict.reason_code)
 
     def _observe(
@@ -186,9 +190,10 @@ class MatchedPromotionRunner:
         request: _WindowRequest,
         window_id: str,
         position: int,
+        local_position: int,
         side: str,
     ) -> PromotionObservation | PromotionRunResult:
-        action_id = f"promotion-{request.attempt_id}-{window_id}-{_SLOTS[position]}"
+        action_id = f"promotion-{request.attempt_id}-{window_id}-{_SLOTS[local_position]}"
         config = (
             request.anchor_config
             if side == "anchor"
@@ -201,6 +206,10 @@ class MatchedPromotionRunner:
             attempt_id=request.attempt_id,
             candidate_id=request.candidate_id,
             opportunity_id=request.opportunity_id,
+            server_owner_kind=("anchor" if side == "anchor" else "candidate"),
+            server_owner_id=(
+                request.anchor_id if side == "anchor" else request.candidate_id
+            ),
         )
         expected_image = (
             request.anchor_image_id
@@ -220,6 +229,8 @@ class MatchedPromotionRunner:
             result, evidence, config, expected_config, expected_image, side
         )
         if not result.succeeded:
+            if _trusted_quality_gate_failure(result, side):
+                return PromotionRunResult(None, evidence.normalized, "quality_gate_failed")
             return PromotionRunResult(
                 None, evidence.normalized, "candidate_e2e_measurement_failed"
             )
@@ -249,26 +260,35 @@ class MatchedPromotionRunner:
     def _complete(
         self,
         request: _WindowRequest,
-        window_id: str,
+        window_ids: tuple[str, ...],
         observations: tuple[PromotionObservation, ...],
     ) -> MatchedPromotion:
-        _validate_observation_set(observations)
-        comparisons = (
-            evaluate_current_anchor(
-                observations[0].measurement, observations[1].measurement, self.policy
-            ),
-            evaluate_current_anchor(
-                observations[3].measurement, observations[2].measurement, self.policy
-            ),
+        _validate_observation_set(observations, self.policy.min_paired_windows)
+        windows = tuple(
+            E2EPairedWindow(
+                window_id,
+                observations[offset].measurement,
+                observations[offset + 1].measurement,
+                observations[offset + 2].measurement,
+                observations[offset + 3].measurement,
+            )
+            for offset, window_id in zip(
+                range(0, len(observations), len(_ORDER)), window_ids, strict=True
+            )
         )
-        selected = select_conservative_e2e_verdict(comparisons)
+        measurement = E2EPairedMeasurement(
+            windows,
+            self.policy.digest,
+            self.policy.min_paired_windows,
+        )
+        verdict = evaluate_paired_current_anchor(measurement, self.policy)
         anchor_image = _side_image(observations, "anchor")
         candidate_image = _side_image(observations, "candidate")
         pair_id = f"pair-{request.attempt_id}-{self.record.controller.state.sequence}"
         placeholder = ArtifactReceipt("", 0, "application/json", "")
         value = MatchedPromotion(
             pair_id,
-            window_id,
+            window_ids,
             request.attempt_id,
             request.candidate_id,
             request.opportunity_id,
@@ -281,9 +301,8 @@ class MatchedPromotionRunner:
             anchor_image,
             candidate_image,
             observations,
-            comparisons,
-            selected,
-            comparisons[selected],
+            measurement,
+            verdict,
             placeholder,
         )
         receipt = self.record.put_json(value.document())
@@ -341,12 +360,43 @@ def _runtime_identity(
     return runtime.requested_image, runtime.resolved_image_id
 
 
+def _trusted_quality_gate_failure(
+    result: NormalizedBenchmarkResult,
+    side: str,
+) -> bool:
+    """Accept only an attributable evaluator hard failure, never missing evidence."""
+
+    runtime = result.serving_runtime
+    return (
+        side == "candidate"
+        and result.pass_type is BenchmarkPass.MEASUREMENT
+        and result.command_exit_code == 0
+        and not result.timed_out
+        and not result.profiling_enabled
+        and result.run_kind == "measurement"
+        and result.reward_eligible
+        and result.errors == ("quality_gate_not_passed",)
+        and result.quality.required
+        and not result.quality.passed
+        and result.quality.hard_failure
+        and result.quality.error == "quality_gate_not_passed"
+        and runtime.required
+        and runtime.passed
+        and runtime.process_succeeded is True
+    )
+
+
 def _validate_observation_set(
     observations: tuple[PromotionObservation, ...],
+    window_count: int,
 ) -> None:
-    if len(observations) != 4 or tuple(item.side for item in observations) != _ORDER:
+    expected_order = _ORDER * window_count
+    if (
+        len(observations) != len(expected_order)
+        or tuple(item.side for item in observations) != expected_order
+    ):
         raise IntegrityError("Matched promotion order differs", "promotion_order_mismatch")
-    if tuple(item.position for item in observations) != tuple(range(4)):
+    if tuple(item.position for item in observations) != tuple(range(len(expected_order))):
         raise IntegrityError("Matched promotion positions differ", "promotion_order_mismatch")
     for side in ("anchor", "candidate"):
         values = tuple(item for item in observations if item.side == side)
@@ -379,7 +429,7 @@ def _record_pair(
 ) -> None:
     lease = record.put_json(gpu_lease.to_dict())
     artifacts = [
-        _binding("matched_promotion_pair", promotion.receipt),
+        _binding("paired_promotion", promotion.receipt),
         _binding("promotion_gpu_lease", lease),
     ]
     for item in promotion.observations:
@@ -399,15 +449,16 @@ def _record_pair(
             "opportunity_id": promotion.opportunity_id,
             "anchor_id": promotion.anchor_id,
             "anchor_generation": promotion.anchor_generation,
-            "measurement_kind": "matched_promotion_ab_ba",
+            "measurement_kind": "paired_promotion_abba",
             "pair_id": promotion.pair_id,
-            "window_id": promotion.window_id,
+            "window_ids": list(promotion.window_ids),
+            "paired_measurement_id": promotion.measurement.digest,
             "gpu_lease_digest": promotion.gpu_lease_digest,
-            "order": list(_ORDER),
+            "window_order": list(_ORDER),
             "verdict": promotion.verdict.to_dict(),
             "artifacts": artifacts,
         },
-        idempotency_key=f"attempt.{promotion.attempt_id}.promotion_pair",
+        idempotency_key=f"attempt.{promotion.attempt_id}.paired_promotion",
     )
 
 

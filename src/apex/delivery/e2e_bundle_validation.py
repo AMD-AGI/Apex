@@ -43,6 +43,7 @@ def validate_final_verification_mapping(
         measurement_sha=measurement_sha,
         replay_sha=replay_sha,
         semantics_sha=semantics_sha,
+        source_materialization_sha=sha256_json(value["repository_receipts"]),
     )
     _validate_build_steps(build, recipe)
     _validate_loaded_bytes(build, engagement, locks, primary)
@@ -130,6 +131,7 @@ def _validate_receipt_lineage(
     measurement_sha,
     replay_sha,
     semantics_sha,
+    source_materialization_sha,
 ) -> None:
     build_ok = all(
         (
@@ -163,14 +165,30 @@ def _validate_receipt_lineage(
             config.get("unchanged_except_image_locator") is True,
         )
     )
-    if not all((build_ok, engagement_ok, config_ok, _replay_lineage_ok(replay, digest, image, primary, replay_sha))):
+    if not all(
+        (
+            build_ok,
+            engagement_ok,
+            config_ok,
+            _replay_lineage_ok(
+                replay,
+                digest,
+                image,
+                primary,
+                replay_sha,
+                source_materialization_sha,
+            ),
+        )
+    ):
         raise IntegrityError(
             "Serialized clean replay evidence is inconsistent",
             "invalid_clean_replay_receipt",
         )
 
 
-def _replay_lineage_ok(replay, digest, image, primary, replay_sha) -> bool:
+def _replay_lineage_ok(
+    replay, digest, image, primary, replay_sha, source_materialization_sha
+) -> bool:
     required_true = (
         "fresh_source_materialization",
         "fresh_runtime",
@@ -188,8 +206,61 @@ def _replay_lineage_ok(replay, digest, image, primary, replay_sha) -> bool:
             replay.get("image_digest") == image.image_digest,
             replay.get("replay_config_sha256") == replay_sha,
             replay.get("source_stack_sha256") == primary.source_stack_sha256,
+            replay.get("source_materialization_sha256")
+            == source_materialization_sha,
+            replay.get("primary_runtime_identity_sha256")
+            == primary.runtime_identity_sha256,
+            _fresh_runtime_identities(replay),
+            _valid_replay_artifact_bindings(replay),
             all(replay.get(field) is True for field in required_true),
         )
+    )
+
+
+def _fresh_runtime_identities(replay: Mapping[str, Any]) -> bool:
+    primary = replay.get("primary_runtime_identity_sha256")
+    identities = replay.get("replay_runtime_identity_sha256s")
+    raw = replay.get("paired_measurement", {}).get("raw_measurement_receipts")
+    return bool(
+        isinstance(primary, str)
+        and isinstance(identities, list)
+        and isinstance(raw, list)
+        and len(identities) == len(raw)
+        and len(set(identities)) == len(identities)
+        and primary not in identities
+        and replay.get("fresh_runtime") is True
+    )
+
+
+def _valid_replay_artifact_bindings(replay: Mapping[str, Any]) -> bool:
+    measurement = replay.get("paired_measurement")
+    artifacts = replay.get("raw_artifacts")
+    if not isinstance(measurement, Mapping) or not isinstance(artifacts, list):
+        return False
+    raw = measurement.get("raw_measurement_receipts")
+    if not isinstance(raw, list):
+        return False
+    reports = [
+        item.get("measurement_receipt")
+        for item in artifacts
+        if isinstance(item, Mapping) and item.get("role") == "benchmark_report"
+    ]
+    attestations = [
+        item.get("measurement_receipt")
+        for item in artifacts
+        if isinstance(item, Mapping)
+        and item.get("role") == "execution_attestation"
+    ]
+    keys = [
+        (item.get("role"), item.get("relative_path"), item.get("measurement_receipt"))
+        for item in artifacts
+        if isinstance(item, Mapping)
+    ]
+    return bool(
+        len(keys) == len(artifacts)
+        and len(set(keys)) == len(keys)
+        and sorted(reports) == sorted(raw)
+        and sorted(attestations) == sorted(raw)
     )
 
 
@@ -255,6 +326,25 @@ def _validate_loaded_bytes(build, engagement, locks, primary) -> None:
             "Runtime loaded old or unexpected bytes",
             "loaded_byte_engagement_failed",
         )
+    policies = {
+        item.runtime_component: (item.engagement_kind, item.build_id_required)
+        for item in locks
+    }
+    for item in loaded:
+        policy = policies.get(item.get("component")) if isinstance(item, Mapping) else None
+        if (
+            policy is None
+            or item.get("engagement_kind") != policy[0]
+            or policy[1]
+            and (
+                not item.get("expected_build_id")
+                or not item.get("observed_build_id")
+            )
+        ):
+            raise IntegrityError(
+                "Loaded artifact violates its component engagement capability",
+                "loaded_byte_engagement_failed",
+            )
 
 
 def _verified_loaded_keys(loaded) -> set[tuple[Any, ...]]:

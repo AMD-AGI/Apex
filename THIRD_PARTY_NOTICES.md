@@ -21,3 +21,12 @@ licensed under the MIT License (Copyright 2020 EleutherAI). Apex does not vendor
 its source. The runtime producer downloads the exact reviewed archive, verifies
 its Git tree, and builds the locked wheel into a content-addressed local runtime;
 the upstream license is retained inside that wheel's distribution metadata.
+
+## AgentKernelArena task inputs
+
+The three pending task-input snapshots under `examples/optimization_showcases/`
+originate from [AMD-AGI/AgentKernelArena commit `1292b453`](https://github.com/AMD-AGI/AgentKernelArena/tree/1292b4531fad8bed02c0ecc292704c44cb63c49a),
+licensed under Apache-2.0. Each template retains the complete upstream license,
+per-file hashes, task-tree identity, source path, import date, and a modified-file
+notice. Apex does not copy AgentKernelArena runners, Forge adapters, scorers,
+validators, hidden tests, optimized vLLM/AITER source, or historical results.

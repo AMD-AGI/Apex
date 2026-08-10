@@ -13,7 +13,7 @@ from apex.storage import ArtifactReceipt
 from .benchmarking import Diagnosis
 from .candidate import E2ECandidate
 from .kernel_lane import KernelOpportunity
-from .outcomes import commit_e2e_reject
+from .outcomes import commit_quality_gate_failure, commit_untrainable_e2e_outcome
 from .run_record import E2ERunRecord
 from .services import (
     AcceptedCandidate,
@@ -222,7 +222,7 @@ def promotion_receipts(
         "micro_receipt": attempt.micro_receipt.digest,
         "safety_receipt": attempt.safety_receipt.digest,
         "delivery_receipt": attempt.delivery_receipt.digest,
-        "promotion_pair_receipt": promotion_receipt.digest,
+        "paired_promotion_receipt": promotion_receipt.digest,
     }
 
 
@@ -234,19 +234,19 @@ def promotion_artifacts(
         ("micro_qualification", attempt.micro_receipt),
         ("safety_qualification", attempt.safety_receipt),
         ("primary_delivery", attempt.delivery_receipt),
-        ("matched_promotion_pair", promotion_receipt),
+        ("paired_promotion", promotion_receipt),
     )
 
 
-def commit_qualified_reject(
+def commit_measurement_null(
     record: E2ERunRecord,
     attempt: QualifiedAttempt,
     benchmark_receipt: ArtifactReceipt,
     reason: str,
 ) -> None:
-    """Close a fully qualified attempt whose E2E measurement cannot win."""
+    """Close an evidence-invalid measurement as reward=null and untrainable."""
 
-    commit_e2e_reject(
+    commit_untrainable_e2e_outcome(
         record,
         attempt_id=attempt.attempt_id,
         opportunity_id=attempt.opportunity.opportunity_id,
@@ -258,11 +258,35 @@ def commit_qualified_reject(
     )
 
 
+def commit_failed_promotion(
+    record: E2ERunRecord,
+    attempt: QualifiedAttempt,
+    benchmark_receipt: ArtifactReceipt,
+    reason: str,
+) -> None:
+    """Commit the only scored early stop, otherwise preserve reward=null."""
+
+    if reason != "quality_gate_failed":
+        commit_measurement_null(record, attempt, benchmark_receipt, reason)
+        return
+    commit_quality_gate_failure(
+        record,
+        attempt_id=attempt.attempt_id,
+        opportunity_id=attempt.opportunity.opportunity_id,
+        candidate_id=candidate_id(attempt.candidate),
+        candidate_manifest=attempt.candidate_receipt,
+        safety_certified=attempt.safety.safety_certified,
+        evidence_receipts=qualified_receipts(attempt, benchmark_receipt),
+        evidence_artifacts=qualified_artifacts(attempt, benchmark_receipt),
+    )
+
+
 __all__ = [
     "QualifiedAttempt",
     "candidate_configs",
     "candidate_id",
-    "commit_qualified_reject",
+    "commit_failed_promotion",
+    "commit_measurement_null",
     "opportunity_map",
     "promotion_artifacts",
     "promotion_receipts",

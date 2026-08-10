@@ -15,7 +15,7 @@ from apex.core import (
     sha256_file,
 )
 from apex.evaluation import (
-    E2EMeasurement,
+    E2EObservation,
     GateVerdict,
     GradeAggregation,
     KernelGrade,
@@ -190,7 +190,7 @@ def recover_measurement(
     *,
     protocol_hash: str,
     quality_receipt: ArtifactReceipt,
-) -> E2EMeasurement:
+) -> E2EObservation:
     value = read_json_object(record, receipt, label="benchmark measurement")
     if value.get("succeeded") is not True or value.get("pass_type") != "measurement":
         raise IntegrityError("Measurement did not succeed", "invalid_measurement_receipt")
@@ -210,7 +210,7 @@ def recover_measurement(
     selected = total if total is not None else throughput.get("output_tokens_per_second")
     metrics = quality.get("metrics")
     primary = _primary_quality(metrics)
-    return E2EMeasurement(
+    return E2EObservation(
         throughput=_float(selected, "throughput"),
         ttft_p99_ms=_latency_p99(latency, "ttft"),
         tpot_p99_ms=_latency_p99(latency, "tpot"),
@@ -230,7 +230,7 @@ def recover_measurement_result(
     *,
     protocol_hash: str,
     quality_receipt: ArtifactReceipt,
-) -> E2EMeasurement | None:
+) -> E2EObservation | None:
     """Recover a successful measurement, or preserve a proven failed result."""
 
     value = read_json_object(record, receipt, label="benchmark measurement")

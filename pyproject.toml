@@ -13,9 +13,11 @@ license-files = [
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
   "tools/perf_knowledge/LICENSE.upstream",
+  "examples/optimization_showcases/*/template/LICENSE.agent-kernel-arena",
 ]
 authors = [{ name = "Advanced Micro Devices, Inc." }]
 dependencies = [
+  "mcp>=1.27,<2",
   "PyYAML>=6.0",
 ]
 
@@ -39,6 +41,13 @@ where = ["src"]
   "data/cards.json",
   "data/LICENSE.GEAK-Apache-2.0",
   "data/THIRD_PARTY_NOTICES.md",
+]
+"apex.intake" = ["data/kernel_template_registry.json"]
+"apex.execution" = [
+  "plugins/apex-amd-kernel/.codex-plugin/plugin.json",
+  "plugins/apex-amd-kernel/.claude-plugin/plugin.json",
+  "plugins/apex-amd-kernel/skills/*/SKILL.md",
+  "plugins/apex-amd-kernel/skills/*/agents/openai.yaml",
 ]
 
 [tool.pytest.ini_options]

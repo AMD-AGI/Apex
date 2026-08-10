@@ -97,6 +97,43 @@ def test_task_result_serializes_standalone_lineage_without_changing_bundle() -> 
     assert value["bundle_digest"] == "a" * 64
 
 
+def test_task_result_validates_frozen_evaluation_contract_receipt() -> None:
+    result = TaskResult(
+        schema_version=1,
+        run_id="run-test",
+        task_id="kernel-task",
+        status=TaskStatus.CANDIDATE_READY,
+        reason_code="verified_candidate",
+        applied=False,
+        external_verification_required=True,
+        bundle_path="/results/bundle",
+        bundle_digest="a" * 64,
+        changed_files=("source/kernel.py",),
+        evaluation_contract_status="verified",
+        evaluation_contract_receipt_digest="b" * 64,
+        evaluation_authority_id="reviewed-template-v1",
+        evaluation_authority_kind="reviewed_template",
+    )
+
+    assert result.to_dict()["evaluation_contract_status"] == "verified"
+
+    with pytest.raises(ValueError, match="requires its receipt digest"):
+        TaskResult(
+            schema_version=1,
+            run_id="run-test",
+            task_id="kernel-task",
+            status=TaskStatus.INVALID_REQUEST,
+            reason_code="evaluation_authority_missing",
+            applied=False,
+            external_verification_required=True,
+            bundle_path=None,
+            bundle_digest=None,
+            changed_files=(),
+            evaluation_contract_status="unverified",
+            evaluation_contract_unverified_reason="evaluation_authority_missing",
+        )
+
+
 def test_task_result_requires_receipts_for_evaluated_safety() -> None:
     with pytest.raises(ValueError, match="requires exact result receipts"):
         TaskResult(

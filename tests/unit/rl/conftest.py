@@ -28,6 +28,10 @@ from apex.storage import (
     EventJournal,
     derive_event_id,
 )
+from tests.support.gpu_evidence import (
+    SyntheticGpuMeasurementGuard,
+    synthetic_gpu_lease,
+)
 
 
 def artifact_binding(role: str, receipt: ArtifactReceipt) -> dict[str, object]:
@@ -175,6 +179,14 @@ def canonical_run(tmp_path: Path):
     execution = artifacts.put_bytes(
         execution_value.canonical_bytes, media_type="application/json"
     )
+    gpu_lease_value = synthetic_gpu_lease(run_id)
+    guard = SyntheticGpuMeasurementGuard(gpu_lease_value, "attempt-1")
+    with guard:
+        pass
+    gpu_bracket = artifacts.put_bytes(
+        canonical_json_bytes(guard.receipt.to_dict()),
+        media_type="application/json",
+    )
     replication = {
         "dependency_receipts": [
             {"name": "Magpie", "commit": "1" * 40, "digest": "b" * 64}
@@ -277,6 +289,21 @@ def canonical_run(tmp_path: Path):
     append_event(
         journal,
         run_id,
+        "dependency_verified",
+        {
+            **common,
+            "kind": "gpu_measurement_bracket",
+            "lease_digest": gpu_lease_value.digest,
+            "bracket_digest": guard.receipt.digest,
+            "artifacts": [
+                artifact_binding("gpu_measurement_bracket", gpu_bracket)
+            ],
+        },
+        "attempt-1-gpu-bracket",
+    )
+    append_event(
+        journal,
+        run_id,
         "measurement_result",
         {
             **common,
@@ -307,9 +334,11 @@ def canonical_run(tmp_path: Path):
         {
             **common,
             "evidence_class": "measured",
+            "scope": "attempt",
             "policy_id": "kernel_robust_v1",
             "scalar_reward": 140.0,
             "reward_vector": {
+                "kernel_reward_stage": "measurement",
                 "compile": True,
                 "correctness": True,
                 "integrity": True,
@@ -517,7 +546,7 @@ def e2e_no_source_run(tmp_path: Path):
                     "evidence_class": "derived",
                     "artifacts": [
                         artifact_binding("decision_evidence", decision),
-                        artifact_binding("e2e_grade", grade_receipt),
+                        artifact_binding("e2e_reward_vector", grade_receipt),
                         artifact_binding("reward_policy", policy),
                         artifact_binding("candidate_manifest", manifest),
                     ],

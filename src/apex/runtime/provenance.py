@@ -8,15 +8,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-import yaml
-
-from apex.core import ContractError, IntegrityError, sha256_file, sha256_json
+from apex.core import ContractError, IntegrityError, sha256_json
 from apex.execution import (
     DOCKER_RUNTIME_ENVIRONMENT_KEYS,
     ProcessResult,
     SubprocessSupervisor,
     build_subprocess_environment,
 )
+
+from .magpie_config import MagpieConfigContract
 
 
 _GIT_OBJECT = re.compile(r"^[0-9a-f]{40}$")
@@ -57,6 +57,58 @@ class RepositoryLock:
 
 
 @dataclass(frozen=True, slots=True)
+class ComponentSourceLockSet:
+    """Exact per-run source locks keyed only by active runtime component."""
+
+    required_components: tuple[str, ...]
+    locks: tuple[RepositoryLock, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.required_components
+            or any(not item.strip() for item in self.required_components)
+            or len(set(self.required_components)) != len(self.required_components)
+        ):
+            raise ContractError(
+                "Active source components are invalid", "invalid_component_source_locks"
+            )
+        names = tuple(item.name for item in self.locks)
+        if len(set(names)) != len(names) or not set(names).issubset(
+            self.required_components
+        ):
+            raise ContractError(
+                "Source locks do not uniquely match active components",
+                "invalid_component_source_locks",
+            )
+
+    @property
+    def exact_components(self) -> frozenset[str]:
+        return frozenset(item.name for item in self.locks if item.exact)
+
+    @property
+    def missing_exact_components(self) -> tuple[str, ...]:
+        return tuple(
+            item for item in self.required_components if item not in self.exact_components
+        )
+
+    @property
+    def ready(self) -> bool:
+        return not self.missing_exact_components
+
+    def lock_for(self, component: str) -> RepositoryLock | None:
+        return next((item for item in self.locks if item.name == component), None)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "apex.component-source-lock-set/v1",
+            "required_components": list(self.required_components),
+            "locks": [asdict(item) for item in self.locks],
+            "exact_components": sorted(self.exact_components),
+            "missing_exact_components": list(self.missing_exact_components),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RunProvenance:
     schema_version: int
     benchmark_config_path: str
@@ -65,15 +117,23 @@ class RunProvenance:
     model_id: str
     model_revision: str | None
     gpu_arch: str
+    run_mode: str
     container: ContainerIdentity
-    active_components: tuple[str, ...]
-    source_locks: tuple[RepositoryLock, ...]
+    component_sources: ComponentSourceLockSet
     status: str
     missing_evidence: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.status not in {"resolved", "partial", "unresolved"}:
+        if (
+            self.schema_version != 2
+            or self.run_mode not in {"docker", "local", "ray"}
+            or self.status not in {"resolved", "partial", "unresolved"}
+        ):
             raise ContractError("Run provenance schema/status is invalid", "invalid_provenance")
+
+    @property
+    def active_components(self) -> tuple[str, ...]:
+        return self.component_sources.required_components
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,9 +144,10 @@ class RunProvenance:
             "model_id": self.model_id,
             "model_revision": self.model_revision,
             "gpu_arch": self.gpu_arch,
+            "run_mode": self.run_mode,
             "container": asdict(self.container),
             "active_components": list(self.active_components),
-            "source_locks": [asdict(item) for item in self.source_locks],
+            "component_source_locks": self.component_sources.to_dict(),
             "status": self.status,
             "missing_evidence": list(self.missing_evidence),
         }
@@ -97,7 +158,7 @@ class RunProvenance:
 
     @property
     def source_delivery_ready(self) -> bool:
-        return self.status == "resolved" and bool(self.source_locks)
+        return self.status == "resolved" and self.component_sources.ready
 
 
 class ProvenanceResolver:
@@ -108,55 +169,62 @@ class ProvenanceResolver:
 
     def resolve(
         self,
-        config_path: Path,
+        resolved: MagpieConfigContract,
         *,
         gpu_arch: str,
         hints: Mapping[str, Any] | None = None,
     ) -> RunProvenance:
-        if not config_path.is_absolute() or not config_path.is_file():
-            raise ContractError("Benchmark config must be an absolute file", "invalid_benchmark_config")
-        try:
-            document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as error:
-            raise ContractError("Benchmark config is not valid YAML", "invalid_benchmark_config") from error
-        if not isinstance(document, Mapping) or not isinstance(document.get("benchmark"), Mapping):
-            raise ContractError("Benchmark config lacks benchmark object", "invalid_benchmark_config")
-        benchmark = document["benchmark"]
-        image = str(benchmark.get("docker_image", ""))
-        framework = str(benchmark.get("framework", ""))
-        model = str(benchmark.get("model", ""))
-        if not image or not framework or not model:
-            raise ContractError("Benchmark identity is incomplete", "invalid_benchmark_config")
+        config_path = resolved.config_path
+        identity = resolved.plan["identity"]
+        source_runtime = resolved.plan["source_runtime"]
+        raw_image = source_runtime.get("requested_image")
+        image = raw_image.strip() if isinstance(raw_image, str) else ""
+        framework = str(identity["framework"])
+        model = str(identity["model"])
+        run_mode = str(identity["run_mode"])
         chosen_hints = dict(hints or {})
-        container = self._inspect_image(image, config_path.parent)
+        container = (
+            self._inspect_image(image, config_path.parent)
+            if run_mode == "docker" and image
+            else ContainerIdentity(image, None, (), ())
+        )
         locks = tuple(
             self._repository_lock(item, config_path.parent)
             for item in chosen_hints.get("source_repositories", ())
         )
-        active = _active_components(framework, benchmark.get("envs"))
+        active = resolved.requested_components
+        component_sources = ComponentSourceLockSet(active, locks)
         model_revision = str(chosen_hints["model_revision"]) if chosen_hints.get("model_revision") else None
         missing: list[str] = []
-        if not container.resolved:
+        if run_mode == "docker" and not image:
+            missing.append("runtime_image_selection")
+        elif run_mode == "docker" and not container.resolved:
             missing.append("image_digest")
+        elif run_mode == "local":
+            missing.append("local_runtime_identity")
+        elif run_mode == "ray":
+            missing.append("ray_worker_runtime_identity")
         if model_revision is None:
             missing.append("model_revision")
-        locked_names = {item.name for item in locks if item.exact}
-        for component in active:
-            if component not in locked_names:
-                missing.append(f"source_lock:{component}")
+        missing.extend(
+            f"source_lock:{component}"
+            for component in component_sources.missing_exact_components
+        )
         missing.append("runtime_loaded_bytes")
-        status = "resolved" if not missing else ("partial" if container.resolved else "unresolved")
+        status = "resolved" if not missing else "partial"
+        if run_mode == "docker" and image and not container.resolved:
+            status = "unresolved"
         return RunProvenance(
-            schema_version=1,
+            schema_version=2,
             benchmark_config_path=str(config_path),
-            benchmark_config_sha256=sha256_file(config_path),
+            benchmark_config_sha256=resolved.config_sha256,
             framework=framework,
             model_id=model,
             model_revision=model_revision,
             gpu_arch=gpu_arch,
+            run_mode=run_mode,
             container=container,
-            active_components=active,
-            source_locks=locks,
+            component_sources=component_sources,
             status=status,
             missing_evidence=tuple(sorted(set(missing))),
         )
@@ -220,12 +288,10 @@ class ProvenanceResolver:
         )
 
 
-def _active_components(framework: str, envs: object) -> tuple[str, ...]:
-    components = [framework.lower()]
-    values = envs if isinstance(envs, Mapping) else {}
-    if str(values.get("VLLM_ROCM_USE_AITER", "0")).lower() in {"1", "true", "yes"}:
-        components.append("aiter")
-    return tuple(dict.fromkeys(components))
-
-
-__all__ = ["ContainerIdentity", "ProvenanceResolver", "RepositoryLock", "RunProvenance"]
+__all__ = [
+    "ComponentSourceLockSet",
+    "ContainerIdentity",
+    "ProvenanceResolver",
+    "RepositoryLock",
+    "RunProvenance",
+]

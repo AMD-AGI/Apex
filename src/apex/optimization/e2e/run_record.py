@@ -1,5 +1,4 @@
 """Canonical event/CAS facade for a workload optimization run."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,18 +9,17 @@ from apex.benchmark import NormalizedBenchmarkResult
 from apex.context import CompiledContext
 from apex.core import ContractError, canonical_json_bytes
 from apex.execution import agent_transcript_document
-from apex.evaluation import E2ERewardGrade, E2ERewardPolicy
+from apex.evaluation import E2ERewardPolicy, E2ERewardVector
 from apex.knowledge import ExperienceIdentity
 from apex.orchestration import RunController
 from apex.ports import DiagnosticsResult, TraceComparisonResult
+from apex.runtime import GpuMeasurementBracketReceipt
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal, SnapshotStore
 
 from ..agent_recording import record_agent_observations
-
-from .benchmark_artifacts import (
-    BenchmarkEvidenceReceipts,
-    persist_benchmark_evidence,
-)
+from .benchmark_artifacts import BenchmarkEvidenceReceipts
+from .benchmark_recording import record_benchmark_result
+from .bundle_recording import capture_final_delivery_bundle
 from .candidate import E2ECandidate
 from .candidate_record import candidate_manifest, store_candidate_sources
 from .deployment_artifacts import persist_deployment_configs
@@ -32,8 +30,6 @@ from .services import (
     SafetyQualification,
 )
 from .trace_comparison_record import persist_trace_comparison
-
-
 @dataclass(slots=True)
 class E2ERunRecord:
     run_id: str
@@ -93,53 +89,22 @@ class E2ERunRecord:
         attempt_id: str | None = None,
         candidate_id: str | None = None,
         opportunity_id: str | None = None,
+        measurement_bracket: GpuMeasurementBracketReceipt | None = None,
+        server_owner_kind: str = "anchor",
+        server_owner_id: str | None = None,
     ) -> BenchmarkEvidenceReceipts:
-        evidence = persist_benchmark_evidence(
-            self.artifacts, result, config_path
+        return record_benchmark_result(
+            self,
+            action_id,
+            result,
+            config_path,
+            attempt_id=attempt_id,
+            candidate_id=candidate_id,
+            opportunity_id=opportunity_id,
+            measurement_bracket=measurement_bracket,
+            server_owner_kind=server_owner_kind,
+            server_owner_id=server_owner_id,
         )
-        self.controller.mark_artifacts_ready(
-            action_id, [item.digest for item in evidence.receipts]
-        )
-        if result.succeeded:
-            self.controller.verify_action(action_id, evidence.normalized.digest)
-            self.controller.complete_action(action_id)
-        else:
-            self.controller.fail_action(action_id, ";".join(result.errors) or "benchmark_failed")
-        lineage: dict[str, object] = {}
-        if attempt_id is not None:
-            lineage = self._attempt_payload(attempt_id, candidate_id=candidate_id)
-            if opportunity_id is not None:
-                lineage["opportunity_id"] = opportunity_id
-        self.controller.record_domain_event(
-            "measurement_result",
-            {
-                **lineage,
-                "action_id": action_id,
-                "pass_type": result.pass_type.value,
-                "succeeded": result.succeeded,
-                "metrics": {
-                    key: value
-                    for key, value in result.metric_mapping().items()
-                    if value is not None
-                },
-                "evidence_class": (
-                    "diagnostic" if result.profiling_enabled else "measured"
-                ),
-                "run_kind": result.run_kind,
-                "reward_eligible": result.reward_eligible,
-                "model_revision_verified": result.model_revision.passed,
-                "inferencex_runtime_verified": result.inferencex_runtime.passed,
-                "lm_eval_runtime_verified": result.lm_eval_runtime.passed,
-                "serving_runtime_verified": result.serving_runtime.passed,
-                "resolved_image_id": result.serving_runtime.resolved_image_id,
-                "config_sha256": evidence.config.digest,
-                "normalized_benchmark_receipt": evidence.normalized.digest,
-                "quality_receipt": evidence.quality.digest,
-                "artifacts": [dict(item) for item in evidence.bindings],
-            },
-            idempotency_key=f"benchmark.{action_id}.measurement",
-        )
-        return evidence
 
     def record_diagnostics(
         self,
@@ -451,7 +416,7 @@ class E2ERunRecord:
         verdict: str,
         reason: str,
         evidence: Mapping[str, Any],
-        grade: E2ERewardGrade,
+        grade: E2ERewardVector,
         evidence_artifacts: tuple[tuple[str, ArtifactReceipt], ...],
     ) -> tuple[ArtifactReceipt, tuple[Mapping[str, Any], ...], Mapping[str, Any]]:
         if grade.verdict != verdict or grade.reason_code != reason:
@@ -475,7 +440,7 @@ class E2ERunRecord:
         policy_receipt = self.put_json(policy.to_dict())
         bindings = (
             _artifact_binding("decision_evidence", decision),
-            _artifact_binding("e2e_grade", grade_receipt),
+            _artifact_binding("e2e_reward_vector", grade_receipt),
             _artifact_binding("reward_policy", policy_receipt),
             *(
                 _artifact_binding(role, receipt)
@@ -484,6 +449,8 @@ class E2ERunRecord:
         )
         reward_payload = {
             **self._attempt_payload(attempt_id, candidate_id=candidate_id),
+            "scope": "attempt",
+            "task_kind": "e2e_kernel_only",
             "verdict": verdict,
             "reason_code": reason,
             "policy_id": grade.policy_id,
@@ -495,8 +462,18 @@ class E2ERunRecord:
         }
         return decision, (bindings[0],), reward_payload
 
-    def record_final_delivery(self, result: FinalDeliveryResult) -> ArtifactReceipt:
+    def record_final_delivery(
+        self, result: FinalDeliveryResult
+    ) -> tuple[ArtifactReceipt, tuple[ArtifactReceipt, ...]]:
         receipt = self.put_json(result.to_dict())
+        bundle = capture_final_delivery_bundle(result, self.artifacts)
+        raw = tuple(
+            self.artifacts.put_file(
+                Path(str(item["path"])),
+                media_type=str(item.get("media_type", "application/octet-stream")),
+            )
+            for item in result.terminal_raw_artifacts
+        )
         self.controller.record_domain_event(
             "delivery_result",
             {
@@ -506,11 +483,22 @@ class E2ERunRecord:
                 "validation_level": result.validation_level.value,
                 "clean_replay_verified": result.clean_replay_verified,
                 "reason_code": result.reason_code,
-                "artifacts": [_artifact_binding("final_delivery", receipt)],
+                "replication": bundle.replication if bundle is not None else None,
+                "artifacts": [
+                    _artifact_binding("final_delivery", receipt),
+                    *(bundle.artifact_bindings() if bundle is not None else ()),
+                    *(
+                        _artifact_binding(
+                            f"terminal_raw_{index}_{result.terminal_raw_artifacts[index]['role']}",
+                            artifact,
+                        )
+                        for index, artifact in enumerate(raw)
+                    ),
+                ],
             },
             idempotency_key="delivery.final",
         )
-        return receipt
+        return receipt, raw
 
     def _attempt_payload(
         self, attempt_id: str, *, candidate_id: str | None = None
@@ -561,6 +549,7 @@ def _agent_execution_payload(result: AgentResult) -> dict[str, object]:
         "discarded_stdout_lines": result.discarded_stdout_lines,
         "discarded_stdout_bytes": result.discarded_stdout_bytes,
         "discarded_stdout_sha256": result.discarded_stdout_sha256,
+        "credential_redaction_count": result.credential_redaction_count,
         "observed_turns": result.observed_turns,
         "invocation": result.invocation.to_dict() if result.invocation else None,
     }

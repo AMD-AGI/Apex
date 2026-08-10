@@ -1,18 +1,20 @@
 # Apex
 
-Apex is an evidence-driven RL environment and optimization agent for AMD GPU
-kernels. It has two user-facing modes built on the same state, evidence, safety,
-and delivery contracts:
+Apex is a general coding-agent launcher with evidence-driven AMD GPU kernel
+capabilities. Ordinary coding stays an ordinary backend-native session. When a
+user enters formal optimization, Apex adds state, evidence, safety, grading, and
+delivery contracts for exactly two optimization task kinds:
 
-- **Kernel optimization** accepts a trusted task descriptor plus a natural-language
-  objective (or a complete `TaskSpec`) and delivers an unapplied source bundle.
+- **Single-kernel optimization** freezes a trusted evaluation contract and
+  delivers an unapplied source bundle.
 - **End-to-end optimization** accepts a workload spec pointing at a Magpie benchmark
   configuration, diagnoses the live workload, improves kernel source, and validates
   the resulting workload without changing model or benchmark semantics.
 
 Codex is the default agent backend. Claude and Cursor are selectable alternatives.
-Agents propose code; evaluator-owned compile, correctness, safety, raw timing, and
-workload evidence decide whether a candidate is accepted.
+Agents propose code; evaluator-owned compile, correctness, raw timing, workload
+evidence, and any independently supplied safety receipt decide whether a
+candidate is accepted. Apex does not ship a sanitizer runtime in this release.
 
 ## Design guarantees
 
@@ -27,7 +29,11 @@ prior command, state, result, or dataset formats.
 - Apex emits bundles by default and does not modify the caller's repository.
 - Normal benchmark measurements are distinct from instrumented diagnostic traces.
 - Missing proof stays missing. Agent output, command success, or an image tag cannot
-  manufacture correctness, reward, provenance, or a higher validation level.
+  manufacture correctness, reward, provenance, safety certification, or a higher
+  validation level.
+- The default safety state is `sanitizer_runtime=not_implemented` and
+  `safety_certified=false`. Apex can validate a complete receipt from an
+  independent trusted evaluator; it does not install or launch a sanitizer.
 
 The validation levels are intentionally explicit:
 
@@ -61,9 +67,28 @@ back to managed exact-commit checkouts. For vLLM and AITER it publishes a separa
 managed checkout under `~/.cache/apex/source-locks` unless an explicit exact root is
 selected. Local siblings may supply Git objects offline but are never reset or
 switched; origin, commit, tree, and cleanliness are verified before use.
+The same dependency lock requires `scripts/magpie_corpus_manifest.json`;
+verification recomputes the `examples/benchmarks` Git tree plus every YAML path
+and SHA-256, so a changed or newly added benchmark cannot bypass compatibility
+review. It also requires the generated
+`scripts/magpie_compatibility_ledger.json`. Its 27 Apex-owned projections bind
+the frozen config hashes and reward fields, but are not live release evidence.
+Release collection loads every row through the published Magpie `main` public
+configuration model, then binds Apex-owned plan and capability-receipt digests.
+The exact pin is `main@12896a49`; no unpublished Magpie branch or resolver API is
+required. Even a complete configuration-resolution pass proves compatibility only; its zero
+workflow/formal-delivery counts cannot be presented as live qualification.
 `prepare-runtime` builds the hash-locked lm-eval quality evaluator once, using the
 pinned vLLM image with networking disabled during wheel build, install, and smoke
-validation; subsequent verification rehashes its read-only CAS tree.
+validation; subsequent verification rehashes its read-only CAS tree. Formal
+Docker composition also includes an exact-image lm-eval sidecar authority. It
+locks an offline dataset and private InferenceX task projection, starts a bounded
+Unix handoff to the observed Magpie listener, and executes one no-network/no-GPU,
+read-only-root evaluator container whose result, sample, runtime, lifecycle, and
+cleanup receipts are independently bound. This is implemented composition and
+CPU-tested contract evidence only: no live Docker/GPU/model campaign has yet
+qualified the sidecar, so it cannot clear a workflow, quality, reward, showcase,
+or release gate.
 See [docs/dependencies.md](docs/dependencies.md) for offline and path overrides.
 
 Install only Apex development dependencies when external runtime adapters are not
@@ -77,9 +102,84 @@ python3 -m venv .venv
 Authenticate any agent CLI you intend to use. Apex does not bundle model access or
 credentials.
 
+## General coding-agent CLI
+
+Run `apex` for the selected backend's native interactive experience, or provide
+an initial request directly. No Apex descriptor, results directory, GPU probe,
+campaign, measurement, or reward is created for this ordinary path:
+
+```bash
+apex
+apex "Refactor the request parser" --workspace /absolute/path/to/repo
+apex "Explain this Triton kernel on gfx950" --kernel
+apex "Fix the tests" --backend claude --print
+apex doctor --backend codex --json
+apex doctor gpu --gpu-devices 0 --json
+```
+
+Codex is the default. `--plain` disables kernel augmentation, while `--kernel`
+forces lazy mounting of the available Apex capability façade and the packaged
+`amd-kernel-optimization`/`amd-kernel-debugging` skills. Auto mode mounts them
+only for kernel-related requests. The skills are instruction-only, have no
+scripts, and cannot create evaluator or sanitizer authority. Implemented tools
+include the read-only, attributed `knowledge.search`, scoped `trace.analyze`
+over an existing Magpie diagnostic workspace, receipt-bound `trace.compare`
+over two existing diagnostic CAS sets, and explicit GPU-leased
+`benchmark.run`/`profile.capture` acquisition. Acquisition lazily verifies the
+pinned Magpie dependency and returns ownership plus byte receipts, but never a
+grade or KEEP/REVERT decision. Analysis remains reward-ineligible and never
+launches profiling itself. `campaign.checkpoint` rebuilds only a disposable
+snapshot from canonical events; status and bundle verification remain read-only.
+`campaign.start` accepts agent-discovered typed kernel scope/commands directly,
+records an unverified Evaluation Contract draft without a descriptor file, and
+returns the exact digest needed for explicit formal confirmation. It does not
+run an agent, acquire a GPU, or grant evaluator authority.
+After that confirmation, `kernel.compile`, `kernel.correctness`,
+`kernel.measure`, and `kernel.grade` operate on evaluator-owned projections;
+only grade can append reward. `bundle.build` accepts only a verified improving
+attempt and emits an immutable unapplied bundle.
+`campaign.stop` closes a standalone formal campaign without selecting a
+candidate. It records any missing REVERT/terminal decision, derives exactly one
+task-terminal reward from evidence already sealed by the evaluator (including
+the measured baseline no-op), and otherwise records an explicit null reward.
+Repeated stop requests are journal-idempotent.
+`campaign.resume` delegates to the same E2E recovery use case as
+`apex run resume`, after revalidating a results-scoped campaign-baseline receipt
+against current source and re-running dependency/provenance/GPU preflight.
+All capability artifacts stay under `--results` (or the lazy hidden sibling
+default outside the source workspace).
+`apex capabilities --json` shows exact schemas, authority, side effects, GPU
+need, timeout, artifact classes, availability, and reward roles. Planned but
+unimplemented surfaces are explicit `available=false` entries and are not
+projected as MCP tools. No sanitizer tool is registered. Cursor currently
+mounts the same skills and emits an explicit MCP-bridge-unavailable notice when
+kernel augmentation was requested; it does not pretend the missing tools exist.
+`apex doctor --backend codex|claude|cursor --json` checks the selected CLI's
+exact entrypoint/version, credential-redacted authentication state, and native
+interactive/headless/resume/effort/MCP surfaces without starting a session or
+probing a GPU. A missing CLI, missing login, or capability gap is a typed,
+nonzero preflight result.
+`apex doctor gpu --gpu-devices 0,1 --json` is a read-only ownership probe. It
+does not acquire a lease or terminate a process: it freezes the visible
+HSA/KFD/DRM/RSMI mapping, selected physical UUIDs, and race-checked KFD
+PID/UID/start-time identities in a digest-bound receipt. It then race-checks
+procfs cgroup, container, namespace, and Slurm identity for each owner and scans
+the process table for exact NHC/`rocminfo`/`rocm-smi`/`amd-smi` activity without
+retaining command arguments. The same ownership-bound library is queried for
+temperature, current system clock, busy percentage, and VRAM usage. The command
+is `ready` only when those fixed APIs succeed, ownership is clean, scheduler
+identity is consistent, and no health/diagnostic process is active. An
+unavailable health API is `incomplete`; other conflicts are `blocked`.
+
+Use `--print` for headless text and `--json` for the backend's structured stream.
+`--resume ID` and `--continue` pass through native session persistence. These
+sessions may edit the user-authorized workspace according to backend-native
+approval and sandbox behavior, but their text and tool output are not evaluator
+evidence. `apex optimize ...` is the separate formal boundary.
+
 ## Kernel optimization CLI
 
-A natural-language request selects a checked-in trusted task descriptor. The
+A formal natural-language request currently selects a checked-in trusted task descriptor. The
 descriptor—not the prose—owns editable paths and fixed-argv compile, correctness,
 performance, and optional safety/measurement contracts.
 
@@ -91,17 +191,36 @@ alone is never a measured candidate. Formal controllers such as AKA may instead
 declare a trusted `external_evaluator` recipe; that explicit path receives a
 source bundle with no Apex reward for central scoring.
 
-V1 executes standalone Python and Triton tasks. A standalone task whose language is
-`hip` fails intake with `hip_execution_unavailable`, even if it carries a fixed HIP
-recipe: the current kernel loop does not yet bind trusted build, deploy, and loaded-byte
-engagement phases, so accepting that descriptor would overstate its evidence.
+V1 executes ordinary standalone Python and Triton tasks. Caller-authored `hip`
+fails intake with `hip_execution_unavailable`, even if it claims a fixed recipe.
+The only planned exception is the exact packaged template-bound image-kernel
+lane: registry admission, immutable image/source identities, Apex-owned evaluator,
+and materialization authority are all mandatory. The three attributed examples
+are currently `pending`, so none launches Docker or a GPU and no HIP capability
+or performance result is claimed.
+
+The pending input snapshots and their byte/license provenance are under
+`examples/optimization_showcases/`. The command shape is already fixed:
+
+```bash
+apex optimize kernel \
+  "Optimize the declared kernel on MI355X/gfx950" \
+  --template examples/optimization_showcases/kernel_triton_paged_attention_2d \
+  --results /absolute/path/to/run \
+  --release-candidate-receipt /absolute/path/to/campaign-baseline.json \
+  --backend codex
+```
+
+Until its blockers are resolved this returns `template_not_materializable`
+before agent, container, GPU, or evaluator execution.
 
 ```bash
 apex optimize kernel \
   "Optimize rms_norm in kernels/rms_norm.py for gfx950" \
   --workspace /absolute/path/to/kernel-repo \
   --results /absolute/path/to/run \
-  --agent-backend codex
+  --release-candidate-receipt /absolute/path/to/campaign-baseline.json \
+  --backend codex
 ```
 
 Descriptors may be named `apex-task.yaml`, `task_spec.yaml`, or placed under
@@ -111,12 +230,16 @@ caller-neutral JSON or YAML contract:
 ```bash
 apex optimize kernel \
   --task-spec /absolute/path/to/task.yaml \
+  --release-candidate-receipt /absolute/path/to/campaign-baseline.json \
   --result-json /absolute/path/to/run/result.json
 ```
 
-Use `--agent-backend claude` or `--agent-backend cursor` to change the backend;
+Use `--backend claude` or `--backend cursor` to change the backend;
 omitting it selects Codex. `--dry-run` validates and receipts intake without invoking
-an agent. A successful candidate produces a source-only bundle and a stable machine
+an agent and emits an Evaluation Contract draft digest. Formal local execution
+requires repeating that exact digest with
+`--evaluation-contract-draft-digest`; repository, source, harness, command, or
+policy drift fails before a GPU is acquired. A successful candidate produces a source-only bundle and a stable machine
 result. Verify a kernel bundle independently with:
 
 ```bash
@@ -150,41 +273,26 @@ Reward = 20 * Icompile
 The evaluator recomputes p50 and nearest-rank p99 from at least 300 valid raw kernel
 invocation samples for each implementation in every case. Missing or insufficient
 p99 yields no reward. `Icorrect` represents correctness, integrity, and
-anti-tampering—not an agent assertion. Safety is a separate promotion gate: a
+anti-tampering—not an agent assertion. Safety is a separate promotion gate only
+when an independent trusted evaluator supplies an exact-lineage receipt. A
 confirmed finding rejects the candidate and suppresses performance reward without
-silently changing the public formula.
+silently changing the public formula. With no external authority, optimization
+may continue under the no-tool policy but remains `safety_certified=false`.
 
 ## End-to-end optimization CLI
 
-An E2E spec wraps an unchanged Magpie benchmark config and freezes search budgets
-and no-regression gates:
-
-```yaml
-schema_version: 1
-config_path: /absolute/path/to/Magpie/examples/benchmarks/benchmark.yaml
-results_dir: /absolute/path/to/apex-run
-agent_backend: codex
-agent_model: gpt-5.5
-agent_effort: xhigh
-scope: kernels
-gpu_arch: gfx950
-goal:
-  primary: throughput
-  direction: maximize
-  gates:
-    accuracy_regression_pct: 0
-    ttft_p99_regression_pct: 5
-    tpot_p99_regression_pct: 2
-max_iterations: 3
-max_kernels: 10
-max_turns: 25
-agent_timeout_seconds: 3600
-```
-
-Run it with:
+The raw Magpie benchmark config is the only workload document. Apex freezes its
+exact bytes and constructs the internal kernel-only budget/backend request from
+CLI flags; users do not copy model, image, metric, or shape fields into another
+spec.
 
 ```bash
-apex optimize e2e --spec /absolute/path/to/e2e.yaml
+apex optimize e2e \
+  --config /absolute/path/to/Magpie/examples/benchmarks/benchmark.yaml \
+  --results /absolute/path/to/apex-run \
+  --backend codex \
+  --release-candidate-receipt /absolute/path/to/campaign-baseline.json \
+  --gpu-arch gfx950
 ```
 
 The controller benchmarks a clean baseline, collects targeted Magpie/TraceLens
@@ -235,6 +343,27 @@ Use `--run-id` when it cannot be derived from the run result or directory name.
 `export-rl` also accepts `--policy-id`, `--on-incomplete skip`, and `--no-sft`.
 Projection output is rejected if it overlaps canonical `events/` or `artifacts/`.
 
+Export a deterministic, sanitized showcase from the same canonical evidence:
+
+```bash
+apex showcase export \
+  --run-root /absolute/path/to/run \
+  --run-id run-id-if-needed \
+  --id kernel-example \
+  --output /absolute/path/to/showcase
+
+apex showcase verify --path /absolute/path/to/showcase
+```
+
+`showcase show` and `showcase list --root <dir>` verify before rendering. Runs
+without a replay-valid reward above 120, KEEP, a CAS-backed winner bundle that
+survives reconstruction and the official bundle loader,
+portable artifacts, and reproduction evidence remain `pending`; export never
+turns a positive control, old score, or hand-edited summary into a winner.
+Offline verification reconstructs the typed parent/child event chain and CAS
+manifest, recomputes single-kernel or E2E terminal reward from raw evidence, and
+re-derives the qualification blockers even if every checksum was regenerated.
+
 ## Architecture
 
 `main.py` and the installed `apex` command both enter the same thin CLI. The sole
@@ -252,7 +381,7 @@ src/apex/
 ├── benchmark/       Magpie config and measurement adapters
 ├── diagnostics/     targeted trace evidence and ranking
 ├── evaluation/      robust kernel reward and E2E gates
-├── evaluation/safety/ sanitizer execution and policy
+├── evaluation/safety/ external safety-receipt contract and pure policy
 ├── delivery/        immutable kernel and E2E patch bundles
 ├── storage/         event journal, CAS, and snapshots
 ├── rl/              episode materialization and dataset export
@@ -267,7 +396,8 @@ Every package has its own README describing purpose, public API, invariants,
 dependencies, failure semantics, provenance, and focused tests. Architecture tests
 enforce layer direction, file/function size limits, import purity, and public surface.
 The [capability matrix](docs/capability_matrix.md) distinguishes implemented CPU
-contracts from live GPU qualification. The
+contracts from live GPU qualification, including the composed but not yet
+live-qualified exact-image evaluator sidecar. The
 [Qwen3-Next 80B FP8 report](docs/validation_qwen3_next_80b_fp8.md) records the
 completed E2E no-gain/no-regression campaign without overstating it as a formal
 source-delivery winner. The clean-cut migration is tracked in
@@ -287,6 +417,46 @@ pytest -q -p no:cacheprovider --import-mode=importlib \
 GPU and live agent/workload campaigns must be invoked explicitly and write to a
 caller-selected results directory. They must retain dependency, image, source,
 measurement, and GPU-lease receipts. See [tests/README.md](tests/README.md).
+The operator sequence and typed receipt ownership are documented in
+[docs/live_qualification_runbook.md](docs/live_qualification_runbook.md).
+
+Release/live baselines additionally use `apex.release-candidate-receipt/v1`.
+`scripts/build_release_candidate_receipt.py` recomputes current Apex Git, lock,
+Magpie 27-config corpus/ledger, lm-eval, and attributed-template identity, then
+joins only explicit fresh-fetch, dependency, CPU-gate, CLI, immutable-image,
+live-qualification, and four-showcase evidence. It performs no live work and
+currently reports `blocked` until those gates genuinely exist. A modified status
+plus a recomputed self-hash is rejected because verification reconstructs the
+entire receipt from current bytes and typed evidence.
+
+On a clean candidate commit, generate the locally provable subset first:
+
+```bash
+.venv/bin/apex release collect-local \
+  --apex-root "$PWD" \
+  --output /absolute/operator-selected/local-release-evidence.json
+```
+
+This command runs the complete fixed CPU gate, exact dependency/runtime verifier,
+fresh installed-CLI import probe, and the Apex config projection over the frozen
+Magpie corpus using published `main` APIs. It binds the result to unchanged source
+bytes before and after execution. All 27 pinned configs resolve as compatible;
+Ray quality runs still require a hash-locked
+evaluator below the identical shared-storage path plus synchronous driver-side
+evidence replay. The command performs no fetch, GPU, image, agent, Magpie live
+campaign, or showcase work, so those release blockers cannot be cleared by it.
+
+After real runs, `apex release collect-showcase` converts an official offline
+showcase-verifier v2 receipt into path-free release evidence on the exact clean
+Apex tree. `apex release join-evidence` combines only already validated
+qualification/showcase fragments into a new evidence file; it never manufactures
+or upgrades a live claim.
+
+The same document has a narrower, non-circular `baseline_status`: clean reviewed
+source, exact dependency/runtime verification, the full CPU/static gate, and CLI
+identity can authorize live qualification through `--require-baseline`; images,
+live results, and published showcases are required only by final
+`--require-ready`.
 
 ## Knowledge and upstream provenance
 
@@ -297,7 +467,7 @@ and retains per-file hashes, exclusions, license, and attribution. Obsolete muta
 knowledge storage is not read.
 
 Benchmarking and targeted trace collection use
-[Magpie at `210513b`](https://github.com/AMD-AGI/Magpie/tree/210513b31b2f3607920be4000d37fc51f14c5711);
+[Magpie at `12896a4`](https://github.com/AMD-AGI/Magpie/tree/12896a49a731ad72c791b7a23abcef7a0d6c4487);
 trace analysis uses
 [TraceLens at `4f25c1a`](https://github.com/AMD-AGI/TraceLens/tree/4f25c1a6f03441e710a97d71a5de9cc5c2fc1555).
 Serving benchmark execution uses

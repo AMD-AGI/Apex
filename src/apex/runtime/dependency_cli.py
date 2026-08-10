@@ -14,6 +14,7 @@ from .dependencies import (
     PythonEnvironment,
     load_lock,
 )
+from .evaluator_lock import load_evaluator_policy_lock
 from .lm_eval_lock import load_lm_eval_runtime_lock
 from .lm_eval_prepare import LmEvalRuntimePreparer
 from .lm_eval_runtime import default_lm_eval_runtime_root, verify_lm_eval_runtime
@@ -66,6 +67,11 @@ def build_parser(apex_root: Path) -> argparse.ArgumentParser:
         type=Path,
         default=apex_root / "scripts" / "lm_eval_runtime.lock.json",
     )
+    parser.add_argument(
+        "--evaluator-policy-lock",
+        type=Path,
+        default=apex_root / "scripts" / "evaluator_policy.lock.json",
+    )
     parser.add_argument("--lm-eval-runtime", type=Path)
     parser.add_argument("--artifact-cache", type=Path)
     parser.add_argument("--offline", action="store_true")
@@ -86,6 +92,13 @@ def emit_result(result: Mapping[str, Any], *, json_output: bool) -> None:
             f"  {value['name']}: {value['action']} at {value['root']} "
             f"({value['commit'][:12]}, {value['resolution']})"
         )
+    corpus = result.get("magpie_corpus")
+    if isinstance(corpus, Mapping):
+        print(
+            f"  Magpie corpus: {corpus['summary']['config_count']} configs "
+            f"(tree {str(corpus['benchmark_tree'])[:12]}, "
+            f"manifest {str(corpus['manifest_sha256'])[:12]})"
+        )
     source_locks = result.get("e2e_source_locks")
     if isinstance(source_locks, Mapping):
         for value in source_locks["sources"].values():
@@ -99,6 +112,12 @@ def emit_result(result: Mapping[str, Any], *, json_output: bool) -> None:
         print(
             f"  lm-eval runtime: {runtime['status']} at {runtime['path']} "
             f"({str(runtime['sha256'])[:12]})"
+        )
+    evaluator = result.get("evaluator_policy")
+    if isinstance(evaluator, Mapping):
+        print(
+            f"  evaluator policy: {evaluator['policy_id']} "
+            f"({str(evaluator['lock_sha256'])[:12]})"
         )
 
 
@@ -159,6 +178,22 @@ def _runtime_result(receipt: Any, status: str) -> dict[str, Any]:
     return result
 
 
+def _attach_evaluator_policy(
+    result: dict[str, Any], lock_path: Path
+) -> None:
+    dependencies = result.get("dependencies")
+    if not isinstance(dependencies, Mapping):
+        raise BootstrapError("dependency result lacks InferenceX")
+    inferencex = dependencies.get("inferencex")
+    if not isinstance(inferencex, Mapping):
+        raise BootstrapError("dependency result lacks InferenceX")
+    receipt = load_evaluator_policy_lock(
+        lock_path.expanduser().resolve(),
+        inferencex_root=Path(str(inferencex["root"])),
+    )
+    result["evaluator_policy"] = receipt.to_dict()
+
+
 def _run(args: argparse.Namespace, apex_root: Path) -> Mapping[str, Any]:
     lock = load_lock(args.lock.expanduser().resolve())
     resolver = RepositoryResolver(
@@ -176,6 +211,8 @@ def _run(args: argparse.Namespace, apex_root: Path) -> Mapping[str, Any]:
         _attach_source_locks(
             result, sources, action="plan" if args.dry_run else "materialize"
         )
+        if not args.dry_run:
+            _attach_evaluator_policy(result, args.evaluator_policy_lock)
         return result
     result = bootstrapper.verify()
     _attach_source_locks(
@@ -183,6 +220,7 @@ def _run(args: argparse.Namespace, apex_root: Path) -> Mapping[str, Any]:
         sources,
         action="materialize" if args.command == "prepare-runtime" else "verify",
     )
+    _attach_evaluator_policy(result, args.evaluator_policy_lock)
     runtime_lock = load_lm_eval_runtime_lock(args.lm_eval_lock.expanduser().resolve())
     runtime_root = _runtime_root(args, apex_root, runtime_lock)
     if args.command == "verify":

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
-import subprocess
 from pathlib import Path
+import subprocess
 
 import pytest
 
-from apex.core import AgentBackendName, IntegrityError
+from apex.core import AgentBackendName, ContractError, IntegrityError
 from apex.execution import AgentRegistry
 from apex.optimization.e2e import candidate as candidate_module
 from apex.optimization.e2e import candidate_fingerprint
@@ -83,6 +84,35 @@ def _repository(tmp_path: Path, name: str = "source") -> Path:
 def _commit(root: Path, message: str = "anchor") -> None:
     _git(root, "add", "-A")
     _git(root, "commit", "-m", message)
+
+
+def test_git_verifier_environment_revokes_agent_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-secret")
+    monkeypatch.setenv("CURSOR_API_KEY", "cursor-test-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-test-secret")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/untrusted-python")
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/untrusted-loader.so")
+
+    environment = candidate_fingerprint.git_environment()
+
+    assert all(
+        key not in environment
+        for key in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CURSOR_API_KEY",
+            "HF_TOKEN",
+            "PYTHONPATH",
+            "LD_PRELOAD",
+        )
+    )
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
 
 
 def _opportunity(root: Path) -> KernelOpportunity:
@@ -208,6 +238,8 @@ def _invocation(request: AgentRequest) -> AgentInvocationReceipt:
         argv=("codex", "exec"),
         workspace=str(request.workspace),
         prompt_transport="stdin",
+        execution_authority=request.execution_authority,
+        credential_environment_key="OPENAI_API_KEY",
         requested_allowed_files=request.allowed_files,
         allowed_files_enforced_by_cli=False,
         max_turns=request.max_turns,
@@ -229,7 +261,19 @@ def _candidate_request(root: Path, destination: Path) -> E2ECandidateRequest:
         effort=None,
         max_turns=50,
         timeout_seconds=30,
+        controller_context_sha256="f" * 64,
     )
+
+
+def test_e2e_candidate_request_requires_controller_authority(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    with pytest.raises(ContractError) as raised:
+        replace(
+            _candidate_request(root, tmp_path / "candidate"),
+            controller_context_sha256="",
+        )
+
+    assert raised.value.reason_code == "agent_execution_authority_missing"
 
 
 def test_git_checkout_preserves_safe_symlink_identity(tmp_path: Path) -> None:
@@ -276,6 +320,11 @@ def test_e2e_worker_freezes_source_at_exact_turn_boundary(tmp_path: Path) -> Non
     assert candidate.changed_files == ("kernel.py",)
     assert candidate.candidate_source_sha256 is not None
     assert candidate.agent_result.candidate_capture_allowed
+    assert candidate.agent_result.invocation is not None
+    authority = candidate.agent_result.invocation.execution_authority
+    assert authority.authority_kind == "e2e_controller"
+    assert authority.parent_receipt_sha256 == "f" * 64
+    assert authority.source_anchor_sha256 == candidate.baseline_source_sha256
     assert (candidate.workspace / "__pycache__" / "poison.pyc").exists()
     assert tuple(source.relative_path for source in candidate.frozen_sources) == (
         "kernel.py",

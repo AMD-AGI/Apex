@@ -30,7 +30,7 @@ def test_materializes_parent_positive_and_negative_child_episodes(canonical_run)
         },
     )
 
-    assert graph.parent.kind == "workload"
+    assert graph.parent.kind == "e2e_kernel_only"
     assert graph.parent.terminal_status == "succeeded"
     assert graph.workload_state_hash is not None
     assert [child.attempt_id for child in graph.children] == ["attempt-1", "attempt-2"]
@@ -183,8 +183,8 @@ def test_no_source_e2e_reject_is_complete_and_rewarded(e2e_no_source_run):
     assert child.candidate_id is None
     assert child.state_generation == 1
     assert child.verdict == "reject"
-    assert child.scalar_reward == -20.0
-    assert child.policy_ids == ("e2e_kernel_candidate_v1",)
+    assert child.scalar_reward == 0.0
+    assert child.policy_ids == ("e2e_throughput_qos_v1",)
     assert child.status == "no_gain"
     assert child.trainability == "complete"
     outcome_events = tuple(
@@ -253,7 +253,7 @@ def _e2e_outcome_inputs(run, attempt_id: str):
         "evidence_class": "derived",
         "artifacts": [
             artifact_binding("decision_evidence", run["decision"]),
-            artifact_binding("e2e_grade", run["grade_receipt"]),
+            artifact_binding("e2e_reward_vector", run["grade_receipt"]),
             artifact_binding("reward_policy", run["policy"]),
             artifact_binding("candidate_manifest", run["manifest"]),
         ],
@@ -564,7 +564,7 @@ def test_missing_reward_lineage_marks_episode_truncated(canonical_run):
     child = next(item for item in graph.children if item.attempt_id == "attempt-3")
     assert child.trainability == "truncated"
     assert "reward_not_measured" in child.validation_reasons
-    assert "reward_measurement_receipt_missing" in child.validation_reasons
+    assert "kernel_reward_stage_invalid" in child.validation_reasons
     assert "reward_policy_receipt_missing" in child.validation_reasons
 
 

@@ -1,9 +1,20 @@
-# Qwen3-Next 80B FP8 live E2E qualification
+# Historical Qwen3-Next 80B FP8 v19 diagnostic record
 
-This report records a live qualification of the complete Apex E2E control flow. It
-is evidence that the controller can diagnose, propose, isolate, measure, reject, and
-report kernel candidates for the named workload. It is **not** evidence of an
-optimized winner or formal source-rebuild delivery.
+This report preserves a 2026-08-09 live control-flow exercise under the older v19
+contract. It is historical diagnostic provenance: the controller diagnosed,
+proposed, isolated, measured, rejected, and reported candidates for the named
+workload. It is **not current Plan V2 live qualification**, an optimized winner,
+formal source-rebuild delivery, or release evidence.
+
+The current contract additionally requires the Apex config-resolution receipt
+derived from published Magpie main, independent semantic trace accounting and
+planning coverage, paired
+scalar attempt/terminal reward evidence, release-candidate baseline identity,
+and the current recovery/delivery gates. This run predates those requirements;
+its 11.3% targeted-trace coverage would fail the current 90% planning-coverage
+policy before an agent. Reusing its hashes or re-labeling its projections cannot
+upgrade it. A new positive-control and agent campaign must start from the current
+release candidate.
 
 ## Frozen workload
 
@@ -68,7 +79,7 @@ the comparison was used only for candidate context—not grading or reward.
 | Capture accounting | 1,766,865 rows seen; 200,000 written; 1,566,865 cap drops |
 | Semantic coverage | 0.113195; incomplete |
 | TraceLens comparison | CAS receipt `9255aa584c8abfded251e74787a7aab4e1ddaafc64a4b35c15d53d4dc65d61be`; partial and reward-ineligible |
-| Safety | no finding; advisory coverage gap retained as `safety_certified=false` |
+| Safety | Apex no-tool policy; no external sanitizer finding evidence; `safety_certified=false` |
 
 ## Integrity audit
 
@@ -93,7 +104,8 @@ Key terminal hashes are:
 | snapshot | `f952e799d2a3beef8be47b43826b7995201339094ab09168254f4eb769296c00` |
 | `result.json` | `a23e6dd66c214c1e122f8bc353e328f737491b3f391969bf05b650e5d6da3720` |
 
-Intake provenance was deliberately permissive for this qualification and remained
+Intake provenance was deliberately permissive for this historical run and remained
 partial: the baseline did not supply runtime-loaded-byte proof. Candidate overlays
 did prove their loaded bytes. This is why the run may prove control-flow and
-no-regression behavior while making no formal delivery claim.
+no-regression behavior under its old contract while making no current
+qualification or formal delivery claim.

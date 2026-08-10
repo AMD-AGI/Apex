@@ -116,6 +116,13 @@ class KnowledgeRetriever:
             token_count=sum(_card_tokens(card) for card in selected),
         )
 
+    def get_card(self, card_id: str) -> KnowledgeCard | None:
+        """Return one exact inert card; no fuzzy fallback or status promotion."""
+
+        if not self._enabled:
+            return None
+        return next((card for card in self._cards if card.card_id == card_id), None)
+
 
 def normalize_operator_terms(symbols: tuple[str, ...]) -> tuple[str, ...]:
     """Map source symbols to the reviewed GEAK operator taxonomy without guessing a winner."""

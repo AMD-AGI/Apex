@@ -17,7 +17,12 @@ from apex.core import (
     canonical_json_bytes,
     sha256_file,
 )
-from apex.evaluation import E2EMeasurement
+from apex.evaluation import (
+    E2EObservation,
+    E2ERewardPolicy,
+    E2ERewardVector,
+    replay_e2e_reward,
+)
 from apex.orchestration import RunPhase
 from apex.runtime import RunProvenance
 from apex.storage import ArtifactReceipt, EventJournal
@@ -38,6 +43,15 @@ class E2EOptimizationResult:
     intake_missing_evidence: tuple[str, ...]
     formal_delivery_verified: bool
     provenance_hash: str
+    task_kind: str
+    task_reward: float | None
+    reward_policy_id: str
+    reward_policy_digest: str
+    reward_vector: Mapping[str, Any] | None
+    reward_source_receipt: str | None
+    raw_measurement_receipts: tuple[str, ...]
+    trainability: str
+    untrainable_reason: str | None
     baseline_metrics: Mapping[str, float]
     final_metrics: Mapping[str, float]
     accepted_patch_ids: tuple[str, ...]
@@ -53,12 +67,36 @@ class E2EOptimizationResult:
     no_regression: bool | None
     details: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        policy = E2ERewardPolicy()
+        if (
+            self.task_kind != "e2e_kernel_only"
+            or self.reward_policy_id != policy.policy_id
+            or self.reward_policy_digest != policy.digest
+            or self.trainability not in {"trainable", "untrainable"}
+        ):
+            raise IntegrityError("Terminal E2E reward contract is invalid", "invalid_e2e_result")
+        if self.trainability == "trainable":
+            if (
+                self.task_reward is None
+                or self.reward_vector is None
+                or not self.reward_source_receipt
+                or not self.raw_measurement_receipts
+                or self.untrainable_reason is not None
+                or self.reward_vector.get("scope") != "task_terminal"
+                or replay_e2e_reward(self.reward_vector) != self.task_reward
+            ):
+                raise IntegrityError("Terminal E2E reward is incomplete", "invalid_e2e_result")
+        elif self.task_reward is not None or self.reward_vector is not None or not self.untrainable_reason:
+            raise IntegrityError("Untrainable E2E result claims reward", "invalid_e2e_result")
+
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["status"] = self.status.value
         value["validation_level"] = self.validation_level.value
         value["intake_missing_evidence"] = list(self.intake_missing_evidence)
         value["accepted_patch_ids"] = list(self.accepted_patch_ids)
+        value["raw_measurement_receipts"] = list(self.raw_measurement_receipts)
         return value
 
     @classmethod
@@ -74,6 +112,31 @@ class E2EOptimizationResult:
                 intake_missing_evidence=tuple(value.get("intake_missing_evidence", ())),
                 formal_delivery_verified=value.get("formal_delivery_verified") is True,
                 provenance_hash=str(value["provenance_hash"]),
+                task_kind=str(value["task_kind"]),
+                task_reward=(
+                    float(value["task_reward"])
+                    if value.get("task_reward") is not None
+                    else None
+                ),
+                reward_policy_id=str(value["reward_policy_id"]),
+                reward_policy_digest=str(value["reward_policy_digest"]),
+                reward_vector=(
+                    dict(value["reward_vector"])
+                    if isinstance(value.get("reward_vector"), Mapping)
+                    else None
+                ),
+                reward_source_receipt=(
+                    str(value["reward_source_receipt"])
+                    if value.get("reward_source_receipt")
+                    else None
+                ),
+                raw_measurement_receipts=tuple(value["raw_measurement_receipts"]),
+                trainability=str(value["trainability"]),
+                untrainable_reason=(
+                    str(value["untrainable_reason"])
+                    if value.get("untrainable_reason")
+                    else None
+                ),
                 baseline_metrics=dict(value.get("baseline_metrics", {})),
                 final_metrics=dict(value.get("final_metrics", {})),
                 accepted_patch_ids=tuple(value.get("accepted_patch_ids", ())),
@@ -245,15 +308,23 @@ def build_e2e_result(
     status: TaskStatus,
     reason: str,
     validation_level: ValidationLevel,
-    baseline: E2EMeasurement | None,
-    final: E2EMeasurement | None,
+    baseline: E2EObservation | None,
+    final: E2EObservation | None,
     plan: KernelOpportunityPlan | None,
     evidence_path: str | None,
     no_regression: bool | None,
     details: Mapping[str, Any],
+    terminal_reward: E2ERewardVector | None = None,
+    reward_source_receipt: str | None = None,
+    raw_measurement_receipts: tuple[str, ...] = (),
+    untrainable_reason: str | None = None,
 ) -> E2EOptimizationResult:
     """Assemble the sole machine-readable terminal result shape."""
 
+    policy = E2ERewardPolicy()
+    if terminal_reward is not None and terminal_reward.scope != "task_terminal":
+        raise IntegrityError("Terminal reward scope is invalid", "invalid_e2e_result")
+    trainable = terminal_reward is not None
     return E2EOptimizationResult(
         schema_version=1,
         run_id=record.run_id,
@@ -267,6 +338,15 @@ def build_e2e_result(
             and validation_level is ValidationLevel.SOURCE_REBUILD_VERIFIED
         ),
         provenance_hash=provenance.digest,
+        task_kind="e2e_kernel_only",
+        task_reward=terminal_reward.scalar_reward if terminal_reward else None,
+        reward_policy_id=policy.policy_id,
+        reward_policy_digest=policy.digest,
+        reward_vector=terminal_reward.to_dict() if terminal_reward else None,
+        reward_source_receipt=reward_source_receipt,
+        raw_measurement_receipts=raw_measurement_receipts,
+        trainability="trainable" if trainable else "untrainable",
+        untrainable_reason=None if trainable else (untrainable_reason or reason),
         baseline_metrics=measurement_metrics(baseline) if baseline else {},
         final_metrics=measurement_metrics(final) if final else {},
         accepted_patch_ids=record.controller.state.accepted_patch_ids,

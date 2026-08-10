@@ -44,6 +44,38 @@ def test_duplicate_transaction_returns_original_receipt_and_conflict_fails(tmp_p
     assert len(journal.iter_events("run-1")) == 1
 
 
+def test_read_only_journal_verifies_without_mutating_and_rejects_append(
+    tmp_path,
+) -> None:
+    path = tmp_path / "events.db"
+    writer = EventJournal(path)
+    event = writer.append(
+        run_id="run-1",
+        event_type="run.started",
+        payload={"value": 1},
+        idempotency_key="start",
+    )
+    before = (path.stat().st_mtime_ns, path.stat().st_size)
+
+    reader = EventJournal.open_read_only(path)
+
+    assert reader.iter_events("run-1") == (event,)
+    assert (path.stat().st_mtime_ns, path.stat().st_size) == before
+    with pytest.raises(ContractError) as failure:
+        reader.append(
+            run_id="run-1",
+            event_type="run.finished",
+            payload={},
+            idempotency_key="finish",
+            parent_event_id=event.event_id,
+        )
+    assert failure.value.reason_code == "event_journal_read_only"
+
+    with pytest.raises(ContractError) as missing:
+        EventJournal.open_read_only(tmp_path / "missing.db")
+    assert missing.value.reason_code == "invalid_event_journal"
+
+
 def test_fault_during_batch_rolls_back_all_events(tmp_path) -> None:
     inserts = 0
 

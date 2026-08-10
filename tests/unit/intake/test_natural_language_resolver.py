@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -35,9 +36,9 @@ def _descriptor(*, task_id: str, source: str, symbol: str) -> dict[str, object]:
         "editable_files": [source],
         "target_functions": [symbol],
         "commands": {
-            "compile": {"argv": success},
-            "correctness": {"argv": success},
-            "performance": {"argv": success},
+            "compile": {"argv": list(success)},
+            "correctness": {"argv": list(success)},
+            "performance": {"argv": list(success)},
         },
     }
 
@@ -129,6 +130,42 @@ def test_hostile_request_cannot_expand_descriptor_policy(tmp_path: Path) -> None
     assert all(command.argv[0] == sys.executable for command in resolved.task.commands.values())
 
 
+@pytest.mark.parametrize("kind", ["alias", "hardlink"])
+def test_natural_language_discovery_rejects_unsafe_descriptor_file(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+    descriptor = workspace / "apex-task.yaml"
+    if kind == "alias":
+        payload = yaml.safe_dump(
+            _descriptor(task_id="rms", source="kernels/rms_norm.py", symbol="rms_norm"),
+            sort_keys=True,
+        )
+        descriptor.write_text(
+            payload + "extra: &shared [value]\ncopy: *shared\n",
+            encoding="utf-8",
+        )
+    else:
+        source = tmp_path / "descriptor-source.yaml"
+        _write_descriptor(
+            source,
+            _descriptor(task_id="rms", source="kernels/rms_norm.py", symbol="rms_norm"),
+        )
+        os.link(source, descriptor)
+
+    with pytest.raises(ContractError) as raised:
+        NaturalLanguageTaskResolver().resolve(
+            NaturalLanguageRequest(
+                "Optimize kernels/rms_norm.py",
+                workspace,
+                tmp_path / "results",
+            )
+        )
+
+    assert raised.value.reason_code == "invalid_task_descriptor"
+
+
 def test_cli_natural_language_dry_run_persists_resolved_contract(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     _write_descriptor(
@@ -153,7 +190,7 @@ def test_cli_natural_language_dry_run_persists_resolved_contract(tmp_path: Path)
 
     assert exit_code == 0
     value = json.loads((results / "result.json").read_text(encoding="utf-8"))
-    assert value["status"] == "resolved"
+    assert value["status"] == "evaluation_contract_preview"
     assert value["task"]["task_id"] == "rms"
     assert len(value["resolution_hash"]) == 64
 

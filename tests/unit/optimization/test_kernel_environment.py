@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,7 @@ def _containment() -> AgentProcessContainmentReceipt:
 class RecordingSupervisor:
     def __init__(self) -> None:
         self.environment: dict[str, str] | None = None
+        self.argv: tuple[str, ...] | None = None
 
     def run(
         self,
@@ -57,6 +59,7 @@ class RecordingSupervisor:
         require_pid_namespace=False,
     ):
         self.environment = dict(environment)
+        self.argv = tuple(argv)
         assert require_pid_namespace is True
         return ProcessResult(
             tuple(argv),
@@ -77,11 +80,16 @@ class UncontainedSupervisor:
         return ProcessResult(tuple(argv), 0, False, "ok", "", False, False, 0.1)
 
 
-def _resolved(tmp_path: Path, *, command_env: dict[str, str] | None = None):
+def _resolved(
+    tmp_path: Path,
+    *,
+    command_env: dict[str, str] | None = None,
+    argv: list[str] | None = None,
+):
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
     (workspace / "kernel.py").write_text("def kernel(x): return x\n", encoding="utf-8")
-    command = {"argv": ["true"], "env": command_env or {}}
+    command = {"argv": argv or ["true"], "env": command_env or {}}
     task = TaskSpec.from_mapping(
         {
             "task_id": "environment-test",
@@ -126,11 +134,23 @@ def test_kernel_verifier_uses_gpu_allowlist_and_explicit_safe_command_env(
     assert "OPENAI_API_KEY" not in supervisor.environment
     assert "BASH_ENV" not in supervisor.environment
     assert supervisor.environment["PYTHONNOUSERSITE"] == "1"
+    assert supervisor.argv is not None
+    assert Path(supervisor.argv[0]).is_absolute()
+    assert not Path(supervisor.argv[0]).is_symlink()
+    assert result.executable_identity.path == supervisor.argv[0]
+    assert result.executable_identity.size > 0
+    assert len(result.executable_identity.sha256) == 64
+    assert result.executable_identity_reverified is True
+    assert result.to_dict()["executable_identity"] == (
+        result.executable_identity.to_dict()
+    )
 
 
 def test_kernel_verifier_rejects_python_or_secret_command_env(tmp_path: Path) -> None:
     for command_env in (
         {"PYTHONPATH": "/tmp/import-first"},
+        {"PATH": "/tmp/evaluator-shadow"},
+        {"LD_PRELOAD": "/tmp/untrusted-loader.so"},
         {"ANTHROPIC_API_KEY": "secret"},
     ):
         resolved = _resolved(tmp_path / next(iter(command_env)), command_env=command_env)
@@ -161,3 +181,83 @@ def test_kernel_verifier_rejects_missing_process_tree_containment(
         )
 
     assert raised.value.reason_code == "verifier_process_containment_failed"
+
+
+def test_kernel_verifier_freezes_relative_executable_bytes(
+    tmp_path: Path,
+) -> None:
+    resolved = _resolved(tmp_path, argv=["./verify-tool", "--fixed"])
+    executable = resolved.workspace / "verify-tool"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    digest = candidate_source_digest(
+        resolved.workspace, resolved.task.editable_files
+    )
+    supervisor = RecordingSupervisor()
+
+    evidence = CandidateVerifier(supervisor).compile(
+        resolved,
+        candidate_root=resolved.workspace,
+        expected_source_digest=digest,
+    )
+
+    assert evidence.argv == (str(executable.resolve()), "--fixed")
+    assert evidence.executable_identity.path == str(executable.resolve())
+    assert evidence.executable_identity.size == executable.stat().st_size
+
+
+class ExecutableMutatingSupervisor(RecordingSupervisor):
+    def run(self, argv, **kwargs):
+        result = super().run(argv, **kwargs)
+        executable = Path(argv[0])
+        executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        executable.chmod(0o755)
+        return result
+
+
+def test_kernel_verifier_rejects_executable_drift_during_phase(
+    tmp_path: Path,
+) -> None:
+    resolved = _resolved(tmp_path, argv=["./verify-tool"])
+    executable = resolved.workspace / "verify-tool"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    digest = candidate_source_digest(
+        resolved.workspace, resolved.task.editable_files
+    )
+
+    with pytest.raises(IntegrityError) as raised:
+        CandidateVerifier(ExecutableMutatingSupervisor()).compile(
+            resolved,
+            candidate_root=resolved.workspace,
+            expected_source_digest=digest,
+        )
+
+    assert raised.value.reason_code == "verifier_executable_changed_during_compile"
+
+
+def test_kernel_verifier_resolves_path_symlink_to_non_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    target = binary_dir / "fixed-tool"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o755)
+    alias = binary_dir / "tool"
+    alias.symlink_to(target.name)
+    monkeypatch.setenv("PATH", str(binary_dir))
+    resolved = _resolved(tmp_path / "task", argv=["tool"])
+    digest = candidate_source_digest(
+        resolved.workspace, resolved.task.editable_files
+    )
+
+    evidence = CandidateVerifier(RecordingSupervisor()).correctness(
+        resolved,
+        candidate_root=resolved.workspace,
+        expected_source_digest=digest,
+    )
+
+    assert evidence.argv[0] == str(target)
+    assert not Path(evidence.argv[0]).is_symlink()
+    assert os.access(evidence.argv[0], os.X_OK)

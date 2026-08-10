@@ -10,11 +10,22 @@ import yaml
 import apex.benchmark.config_views as config_views_module
 from apex.benchmark import (
     EvaluatorPolicy,
-    build_config_views,
+    build_config_views as _build_config_views,
     validate_phase_set_contract,
 )
 from apex.core import IntegrityError, sha256_json
 from apex.runtime import DependencyReceipt
+from tests.support.magpie_contract import resolved_contract
+
+
+def build_config_views(source: Path, output: Path, **kwargs):
+    receipt = kwargs["dependency_receipt"]
+    return _build_config_views(
+        source,
+        output,
+        resolved_contract=resolved_contract(source, receipt),
+        **kwargs,
+    )
 
 
 def _profiler(*, diagnostic: bool) -> dict[str, Any]:
@@ -44,6 +55,19 @@ def _dependencies() -> dict[str, Any]:
     }
 
 
+def _magpie_config_resolution() -> dict[str, str]:
+    return {
+        "plan_schema": "apex.magpie-main-resolved-plan/v1",
+        "plan_sha256": "6" * 64,
+        "capability_schema": "apex.magpie-main-capability-receipt/v1",
+        "capability_receipt_sha256": "7" * 64,
+        "effective_config_sha256": "8" * 64,
+        "scoring_config_sha256": "9" * 64,
+        "phase_views_sha256": "a" * 64,
+        "resolution_method_sha256": "b" * 64,
+    }
+
+
 def _phase_set(
     *, serving: bool = True, with_policy: bool = False
 ) -> tuple[list[dict[str, Any]], str]:
@@ -51,13 +75,25 @@ def _phase_set(
     framework = "vllm" if serving else "pytorch"
     quality_kind = "lm_eval" if serving else "framework_quality_gate"
     tasks = "gsm8k" if serving else ""
-    policy = None
     if serving:
         envs.update({"RUN_EVAL": "true", "MAGPIE_EVAL_TASKS": tasks})
-    if with_policy:
-        typed = EvaluatorPolicy("strict-v1", tasks, "exact_match", 128, 32)
+        typed = (
+            EvaluatorPolicy(
+                "strict-v2", tasks, "utils/evals/gsm8k.yaml", "c" * 64,
+                "openai/gsm8k", "main", "d" * 40, "exact_match", 128, 32,
+            )
+            if with_policy
+            else EvaluatorPolicy(
+                "apex-lm-eval-gsm8k-v2", tasks,
+                "utils/evals/gsm8k.yaml", "c" * 64,
+                "openai/gsm8k", "main", "d" * 40,
+                "exact_match,strict-match", 2248, 480,
+            )
+        )
         envs.update(typed.env())
         policy = typed.to_dict()
+    else:
+        policy = None
     benchmark: dict[str, Any] = {
         "framework": framework,
         "model": "Qwen/example",
@@ -102,11 +138,12 @@ def _phase_set(
                 "benchmark": selected,
                 "apex": {
                     "benchmark_view": {
-                        "schema": "apex.benchmark-view.v1",
+                        "schema": "apex.benchmark-view.v2",
                         "kind": kind,
                         "original_sha256": "b" * 64,
                         "workload_semantics_sha256": semantics,
                         "dependencies": _dependencies(),
+                        "magpie_config_resolution": _magpie_config_resolution(),
                         "quality_contract": quality,
                     }
                 },
@@ -142,10 +179,28 @@ def test_accepts_self_consistent_framework_quality_phase_set() -> None:
     validate_phase_set_contract(*documents, semantics)
 
 
+@pytest.mark.parametrize("run_mode", ("local", "ray"))
+def test_accepts_phase_set_without_docker_image(run_mode: str) -> None:
+    documents, semantics = _phase_set()
+    for document in documents:
+        document["benchmark"]["run_mode"] = run_mode
+        document["benchmark"].pop("docker_image")
+    projected = copy.deepcopy(documents[0]["benchmark"])
+    for key in ("profiler", "gap_analysis", "run_kind"):
+        projected.pop(key)
+    semantics = sha256_json(projected)
+    for document in documents:
+        document["apex"]["benchmark_view"][
+            "workload_semantics_sha256"
+        ] = semantics
+
+    validate_phase_set_contract(*documents, semantics)
+
+
 @pytest.mark.parametrize(
     ("view", "path", "value"),
     (
-        (0, ("apex", "benchmark_view", "schema"), "apex.benchmark-view.v2"),
+        (0, ("apex", "benchmark_view", "schema"), "apex.benchmark-view.v3"),
         (1, ("apex", "benchmark_view", "kind"), "measurement"),
         (2, ("apex", "benchmark_view", "workload_semantics_sha256"), "0" * 64),
         (1, ("apex", "benchmark_view", "original_sha256"), "0" * 64),

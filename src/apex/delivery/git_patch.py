@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from apex.core import ContractError, IntegrityError, sha256_bytes, sha256_file
-from apex.execution import SubprocessSupervisor
+from apex.execution import SubprocessSupervisor, build_subprocess_environment
 from apex.runtime import canonical_repository
 
 from .e2e_models import SourceFileChange, SourceRepositoryLock, safe_bundle_path
@@ -67,10 +67,16 @@ class RepositoryApplyReceipt:
 
 
 def _environment(**extra: str) -> dict[str, str]:
-    value = os.environ.copy()
-    value.pop("PYTHONPATH", None)
-    value.update(extra)
-    return value
+    return build_subprocess_environment(
+        extra,
+        fixed={
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+    )
 
 
 class _Git:
@@ -192,6 +198,8 @@ def capture_repository_patch(
     anchor_generation: int,
     license_id: str,
     runtime_component: str,
+    engagement_kind: str = "python_import",
+    build_id_required: bool = False,
     supervisor: SubprocessSupervisor | None = None,
 ) -> CapturedRepositoryPatch:
     """Freeze a candidate worktree without mutating its real Git index."""
@@ -217,6 +225,8 @@ def capture_repository_patch(
         clean_base=True,
         license_id=license_id,
         runtime_component=runtime_component,
+        engagement_kind=engagement_kind,
+        build_id_required=build_id_required,
     )
     return CapturedRepositoryPatch(lock, patch)
 

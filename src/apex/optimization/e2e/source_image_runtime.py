@@ -487,7 +487,7 @@ def _build_document(
     recipe, image, parent_locator, layer, dockerfile, result, artifacts, steps
 ) -> dict[str, Any]:
     return {
-        "schema": "apex.qwen-source-build/v1",
+        "schema": "apex.e2e-python-source-build/v1",
         "recipe_sha256": recipe.computed_sha256,
         "parent_locator": parent_locator,
         "image": image.to_dict(),

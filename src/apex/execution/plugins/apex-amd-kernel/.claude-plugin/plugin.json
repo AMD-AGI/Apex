@@ -1,0 +1,9 @@
+{
+  "name": "apex-amd-kernel",
+  "version": "0.1.0",
+  "description": "Evidence-first AMD GPU kernel optimization and debugging skills for Apex.",
+  "author": {
+    "name": "Advanced Micro Devices, Inc."
+  },
+  "skills": "./skills/"
+}

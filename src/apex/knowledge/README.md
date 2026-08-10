@@ -84,6 +84,9 @@ versions, shape/source/harness/policy hashes, and evidence receipts. Success,
 failure, no-gain, regression, and infrastructure failure remain distinct.
 Deleting a view loses no truth: replaying the journal reconstructs it byte for
 byte.
+The MCP projection uses the same `ExperienceView` over a checksum-verified
+read-only canonical journal and requires the complete `ExperienceIdentity`; it
+does not add a second experience store or fuzzy cross-workload retrieval policy.
 
 ## File map
 

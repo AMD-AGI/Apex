@@ -434,7 +434,6 @@ def _query_process_map(
         canonical = tuple(sorted(set(indices)))
         if (
             device_status != 0
-            or not canonical
             or canonical != tuple(sorted(indices))
             or not set(canonical).issubset(valid_indices)
         ):

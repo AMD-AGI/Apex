@@ -15,7 +15,7 @@ from apex.core import (
     sha256_json,
 )
 from apex.execution import AgentRegistry, SubprocessSupervisor
-from apex.ports import AgentRequest, AgentResult
+from apex.ports import AgentExecutionAuthorityReceipt, AgentRequest, AgentResult
 
 from .candidate_fingerprint import (
     IGNORED_DIRECTORIES as _IGNORED_DIRECTORIES,
@@ -54,6 +54,15 @@ class E2ECandidateRequest:
     effort: str | None
     max_turns: int
     timeout_seconds: int
+    controller_context_sha256: str
+
+    def __post_init__(self) -> None:
+        digest = self.controller_context_sha256
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ContractError(
+                "E2E agent controller authority is missing or invalid",
+                "agent_execution_authority_missing",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +186,9 @@ class AgentCandidateWorker:
             destination=request.destination,
         )
         baseline_digest = workspace.baseline_source_sha256
-        result = self._agents.get(request.backend).run(_agent_request(request, workspace))
+        result = self._agents.get(request.backend).run(
+            _agent_request(request, workspace, baseline_digest)
+        )
         failure = _agent_failure_reason(result)
         if failure is not None:
             return _agent_rejection(request, workspace, result, baseline_digest, failure)
@@ -190,8 +201,22 @@ class AgentCandidateWorker:
 
 
 def _agent_request(
-    request: E2ECandidateRequest, workspace: SourceCandidateWorkspace
+    request: E2ECandidateRequest,
+    workspace: SourceCandidateWorkspace,
+    baseline_digest: str,
 ) -> AgentRequest:
+    authority = AgentExecutionAuthorityReceipt(
+        authority_id="apex-e2e-controller-v1",
+        authority_kind="e2e_controller",
+        run_id=request.run_id,
+        attempt_id=request.attempt_id,
+        backend=request.backend.value,
+        workspace=str(workspace.root),
+        allowed_files=workspace.editable_files,
+        requested_environment_keys=(),
+        parent_receipt_sha256=request.controller_context_sha256,
+        source_anchor_sha256=baseline_digest,
+    )
     return AgentRequest(
         run_id=request.run_id,
         attempt_id=request.attempt_id,
@@ -199,6 +224,7 @@ def _agent_request(
         prompt=request.prompt,
         workspace=workspace.root,
         allowed_files=workspace.editable_files,
+        execution_authority=authority,
         model=request.model,
         effort=request.effort,
         max_turns=request.max_turns,

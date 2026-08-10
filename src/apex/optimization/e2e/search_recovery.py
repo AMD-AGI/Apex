@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from apex.core import ContractError, IntegrityError
-from apex.evaluation import E2EMeasurement
+from apex.evaluation import E2EObservation
 from apex.orchestration import SearchStage
 from apex.storage import ArtifactReceipt
 
@@ -33,7 +33,7 @@ class SearchProgress:
     diagnosis: Diagnosis
     accepted: list[AcceptedCandidate]
     accepted_sources: set[str]
-    anchor: E2EMeasurement
+    anchor: E2EObservation
     configs: tuple[Path, Path, Path]
     history: list[str]
 
@@ -47,7 +47,7 @@ class SearchRecovery:
     def progress(
         self,
         initial: Diagnosis,
-        baseline: E2EMeasurement,
+        baseline: E2EObservation,
         recovery: RecoveredSearch | None,
     ) -> SearchProgress:
         if recovery is None:
@@ -403,8 +403,8 @@ class SearchRecovery:
         if recovered.promotion is None:
             return values
         return (*values, (
-            "promotion_pair_receipt",
-            "matched_promotion_pair",
+            "paired_promotion_receipt",
+            "paired_promotion",
             recovered.promotion.receipt,
         ))
 

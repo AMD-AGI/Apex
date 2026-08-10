@@ -80,7 +80,7 @@ def test_minified_source_false_positive_exports_exact_observation(
     record = next(
         item for item in document["records"] if item["attempt_id"] == "attempt-1"
     )
-    assert record["exporter_version"] == "apex_rl_export_v2"
+    assert record["exporter_version"] == "apex_rl_export_v3"
     artifact = next(
         item
         for item in record["artifacts_by_role"]["agent_message"]

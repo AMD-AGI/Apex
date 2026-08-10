@@ -25,6 +25,10 @@ from .targeted_trace_models import (
     strict_nonnegative_int,
 )
 from .targeted_trace_io import read_object, resolve_trace_path, resolve_workspace_path
+from .targeted_trace_quality import (
+    SemanticQualityAccumulator,
+    validate_semantic_quality,
+)
 from .targeted_trace_validation import validate_envelope, validate_event
 
 
@@ -154,8 +158,11 @@ class TargetedTraceValidator:
             manifest, workspace=workspace, trace_dir=manifest_path.parent
         )
         self._validate_shard_set(receipts, trace_dir=manifest_path.parent)
+        semantic_quality = SemanticQualityAccumulator()
         actual = tuple(
-            self._validate_shard(receipt, run_id=run_id, on_event=None)
+            self._validate_shard(
+                receipt, run_id=run_id, on_event=semantic_quality.observe
+            )
             for receipt in receipts
         )
         if AcquisitionCoverage.aggregate(actual) != coverage:
@@ -163,7 +170,9 @@ class TargetedTraceValidator:
                 "Manifest coverage differs from shard sentinels", "coverage_mismatch"
             )
         _validate_report_coverage(targeted, coverage)
-        _validate_summary(summary_path, run_id, coverage, receipts)
+        semantic_claimed, semantic_reasons = _validate_summary(
+            summary_path, run_id, coverage, receipts, semantic_quality
+        )
         if on_event is not None:
             self._replay_events(receipts, run_id=run_id, on_event=on_event)
         _assert_metadata_unchanged(initial_artifacts, manifest_path, summary_path, workspace)
@@ -179,6 +188,8 @@ class TargetedTraceValidator:
             coverage,
             initial_artifacts + shard_artifacts,
             tuple(sorted(warnings)),
+            semantic_claimed,
+            semantic_reasons,
         )
 
     @staticmethod
@@ -452,7 +463,8 @@ def _validate_summary(
     run_id: str,
     coverage: AcquisitionCoverage,
     receipts: tuple[ShardReceipt, ...],
-) -> None:
+    semantic_quality: SemanticQualityAccumulator,
+) -> tuple[bool, tuple[str, ...]]:
     summary = read_object(path, "TargetedKernelTrace summary")
     if (
         summary.get("schema_name") != SCHEMA_NAME
@@ -473,6 +485,9 @@ def _validate_summary(
     if not isinstance(raw, Mapping) or AcquisitionCoverage.from_mapping(raw) != coverage:
         raise IntegrityError("Targeted summary coverage mismatch", "coverage_mismatch")
     _validate_summary_shards(summary.get("shards"), receipts)
+    return validate_semantic_quality(
+        summary.get("evidence_quality"), coverage, semantic_quality
+    )
 
 
 def _validate_summary_shards(

@@ -4,7 +4,9 @@ This package owns durable evidence, not optimization policy.
 
 - `EventJournal` is the canonical append-only SQLite history. Events have a global
   sequence, explicit parent, content checksum, transaction receipt, and run-scoped
-  idempotency key.
+  idempotency key. `EventJournal.open_read_only()` opens an existing regular file
+  with SQLite `mode=ro`, performs no schema/WAL setup, retains full checksum and
+  transaction verification, and rejects every append attempt.
 - `ArtifactStore` publishes SHA-256-addressed bytes with temp-file, `fsync`, atomic
   rename, parent-directory `fsync`, and receipt verification on reads.
 - `SnapshotStore` caches state projections. Snapshots are checksummed but disposable;
@@ -12,6 +14,10 @@ This package owns durable evidence, not optimization policy.
 
 Storage types are immutable at their public boundary. SQLite triggers reject updates
 and deletes; application state must advance by appending a new event.
+E2E terminal reward events bind second-clean-replay raw files, while standalone
+terminal events bind exact gate or raw invocation evidence, using indexed CAS
+roles. Storage preserves and verifies those bytes but does not parse measurements,
+compute reward, or decide trainability.
 
 ## Purpose
 
@@ -41,7 +47,8 @@ snapshot corruption raises integrity failure; corrupt snapshots may be rebuilt.
 ## Tests
 
 Hermetic tests cover atomic CAS writes, concurrent/deduplicated appends, transaction
-boundaries, crash recovery, snapshot validation, and replay ordering.
+boundaries, crash recovery, mutation-free read-only replay, snapshot validation,
+and replay ordering.
 
 ## Provenance
 

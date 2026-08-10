@@ -4,20 +4,30 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
-from apex.core import ContractError, canonical_json_bytes, sha256_json
+from apex.core import ContractError, canonical_json_bytes, sha256_bytes, sha256_json
 
 from .gpu_ownership import (
-    GpuOwnershipInspector,
     GpuOwnershipReceipt,
-    RocmSmiGpuOwnershipInspector,
+)
+from .gpu_doctor import (
+    GpuDoctorInspector,
+    GpuDoctorReceipt,
+    LinuxGpuDoctorInspector,
 )
 from .gpu_topology import selector_scope
+from .gpu_lifecycle import (
+    GpuLeaseHeartbeatReceipt,
+    GpuLeaseOwnerIdentity,
+    GpuMeasurementBracketReceipt,
+    GpuMeasurementGuard,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +40,7 @@ class GpuLeaseReceipt:
     acquired_unix_seconds: float
     lock_path: str
     ownership: GpuOwnershipReceipt
+    doctor: GpuDoctorReceipt
     lock_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -39,7 +50,7 @@ class GpuLeaseReceipt:
             sorted(device.unique_id for device in self.ownership.selected_devices)
         )
         if (
-            self.schema_version != 2
+            self.schema_version != 3
             or self.owner_pid <= 0
             or self.acquired_unix_seconds < 0
             or not Path(self.lock_path).is_absolute()
@@ -51,6 +62,8 @@ class GpuLeaseReceipt:
             or self.execution_scope != self.ownership.execution_scope
             or self.physical_scope != self.ownership.physical_scope
             or self.ownership.foreign_owners
+            or self.doctor.ownership != self.ownership
+            or not self.doctor.formal_measurement_ready
         ):
             raise ContractError(
                 "GPU lease receipt is inconsistent with ownership evidence",
@@ -68,6 +81,7 @@ class GpuLeaseReceipt:
             "lock_path": self.lock_path,
             "lock_paths": list(self.lock_paths),
             "ownership": self.ownership.to_dict(),
+            "doctor": self.doctor.to_dict(),
         }
 
     @property
@@ -81,6 +95,10 @@ class GpuLease(Protocol):
     def __enter__(self) -> "GpuLease": ...
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None: ...
+
+    def heartbeat(self, reason: str = "manual") -> GpuLeaseHeartbeatReceipt: ...
+
+    def measurement(self, action_id: str) -> GpuMeasurementGuard: ...
 
 
 class GpuLeaseManager(Protocol):
@@ -98,26 +116,38 @@ class LocalGpuLease:
         *,
         lock_root: Path | None = None,
         requested_devices: str | None = None,
-        ownership_inspector: GpuOwnershipInspector | None = None,
+        doctor_inspector: GpuDoctorInspector | None = None,
+        ttl_seconds: float = 10_800.0,
+        clock: Callable[[], float] = time.time,
+        owner_identity_provider: Callable[[], GpuLeaseOwnerIdentity] | None = None,
     ) -> None:
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError("GPU lease TTL must be positive")
         self._run_id = run_id
+        self._ttl_seconds = float(ttl_seconds)
+        self._clock = clock
+        self._owner_identity_provider = owner_identity_provider or _current_owner
+        self._preflight_owner = self._owner_identity_provider()
         self._selector_scope = resolve_gpu_device_scope(requested_devices)
-        self._ownership_inspector = (
-            ownership_inspector or RocmSmiGpuOwnershipInspector()
-        )
-        preflight = self._ownership_inspector.inspect(
+        self._doctor_inspector = doctor_inspector or LinuxGpuDoctorInspector()
+        preflight_doctor = self._doctor_inspector.inspect(
             self._selector_scope, allowed_pids=(os.getpid(),)
         )
+        preflight = preflight_doctor.ownership
         _reject_foreign_owners(preflight)
+        _reject_doctor(preflight_doctor)
         self._execution_scope = preflight.execution_scope
         self._physical_scope = preflight.physical_scope
         self._preflight = preflight
+        self._preflight_doctor = preflight_doctor
         root = lock_root or Path("/tmp/apex-gpu-leases")
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._locks = _physical_lock_paths(root, preflight)
         self._descriptors: tuple[int, ...] = ()
+        self._heartbeat_receipt: GpuLeaseHeartbeatReceipt | None = None
+        self._heartbeat_sequence = 0
         self.receipt = GpuLeaseReceipt(
-            2,
+            3,
             run_id,
             self._execution_scope,
             self._physical_scope,
@@ -125,6 +155,7 @@ class LocalGpuLease:
             0.0,
             str(self._locks[0][1]),
             preflight,
+            preflight_doctor,
             tuple(str(path) for _, path in self._locks),
         )
 
@@ -135,9 +166,11 @@ class LocalGpuLease:
                 acquired_descriptors.append(
                     _acquire_physical_lock(unique_id, path, self._physical_scope)
                 )
-            ownership = self._ownership_inspector.inspect(
+            doctor = self._doctor_inspector.inspect(
                 self._selector_scope, allowed_pids=(os.getpid(),)
             )
+            _reject_doctor(doctor)
+            ownership = doctor.ownership
             if ownership.selected_devices != self._preflight.selected_devices:
                 raise ContractError(
                     "Physical GPU mapping changed while acquiring the lease",
@@ -153,9 +186,15 @@ class LocalGpuLease:
                     "gpu_physical_mapping_changed",
                 )
             _reject_foreign_owners(ownership)
-            acquired_at = time.time()
+            owner = self._owner_identity_provider()
+            if owner != self._preflight_owner:
+                raise ContractError(
+                    "GPU lease owner process changed during acquisition",
+                    "gpu_lease_owner_changed",
+                )
+            acquired_at = self._clock()
             self.receipt = GpuLeaseReceipt(
-                2,
+                3,
                 self._run_id,
                 self._execution_scope,
                 self._physical_scope,
@@ -163,15 +202,14 @@ class LocalGpuLease:
                 acquired_at,
                 str(self._locks[0][1]),
                 ownership,
+                doctor,
                 tuple(str(path) for _, path in self._locks),
             )
-            payload = canonical_json_bytes(self.receipt.to_dict()) + b"\n"
-            for descriptor in acquired_descriptors:
-                os.ftruncate(descriptor, 0)
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                os.write(descriptor, payload)
-                os.fsync(descriptor)
             self._descriptors = tuple(acquired_descriptors)
+            self._heartbeat_receipt = self._new_heartbeat(
+                "acquired", doctor, owner, acquired_at
+            )
+            self._write_metadata()
             return self
         except BaseException:
             _release_descriptors(acquired_descriptors)
@@ -190,16 +228,137 @@ class LocalGpuLease:
                 {"failures": failures},
             )
 
+    def heartbeat(self, reason: str = "manual") -> GpuLeaseHeartbeatReceipt:
+        """Renew only after proving this process still owns the same healthy GPUs."""
+
+        if not self._descriptors or self._heartbeat_receipt is None:
+            raise ContractError("GPU lease is not active", "gpu_lease_inactive")
+        now = self._clock()
+        previous = self._heartbeat_receipt
+        if now < previous.observed_unix_seconds:
+            raise ContractError("GPU lease clock regressed", "gpu_lease_clock_regressed")
+        if now > previous.valid_until_unix_seconds:
+            raise ContractError(
+                "GPU lease expired before its next heartbeat",
+                "gpu_lease_expired",
+                {"expired_unix_seconds": previous.valid_until_unix_seconds},
+            )
+        owner = self._owner_identity_provider()
+        if owner != self._preflight_owner:
+            raise ContractError(
+                "GPU lease owner process identity changed",
+                "gpu_lease_owner_changed",
+            )
+        doctor = self._doctor_inspector.inspect(
+            self._selector_scope, allowed_pids=(owner.pid,)
+        )
+        self._validate_renewal(doctor)
+        receipt = self._new_heartbeat(reason, doctor, owner, now)
+        self._heartbeat_receipt = receipt
+        self._write_metadata()
+        return receipt
+
+    def measurement(self, action_id: str) -> GpuMeasurementGuard:
+        """Create a fail-closed pre/post bracket for one formal measurement."""
+
+        if not action_id:
+            raise ValueError("measurement action_id is required")
+        return _LocalMeasurementGuard(self, action_id)
+
+    def _validate_renewal(self, doctor: GpuDoctorReceipt) -> None:
+        _reject_doctor(doctor)
+        ownership = doctor.ownership
+        _reject_foreign_owners(ownership)
+        if (
+            ownership.selected_devices != self._preflight.selected_devices
+            or ownership.device_inventory != self._preflight.device_inventory
+            or ownership.selector_inputs != self._preflight.selector_inputs
+            or ownership.hsa_inventory != self._preflight.hsa_inventory
+        ):
+            raise ContractError(
+                "GPU identity changed during an active lease",
+                "gpu_lease_device_identity_changed",
+            )
+
+    def _new_heartbeat(
+        self,
+        reason: str,
+        doctor: GpuDoctorReceipt,
+        owner: GpuLeaseOwnerIdentity,
+        observed: float,
+    ) -> GpuLeaseHeartbeatReceipt:
+        self._heartbeat_sequence += 1
+        return GpuLeaseHeartbeatReceipt(
+            1,
+            self._run_id,
+            self.receipt.digest,
+            self._heartbeat_sequence,
+            reason,
+            observed,
+            observed + self._ttl_seconds,
+            self._ttl_seconds,
+            owner,
+            doctor.ownership,
+            doctor,
+        )
+
+    def _write_metadata(self) -> None:
+        heartbeat = self._heartbeat_receipt
+        assert heartbeat is not None
+        document = {**self.receipt.to_dict(), "heartbeat": heartbeat.to_dict()}
+        payload = canonical_json_bytes(document) + b"\n"
+        for descriptor in self._descriptors:
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+
+
+class _LocalMeasurementGuard:
+    def __init__(self, lease: LocalGpuLease, action_id: str) -> None:
+        self._lease = lease
+        self._action_id = action_id
+        self._pre: GpuLeaseHeartbeatReceipt | None = None
+        self._started = 0.0
+        self.receipt: GpuMeasurementBracketReceipt
+
+    def __enter__(self) -> "_LocalMeasurementGuard":
+        self._pre = self._lease.heartbeat("measurement_pre")
+        self._started = self._lease._clock()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+        finished = self._lease._clock()
+        post = self._lease.heartbeat("measurement_post")
+        assert self._pre is not None
+        self.receipt = GpuMeasurementBracketReceipt(
+            1,
+            self._lease.receipt.run_id,
+            self._action_id,
+            self._lease.receipt.digest,
+            self._started,
+            finished,
+            self._pre,
+            post,
+        )
+
 
 class LocalGpuLeaseManager:
     def __init__(
         self,
         *,
         lock_root: Path | None = None,
-        ownership_inspector: GpuOwnershipInspector | None = None,
+        doctor_inspector: GpuDoctorInspector | None = None,
+        ttl_seconds: float = 10_800.0,
+        clock: Callable[[], float] = time.time,
+        owner_identity_provider: Callable[[], GpuLeaseOwnerIdentity] | None = None,
     ) -> None:
         self._lock_root = lock_root
-        self._ownership_inspector = ownership_inspector
+        self._doctor_inspector = doctor_inspector
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._owner_identity_provider = owner_identity_provider
 
     def acquire(
         self, run_id: str, *, requested_devices: str | None = None
@@ -208,7 +367,10 @@ class LocalGpuLeaseManager:
             run_id,
             lock_root=self._lock_root,
             requested_devices=requested_devices,
-            ownership_inspector=self._ownership_inspector,
+            doctor_inspector=self._doctor_inspector,
+            ttl_seconds=self._ttl_seconds,
+            clock=self._clock,
+            owner_identity_provider=self._owner_identity_provider,
         )
 
 
@@ -305,6 +467,40 @@ def _reject_foreign_owners(receipt: GpuOwnershipReceipt) -> None:
             "ownership_receipt": receipt.to_dict(),
             "ownership_receipt_sha256": receipt.digest,
         },
+    )
+
+
+def _reject_doctor(receipt: GpuDoctorReceipt) -> None:
+    if receipt.formal_measurement_ready:
+        return
+    raise ContractError(
+        "GPU doctor preflight did not establish formal measurement readiness",
+        "gpu_doctor_not_ready",
+        {
+            "status": receipt.status,
+            "doctor_receipt": receipt.to_dict(),
+            "doctor_receipt_sha256": receipt.digest,
+        },
+    )
+
+
+def _current_owner() -> GpuLeaseOwnerIdentity:
+    pid = os.getpid()
+    root = Path("/proc") / str(pid)
+    try:
+        metadata = root.stat()
+        raw_stat = (root / "stat").read_text(encoding="utf-8")
+        cmdline = (root / "cmdline").read_bytes()
+        tail = raw_stat[raw_stat.rindex(")") + 2 :].split()
+        start_time_ticks = int(tail[19])
+    except (OSError, UnicodeError, ValueError, IndexError) as error:
+        raise ContractError(
+            "GPU lease owner process identity is unavailable",
+            "gpu_lease_owner_identity_unavailable",
+            {"pid": pid},
+        ) from error
+    return GpuLeaseOwnerIdentity(
+        pid, metadata.st_uid, start_time_ticks, sha256_bytes(cmdline)
     )
 
 

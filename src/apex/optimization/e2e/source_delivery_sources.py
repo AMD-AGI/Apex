@@ -24,6 +24,7 @@ from .candidate import (
     frozen_candidate_source,
     validate_frozen_sources,
 )
+from .candidate_fingerprint import git_environment
 from .services import AcceptedCandidate, FinalDeliveryRequest
 from .source_delivery_models import FormalRepositoryProfile, FormalSourceDeliveryProfile
 
@@ -41,7 +42,9 @@ class CumulativeSourceMaterializer:
         destination: Path,
     ) -> dict[str, Path]:
         destination.mkdir(parents=True)
-        locks = {item.name: item for item in request.provenance.source_locks}
+        locks = {
+            item.name: item for item in request.provenance.component_sources.locks
+        }
         roots: dict[str, Path] = {}
         for repository in profile.repositories:
             lock = locks.get(repository.repository_id)
@@ -82,6 +85,8 @@ class CumulativeSourceMaterializer:
                     anchor_generation=len(request.accepted),
                     license_id=repository.license_id,
                     runtime_component=repository.runtime_component,
+                    engagement_kind=repository.engagement_kind,
+                    build_id_required=repository.build_id_required,
                     supervisor=self._supervisor,
                 )
             )
@@ -163,13 +168,10 @@ class CumulativeSourceMaterializer:
             )
 
     def _git(self, cwd: Path, *args: str, timeout: int = 60) -> str:
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
         result = self._supervisor.run(
             ("git", *args),
             cwd=cwd,
-            environment=environment,
+            environment=git_environment(),
             timeout_seconds=timeout,
         )
         if result.exit_code != 0 or result.timed_out or result.stdout_truncated:
@@ -342,7 +344,9 @@ def _candidate_ids(
 
 def _source_lock(request: FinalDeliveryRequest, repository_id: str) -> RepositoryLock:
     matches = tuple(
-        item for item in request.provenance.source_locks if item.name == repository_id
+        item
+        for item in request.provenance.component_sources.locks
+        if item.name == repository_id
     )
     if len(matches) != 1 or not matches[0].exact:
         raise ContractError("Exact source lock is missing", "source_lock_unresolved")

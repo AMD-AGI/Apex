@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from apex.core import AgentBackendName, ContractError
+from apex.core import (
+    AgentBackendName,
+    ContractError,
+    canonical_json_bytes,
+    sha256_bytes,
+)
 from apex.intake import E2EOptimizeSpec, TaskResolver, TaskSpec
 
 
@@ -83,6 +88,17 @@ def test_task_spec_round_trip_json(tmp_path: Path) -> None:
     task = TaskSpec.from_file(task_path)
 
     assert TaskSpec.from_mapping(task.to_dict()).to_dict() == task.to_dict()
+
+
+def test_task_spec_from_file_uses_strict_yaml_loader(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.yaml"
+    task_path.write_text("task_id: first\ntask_id: second\n", encoding="utf-8")
+
+    with pytest.raises(ContractError) as raised:
+        TaskSpec.from_file(task_path)
+
+    assert raised.value.reason_code == "invalid_task_spec"
+    assert "duplicate key" in raised.value.details["cause"]
 
 
 def test_task_spec_preserves_matched_agent_options_and_budget(tmp_path: Path) -> None:
@@ -459,3 +475,33 @@ def test_specs_validate_dataset_partition(tmp_path: Path, kind: str) -> None:
     accepted = build(data)
     assert accepted.dataset_split == "heldout"
     assert accepted.data_visibility == "heldout_private"
+
+
+def test_e2e_spec_round_trips_ready_campaign_baseline_and_rejects_tamper(
+    tmp_path: Path,
+) -> None:
+    baseline = {
+        "schema": "apex.release-candidate-receipt/v2",
+        "baseline_status": "ready",
+        "baseline_blockers": [],
+        "status": "blocked",
+        "blockers": ["live_pending"],
+        "qualification_authorities": [],
+    }
+    baseline["receipt_sha256"] = sha256_bytes(canonical_json_bytes(baseline))
+    values = {
+        "config_path": str((tmp_path / "benchmark.yaml").resolve()),
+        "results_dir": str((tmp_path / "results").resolve()),
+        "campaign_baseline_receipt": baseline,
+    }
+
+    spec = E2EOptimizeSpec.from_mapping(values)
+    assert E2EOptimizeSpec.from_mapping(spec.to_dict()).to_dict() == spec.to_dict()
+
+    with pytest.raises(ContractError, match="invalid or blocked"):
+        E2EOptimizeSpec.from_mapping({
+            **values,
+            "campaign_baseline_receipt": {**baseline, "baseline_status": "blocked"},
+        })
+    with pytest.raises(ContractError, match="must be an object"):
+        E2EOptimizeSpec.from_mapping({**values, "campaign_baseline_receipt": "fake"})

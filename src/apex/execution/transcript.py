@@ -63,6 +63,7 @@ def agent_transcript_document(result: AgentResult) -> dict[str, object]:
                 "bytes": result.discarded_stdout_bytes,
                 "sha256": result.discarded_stdout_sha256,
             },
+            "credential_redaction_count": result.credential_redaction_count,
             "observed_turns": result.observed_turns,
             "max_turns": result.invocation.max_turns if result.invocation else None,
             "turn_policy": result.invocation.turn_policy if result.invocation else None,

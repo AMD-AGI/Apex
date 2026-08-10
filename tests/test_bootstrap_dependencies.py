@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import apex.runtime as bootstrap
+from apex.core import sha256_file, sha256_json
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,55 @@ def add_commit(root: Path) -> str:
     git(root, "add", "package.py")
     git(root, "commit", "-q", "-m", "advance")
     return git(root, "rev-parse", "HEAD")
+
+
+def add_magpie_corpus(root: Path) -> str:
+    corpus = root / "examples" / "benchmarks"
+    corpus.mkdir(parents=True)
+    (corpus / "benchmark_test.yaml").write_text(
+        "benchmark:\n  framework: test\n", encoding="utf-8"
+    )
+    git(root, "add", "examples/benchmarks/benchmark_test.yaml")
+    git(root, "commit", "-q", "-m", "add benchmark corpus")
+    return git(root, "rev-parse", "HEAD")
+
+
+def write_magpie_manifest(path: Path, root: Path) -> Path:
+    manifest = bootstrap.build_magpie_corpus_manifest(root)
+    path.write_text(
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_magpie_compatibility_ledger(path: Path, root: Path) -> Path:
+    manifest = bootstrap.build_magpie_corpus_manifest(root)
+    entries = tuple(
+        bootstrap.MagpieCompatibilityEntry(
+            path=item.path,
+            config_sha256=item.sha256,
+            framework="test",
+            run_mode="docker",
+            precision="fp8",
+            lifecycle="one_shot",
+            image_status="runtime_selection_required",
+            model_identity_sha256=sha256_json({"model": "fixture"}),
+            compatibility_status="config_compatible",
+        )
+        for item in manifest.files
+    )
+    ledger = bootstrap.build_magpie_compatibility_ledger(
+        magpie_commit=manifest.commit,
+        benchmark_tree=manifest.benchmark_tree,
+        corpus_manifest_sha256=manifest.manifest_sha256,
+        entries=entries,
+    )
+    path.write_text(
+        json.dumps(ledger.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def write_source_lock(path: Path, entries: dict[str, tuple[Path, str]]) -> Path:
@@ -136,7 +186,7 @@ def test_repository_lock_contains_reviewed_exact_dependencies():
     assert lock.receipt_schema == "apex.dependencies.receipt/v1"
     assert len(lock.sha256) == 64
     observed = {item.key: item for item in lock.dependencies}
-    assert observed["magpie"].commit == "210513b31b2f3607920be4000d37fc51f14c5711"
+    assert observed["magpie"].commit == "12896a49a731ad72c791b7a23abcef7a0d6c4487"
     assert observed["magpie"].import_root == "Magpie"
     assert observed["magpie"].package_version == "0.2.0"
     assert observed["tracelens"].commit == "4f25c1a6f03441e710a97d71a5de9cc5c2fc1555"
@@ -147,6 +197,16 @@ def test_repository_lock_contains_reviewed_exact_dependencies():
     )
     assert observed["inferencex"].repository_only
     assert observed["inferencex"].import_root == ""
+    manifest = bootstrap.load_magpie_corpus_manifest(lock.magpie_corpus_manifest)
+    assert len(manifest.files) == 27
+    assert manifest.benchmark_tree == "c63881f80146e987d5563b553df233b7cb8ba643"
+    ledger = bootstrap.load_magpie_compatibility_ledger(
+        lock.magpie_compatibility_ledger
+    )
+    assert len(ledger.entries) == 27
+    assert all(
+        item.compatibility_status == "config_compatible" for item in ledger.entries
+    )
 
 
 @pytest.mark.parametrize(
@@ -165,6 +225,46 @@ def test_lock_rejects_ambiguous_or_unsafe_entries(tmp_path, mutation, message):
     lock_path.write_text(json.dumps(raw), encoding="utf-8")
 
     with pytest.raises(bootstrap.BootstrapError, match=message):
+        bootstrap.load_lock(lock_path)
+
+
+def test_lock_requires_a_regular_magpie_corpus_manifest(tmp_path):
+    raw = json.loads((REPO_ROOT / "scripts" / "dependencies.lock.json").read_text())
+    raw.pop("magpie_corpus_manifest")
+    lock_path = tmp_path / "dependencies.lock.json"
+    lock_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(bootstrap.BootstrapError, match="magpie_corpus_manifest"):
+        bootstrap.load_lock(lock_path)
+
+    raw["magpie_corpus_manifest"] = "corpus.json"
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    (tmp_path / "corpus.json").symlink_to(target)
+    lock_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(bootstrap.BootstrapError, match="regular file"):
+        bootstrap.load_lock(lock_path)
+
+
+def test_lock_requires_a_regular_magpie_compatibility_ledger(tmp_path):
+    raw = json.loads((REPO_ROOT / "scripts" / "dependencies.lock.json").read_text())
+    (tmp_path / raw["magpie_corpus_manifest"]).write_bytes(
+        (REPO_ROOT / "scripts" / raw["magpie_corpus_manifest"]).read_bytes()
+    )
+    raw.pop("magpie_compatibility_ledger")
+    lock_path = tmp_path / "dependencies.lock.json"
+    lock_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(bootstrap.BootstrapError, match="magpie_compatibility_ledger"):
+        bootstrap.load_lock(lock_path)
+
+    raw["magpie_compatibility_ledger"] = "compatibility.json"
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    (tmp_path / "compatibility.json").symlink_to(target)
+    lock_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(bootstrap.BootstrapError, match="regular file"):
         bootstrap.load_lock(lock_path)
 
 
@@ -343,13 +443,20 @@ def test_install_is_idempotent_when_exact_package_is_already_imported(
 ):
     monkeypatch.delenv("MAGPIE_ROOT", raising=False)
     source = tmp_path / "siblings" / "Magpie"
-    commit = init_repository(source, "git@github.com:AMD-AGI/Magpie.git")
+    init_repository(source, "git@github.com:AMD-AGI/Magpie.git")
+    commit = add_magpie_corpus(source)
+    manifest = write_magpie_manifest(tmp_path / "corpus.json", source)
+    ledger = write_magpie_compatibility_ledger(
+        tmp_path / "compatibility.json", source
+    )
     locked = dependency(commit)
     lock = bootstrap.DependencyLock(
         path=tmp_path / "lock.json",
         receipt_schema="apex.dependencies.receipt/v1",
         dependencies=(locked,),
         sha256="0" * 64,
+        magpie_corpus_manifest=manifest,
+        magpie_compatibility_ledger=ledger,
     )
     resolver = bootstrap.RepositoryResolver(
         sibling_root=source.parent,
@@ -400,12 +507,19 @@ def test_cli_performs_real_offline_install_verify_and_repeat_without_network(
     siblings = tmp_path / "siblings"
     magpie_url = "https://example.invalid/AMD-AGI/Magpie.git"
     tracelens_url = "https://example.invalid/AMD-AGI/TraceLens.git"
-    magpie_commit = init_installable_repository(
+    init_installable_repository(
         siblings / "Magpie",
         remote=magpie_url,
         distribution="magpie-eval",
         import_root="Magpie",
         version="0.2.0",
+    )
+    magpie_commit = add_magpie_corpus(siblings / "Magpie")
+    corpus_manifest = write_magpie_manifest(
+        tmp_path / "magpie_corpus_manifest.json", siblings / "Magpie"
+    )
+    compatibility_ledger = write_magpie_compatibility_ledger(
+        tmp_path / "magpie_compatibility_ledger.json", siblings / "Magpie"
     )
     tracelens_commit = init_installable_repository(
         siblings / "TraceLens",
@@ -413,6 +527,57 @@ def test_cli_performs_real_offline_install_verify_and_repeat_without_network(
         distribution="TraceLens",
         import_root="TraceLens",
         version="0.1.0.dev1",
+    )
+    inferencex_url = "https://example.invalid/SemiAnalysisAI/InferenceX.git"
+    inferencex = siblings / "InferenceX"
+    init_repository(inferencex, inferencex_url)
+    task = inferencex / "utils" / "evals" / "gsm8k.yaml"
+    task.parent.mkdir(parents=True)
+    task.write_text(
+        "task: gsm8k\ndataset_path: openai/gsm8k\ndataset_name: main\n",
+        encoding="utf-8",
+    )
+    git(inferencex, "add", "utils/evals/gsm8k.yaml")
+    git(inferencex, "commit", "-q", "-m", "add evaluator task")
+    inferencex_commit = git(inferencex, "rev-parse", "HEAD")
+    evaluator_lock = tmp_path / "evaluator_policy.lock.json"
+    evaluator_lock.write_text(
+        json.dumps(
+            {
+                "schema": "apex.evaluator-policy-lock/v2",
+                "policy_id": "apex-lm-eval-gsm8k-v2",
+                "primary_metric": "exact_match,strict-match",
+                "sample_logging_required": True,
+                "task": {
+                    "name": "gsm8k",
+                    "definition_dependency": "inferencex",
+                    "definition_path": "utils/evals/gsm8k.yaml",
+                    "definition_sha256": sha256_file(task),
+                },
+                "dataset": {
+                    "repository": "https://huggingface.co/datasets/openai/gsm8k",
+                    "path": "openai/gsm8k",
+                    "name": "main",
+                    "revision": "7" * 40,
+                    "splits": ["test", "train"],
+                    "files": [
+                        {
+                            "split": "test",
+                            "path": "main/test.parquet",
+                            "size_bytes": 4,
+                            "sha256": "8" * 64,
+                        },
+                        {
+                            "split": "train",
+                            "path": "main/train.parquet",
+                            "size_bytes": 5,
+                            "sha256": "9" * 64,
+                        },
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
     )
     vllm_url = "https://example.invalid/vllm-project/vllm.git"
     aiter_url = "https://example.invalid/ROCm/aiter.git"
@@ -429,6 +594,8 @@ def test_cli_performs_real_offline_install_verify_and_repeat_without_network(
         "schema": "apex.dependencies.lock",
         "version": 1,
         "receipt_schema": "apex.dependencies.receipt/v1",
+        "magpie_corpus_manifest": corpus_manifest.name,
+        "magpie_compatibility_ledger": compatibility_ledger.name,
         "dependencies": {
             "magpie": {
                 "name": "Magpie",
@@ -460,6 +627,15 @@ def test_cli_performs_real_offline_install_verify_and_repeat_without_network(
                     "extras": [],
                 },
             },
+            "inferencex": {
+                "name": "InferenceX",
+                "repository": inferencex_url,
+                "commit": inferencex_commit,
+                "sibling": "InferenceX",
+                "managed_checkout": "inferencex",
+                "root_env": "MAGPIE_INFERENCEX_PATH",
+                "repository_only": True,
+            },
         },
     }
     lock_path = tmp_path / "dependencies.lock.json"
@@ -477,6 +653,8 @@ def test_cli_performs_real_offline_install_verify_and_repeat_without_network(
         str(tmp_path / "managed"),
         "--e2e-source-lock",
         str(source_lock),
+        "--evaluator-policy-lock",
+        str(evaluator_lock),
         "--source-lock-root",
         str(tmp_path / "source-locks"),
         "--venv",
@@ -501,15 +679,17 @@ def test_cli_performs_real_offline_install_verify_and_repeat_without_network(
     assert first_receipt["status"] == "verified"
     assert {
         value["action"] for value in first_receipt["dependencies"].values()
-    } == {"installed"}
+    } == {"installed", "repository-verified"}
     assert {
         value["action"] for value in second_receipt["dependencies"].values()
-    } == {"already-installed"}
+    } == {"already-installed", "repository-verified"}
     assert verify_receipt["status"] == "verified"
+    assert verify_receipt["magpie_corpus"]["summary"]["config_count"] == 1
+    assert verify_receipt["evaluator_policy"]["dataset"]["revision"] == "7" * 40
     assert set(verify_receipt["e2e_source_locks"]["sources"]) == {"vllm", "aiter"}
     assert {
         value["action"] for value in verify_receipt["dependencies"].values()
-    } == {"verified"}
+    } == {"verified", "repository-verified"}
 
 
 def test_fresh_checkout_shim_executes_runtime_cli_for_dry_run(

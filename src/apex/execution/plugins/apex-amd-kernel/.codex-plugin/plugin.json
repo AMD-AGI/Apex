@@ -1,0 +1,18 @@
+{
+  "name": "apex-amd-kernel",
+  "version": "0.1.0",
+  "description": "Evidence-first AMD GPU kernel optimization and debugging skills for Apex.",
+  "author": {
+    "name": "Advanced Micro Devices, Inc."
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Apex AMD Kernel",
+    "shortDescription": "Optimize AMD kernels with evidence",
+    "longDescription": "Guides agents through Apex's typed, evaluator-owned AMD kernel optimization and debugging workflow.",
+    "developerName": "Advanced Micro Devices, Inc.",
+    "category": "Developer Tools",
+    "capabilities": [],
+    "defaultPrompt": "Use Apex to inspect and improve this AMD GPU kernel without making unverified performance claims."
+  }
+}

@@ -6,9 +6,17 @@ from typing import Any, Mapping
 
 from apex.benchmark import BenchmarkConfigViews
 from apex.core import ContractError, TaskStatus, ValidationLevel
-from apex.evaluation import E2EAcceptancePolicy, E2EMeasurement, evaluate_no_regression
+from apex.evaluation import (
+    E2EAcceptancePolicy,
+    E2EObservation,
+    E2ERewardVector,
+    evaluate_no_regression,
+    evaluate_paired_current_anchor,
+    grade_e2e_outcome,
+)
 from apex.orchestration import RunPhase, SearchStage
 from apex.runtime import GpuLeaseReceipt, RunProvenance
+from apex.storage import ArtifactReceipt
 
 from ..projections import publish_terminal_projections
 from .benchmarking import Diagnosis, E2EBenchmarkSession, measurement_metrics
@@ -20,7 +28,13 @@ from .result import (
 )
 from .run_record import E2ERunRecord
 from .search import SearchOutcome
-from .services import AcceptedCandidate, FinalDeliveryPort, FinalDeliveryRequest
+from .services import (
+    AcceptedCandidate,
+    FinalDeliveryPort,
+    FinalDeliveryRequest,
+    FinalDeliveryResult,
+)
+from .terminal_reward import record_terminal_reward
 
 
 class E2EFinalizer:
@@ -56,7 +70,7 @@ class E2EFinalizer:
         self,
         *,
         initial: Diagnosis,
-        baseline: E2EMeasurement,
+        baseline: E2EObservation,
         search: SearchOutcome,
         measurement_action_id: str = "final-measurement",
     ) -> E2EOptimizationResult:
@@ -82,6 +96,7 @@ class E2EFinalizer:
             search.diagnostic_config,
             baseline=initial,
         ).to_dict()
+        self.session.verify_lease(f"{terminal_action_id}-complete")
         if not search.accepted:
             return self._without_winner(initial, baseline, final, receipt.digest, search)
         cumulative = evaluate_no_regression(
@@ -99,7 +114,7 @@ class E2EFinalizer:
         self,
         *,
         initial: Diagnosis | None,
-        baseline: E2EMeasurement | None,
+        baseline: E2EObservation | None,
         status: TaskStatus,
         reason: str,
         details: Mapping[str, Any] | None = None,
@@ -126,8 +141,8 @@ class E2EFinalizer:
     def _without_winner(
         self,
         initial: Diagnosis,
-        baseline: E2EMeasurement,
-        final: E2EMeasurement,
+        baseline: E2EObservation,
+        final: E2EObservation,
         final_receipt: str,
         search: SearchOutcome,
     ) -> E2EOptimizationResult:
@@ -188,8 +203,8 @@ class E2EFinalizer:
     def _cumulative_regression(
         self,
         initial: Diagnosis,
-        baseline: E2EMeasurement,
-        final: E2EMeasurement,
+        baseline: E2EObservation,
+        final: E2EObservation,
         final_receipt: str,
         search: SearchOutcome,
         verdict: dict[str, Any],
@@ -220,8 +235,8 @@ class E2EFinalizer:
     def _deliver(
         self,
         initial: Diagnosis,
-        baseline: E2EMeasurement,
-        final: E2EMeasurement,
+        baseline: E2EObservation,
+        final: E2EObservation,
         final_receipt: str,
         search: SearchOutcome,
         cumulative: dict[str, Any],
@@ -238,6 +253,7 @@ class E2EFinalizer:
                 search.replay_config,
                 baseline,
                 final,
+                self.acceptance_policy,
                 self.record.root / "delivery" / "second-clean-replay",
                 agent_backend,
                 agent_model,
@@ -246,7 +262,15 @@ class E2EFinalizer:
                 self.safety_policy_sha256,
             )
         )
-        delivery_receipt = self.record.record_final_delivery(result)
+        delivery_receipt, raw_evidence = self.record.record_final_delivery(result)
+        terminal_reward, reward_source, raw_receipts = self._terminal_reward(
+            result,
+            delivery_receipt,
+            raw_evidence=raw_evidence,
+            safety_certified=all(
+                item.safety.safety_certified for item in search.accepted
+            ),
+        )
         lineage = self.record.put_json(
             {
                 "schema_version": 1,
@@ -268,6 +292,10 @@ class E2EFinalizer:
         )
         details = self._search_details(search, "cumulative_verdict", cumulative)
         details["final_delivery"] = result.to_dict()
+        if terminal_reward is not None and result.terminal_measurement is not None:
+            details["terminal_paired_verdict"] = evaluate_paired_current_anchor(
+                result.terminal_measurement, self.acceptance_policy
+            ).to_dict()
         return self._write(
             initial=initial,
             status=result.status,
@@ -279,7 +307,42 @@ class E2EFinalizer:
             details=details,
             terminal_phase=phase,
             stop_reason=stop_reason,
+            terminal_reward=terminal_reward,
+            reward_source_receipt=reward_source,
+            raw_measurement_receipts=raw_receipts,
         )
+
+    def _terminal_reward(
+        self,
+        result: FinalDeliveryResult,
+        delivery_receipt: ArtifactReceipt,
+        *,
+        raw_evidence: tuple[ArtifactReceipt, ...],
+        safety_certified: bool,
+    ) -> tuple[E2ERewardVector | None, str | None, tuple[str, ...]]:
+        if not result.verified or result.terminal_measurement is None:
+            return None, None, ()
+        measurement = result.terminal_measurement
+        verdict = evaluate_paired_current_anchor(measurement, self.acceptance_policy)
+        decision = "keep" if verdict.keep else "revert"
+        grade = grade_e2e_outcome(
+            verdict=decision,
+            reason_code=verdict.reason_code,
+            candidate_present=True,
+            measurement_verdict=verdict,
+            safety_certified=safety_certified,
+            scope="task_terminal",
+        )
+        paired_receipt = self.record.put_json(measurement.to_dict())
+        record_terminal_reward(
+            self.record,
+            grade,
+            reward_source=delivery_receipt,
+            paired_measurement=paired_receipt,
+            raw_measurement_receipts=measurement.raw_measurement_receipts,
+            raw_evidence=raw_evidence,
+        )
+        return grade, delivery_receipt.digest, measurement.raw_measurement_receipts
 
     def _search_details(
         self,
@@ -301,12 +364,15 @@ class E2EFinalizer:
         status: TaskStatus,
         reason: str,
         validation: ValidationLevel,
-        baseline: E2EMeasurement | None,
-        final: E2EMeasurement | None,
+        baseline: E2EObservation | None,
+        final: E2EObservation | None,
         no_regression: bool | None,
         details: dict[str, Any],
         terminal_phase: RunPhase,
         stop_reason: str,
+        terminal_reward: E2ERewardVector | None = None,
+        reward_source_receipt: str | None = None,
+        raw_measurement_receipts: tuple[str, ...] = (),
     ) -> E2EOptimizationResult:
         if self._terminal_diagnostics is not None:
             details = {
@@ -326,6 +392,10 @@ class E2EFinalizer:
             evidence_path=str(initial.evidence_path) if initial else None,
             no_regression=no_regression,
             details=details,
+            terminal_reward=terminal_reward,
+            reward_source_receipt=reward_source_receipt,
+            raw_measurement_receipts=raw_measurement_receipts,
+            untrainable_reason="terminal_paired_replay_missing",
         )
         bind_terminal_result(
             self.record,

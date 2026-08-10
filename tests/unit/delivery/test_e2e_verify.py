@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import apex.delivery.git_patch as git_patch
+from apex.delivery.e2e_models import SourceComponentCapability
 
 from apex.core import (
     IntegrityError,
@@ -21,15 +23,52 @@ from apex.delivery import (
     E2EBundleVerifier,
     LoadedArtifact,
     LoadedByteEngagementReceipt,
+    ReplayArtifactReceipt,
     CleanPatchMaterializer,
     SourceBuildReceipt,
     SourceBuildRequest,
     SupervisedRecipeBuildBackend,
+    capture_portable_bundle,
+    e2e_reproduction_declaration,
     compute_e2e_bundle_digest,
     delivery_terminal_policy,
     load_and_verify_e2e_bundle,
+    verify_portable_bundle,
 )
 from apex.execution import ProcessResult
+from apex.evaluation import (
+    E2EAcceptancePolicy,
+    E2EObservation,
+    E2EPairedMeasurement,
+    E2EPairedWindow,
+    evaluate_paired_current_anchor,
+)
+from apex.storage import ArtifactStore
+
+
+def _paired_replay(keep: bool) -> tuple[dict, dict]:
+    policy = E2EAcceptancePolicy()
+    windows = []
+    for window in range(3):
+        values = []
+        for position, candidate in enumerate((False, True, True, False)):
+            receipt = f"{window}-{position}"
+            values.append(
+                E2EObservation(
+                    101.0 if candidate and keep else 100.0,
+                    10.0,
+                    1.0,
+                    1.0,
+                    10,
+                    "a" * 64,
+                    f"quality-{receipt}",
+                    f"measurement-{receipt}",
+                )
+            )
+        windows.append(E2EPairedWindow(f"window-{window}", *values))
+    measurement = E2EPairedMeasurement(tuple(windows), policy.digest, 3)
+    verdict = evaluate_paired_current_anchor(measurement, policy)
+    return measurement.to_dict(), verdict.to_dict()
 
 
 class FakeBuild:
@@ -79,9 +118,16 @@ class FakeBuild:
 
 
 class FakeEngagement:
-    def __init__(self, *, old_bytes: bool = False, wrong_image: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        old_bytes: bool = False,
+        wrong_image: bool = False,
+        engagement_kind: str = "python_import",
+    ) -> None:
         self.old_bytes = old_bytes
         self.wrong_image = wrong_image
+        self.engagement_kind = engagement_kind
 
     def verify_loaded_bytes(self, request):
         artifacts = tuple(
@@ -92,7 +138,7 @@ class FakeEngagement:
                 "b" * 64 if self.old_bytes else item.sha256,
                 item.build_id,
                 item.build_id,
-                "python_import",
+                self.engagement_kind,
                 f"import:{item.component}",
                 True,
             )
@@ -114,29 +160,86 @@ class FakeReplay:
         same_environment: bool = False,
         objective_improved: bool = True,
         quality_passed: bool = True,
+        reused_runtime: bool = False,
+        wrong_source_materialization: bool = False,
+        omit_execution_attestation: bool = False,
     ) -> None:
         self.same_environment = same_environment
         self.objective_improved = objective_improved
         self.quality_passed = quality_passed
+        self.reused_runtime = reused_runtime
+        self.wrong_source_materialization = wrong_source_materialization
+        self.omit_execution_attestation = omit_execution_attestation
 
     def replay(self, request):
         environment = request.primary_environment_id if self.same_environment else "independent-replay-environment"
-        return CleanReplayReceipt(
-            request.bundle_digest,
-            request.primary_environment_id,
-            environment,
-            request.expected_image.image_digest,
-            request.config_receipt.replay_config_sha256,
-            "c" * 64,
-            request.source_stack_sha256,
-            True,
-            True,
-            True,
-            self.quality_passed,
-            True,
-            True,
-            self.objective_improved,
+        measurement, verdict = _paired_replay(self.objective_improved)
+        artifacts = _raw_replay_artifacts(request, measurement)
+        if self.omit_execution_attestation:
+            artifacts = tuple(
+                item for item in artifacts if item.role != "execution_attestation"
+            )
+        runtime_ids = tuple(
+            sha256_json({"runtime": 0 if self.reused_runtime else index})
+            for index in range(len(measurement["raw_measurement_receipts"]))
         )
+        return CleanReplayReceipt(
+            bundle_digest=request.bundle_digest,
+            primary_environment_id=request.primary_environment_id,
+            replay_environment_id=environment,
+            image_digest=request.expected_image.image_digest,
+            replay_config_sha256=request.config_receipt.replay_config_sha256,
+            benchmark_receipt_sha256="c" * 64,
+            source_stack_sha256=request.source_stack_sha256,
+            source_materialization_sha256=sha256_json(
+                [item.to_dict() for item in request.repository_receipts]
+            )
+            if not self.wrong_source_materialization
+            else "0" * 64,
+            primary_runtime_identity_sha256="d" * 64,
+            replay_runtime_identity_sha256s=runtime_ids,
+            normal_runtime_measurement=True,
+            quality_passed=self.quality_passed,
+            accuracy_passed=True,
+            latency_gates_passed=True,
+            objective_improved=self.objective_improved,
+            paired_measurement=measurement,
+            paired_verdict=verdict,
+            raw_artifacts=artifacts,
+        )
+
+
+def _raw_replay_artifacts(request, measurement: dict) -> tuple[ReplayArtifactReceipt, ...]:
+    root = request.output_dir
+    assert root is not None
+    root.mkdir(parents=True, exist_ok=True)
+    values = []
+    observations = [
+        item
+        for window in measurement["windows"]
+        for item in window["observations"]
+    ]
+    for index, observation in enumerate(observations):
+        for role in (
+            "benchmark_report",
+            "execution_attestation",
+            "quality_result",
+        ):
+            path = root / f"{index}-{role}.json"
+            path.write_text(json.dumps({"index": index, "role": role}), encoding="utf-8")
+            values.append(
+                ReplayArtifactReceipt(
+                    role,
+                    f"run-{index}",
+                    observation["measurement_receipt"],
+                    observation["quality_receipt"],
+                    path.relative_to(root).as_posix(),
+                    sha256_file(path),
+                    path.stat().st_size,
+                    "application/json",
+                )
+            )
+    return tuple(values)
 
 
 class RecordingSupervisor:
@@ -148,6 +251,31 @@ class RecordingSupervisor:
         return ProcessResult(tuple(argv), 0, False, "", "", False, False, 0.01)
 
 
+def test_patch_git_child_revokes_agent_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-secret")
+    monkeypatch.setenv("CURSOR_API_KEY", "cursor-test-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-test-secret")
+    supervisor = RecordingSupervisor()
+
+    git_patch._Git(supervisor).run(tmp_path, "status")
+
+    environment = supervisor.calls[0][2]
+    assert all(
+        key not in environment
+        for key in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CURSOR_API_KEY",
+            "HF_TOKEN",
+        )
+    )
+    assert environment["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+
+
 class FakeAttestor:
     def attest(self, request):
         return FakeBuild().build(request)
@@ -157,6 +285,11 @@ def verifier(fixture, *, build=None, engagement=None, replay=None):
     return E2EBundleVerifier(
         trusted_recipes={fixture.recipe.computed_sha256: fixture.recipe},
         trusted_source_urls={item.repository_id: item.url for item in fixture.bundle.repositories},
+        trusted_recipe_capabilities={
+            fixture.recipe.computed_sha256: tuple(
+                item.component_capability for item in fixture.bundle.repositories
+            )
+        },
         build_backend=build or FakeBuild(),
         engagement_backend=engagement or FakeEngagement(),
         replay_backend=replay or FakeReplay(),
@@ -184,6 +317,29 @@ def test_full_second_clean_replay_finalizes_verified_bundle(make_e2e_bundle, tmp
     assert serialized["engagement_receipt"]["artifacts"][0]["verified"] is True
     assert serialized["replay_receipt"]["fresh_source_materialization"] is True
 
+    artifacts = ArtifactStore(tmp_path / "portable-cas")
+    portable = capture_portable_bundle(
+        artifacts,
+        outcome.verified_bundle.path,
+        bundle_kind="e2e",
+        expected_digest=outcome.verified_bundle.digest,
+    )
+    replayed = verify_portable_bundle(
+        artifacts, portable.evidence_receipt, portable.verification_receipt
+    )
+    assert replayed.bundle_kind == "e2e"
+    assert replayed.bundle_digest == outcome.verified_bundle.digest
+    assert replayed.file_count > 10
+    reproduction = e2e_reproduction_declaration(outcome.verified_bundle, portable)
+    assert reproduction["task_kind"] == "e2e_kernel_only"
+    assert reproduction["parent_image_digest"] == fixture.recipe.parent_image_digest
+    assert reproduction["derived_image_digest"] == fixture.image.image_digest
+    assert {item["name"] for item in reproduction["commands"]} >= {
+        "verify_bundle",
+        "build_image",
+        "clean_replay",
+    }
+
 
 def test_composed_default_sources_are_cloned_into_fresh_verifier_worktrees(
     make_e2e_bundle, tmp_path: Path
@@ -193,6 +349,11 @@ def test_composed_default_sources_are_cloned_into_fresh_verifier_worktrees(
         trusted_recipes={fixture.recipe.computed_sha256: fixture.recipe},
         trusted_source_urls={
             item.repository_id: item.url for item in fixture.bundle.repositories
+        },
+        trusted_recipe_capabilities={
+            fixture.recipe.computed_sha256: tuple(
+                item.component_capability for item in fixture.bundle.repositories
+            )
         },
         build_backend=FakeBuild(),
         engagement_backend=FakeEngagement(),
@@ -212,8 +373,15 @@ def test_composed_default_sources_are_cloned_into_fresh_verifier_worktrees(
 
 
 def test_fixed_recipe_executor_uses_argv_supervisor_without_shell(
-    make_e2e_bundle, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, make_e2e_bundle, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-secret")
+    monkeypatch.setenv("CURSOR_API_KEY", "cursor-test-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-test-secret")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///tmp/apex-test-docker.sock")
+    monkeypatch.setenv("ROCM_PATH", "/opt/rocm-test")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/untrusted-python")
     fixture = make_e2e_bundle()
     roots, receipts = CleanPatchMaterializer().materialize(
         bundle_root=fixture.bundle.path,
@@ -235,6 +403,21 @@ def test_fixed_recipe_executor_uses_argv_supervisor_without_shell(
     assert receipt.verified
     assert [call[0] for call in supervisor.calls] == [("python3", "build.py")]
     assert supervisor.calls[0][1] == roots["repo0"]
+    environment = supervisor.calls[0][2]
+    assert environment["DOCKER_HOST"] == "unix:///tmp/apex-test-docker.sock"
+    assert environment["ROCM_PATH"] == "/opt/rocm-test"
+    assert all(
+        key not in environment
+        for key in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CURSOR_API_KEY",
+            "HF_TOKEN",
+            "PYTHONPATH",
+        )
+    )
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
 
 
 @pytest.mark.parametrize(
@@ -244,7 +427,21 @@ def test_fixed_recipe_executor_uses_argv_supervisor_without_shell(
         (FakeBuild(wrong_source=True), None, None, "source_build_receipt_mismatch"),
         (None, FakeEngagement(old_bytes=True), None, "loaded_byte_engagement_failed"),
         (None, FakeEngagement(wrong_image=True), None, "loaded_byte_engagement_failed"),
+        (None, FakeEngagement(engagement_kind="process_map"), None, "loaded_byte_engagement_failed"),
         (None, None, FakeReplay(same_environment=True), "second_clean_replay_failed"),
+        (None, None, FakeReplay(reused_runtime=True), "second_clean_replay_failed"),
+        (
+            None,
+            None,
+            FakeReplay(wrong_source_materialization=True),
+            "second_clean_replay_failed",
+        ),
+        (
+            None,
+            None,
+            FakeReplay(omit_execution_attestation=True),
+            "invalid_replay_receipt",
+        ),
         (None, None, FakeReplay(objective_improved=False), "second_clean_replay_failed"),
         (None, None, FakeReplay(quality_passed=False), "second_clean_replay_failed"),
     ],
@@ -272,6 +469,25 @@ def test_any_required_receipt_failure_is_verification_failed(
     assert json.loads(outcome.result_path.read_text())["verified"] is False
 
 
+def test_build_id_capability_rejects_digest_only_engagement(
+    make_e2e_bundle, tmp_path: Path
+) -> None:
+    fixture = make_e2e_bundle(
+        engagement_kind="linker_build_id", build_id_required=True
+    )
+    outcome = verifier(
+        fixture,
+        engagement=FakeEngagement(engagement_kind="linker_build_id"),
+    ).verify(
+        bundle_dir=fixture.bundle.path,
+        results_dir=tmp_path / "missing-build-id",
+        source_overrides=fixture.bases,
+    )
+
+    assert outcome.result.reason_code == "loaded_byte_engagement_failed"
+    assert outcome.verified_bundle is None
+
+
 def test_wrong_exact_source_override_fails_before_build(make_e2e_bundle, tmp_path: Path) -> None:
     fixture = make_e2e_bundle()
     base = fixture.bases["repo0"]
@@ -294,6 +510,7 @@ def test_untrusted_recipe_returns_structured_failure_before_build(make_e2e_bundl
     verifier_instance = E2EBundleVerifier(
         trusted_recipes={},
         trusted_source_urls={item.repository_id: item.url for item in fixture.bundle.repositories},
+        trusted_recipe_capabilities={},
         build_backend=FakeBuild(),
         engagement_backend=FakeEngagement(),
         replay_backend=FakeReplay(),
@@ -318,12 +535,17 @@ def test_trusted_recipe_rejects_an_unregistered_repository_set(
         trusted_source_urls={
             item.repository_id: item.url for item in fixture.bundle.repositories
         },
+        trusted_recipe_capabilities={
+            fixture.recipe.computed_sha256: (
+                fixture.bundle.repositories[0].component_capability,
+                SourceComponentCapability(
+                    "repo1", "wrong-runtime", "python_import"
+                ),
+            )
+        },
         build_backend=FakeBuild(),
         engagement_backend=FakeEngagement(),
         replay_backend=FakeReplay(),
-        trusted_recipe_repositories={
-            fixture.recipe.computed_sha256: frozenset({"repo0"})
-        },
     )
 
     outcome = verifier_instance.verify(
@@ -342,6 +564,11 @@ def test_untrusted_source_url_is_rejected_before_clone(make_e2e_bundle, tmp_path
     verifier_instance = E2EBundleVerifier(
         trusted_recipes={fixture.recipe.computed_sha256: fixture.recipe},
         trusted_source_urls={"repo0": "https://example.com/different.git"},
+        trusted_recipe_capabilities={
+            fixture.recipe.computed_sha256: tuple(
+                item.component_capability for item in fixture.bundle.repositories
+            )
+        },
         build_backend=FakeBuild(),
         engagement_backend=FakeEngagement(),
         replay_backend=FakeReplay(),

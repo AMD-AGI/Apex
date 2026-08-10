@@ -5,14 +5,23 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
+from apex.benchmark import (
+    parse_serving_runtime_evidence,
+    validate_magpie_execution_attestation_document,
+)
 from apex.core import ContractError, IntegrityError, canonical_json_bytes
-from apex.evaluation import E2EMeasurement
+from apex.evaluation import E2EObservation
+from apex.ports import BenchmarkPass
 from apex.storage import ArtifactReceipt, ArtifactStore
 
-from .e2e_quality_validation import metric_documents, validate_quality_evidence
+from .e2e_quality_validation import (
+    metric_documents,
+    validate_quality_evidence,
+    validate_quality_hard_failure,
+)
 from .models import CandidateEpisode, EpisodeEvent
 
 
@@ -31,7 +40,7 @@ class BenchmarkBundle:
     normalized: Mapping[str, Any]
     quality: Mapping[str, Any]
     report: Mapping[str, Any]
-    measurement: E2EMeasurement
+    measurement: E2EObservation
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +50,19 @@ class DeliveryEvidence:
     receipt: ArtifactReceipt
     measurement_config: ArtifactReceipt
     image_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class QualityGateFailureBundle:
+    """One normal-runtime candidate observation stopped by trusted quality."""
+
+    event: EpisodeEvent
+    config: ArtifactReceipt
+    normalized_receipt: ArtifactReceipt
+    quality_receipt: ArtifactReceipt
+    normalized: Mapping[str, Any]
+    quality: Mapping[str, Any]
+    report: Mapping[str, Any]
 
 
 def load_benchmark_bundle(
@@ -57,10 +79,18 @@ def load_benchmark_bundle(
     normalized = read_json(artifacts, normalized_receipt, canonical=True)
     quality = read_json(artifacts, quality_receipt, canonical=True)
     report = read_json(artifacts, report_receipt, canonical=False)
+    attestation = _load_execution_attestation(
+        event,
+        artifacts,
+        normalized,
+        report_receipt,
+        report,
+        config.digest,
+    )
     _validate_event_receipts(event, config, normalized_receipt, quality_receipt)
     _validate_normal_lane(event, normalized)
     accuracy = validate_quality_evidence(event, artifacts, normalized, quality)
-    _validate_report(report, normalized)
+    _validate_report(report, normalized, attestation)
     serving = mapping(normalized.get("serving_runtime"), "serving runtime")
     if serving.get("input_config_sha256") != config.digest:
         reject("Benchmark config differs from the executed scoring runtime")
@@ -128,6 +158,51 @@ def load_delivery(
     return DeliveryEvidence(delivery_receipt, configs["measurement"], image_id)
 
 
+def load_quality_gate_failure_bundle(
+    event: EpisodeEvent,
+    artifacts: ArtifactStore,
+) -> QualityGateFailureBundle:
+    """Rebuild a runtime-valid quality hard failure without performance metrics."""
+
+    config = single_event_receipt(event, "benchmark_config")
+    normalized_receipt = single_event_receipt(event, "normalized_benchmark")
+    quality_receipt = single_event_receipt(event, "quality_evidence")
+    report_receipt = single_event_receipt(event, "benchmark_report")
+    normalized = read_json(artifacts, normalized_receipt, canonical=True)
+    quality = read_json(artifacts, quality_receipt, canonical=True)
+    report = read_json(artifacts, report_receipt, canonical=False)
+    attestation = _load_execution_attestation(
+        event,
+        artifacts,
+        normalized,
+        report_receipt,
+        report,
+        config.digest,
+    )
+    _validate_event_receipts(event, config, normalized_receipt, quality_receipt)
+    _validate_quality_failure_lane(event, normalized)
+    validate_quality_hard_failure(
+        event,
+        artifacts,
+        normalized,
+        quality,
+        _quality_gate_receipt(attestation),
+    )
+    _validate_report(report, normalized, attestation)
+    serving = mapping(normalized.get("serving_runtime"), "serving runtime")
+    if serving.get("input_config_sha256") != config.digest:
+        reject("Quality failure config differs from the executed runtime")
+    return QualityGateFailureBundle(
+        event,
+        config,
+        normalized_receipt,
+        quality_receipt,
+        normalized,
+        quality,
+        report,
+    )
+
+
 def validate_candidate_runtime(
     benchmark: BenchmarkBundle,
     delivery: DeliveryEvidence,
@@ -142,6 +217,25 @@ def validate_candidate_runtime(
         or serving.get("resolved_image_id") != delivery.image_id
     ):
         reject("Delivery image/config differs from the executed scoring runtime")
+
+
+def validate_failed_candidate_runtime(
+    benchmark: QualityGateFailureBundle,
+    delivery: DeliveryEvidence,
+) -> None:
+    """Bind a quality-stopped observation to the delivered image and config."""
+
+    serving = mapping(benchmark.normalized.get("serving_runtime"), "serving runtime")
+    if (
+        benchmark.config.digest != delivery.measurement_config.digest
+        or serving.get("required") is not True
+        or serving.get("passed") is not True
+        or serving.get("process_succeeded") is not True
+        or serving.get("input_config_sha256") != benchmark.config.digest
+        or serving.get("requested_image") != delivery.image_id
+        or serving.get("resolved_image_id") != delivery.image_id
+    ):
+        reject("Quality failure does not prove the delivered runtime")
 
 
 def single_event_receipt(event: EpisodeEvent, role: str) -> ArtifactReceipt:
@@ -254,6 +348,34 @@ def _validate_normal_lane(
         reject("Benchmark event summary differs from its normalized artifact")
 
 
+def _validate_quality_failure_lane(
+    event: EpisodeEvent,
+    normalized: Mapping[str, Any],
+) -> None:
+    if (
+        event.evidence_class.value != "measured"
+        or normalized.get("schema_version") != 1
+        or normalized.get("pass_type") != "measurement"
+        or normalized.get("succeeded") is not False
+        or normalized.get("profiling_enabled") is not False
+        or normalized.get("run_kind") != "measurement"
+        or normalized.get("reward_eligible") is not True
+        or normalized.get("errors") != ["quality_gate_not_passed"]
+        or normalized.get("command_exit_code") != 0
+        or normalized.get("timed_out") is not False
+    ):
+        reject("Quality failure lane contains invalid or incomplete evidence")
+    checks = {
+        "pass_type": "measurement",
+        "succeeded": False,
+        "run_kind": "measurement",
+        "reward_eligible": True,
+        "metrics": _event_metrics(normalized),
+    }
+    if any(event.payload.get(key) != value for key, value in checks.items()):
+        reject("Quality failure event differs from its normalized artifact")
+
+
 def _event_metrics(normalized: Mapping[str, Any]) -> dict[str, object]:
     throughput = mapping(normalized.get("throughput"), "throughput")
     latency = mapping(normalized.get("latency"), "latency")
@@ -279,12 +401,11 @@ def _event_metrics(normalized: Mapping[str, Any]) -> dict[str, object]:
 def _validate_report(
     report: Mapping[str, Any],
     normalized: Mapping[str, Any],
+    attestation: Mapping[str, Any],
 ) -> None:
     if (
         report.get("success") is not True
         or report.get("errors") != []
-        or report.get("run_kind") != "measurement"
-        or report.get("reward_eligible") is not True
         or report.get("profiling_enabled") is not False
         or report.get("framework") != normalized.get("framework")
         or report.get("model") != normalized.get("model")
@@ -308,17 +429,27 @@ def _validate_report(
             latency.get(name), name
         ).get("p99_ms"):
             reject("Normalized tail latency differs from the raw benchmark report")
-    _validate_serving_runtime(report, normalized)
+    _validate_serving_runtime(attestation, normalized)
 
 
 def _validate_serving_runtime(
-    report: Mapping[str, Any],
+    attestation: Mapping[str, Any],
     normalized: Mapping[str, Any],
 ) -> None:
     serving = mapping(normalized.get("serving_runtime"), "serving runtime")
     if serving.get("required") is not True:
         return
-    receipt = mapping(report.get("serving_runtime_receipt"), "runtime receipt")
+    runtime = mapping(attestation.get("runtime"), "runtime attestation")
+    receipt = mapping(runtime.get("serving_runtime_receipt"), "runtime receipt")
+    parsed = parse_serving_runtime_evidence(
+        {
+            "framework": normalized.get("framework"),
+            "serving_runtime_receipt": receipt,
+        },
+        expected_config_sha256=serving.get("input_config_sha256"),
+        expected_requested_image=serving.get("input_image"),
+        expected_execution_mode="docker",
+    )
     expected = {
         "input_config_sha256": serving.get("input_config_sha256"),
         "input_image": serving.get("input_image"),
@@ -327,13 +458,14 @@ def _validate_serving_runtime(
         "resolved_image_id": serving.get("resolved_image_id"),
         "image_derivation": serving.get("image_derivation"),
         "container_name": serving.get("container_name"),
-        "docker_argv_sha256": serving.get("docker_argv_sha256"),
+        "container_spec_sha256": serving.get("container_spec_sha256"),
         "process_succeeded": serving.get("process_succeeded"),
     }
     if (
         serving.get("passed") is not True
         or serving.get("error") is not None
-        or receipt.get("schema") != "magpie.serving-runtime-receipt/v2"
+        or asdict(parsed) != dict(serving)
+        or receipt.get("schema") != "apex.magpie-serving-runtime-observation/v3"
         or receipt.get("execution_mode") != "docker"
         or receipt.get("verified") is not True
         or receipt.get("errors") != []
@@ -342,19 +474,65 @@ def _validate_serving_runtime(
         reject("Normalized serving runtime differs from the raw runtime receipt")
 
 
+def _load_execution_attestation(
+    event: EpisodeEvent,
+    artifacts: ArtifactStore,
+    normalized: Mapping[str, Any],
+    report_receipt: ArtifactReceipt,
+    report: Mapping[str, Any],
+    config_sha256: str,
+) -> Mapping[str, Any]:
+    receipt = single_event_receipt(event, "benchmark_execution_attestation")
+    document = read_json(artifacts, receipt, canonical=False)
+    validated = validate_magpie_execution_attestation_document(
+        document,
+        report_sha256=report_receipt.digest,
+        report_size_bytes=report_receipt.size,
+        report=report,
+        expected_config_sha256=config_sha256,
+        expected_run_id=str(normalized.get("run_id")),
+        expected_pass_type=BenchmarkPass.MEASUREMENT,
+        command_exit_code=normalized.get("command_exit_code"),
+        timed_out=normalized.get("timed_out") is True,
+    )
+    nested = (
+        mapping(validated.get("process"), "process attestation"),
+        mapping(validated.get("dependencies"), "dependency attestation"),
+        mapping(validated.get("runtime"), "runtime attestation"),
+        mapping(validated.get("gpu_engagement"), "GPU attestation"),
+        mapping(validated.get("quality_gate"), "quality attestation"),
+    )
+    if (
+        validated.get("lane_verified") is not True
+        or validated.get("reward_eligible") is not True
+        or validated.get("profiling_enabled") is not False
+        or validated.get("errors") != []
+        or any(item.get("verified") is not True for item in nested)
+    ):
+        reject("Execution attestation does not prove a reward-eligible lane")
+    return validated
+
+
+def _quality_gate_receipt(
+    attestation: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    quality = mapping(attestation.get("quality_gate"), "quality attestation")
+    return mapping(quality.get("receipt"), "quality gate receipt")
+
+
 def _measurement(
     normalized: Mapping[str, Any],
     accuracy: float,
     protocol_hash: str,
     quality_receipt: str,
     measurement_receipt: str,
-) -> E2EMeasurement:
+) -> E2EObservation:
     throughput = mapping(normalized.get("throughput"), "throughput")
     latency = mapping(normalized.get("latency"), "latency")
     total = throughput.get("total_tokens_per_second")
     selected = total if total is not None else throughput.get("output_tokens_per_second")
     try:
-        return E2EMeasurement(
+        return E2EObservation(
             throughput=_finite(selected),
             ttft_p99_ms=_finite(mapping(latency.get("ttft"), "ttft").get("p99_ms")),
             tpot_p99_ms=_finite(mapping(latency.get("tpot"), "tpot").get("p99_ms")),
@@ -399,13 +577,16 @@ def _positive_int(value: object) -> int:
 __all__ = [
     "BenchmarkBundle",
     "DeliveryEvidence",
+    "QualityGateFailureBundle",
     "event_has_role",
     "load_benchmark_bundle",
     "load_delivery",
+    "load_quality_gate_failure_bundle",
     "mapping",
     "read_json",
     "reject",
     "single_child_receipt",
     "single_event_receipt",
     "validate_candidate_runtime",
+    "validate_failed_candidate_runtime",
 ]

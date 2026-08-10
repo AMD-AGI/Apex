@@ -20,14 +20,14 @@ def _reward(
         "attempt_id": attempt_id,
         "verdict": verdict,
         "reason_code": reason,
-        "policy_id": "e2e_kernel_candidate_v1",
+        "policy_id": "e2e_throughput_qos_v1",
         "policy_digest": "e" * 64,
         "scalar_reward": scalar,
         "reward_vector": {
             "verdict": verdict,
             "reason_code": reason,
             "candidate_present": candidate_id is not None,
-            "policy_id": "e2e_kernel_candidate_v1",
+            "policy_id": "e2e_throughput_qos_v1",
             "policy_digest": "e" * 64,
             "scalar_reward": scalar,
         },
@@ -205,6 +205,40 @@ def test_keep_advances_only_current_live_anchor_then_forces_reprofile(tmp_path: 
     assert controller.state.e2e.bottleneck_generation == 2
     controller.complete_e2e_update(stop=True, reason="target_reached")
     assert controller.state.e2e.stage is SearchStage.FINALIZING
+
+
+def test_invalid_measurement_commits_decision_with_null_reward(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    _through_diagnostics(controller)
+    controller.select_e2e_opportunity(
+        attempt_id="attempt-1",
+        opportunity_id="opportunity-1",
+        context_packet_id="packet-receipt",
+    )
+    controller.freeze_e2e_candidate(candidate_id="candidate-1", artifact_ref="source")
+    controller.commit_e2e_micro_verification(
+        candidate_id="candidate-1", receipt="micro", qualified=True
+    )
+    controller.commit_e2e_safety_verification(
+        candidate_id="candidate-1", receipt="safety", finding=False
+    )
+    controller.commit_e2e_delivery_verification(
+        candidate_id="candidate-1", receipt="delivery"
+    )
+
+    controller.decide_e2e_untrainable(
+        candidate_id="candidate-1",
+        receipt="decision",
+        reason="e2e_metrics_missing",
+    )
+
+    assert controller.state.e2e is not None
+    assert controller.state.e2e.decisions[-1].verdict == "needs_more_measurement"
+    events = EventJournal(tmp_path / "events.db").iter_events("e2e-run")
+    decision = events[-1]
+    assert decision.payload["trainability"] == "untrainable"
+    assert decision.payload["untrainable_reason"] == "e2e_metrics_missing"
+    assert not any(event.event_type == "reward_committed" for event in events)
 
 
 def test_baseline_quality_failure_cannot_enter_diagnosis(tmp_path: Path) -> None:
@@ -430,4 +464,8 @@ def test_decision_and_reward_commit_atomically_under_journal_fault(
         if event.event_type in {"e2e.candidate_decided", "reward_committed"}
     )
     assert len(committed) == 2
+    assert [event.event_type for event in committed] == [
+        "reward_committed",
+        "e2e.candidate_decided",
+    ]
     assert committed[0].transaction_id == committed[1].transaction_id

@@ -6,8 +6,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from apex.benchmark import NormalizedBenchmarkResult
+from apex.benchmark import NormalizedBenchmarkResult, expected_attestation_path
 from apex.core import ContractError, IntegrityError, canonical_json_bytes
+from apex.runtime import GpuMeasurementBracketReceipt
 from apex.storage import ArtifactReceipt, ArtifactStore
 
 from .benchmark_document import benchmark_document
@@ -22,12 +23,15 @@ class BenchmarkEvidenceReceipts:
     config: ArtifactReceipt
     bindings: tuple[dict[str, object], ...]
     receipts: tuple[ArtifactReceipt, ...]
+    measurement_bracket: ArtifactReceipt | None = None
 
 
 def persist_benchmark_evidence(
     store: ArtifactStore,
     result: NormalizedBenchmarkResult,
     config_path: Path,
+    *,
+    measurement_bracket: GpuMeasurementBracketReceipt | None = None,
 ) -> BenchmarkEvidenceReceipts:
     """Store exact config, raw artifacts, and normalized projections separately."""
 
@@ -41,14 +45,29 @@ def persist_benchmark_evidence(
         canonical_json_bytes(_quality_document(result, raw)),
         media_type="application/json",
     )
+    bracket = (
+        store.put_bytes(
+            canonical_json_bytes(measurement_bracket.to_dict()),
+            media_type="application/json",
+        )
+        if measurement_bracket is not None
+        else None
+    )
     bindings = (
         _binding("benchmark_config", config),
         _binding("normalized_benchmark", normalized),
         _binding("quality_evidence", quality),
+        *((_binding("gpu_measurement_bracket", bracket),) if bracket else ()),
         *(_binding(role, receipt) for role, _path, receipt in raw),
     )
     receipts = _unique_receipts(
-        (config, normalized, quality, *(item[2] for item in raw))
+        (
+            config,
+            normalized,
+            quality,
+            *((bracket,) if bracket else ()),
+            *(item[2] for item in raw),
+        )
     )
     return BenchmarkEvidenceReceipts(
         normalized=normalized,
@@ -56,6 +75,43 @@ def persist_benchmark_evidence(
         config=config,
         bindings=bindings,
         receipts=receipts,
+        measurement_bracket=bracket,
+    )
+
+
+def persist_formal_benchmark_evidence(
+    store: ArtifactStore,
+    result: NormalizedBenchmarkResult,
+    config_path: Path,
+    *,
+    run_id: str,
+    action_id: str,
+    measurement_bracket: GpuMeasurementBracketReceipt | None,
+) -> BenchmarkEvidenceReceipts:
+    """Require a correctly targeted lease bracket for every scoring lane."""
+
+    from apex.ports import BenchmarkPass
+
+    if (result.pass_type is BenchmarkPass.MEASUREMENT) != (
+        measurement_bracket is not None
+    ):
+        raise ContractError(
+            "Formal benchmark evidence requires one GPU lease bracket",
+            "gpu_measurement_bracket_missing",
+        )
+    if measurement_bracket is not None and (
+        measurement_bracket.run_id != run_id
+        or measurement_bracket.action_id != action_id
+    ):
+        raise ContractError(
+            "GPU measurement bracket targets another action",
+            "gpu_measurement_bracket_mismatch",
+        )
+    return persist_benchmark_evidence(
+        store,
+        result,
+        config_path,
+        measurement_bracket=measurement_bracket,
     )
 
 
@@ -103,6 +159,9 @@ def _artifact_roles(result: NormalizedBenchmarkResult) -> dict[Path, str]:
         roles[path.resolve()] = "quality_result"
     if result.report_path is not None:
         roles[result.report_path.resolve()] = "benchmark_report"
+        attestation = expected_attestation_path(result.report_path)
+        if attestation in {path.resolve() for path in result.artifacts}:
+            roles[attestation] = "benchmark_execution_attestation"
     return roles
 
 
@@ -117,6 +176,7 @@ def _quality_document(
         "required": quality.required,
         "kind": quality.kind,
         "passed": quality.passed,
+        "hard_failure": quality.hard_failure,
         "metrics": [asdict(item) for item in quality.metrics],
         "primary_metrics": [asdict(item) for item in quality.primary_metrics],
         "error": quality.error,
@@ -168,4 +228,8 @@ def _media_type(path: Path) -> str:
     }.get(path.suffix.lower(), "application/octet-stream")
 
 
-__all__ = ["BenchmarkEvidenceReceipts", "persist_benchmark_evidence"]
+__all__ = [
+    "BenchmarkEvidenceReceipts",
+    "persist_benchmark_evidence",
+    "persist_formal_benchmark_evidence",
+]

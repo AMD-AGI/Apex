@@ -6,14 +6,20 @@ import sys
 
 import pytest
 
-from apex.core import AgentBackendName, ConfigurationError
-from apex.execution import AgentRegistry, ProcessResult, build_default_registry
+from apex.core import AgentBackendName, ConfigurationError, ContractError, DependencyError
+from apex.execution import (
+    AgentRegistry,
+    ProcessResult,
+    agent_transcript_document,
+    build_default_registry,
+)
 from apex.execution.claude import ClaudeBackend
 from apex.execution.codex import CodexBackend
 from apex.execution.cursor import CursorBackend
 from apex.ports import (
     AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
+    AgentExecutionAuthorityReceipt,
     AgentProcessContainmentReceipt,
     AgentRequest,
     AgentTerminationKind,
@@ -56,6 +62,8 @@ class FakeSupervisor:
         *,
         stdout_truncated: bool = False,
         cleanup_succeeded: bool = True,
+        stderr: str = "",
+        version_output: str = "test-agent 1.2.3\n",
     ) -> None:
         self.call: dict[str, object] | None = None
         self.stdout = (
@@ -65,6 +73,8 @@ class FakeSupervisor:
         )
         self.stdout_truncated = stdout_truncated
         self.cleanup_succeeded = cleanup_succeeded
+        self.stderr = stderr
+        self.version_output = version_output
         self.pid_namespace_requests: list[bool] = []
 
     def run(
@@ -93,7 +103,7 @@ class FakeSupervisor:
                 argv=tuple(argv),
                 exit_code=0,
                 timed_out=False,
-                stdout="test-agent 1.2.3\n",
+                stdout=self.version_output,
                 stderr="",
                 stdout_truncated=False,
                 stderr_truncated=False,
@@ -111,7 +121,7 @@ class FakeSupervisor:
             exit_code=137 if observer_stopped else 0,
             timed_out=False,
             stdout="".join(emitted),
-            stderr="",
+            stderr=self.stderr,
             stdout_truncated=self.stdout_truncated,
             stderr_truncated=False,
             duration_seconds=0.1,
@@ -122,14 +132,29 @@ class FakeSupervisor:
         )
 
 
-def _request(tmp_path: Path) -> AgentRequest:
+def _request(
+    tmp_path: Path, backend: AgentBackendName = AgentBackendName.CODEX
+) -> AgentRequest:
+    authority = AgentExecutionAuthorityReceipt(
+        authority_id="test-formal-controller-v1",
+        authority_kind="evaluation_contract",
+        run_id="run-1",
+        attempt_id="attempt-1",
+        backend=backend.value,
+        workspace=str(tmp_path),
+        allowed_files=("source/kernel.py",),
+        requested_environment_keys=(),
+        parent_receipt_sha256="d" * 64,
+        source_anchor_sha256="e" * 64,
+    )
     return AgentRequest(
         run_id="run-1",
         attempt_id="attempt-1",
-        backend=AgentBackendName.CODEX,
+        backend=backend,
         prompt="Optimize only source/kernel.py",
         workspace=tmp_path,
         allowed_files=("source/kernel.py",),
+        execution_authority=authority,
         model="test-model",
         effort="high",
         timeout_seconds=42,
@@ -235,7 +260,7 @@ def test_each_backend_receives_only_its_own_credential(
     monkeypatch.setenv("PYTHONSTARTUP", "/tmp/injected.py")
     supervisor = FakeSupervisor()
 
-    request = _request(tmp_path)
+    request = _request(tmp_path, backend_class.name)
     if backend_class is CursorBackend:
         request = replace(request, effort=None)
     backend_class(supervisor).run(request)
@@ -247,9 +272,119 @@ def test_each_backend_receives_only_its_own_credential(
     assert "PYTHONSTARTUP" not in environment
 
 
+@pytest.mark.parametrize(
+    ("backend_class", "module", "backend"),
+    (
+        (CodexBackend, "apex.execution.codex.require_executable", AgentBackendName.CODEX),
+        (ClaudeBackend, "apex.execution.claude.require_executable", AgentBackendName.CLAUDE),
+        (CursorBackend, "apex.execution.cursor.require_executable", AgentBackendName.CURSOR),
+    ),
+)
+def test_formal_backends_keep_prompt_out_of_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_class,
+    module: str,
+    backend: AgentBackendName,
+) -> None:
+    monkeypatch.setattr(module, lambda _: sys.executable)
+    supervisor = FakeSupervisor()
+    request = replace(_request(tmp_path, backend), effort=None)
+
+    result = backend_class(supervisor).run(request)
+
+    assert result.invocation is not None
+    assert request.prompt not in result.invocation.argv
+    assert result.invocation.prompt_transport == "stdin"
+    assert supervisor.call is not None
+    assert supervisor.call["stdin_text"] == request.prompt
+
+
+def test_missing_or_mismatched_formal_authority_fails_before_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("apex.execution.codex.require_executable", lambda _: sys.executable)
+    supervisor = FakeSupervisor()
+    missing = replace(_request(tmp_path), execution_authority=None)
+
+    with pytest.raises(ContractError) as absent:
+        CodexBackend(supervisor).run(missing)
+    assert absent.value.reason_code == "agent_execution_authority_missing"
+    assert supervisor.call is None
+
+    request = _request(tmp_path)
+    assert request.execution_authority is not None
+    mismatch = replace(
+        request,
+        execution_authority=replace(
+            request.execution_authority, attempt_id="another-attempt"
+        ),
+    )
+    with pytest.raises(ContractError) as changed:
+        CodexBackend(supervisor).run(mismatch)
+    assert changed.value.reason_code == "agent_execution_authority_mismatch"
+    assert supervisor.call is None
+
+
+def test_backend_credential_echo_is_redacted_and_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "test-only-openai-credential-value"
+    monkeypatch.setattr("apex.execution.codex.require_executable", lambda _: sys.executable)
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    supervisor = FakeSupervisor(
+        '{"type":"turn.completed","credential":"' + secret + '"}\n',
+        stderr="credential=" + secret,
+    )
+
+    result = CodexBackend(supervisor).run(_request(tmp_path))
+
+    transcript = str(agent_transcript_document(result))
+    assert secret not in result.stdout
+    assert secret not in result.stderr
+    assert secret not in transcript
+    assert result.capture_status is AgentCaptureStatus.CREDENTIAL_REDACTED
+    assert result.credential_redaction_count == 2
+    assert result.candidate_rejection_reason == "agent_credential_leak_redacted"
+    assert not result.candidate_capture_allowed
+
+
+def test_cli_version_cannot_echo_backend_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "test-only-openai-version-credential"
+    monkeypatch.setattr("apex.execution.codex.require_executable", lambda _: sys.executable)
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    supervisor = FakeSupervisor(version_output=f"agent {secret}\n")
+
+    with pytest.raises(DependencyError) as raised:
+        CodexBackend(supervisor).run(_request(tmp_path))
+
+    assert raised.value.reason_code == "agent_cli_identity_failed"
+    assert secret not in str(raised.value)
+
+
+def test_backend_credential_cannot_enter_process_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "test-model"
+    monkeypatch.setattr("apex.execution.codex.require_executable", lambda _: sys.executable)
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    supervisor = FakeSupervisor()
+
+    with pytest.raises(ContractError) as raised:
+        CodexBackend(supervisor).run(_request(tmp_path))
+
+    assert raised.value.reason_code == "agent_credential_in_argv"
+    assert secret not in str(raised.value)
+    assert supervisor.call is None
+
+
 def test_cursor_rejects_unrepresentable_effort_before_execution(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError) as raised:
-        CursorBackend(FakeSupervisor()).run(_request(tmp_path))
+        CursorBackend(FakeSupervisor()).run(
+            _request(tmp_path, AgentBackendName.CURSOR)
+        )
 
     assert raised.value.reason_code == "agent_effort_unsupported"
 
@@ -287,7 +422,7 @@ def test_non_codex_backends_use_fail_closed_cli_isolation(
 ) -> None:
     monkeypatch.setattr(module, lambda _: sys.executable)
     supervisor = FakeSupervisor()
-    request = replace(_request(tmp_path), effort=None)
+    request = replace(_request(tmp_path, backend_class.name), effort=None)
 
     result = backend_class(supervisor).run(request)
 
@@ -311,7 +446,7 @@ def test_backend_exact_boundary_is_a_complete_candidate_checkpoint(
         )
     )
     result = ClaudeBackend(FakeSupervisor(stdout)).run(
-        replace(_request(tmp_path), backend=AgentBackendName.CLAUDE, max_turns=1)
+        replace(_request(tmp_path, AgentBackendName.CLAUDE), max_turns=1)
     )
 
     assert result.termination_kind is AgentTerminationKind.EXACT_TURN_BOUNDARY

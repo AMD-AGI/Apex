@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from apex.benchmark import BenchmarkConfigViews
 from apex.core import IntegrityError
-from apex.evaluation import E2EAcceptancePolicy, E2EMeasurement
+from apex.evaluation import E2EAcceptancePolicy, E2EObservation
 from apex.intake import E2EOptimizeSpec
 from apex.orchestration import SearchStage
 from apex.storage import ArtifactReceipt, EventJournal, EventRecord
@@ -27,8 +27,17 @@ from .recovery_bindings import (
     unique_role as _unique_role,
     verify_deployment_config_bindings as _verify_deployment_config_bindings,
 )
+from .recovery_context import initial_anchor_id, protocol_hash, views_from_state
+from .recovery_outcome import (
+    verify_decision_reward_transaction,
+    verify_untrainable_decision,
+)
 from .promotion import MatchedPromotion
 from .promotion_recovery import recover_matched_promotion, validate_promotion_context, verify_promotion_reward_binding
+from .quality_failure_recovery import (
+    try_verify_quality_gate_decision,
+    verify_quality_gate_reward,
+)
 from .run_record import E2ERunRecord
 from .search_support import QualifiedAttempt, validate_deployment
 from .services import AcceptedCandidate
@@ -83,7 +92,7 @@ class RecoveredSearch:
     initial_diagnosis: Diagnosis
     diagnosis: Diagnosis
     accepted: tuple[AcceptedCandidate, ...]
-    anchor: E2EMeasurement
+    anchor: E2EObservation
     measurement_config: Path
     diagnostic_config: Path
     replay_config: Path
@@ -124,7 +133,7 @@ def recover_search(
     *,
     spec: E2EOptimizeSpec,
     views: BenchmarkConfigViews,
-    baseline: E2EMeasurement,
+    baseline: E2EObservation,
 ) -> RecoveredSearch:
     """Replay accepted/current attempt evidence and recompute the live anchor."""
 
@@ -211,34 +220,39 @@ def _accepted_chain(
     diagnoses: tuple[_DiagnosisEntry, ...],
     *,
     spec: E2EOptimizeSpec,
-    baseline: E2EMeasurement,
+    baseline: E2EObservation,
     views: BenchmarkConfigViews,
-) -> tuple[tuple[AcceptedCandidate, ...], E2EMeasurement]:
+) -> tuple[tuple[AcceptedCandidate, ...], E2EObservation]:
     search = record.controller.state.e2e
     assert search is not None
     policy = E2EAcceptancePolicy(spec.goal.gates)
     accepted: list[AcceptedCandidate] = []
     anchor = baseline
-    anchor_id = _initial_anchor_id(index)
+    anchor_id = initial_anchor_id(index)
     anchor_config = views.measurement
     anchor_image_id = None
     for decision in search.decisions:
-        reward_event = _verify_decision_reward_transaction(index, decision.attempt_id)
         if decision.verdict == "reject":
+            verify_decision_reward_transaction(index, decision.attempt_id)
             continue
+        if decision.verdict == "needs_more_measurement":
+            verify_untrainable_decision(index, decision.attempt_id, decision.reason)
+            continue
+        reward_event = verify_decision_reward_transaction(index, decision.attempt_id)
         attempt = _recover_decided_attempt(
             record,
             index,
             diagnoses,
             attempt_id=decision.attempt_id,
-            candidate_receipt=receipt_for_digest(
-                record, decision.candidate_artifact_ref
-            ),
+            candidate_receipt=receipt_for_digest(record, decision.candidate_artifact_ref),
             decision_receipt=receipt_for_digest(record, decision.evidence_ref),
             policy=policy,
         )
         promotion = attempt.promotion
         if promotion is None:
+            if verify_quality_gate_reward(
+                reward_event, verdict=decision.verdict, reason=decision.reason):
+                continue
             raise IntegrityError(
                 "Measured decision lacks a matched promotion pair",
                 "recovery_lineage_incomplete",
@@ -281,23 +295,6 @@ def _accepted_chain(
     return tuple(accepted), anchor
 
 
-def _verify_decision_reward_transaction(index: _EventIndex, attempt_id: str) -> EventRecord:
-    decision = index.keyed(f"e2e.attempt.{attempt_id}.decision")
-    reward = index.keyed(f"e2e.attempt.{attempt_id}.reward")
-    if (
-        decision is None
-        or reward is None
-        or decision.event_type != "e2e.candidate_decided"
-        or reward.event_type != "reward_committed"
-        or decision.transaction_id != reward.transaction_id
-    ):
-        raise IntegrityError(
-            "Decision and reward are not one transaction",
-            "e2e_reward_transaction_mismatch",
-        )
-    return reward
-
-
 def _recover_decided_attempt(
     record: E2ERunRecord,
     index: _EventIndex,
@@ -324,6 +321,7 @@ def _recover_decided_attempt(
     _verify_decision_document(
         record,
         decision_receipt,
+        events=index.attempt_events(attempt_id),
         attempt_id=attempt_id,
         opportunity_id=opportunity.opportunity_id,
         candidate_id=candidate.candidate_id,
@@ -421,17 +419,17 @@ def _attempt_parts(
         ),
     )
     if deployment is not None:
-        validate_deployment(deployment[0], candidate, _views_from_state(record))
+        validate_deployment(deployment[0], candidate, views_from_state(record))
         if deployment[0].deployed:
             _verify_deployment_config_bindings(record, events, deployment[0])
-    pair_event = index.keyed(f"attempt.{attempt_id}.promotion_pair")
+    pair_event = index.keyed(f"attempt.{attempt_id}.paired_promotion")
     promotion = None
     if pair_event is not None:
         promotion = recover_matched_promotion(
             record,
             pair_event=pair_event,
             events_by_key=index.by_key,
-            protocol_hash=_protocol_hash(record),
+            protocol_hash=protocol_hash(record),
             policy=policy,
             attempt_id=attempt_id,
             candidate_id=candidate.candidate_id,
@@ -470,6 +468,7 @@ def _verify_decision_document(
     record: E2ERunRecord,
     receipt: ArtifactReceipt,
     *,
+    events: tuple[EventRecord, ...],
     attempt_id: str,
     opportunity_id: str,
     candidate_id: str | None,
@@ -494,9 +493,20 @@ def _verify_decision_document(
         if pair is None or value.get(name) != pair[1].digest:
             raise IntegrityError("Decision evidence is incomplete", "recovery_lineage_incomplete")
     promotion = parts[3]
+    if try_verify_quality_gate_decision(
+        record,
+        events,
+        value,
+        promotion=promotion,
+        deployment_pair=parts[2],
+        attempt_id=attempt_id,
+        candidate_id=candidate_id,
+        opportunity_id=opportunity_id,
+    ):
+        return
     if (
         promotion is None
-        or value.get("promotion_pair_receipt") != promotion.receipt.digest
+        or value.get("paired_promotion_receipt") != promotion.receipt.digest
         or value.get("measurement_verdict") != promotion.verdict.to_dict()
     ):
         raise IntegrityError("Decision lacks matched proof", "recovery_lineage_incomplete")
@@ -549,13 +559,6 @@ def _active_configs(
         deployment.replay_config,
     )
 
-def _initial_anchor_id(index: _EventIndex) -> str:
-    events = tuple(event for event in index.events if event.event_type == "run.started")
-    if len(events) != 1 or not isinstance(events[0].payload.get("initial_anchor_id"), str):
-        raise IntegrityError("Initial anchor is missing", "anchor_lineage_mismatch")
-    return str(events[0].payload["initial_anchor_id"])
-
-
 def _validate_active_promotion(
     record: E2ERunRecord,
     active: RecoveredAttempt,
@@ -570,31 +573,6 @@ def _validate_active_promotion(
         anchor_config=configs[0],
         anchor_image_id=(accepted[-1].deployment.deployed_image_id if accepted else None),
         deployment=active.deployment_pair[0],
-    )
-
-def _protocol_hash(record: E2ERunRecord) -> str:
-    search = record.controller.state.e2e
-    if search is None:
-        raise IntegrityError("E2E state is absent", "recovery_lineage_incomplete")
-    return search.measurement_protocol_hash
-
-
-def _views_from_state(record: E2ERunRecord) -> BenchmarkConfigViews:
-    """Only workload hash is used by validate_deployment during recovery."""
-
-    search = record.controller.state.e2e
-    if search is None:
-        raise IntegrityError("E2E state is absent", "recovery_lineage_incomplete")
-    placeholder = record.root / "run.request.json"
-    return BenchmarkConfigViews(
-        placeholder,
-        placeholder,
-        placeholder,
-        placeholder,
-        "0" * 64,
-        search.measurement_protocol_hash,
-        "",
-        None,
     )
 
 __all__ = ["RecoveredAttempt", "RecoveredSearch", "recover_search"]

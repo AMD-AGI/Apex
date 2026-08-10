@@ -13,7 +13,68 @@ candidate is correct or fast.
 
 Public API: `AgentRegistry`, `build_default_registry`, `SubprocessSupervisor`,
 `ProcessResult`, `build_subprocess_environment`,
-`StructuredKernelMeasurementAdapter`, and its immutable adapter/method IDs.
+`NativeBackendDoctor`,
+`StructuredKernelMeasurementAdapter`, `KernelTemplateMaterializer`,
+`DockerTemplateImageSourceRuntime`, and their immutable receipts/identities.
+
+## Reviewed template materialization
+
+`KernelTemplateMaterializer` is the only image-kernel template entry. It accepts
+an exact manifest already admitted by the packaged intake registry, requires
+`reviewed` status with no blockers, inspects a digest-pinned Docker image, and
+copies the declared in-image source from a stopped container. It does not start
+the image or acquire a GPU. The copied tree rejects symlinks/hardlinks and must
+match the manifest's full byte/mode digest before protected Apex evaluator files
+are added.
+
+The materializer creates an isolated Git baseline with a synthetic
+`templates.apex.invalid` origin, writes an external
+`apex.kernel-template-materialization/v1` receipt, and constructs an internal
+authority-bound TaskSpec. Serialized authority cannot be parsed back through
+the user TaskSpec path. A partial copy, image/source mismatch, evaluator overlap,
+or stale output is removed before returning a typed failure. Current checked-in
+templates are `pending`, so this code path stops before Docker.
+
+## Native coding sessions
+
+`NativeCodingSessionLauncher` is the non-formal path used by bare `apex`. It
+delegates interactive, text, JSONL, and resume behavior to Codex, Claude, or
+Cursor without the formal candidate sandbox, source freeze, turn checkpoint, or
+reward pipeline. Backend-native project instructions, approvals, and persistence
+remain active. Cross-backend credentials and language/dynamic-loader injection
+are still excluded by the common environment builder.
+The interactive natural-language `apex optimize kernel` intake also uses this
+boundary when a trusted descriptor or target cannot be selected. It forces
+kernel enhancement, labels the session as discovery-only, and composes no formal
+optimizer or evaluation authorizer. Machine/headless intake never opens it.
+
+Kernel-related Codex and Claude sessions receive an ephemeral command-line MCP
+configuration pointing to the local Apex server; user configuration is not
+mutated. Non-kernel and `--plain` sessions do not start that server. Cursor has no
+equivalent run-scoped MCP flag in the supported surface, so the launcher reports
+that typed difference.
+Kernel-related sessions also receive the same integrity-checked, instruction-only
+`amd-kernel-optimization` and `amd-kernel-debugging` skills. Codex receives
+session-local `skills.config` paths; Claude and Cursor receive the packaged local
+plugin through `--plugin-dir`. The skills guide typed capability selection and
+evidence boundaries, contain no executable scripts, and cannot award reward or
+provide a sanitizer runtime. Non-kernel and `--plain` sessions mount neither the
+skills nor MCP. Cursor therefore retains kernel methodology while explicitly
+lacking the MCP tool bridge.
+The ephemeral command also fixes the current workspace and either the caller's
+`--results` root or the stable hidden sibling
+`.WORKSPACE_NAME.apex-capability-results`; tools cannot replace
+those roots through their input schema.
+
+`NativeBackendDoctor` performs a separate read-only preflight. For exactly one
+selected backend it resolves and hashes the CLI entrypoint and runs fixed bounded
+`--version` and native authentication-status argv. Authentication requires
+recognized backend-specific evidence; exit status alone cannot turn an unsupported
+status command into “authentication required.” Feature entries are a
+`launcher_contract_only` inventory after CLI/auth prerequisites, not proof that a
+live interactive/headless/resume/tool/approval/cleanup probe succeeded. It never
+records status-command output or a credential value. Missing identity, ambiguous
+auth evidence, or Cursor MCP/effort gaps remain explicit machine states.
 
 ## Kernel measurement adapter
 
@@ -47,7 +108,7 @@ assistant claims about tokens, and stderr cannot create usage or cost.
 normalized semantic events, requested model/effort, usage, and cost. Raw stdout/stderr remain separate
 diagnostic artifacts.
 
-Every production result also embeds an `apex.agent-invocation/v3` receipt. It
+Every production result also embeds an `apex.agent-invocation/v4` receipt. It
 records the discovered and resolved CLI entrypoint, SHA-256 of those exact
 entrypoint bytes, the CLI's bounded `--version` output, actual argv, prompt
 transport, requested editable files, turn policy, and explicit isolation modes.
@@ -154,6 +215,16 @@ locally supported CLI surfaces provides a portable output-token limit; the
 ContextPacket's response allocation is therefore not represented as an
 execution cap.
 
+Every formal backend invocation uses stdin for the complete prompt. The
+`apex.agent-invocation/v4` receipt binds an
+`apex.agent-execution-authority/v1` permission receipt to the exact run,
+attempt, backend, writable projection, editable files, requested environment
+key names, and parent evaluation/controller receipt. Missing or mismatched
+authority fails before the CLI version probe or agent process. The receipt names
+the backend credential environment key and redaction policy, but never its
+value. Ordinary user-owned interactive sessions remain a separate native
+backend surface and may use the backend's native argv UX.
+
 ## Process environments
 
 Subprocesses never receive a copy of `os.environ`. The shared builder inherits a
@@ -168,14 +239,20 @@ Agent adapters opt in to exactly one ambient credential: Codex receives only
 `OPENAI_API_KEY`, Claude only `ANTHROPIC_API_KEY`, and Cursor only
 `CURSOR_API_KEY`. Cross-backend credentials and unrelated host secrets are not
 inherited. An explicit request may override only that same backend credential.
+Formal stdout/stderr and structured events are exact-value scrubbed before an
+`AgentResult` exists. A credential echo produces
+`capture_status=credential_redacted`, preserves only the replacement count,
+and cannot yield a candidate or reward. Credential text in a CLI identity probe
+fails provenance closed, so neither invocation receipts nor CAS artifacts can
+retain it.
 
 Tests: `pytest tests/unit/execution tests/contract -q`.
 
 ## Purpose
 
-Execution contains stateless Codex, Claude, Cursor, and structured kernel
-measurement adapters plus one bounded subprocess supervisor for trusted
-fixed-argv commands.
+Execution contains stateless Codex, Claude, Cursor, structured kernel
+measurement, and digest-pinned template materialization adapters plus one
+bounded subprocess supervisor for trusted fixed-argv commands.
 
 ## Public API
 
@@ -191,8 +268,8 @@ inheritance is explicit rather than ambient.
 
 ## Dependencies
 
-Execution depends only on core and agent ports. It never imports optimization,
-evaluation, storage, benchmark, or CLI packages.
+Execution depends only on core, intake contracts, and ports. It never imports
+optimization, evaluation, storage, benchmark, or CLI packages.
 
 ## Failure semantics
 
@@ -210,6 +287,12 @@ teardown defeat a `setsid` + double-fork + `clearenv` delayed writer. Determinis
 containment tests cover the status/mount readiness race, visible topmost procfs
 selection, identity changes, incomplete membership scans, and the observer/wrapper
 exit race.
+Template tests use a fake image runtime plus real local Git to prove source-tree
+binding, baseline cleanliness, non-replayable authority, cleanup, and that a
+pending manifest never calls Docker.
+Doctor tests use bounded fake probes to cover exact argv, entrypoint identity,
+credential/output redaction, authentication-required state, and backend feature
+differences without contacting a model service.
 
 ## Provenance
 

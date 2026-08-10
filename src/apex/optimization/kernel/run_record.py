@@ -13,6 +13,7 @@ from apex.evaluation import (
     KernelMeasurementArtifact,
     KernelMeasurementExecutionReceipt,
     MeasurementStatus,
+    kernel_reward_policy_source,
 )
 from apex.evaluation.safety import PhaseIsolationReceipt, SafetyGateResult, VerificationPlan
 from apex.execution import agent_transcript_document
@@ -30,11 +31,7 @@ from apex.storage import (
 
 from ..agent_recording import record_agent_observations
 from .verification import CommandEvidence
-from .grading_record import (
-    kernel_reward_policy_source,
-    measurement_payload,
-    reward_vector,
-)
+from .grading_record import measurement_payload, reward_vector
 from .transcript import transcript_metadata
 
 
@@ -82,22 +79,38 @@ class KernelRunRecord:
 
         return self.journal.iter_events(self.run_id, verify=True)
 
-    def record_gpu_lease(self, lease: GpuLeaseReceipt) -> ArtifactReceipt:
+    def record_gpu_lease(
+        self,
+        lease: GpuLeaseReceipt,
+        *,
+        attempt_id: str | None = None,
+        phase: str | None = None,
+    ) -> ArtifactReceipt:
         """Bind the exact run-scoped GPU ownership receipt before any command."""
+
+        if (attempt_id is None) != (phase is None):
+            raise ValueError("attempt_id and phase must be supplied together")
 
         receipt = self.artifacts.put_bytes(
             canonical_json_bytes(lease.to_dict()), media_type="application/json"
         )
+        payload: dict[str, object] = {
+            "kind": "gpu_lease",
+            "execution_scope": lease.execution_scope,
+            "physical_scope": lease.physical_scope,
+            "lease_digest": lease.digest,
+            "artifacts": [_artifact_binding("gpu_lease", receipt)],
+        }
+        if attempt_id is not None and phase is not None:
+            payload.update({**self.attempt_payload(attempt_id), "phase": phase})
         self.controller.record_domain_event(
             "dependency_verified",
-            {
-                "kind": "gpu_lease",
-                "execution_scope": lease.execution_scope,
-                "physical_scope": lease.physical_scope,
-                "lease_digest": lease.digest,
-                "artifacts": [_artifact_binding("gpu_lease", receipt)],
-            },
-            idempotency_key="gpu_lease.acquired",
+            payload,
+            idempotency_key=(
+                f"attempt.{attempt_id}.gpu_lease.{phase}"
+                if attempt_id is not None
+                else "gpu_lease.acquired"
+            ),
         )
         return receipt
 
@@ -122,7 +135,7 @@ class KernelRunRecord:
         record_agent_observations(
             self.controller,
             result=result,
-            common_payload=self._attempt_payload(attempt_id),
+            common_payload=self.attempt_payload(attempt_id),
             transcript=transcript,
             idempotency_prefix=f"attempt.{attempt_id}",
         )
@@ -132,7 +145,7 @@ class KernelRunRecord:
         self.controller.record_domain_event(
             event_type,
             {
-                **self._attempt_payload(attempt_id),
+                **self.attempt_payload(attempt_id),
                 **transcript_metadata(result),
                 "backend": result.backend.value,
                 "model": result.model,
@@ -182,7 +195,7 @@ class KernelRunRecord:
         """Bind the exact observation, advisory read, and prompt before invocation."""
 
         prompt_receipt = self.artifacts.put_bytes(prompt.encode(), media_type="text/plain")
-        common = self._attempt_payload(attempt_id)
+        common = self.attempt_payload(attempt_id)
         context = compiled.packet
         self.controller.record_domain_event(
             "context_packet_created",
@@ -234,20 +247,34 @@ class KernelRunRecord:
         *,
         candidate_files: Mapping[str, bytes],
         changed_files: Sequence[str],
+        source_digest: str | None = None,
     ) -> tuple[ArtifactReceipt, ...]:
-        receipts = tuple(
-            self.artifacts.put_bytes(content, media_type=_source_media_type(relative))
+        entries = tuple(
+            (
+                relative,
+                self.artifacts.put_bytes(
+                    content, media_type=_source_media_type(relative)
+                ),
+            )
             for relative, content in sorted(candidate_files.items())
         )
+        receipts = tuple(receipt for _, receipt in entries)
+        payload: dict[str, object] = {
+            **self.attempt_payload(attempt_id),
+            "changed_files": list(changed_files),
+            "artifacts": [
+                {
+                    **_artifact_binding("candidate", receipt),
+                    "path": relative,
+                }
+                for relative, receipt in entries
+            ],
+        }
+        if source_digest is not None:
+            payload["candidate_source_sha256"] = source_digest
         self.controller.record_domain_event(
             "candidate_frozen",
-            {
-                **self._attempt_payload(attempt_id),
-                "changed_files": list(changed_files),
-                "artifacts": [
-                    _artifact_binding("candidate", receipt) for receipt in receipts
-                ],
-            },
+            payload,
             idempotency_key=f"attempt.{attempt_id}.candidate",
         )
         self.controller.mark_artifacts_ready(
@@ -263,7 +290,7 @@ class KernelRunRecord:
         receipt = self.artifacts.put_bytes(
             canonical_json_bytes(evidence.to_dict()), media_type="application/json"
         )
-        common = self._attempt_payload(attempt_id)
+        common = self.attempt_payload(attempt_id)
         event_type = {
             "compile": "compile_result",
             "correctness": "correctness_result",
@@ -329,7 +356,7 @@ class KernelRunRecord:
         self.controller.record_domain_event(
             "measurement_result",
             {
-                **self._attempt_payload(attempt_id),
+                **self.attempt_payload(attempt_id),
                 **measurement_payload(artifact, grade),
                 "measurement_execution_sha256": execution.fingerprint,
                 "measurement_writer_id": execution.writer_id,
@@ -351,7 +378,8 @@ class KernelRunRecord:
             self.controller.record_domain_event(
                 "reward_committed",
                 {
-                    **self._attempt_payload(attempt_id),
+                    **self.attempt_payload(attempt_id),
+                    "scope": "attempt",
                     "policy_id": grade.policy_id,
                     "scalar_reward": grade.reward,
                     "reward_vector": reward_vector(grade),
@@ -367,24 +395,6 @@ class KernelRunRecord:
                 idempotency_key=f"attempt.{attempt_id}.reward",
             )
         return grade_receipt
-
-    def record_measurement_error(
-        self,
-        attempt_id: str,
-        *,
-        reason_code: str,
-    ) -> None:
-        self.controller.record_domain_event(
-            "measurement_result",
-            {
-                **self._attempt_payload(attempt_id),
-                "measurement_status": "error",
-                "reason_code": reason_code,
-                "reward": None,
-                "evidence_class": "measured",
-            },
-            idempotency_key=f"attempt.{attempt_id}.measurement",
-        )
 
     def record_safety(
         self,
@@ -406,7 +416,7 @@ class KernelRunRecord:
         self.controller.record_domain_event(
             "safety_result",
             {
-                **self._attempt_payload(attempt_id),
+                **self.attempt_payload(attempt_id),
                 "plan_fingerprint": plan.fingerprint,
                 "result_fingerprint": result.fingerprint,
                 "allowed_to_measure": result.decision.allowed_to_measure,
@@ -454,7 +464,7 @@ class KernelRunRecord:
         self.controller.record_domain_event(
             "experience.measured",
             {
-                **self._attempt_payload(attempt_id),
+                **self.attempt_payload(attempt_id),
                 "evidence_class": "measured",
                 "dry_run": False,
                 "identity": identity.to_dict(),
@@ -513,7 +523,7 @@ class KernelRunRecord:
         if verdict not in {"keep", "revert", "reject", "needs_more_measurement"}:
             raise ValueError(f"unsupported kernel decision: {verdict}")
         payload: dict[str, object] = {
-            **self._attempt_payload(attempt_id),
+            **self.attempt_payload(attempt_id),
             "verdict": verdict,
             "reason": reason,
             "bundle_digest": bundle_digest,
@@ -565,7 +575,9 @@ class KernelRunRecord:
         if self.controller.state.phase is RunPhase.RUNNING:
             self.controller.finish(RunPhase.FAILED, reason=reason)
 
-    def _attempt_payload(self, attempt_id: str) -> dict[str, object]:
+    def attempt_payload(self, attempt_id: str) -> dict[str, object]:
+        """Return canonical child-attempt lineage for auxiliary recorders."""
+
         return {
             "attempt_id": attempt_id,
             "candidate_id": attempt_id,
@@ -573,13 +585,6 @@ class KernelRunRecord:
             "split": self.dataset_split,
             "visibility": self.data_visibility,
         }
-
-
-def candidate_file_bytes(root: Path, relative_paths: Sequence[str]) -> dict[str, bytes]:
-    return {
-        relative: root.joinpath(*relative.split("/")).read_bytes()
-        for relative in relative_paths
-    }
 
 
 def _artifact_binding(role: str, receipt: ArtifactReceipt) -> dict[str, object]:
@@ -591,4 +596,4 @@ def _source_media_type(relative: str) -> str:
     return "text/x-c++" if suffix in {".hip", ".cpp", ".cc", ".cxx"} else "text/x-python"
 
 
-__all__ = ["KernelRunRecord", "candidate_file_bytes"]
+__all__ = ["KernelRunRecord"]

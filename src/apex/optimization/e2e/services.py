@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from apex.core import ContractError, TaskStatus, ValidationLevel, sha256_file
-from apex.evaluation import E2EMeasurement, KernelGrade, MeasurementStatus
+from apex.evaluation import (
+    E2EAcceptancePolicy,
+    E2EObservation,
+    E2EPairedMeasurement,
+    KernelGrade,
+    MeasurementStatus,
+)
 from apex.evaluation.safety import (
     ArtifactKind,
     FindingStatus,
@@ -404,7 +410,7 @@ class AcceptedCandidate:
     micro: MicroQualification
     safety: SafetyQualification
     deployment: CandidateDeployment
-    primary_measurement: E2EMeasurement
+    primary_measurement: E2EObservation
     decision_receipt: str
 
 
@@ -417,8 +423,9 @@ class FinalDeliveryRequest:
     benchmark_measurement: Path
     benchmark_diagnostic: Path
     benchmark_replay: Path
-    baseline: E2EMeasurement
-    final: E2EMeasurement
+    baseline: E2EObservation
+    final: E2EObservation
+    acceptance_policy: E2EAcceptancePolicy
     artifact_root: Path
     agent_backend: str | None = None
     agent_model: str | None = None
@@ -439,6 +446,8 @@ class FinalDeliveryResult:
     bundle_path: str | None
     bundle_digest: str | None
     evidence: Mapping[str, Any]
+    terminal_measurement: E2EPairedMeasurement | None = None
+    terminal_raw_artifacts: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         formal = (
@@ -448,8 +457,24 @@ class FinalDeliveryResult:
             and self.validation_level is ValidationLevel.SOURCE_REBUILD_VERIFIED
             and bool(self.bundle_path)
             and bool(self.bundle_digest)
+            and self.terminal_measurement is not None
+            and bool(self.terminal_raw_artifacts)
         )
-        if self.verified != formal or (self.status is TaskStatus.SUCCEEDED) != formal:
+        raw_ids = (
+            set(self.terminal_measurement.raw_measurement_receipts)
+            if self.terminal_measurement is not None
+            else set()
+        )
+        raw_valid = all(
+            _terminal_raw_artifact_valid(item, raw_ids)
+            for item in self.terminal_raw_artifacts
+        )
+        if (
+            self.verified != formal
+            or (self.status is TaskStatus.SUCCEEDED) != formal
+            or not raw_valid
+            or (not formal and self.terminal_raw_artifacts)
+        ):
             raise ContractError(
                 "Formal E2E success requires source rebuild and second clean replay",
                 "invalid_final_delivery_verdict",
@@ -459,7 +484,36 @@ class FinalDeliveryResult:
         value = asdict(self)
         value["status"] = self.status.value
         value["validation_level"] = self.validation_level.value
+        value["terminal_raw_artifacts"] = [
+            dict(item) for item in self.terminal_raw_artifacts
+        ]
         return value
+
+
+def _terminal_raw_artifact_valid(
+    value: Mapping[str, Any], raw_measurement_ids: set[str]
+) -> bool:
+    path = Path(str(value.get("path", "")))
+    digest = value.get("sha256")
+    return bool(
+        value.get("role")
+        in {
+            "benchmark_report",
+            "execution_attestation",
+            "quality_result",
+            "quality_sample",
+            "quality_raw_artifact",
+        }
+        and value.get("measurement_receipt") in raw_measurement_ids
+        and isinstance(value.get("quality_receipt"), str)
+        and path.is_absolute()
+        and path.is_file()
+        and not path.is_symlink()
+        and isinstance(digest, str)
+        and _SHA256.fullmatch(digest)
+        and sha256_file(path) == digest
+        and value.get("size_bytes") == path.stat().st_size
+    )
 
 
 class FinalDeliveryPort(Protocol):
@@ -475,6 +529,10 @@ class UnavailableMicroQualifier:
 
 
 class UnavailableDeployment:
+    adapter_id = "unavailable"
+    supported_components: frozenset[str] = frozenset()
+    supported_run_modes: frozenset[str] = frozenset()
+
     def supports(self, _opportunity: KernelOpportunity, _provenance: RunProvenance) -> bool:
         return False
 
@@ -486,6 +544,8 @@ class UnavailableDeployment:
 
 
 class UnavailableFinalDelivery:
+    adapter_id = "unavailable"
+
     def finalize(self, request: FinalDeliveryRequest) -> FinalDeliveryResult:
         status = (
             TaskStatus.PROVENANCE_UNRESOLVED

@@ -19,7 +19,7 @@ from apex.context import (
     render_context_packet,
 )
 from apex.core import canonical_json_bytes, sha256_json
-from apex.evaluation import E2EMeasurement
+from apex.evaluation import E2EObservation
 from apex.intake import E2EOptimizeSpec
 from apex.knowledge import (
     ExperienceIdentity,
@@ -66,7 +66,7 @@ class E2EContextBuilder:
         record: E2ERunRecord,
         opportunity: KernelOpportunity,
         attempt_id: str,
-        anchor: E2EMeasurement,
+        anchor: E2EObservation,
         diagnostic_receipt: ArtifactReceipt,
         qualification_mode: str = "strict_micro",
     ) -> E2EContext:
@@ -155,7 +155,7 @@ def _compile_request(
     spec: E2EOptimizeSpec,
     record: E2ERunRecord,
     opportunity: KernelOpportunity,
-    anchor: E2EMeasurement,
+    anchor: E2EObservation,
     diagnostic_receipt: ArtifactReceipt,
     inputs: _ContextInputs,
     qualification_mode: str,
@@ -308,7 +308,7 @@ def _artifact(kind: str, receipt: ArtifactReceipt) -> ArtifactReference:
     )
 
 
-def _anchor_metrics(anchor: E2EMeasurement) -> dict[str, float]:
+def _anchor_metrics(anchor: E2EObservation) -> dict[str, float]:
     return {
         "throughput": anchor.throughput,
         "ttft_p99_ms": anchor.ttft_p99_ms,

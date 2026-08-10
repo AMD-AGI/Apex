@@ -2,13 +2,28 @@ from __future__ import annotations
 
 import json
 import py_compile
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from tests.support.gpu_evidence import StaticGpuDoctorInspector
 
-from apex.core import AgentBackendName, TaskStatus, sha256_bytes, sha256_json
+from apex.core import (
+    AgentBackendName,
+    IntegrityError,
+    TaskStatus,
+    canonical_json_bytes,
+    sha256_bytes,
+    sha256_json,
+)
 from apex.delivery import load_and_verify_kernel_bundle
+from apex.evaluation import (
+    EvaluationAuthorityIdentity,
+    EvaluationAuthorityKind,
+    EvaluationAuthorityReceipt,
+    EvaluationContractDraft,
+)
 from apex.evaluation.safety import (
     CapabilityCheck,
     CapabilityStatus,
@@ -52,6 +67,7 @@ from apex.runtime import (
     HsaGpuIdentity,
     HsaInventoryEvidence,
     LocalGpuLeaseManager,
+    ReleaseCandidateReceipt,
     RsmiDeviceIdentity,
 )
 
@@ -83,6 +99,7 @@ def _agent_containment(*, stopped: bool = False) -> AgentProcessContainmentRecei
         live_namespace_members_after=(),
     )
 from apex.rl import DatasetExportConfig, DatasetExporter, EpisodeGraphMaterializer
+from apex.reporting import ShowcaseExporter, verify_showcase
 from apex.storage import ArtifactReceipt, ArtifactStore, EventJournal
 
 
@@ -122,8 +139,17 @@ class _FakeOwnershipInspector:
 def _gpu_leases(tmp_path: Path) -> LocalGpuLeaseManager:
     return LocalGpuLeaseManager(
         lock_root=tmp_path / "gpu-leases",
-        ownership_inspector=_FakeOwnershipInspector(),
+        doctor_inspector=StaticGpuDoctorInspector(_FakeOwnershipInspector()),
     )
+
+
+class _ForbiddenGpuLeases:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def acquire(self, run_id: str):
+        self.calls += 1
+        raise AssertionError(f"GPU lease requested before contract authority: {run_id}")
 
 
 class EditingAgent:
@@ -143,8 +169,10 @@ class EditingAgent:
         self.termination_kind = termination_kind
         self.capture_status = capture_status
         self.ignored_artifact_marker = ignored_artifact_marker
+        self.requests: list[AgentRequest] = []
 
     def run(self, request: AgentRequest) -> AgentResult:
+        self.requests.append(request)
         if self.make_change:
             (request.workspace / "source" / "kernel.py").write_text(
                 "def kernel(x):\n    return x + 0\n", encoding="utf-8"
@@ -201,6 +229,8 @@ def _agent_invocation(request: AgentRequest) -> AgentInvocationReceipt:
         argv=("codex", "exec"),
         workspace=str(request.workspace),
         prompt_transport="stdin",
+        execution_authority=request.execution_authority,
+        credential_environment_key="OPENAI_API_KEY",
         requested_allowed_files=request.allowed_files,
         allowed_files_enforced_by_cli=False,
         max_turns=request.max_turns,
@@ -395,6 +425,39 @@ class FixtureMeasurementEvaluator:
         return KernelMeasurementOutput(self.writer_id, request.report_path)
 
 
+class _FixtureEvaluationAuthorizer:
+    """Test composition authority; task recipe provenance is deliberately ignored."""
+
+    def authorize(self, draft: EvaluationContractDraft) -> EvaluationAuthorityReceipt:
+        identity = EvaluationAuthorityIdentity(
+            authority_id="fixture-reviewed-kernel-contract-v1",
+            kind=EvaluationAuthorityKind.REVIEWED_TEMPLATE,
+            issuer="tests.integration.kernel",
+            policy_sha256="a" * 64,
+            template_sha256="b" * 64,
+        )
+        return EvaluationAuthorityReceipt(identity, draft.digest)
+
+
+def _initialize_git_repository(workspace: Path) -> None:
+    commands = (
+        ("git", "init", "--quiet"),
+        ("git", "config", "user.email", "apex-fixture@example.invalid"),
+        ("git", "config", "user.name", "Apex Fixture"),
+        (
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/apex/kernel-fixture.git",
+        ),
+        ("git", "add", "source/kernel.py", "harness.py"),
+        ("git", "commit", "--quiet", "-m", "fixture baseline"),
+    )
+    for command in commands:
+        subprocess.run(command, cwd=workspace, check=True, capture_output=True)
+
+
 def _task(
     tmp_path: Path,
     *,
@@ -404,6 +467,7 @@ def _task(
     candidate_forges_report: bool = False,
     max_iterations: int = 1,
     external_evaluator: bool = True,
+    executable: str = sys.executable,
 ) -> TaskSpec:
     workspace = tmp_path / "workspace"
     (workspace / "source").mkdir(parents=True)
@@ -411,9 +475,10 @@ def _task(
         "def kernel(x):\n    return x\n", encoding="utf-8"
     )
     (workspace / "harness.py").write_text("assert True\n", encoding="utf-8")
-    success = [sys.executable, "-c", "print('ok')"]
+    _initialize_git_repository(workspace)
+    success = [executable, "-c", "print('ok')"]
     compile_command = [
-        sys.executable,
+        executable,
         "-c",
         (
             "from pathlib import Path; "
@@ -421,10 +486,19 @@ def _task(
             "raise SystemExit(1 if 'COMPILE_FAIL' in source else 0)"
         ),
     ]
+    correctness_command = [
+        executable,
+        "-c",
+        (
+            "from pathlib import Path; "
+            "source=Path('source/kernel.py').read_text(); "
+            "raise SystemExit(1 if 'CORRECTNESS_FAIL' in source else 0)"
+        ),
+    ]
     performance = success
     if performance_marker is not None:
         performance = [
-            sys.executable,
+            executable,
             "-c",
             (
                 "from pathlib import Path; "
@@ -434,7 +508,7 @@ def _task(
     if candidate_forges_report:
         report = _measurement_report(100.0, 0.1, 300)
         performance = [
-            sys.executable,
+            executable,
             "-c",
             (
                 "import json; from pathlib import Path; "
@@ -452,7 +526,7 @@ def _task(
             "target_functions": ["kernel"],
             "commands": {
                 "compile": {"argv": compile_command},
-                "correctness": {"argv": success},
+                "correctness": {"argv": correctness_command},
                 "performance": {"argv": performance},
             },
         "budget": {"max_iterations": max_iterations},
@@ -470,7 +544,7 @@ def _task(
             "adapter_id": "fixture-evaluator-v1",
             "harness_files": ["harness.py"],
             "measurement_method_sha256": "1" * 64,
-            "runner": {"argv": [sys.executable, "harness.py"]},
+            "runner": {"argv": [executable, "harness.py"]},
             "aggregation": "equal_case",
         }
     return TaskSpec.from_mapping(data)
@@ -485,11 +559,14 @@ def _run(
     safety_tools: tuple[ToolVerificationPlan, ...] = (),
     performance_marker: Path | None = None,
     measurement_values: tuple[float, float, int] | None = None,
+    executable: str = sys.executable,
+    campaign_baseline: ReleaseCandidateReceipt | None = None,
 ):
     task = _task(
         tmp_path,
         performance_marker=performance_marker,
         measurement_values=measurement_values,
+        executable=executable,
     )
     result_json = tmp_path / "machine" / "result.json"
     use_case = KernelOptimizeUseCase(
@@ -498,14 +575,34 @@ def _run(
         safety_policy=safety_policy,
         safety_tools=safety_tools,
         gpu_leases=_gpu_leases(tmp_path),
+        evaluation_authorizer=_FixtureEvaluationAuthorizer(),
         measurement_evaluator=(
             FixtureMeasurementEvaluator(measurement_values)
             if measurement_values is not None
             else None
         ),
     )
-    result = use_case.run(KernelOptimizeRequest(task=task, result_json=result_json))
+    result = use_case.run(KernelOptimizeRequest(
+        task=task,
+        result_json=result_json,
+        campaign_baseline=campaign_baseline,
+    ))
     return task, result, result_json
+
+
+def _campaign_baseline() -> ReleaseCandidateReceipt:
+    payload = {
+        "schema": "apex.release-candidate-receipt/v2",
+        "baseline_status": "ready",
+        "baseline_blockers": [],
+        "status": "blocked",
+        "blockers": ["live_qualification_pending"],
+        "static": {"apex_checkout": {"tree": "a" * 40}},
+        "evidence": {},
+        "qualification_authorities": [],
+    }
+    content = canonical_json_bytes(payload)
+    return ReleaseCandidateReceipt(content, sha256_bytes(content))
 
 
 def _run_sequence(
@@ -530,6 +627,7 @@ def _run_sequence(
             else None
         ),
         gpu_leases=_gpu_leases(tmp_path),
+        evaluation_authorizer=_FixtureEvaluationAuthorizer(),
     )
     result = use_case.run(KernelOptimizeRequest(task=task, result_json=result_json))
     run_root = next((task.results_dir / "runs").iterdir())
@@ -538,7 +636,8 @@ def _run_sequence(
 
 
 def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path: Path) -> None:
-    task, result, result_json = _run(tmp_path, EditingAgent())
+    agent = EditingAgent()
+    task, result, result_json = _run(tmp_path, agent)
 
     assert result.status is TaskStatus.CANDIDATE_READY
     assert result.reason_code == "candidate_deferred_to_external_evaluator"
@@ -566,12 +665,31 @@ def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path
     assert result.gpu_lease["run_id"] == result.run_id
     assert result.gpu_lease_receipt_digest == sha256_json(result.gpu_lease)
     assert result.gpu_lease_receipt_digest in result.artifact_store_ref["receipt_digests"]
+    assert result.evaluation_contract_status == "verified"
+    assert result.evaluation_contract_receipt_digest is not None
+    assert result.evaluation_contract_unverified_reason is None
+    assert result.evaluation_authority_id == "fixture-reviewed-kernel-contract-v1"
+    assert result.evaluation_authority_kind == "reviewed_template"
+    authority = agent.requests[0].execution_authority
+    assert authority is not None
+    assert authority.authority_kind == "evaluation_contract"
+    assert authority.parent_receipt_sha256 == result.evaluation_contract_receipt_digest
+    assert authority.workspace == str(agent.requests[0].workspace)
+    assert result.task_reward is None
+    assert result.task_trainability == "untrainable"
+    assert result.untrainable_reason == "external_evaluation_pending"
+    assert result.reward_policy_id == "kernel_robust_v1"
+    assert (
+        result.evaluation_contract_receipt_digest
+        in result.artifact_store_ref["receipt_digests"]
+    )
     assert result.error is None
     serialized = json.loads(result_json.read_text())
     assert serialized["run_id"] == result.run_id
     assert serialized["internal_verdict_ref"] == result.internal_verdict_ref
     assert serialized["gpu_lease"] == json.loads(json.dumps(result.gpu_lease))
     assert serialized["gpu_lease_receipt_digest"] == result.gpu_lease_receipt_digest
+    assert serialized["evaluation_contract_status"] == "verified"
 
     run_root = next((task.results_dir / "runs").iterdir())
     for projection in (
@@ -583,6 +701,12 @@ def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path
         assert (run_root / projection).is_file()
     journal = EventJournal(run_root / "events" / "run.db")
     events = journal.iter_events(run_root.name)
+    graph = EpisodeGraphMaterializer(
+        journal, ArtifactStore(run_root / "artifacts")
+    ).materialize(run_root.name)
+    assert graph.parent.task_reward is None
+    assert graph.parent.trainability == "untrainable"
+    assert graph.parent.untrainable_reason == "external_evaluation_pending"
     assert not any(item.event_type == "experience.measured" for item in events)
     deferred = [item for item in events if item.event_type == "experience.deferred"]
     assert len(deferred) == 1
@@ -608,6 +732,48 @@ def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path
     assert event_types.index("safety_result") < event_types.index("performance_command_result")
 
 
+def test_kernel_run_records_verified_campaign_baseline(tmp_path: Path) -> None:
+    task, result, _ = _run(
+        tmp_path,
+        EditingAgent(),
+        campaign_baseline=_campaign_baseline(),
+    )
+    run_root = task.results_dir / "runs" / str(result.run_id)
+    events = EventJournal(run_root / "events" / "run.db").iter_events(str(result.run_id))
+    event = next(
+        item
+        for item in events
+        if item.event_type == "dependency_verified"
+        and item.payload.get("kind") == "campaign_baseline"
+    )
+
+    assert event.payload["apex_tree"] == "a" * 40
+    assert event.payload["artifacts"][0]["role"] == "campaign_baseline"
+
+
+def test_missing_evaluator_authority_rejects_before_gpu_or_agent(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    agent = EditingAgent()
+    gpu_leases = _ForbiddenGpuLeases()
+    result_json = tmp_path / "machine" / "result.json"
+
+    result = KernelOptimizeUseCase(
+        agents=AgentRegistry([agent], default=AgentBackendName.CODEX),
+        gpu_leases=gpu_leases,  # type: ignore[arg-type]
+    ).run(KernelOptimizeRequest(task=task, result_json=result_json))
+
+    assert result.status is TaskStatus.INVALID_REQUEST
+    assert result.reason_code == "evaluation_authority_missing"
+    assert result.evaluation_contract_status == "unverified"
+    assert result.evaluation_contract_receipt_digest is not None
+    assert result.evaluation_contract_unverified_reason == "evaluation_authority_missing"
+    assert result.gpu_lease is None
+    assert gpu_leases.calls == 0
+    assert agent.requests == []
+    assert not (task.results_dir / "runs").exists()
+    assert json.loads(result_json.read_text())["evaluation_contract_status"] == "unverified"
+
+
 def test_command_success_without_measurement_authority_never_becomes_candidate_ready(
     tmp_path: Path,
 ) -> None:
@@ -615,6 +781,7 @@ def test_command_success_without_measurement_authority_never_becomes_candidate_r
     result = KernelOptimizeUseCase(
         agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
         gpu_leases=_gpu_leases(tmp_path),
+        evaluation_authorizer=_FixtureEvaluationAuthorizer(),
     ).run(
         KernelOptimizeRequest(
             task=task,
@@ -912,6 +1079,10 @@ def test_raw_measurement_commits_robust_reward_and_rl_receipts(tmp_path: Path) -
     assert result.s99 == 1.25
     assert result.srobust == 1.25
     assert result.reward == 170.0
+    assert result.task_reward == 170.0
+    assert result.task_trainability == "trainable"
+    assert result.reward_policy_id == "kernel_robust_v1"
+    assert len(result.raw_measurement_receipts) == 1
     run_root = next((task.results_dir / "runs").iterdir())
     journal = EventJournal(run_root / "events" / "run.db")
     events = journal.iter_events(run_root.name)
@@ -919,6 +1090,15 @@ def test_raw_measurement_commits_robust_reward_and_rl_receipts(tmp_path: Path) -
     assert event_types.index("performance_command_result") < event_types.index(
         "measurement_result"
     )
+    bracket = next(
+        item
+        for item in events
+        if item.payload.get("kind") == "gpu_measurement_bracket"
+    )
+    measured = next(item for item in events if item.event_type == "measurement_result")
+    rewarded = next(item for item in events if item.event_type == "reward_committed")
+    assert bracket.sequence < measured.sequence < rewarded.sequence
+    assert bracket.payload["attempt_id"] == measured.payload["attempt_id"]
     assert event_types.index("measurement_result") < event_types.index(
         "reward_committed"
     )
@@ -930,6 +1110,24 @@ def test_raw_measurement_commits_robust_reward_and_rl_receipts(tmp_path: Path) -
     assert child.scalar_reward == 170.0
     assert child.policy_ids == ("kernel_robust_v1",)
     assert child.trainability == "complete"
+    assert graph.parent.task_reward == 170.0
+    assert graph.parent.reward_vector == result.task_reward_vector
+    assert graph.parent.reward_policy_id == "kernel_robust_v1"
+    assert graph.parent.trainability == "complete"
+    report = json.loads((run_root / "report.json").read_text(encoding="utf-8"))
+    assert report["terminal_reward"]["task_reward"] == result.task_reward
+    assert report["terminal_reward"]["reward_vector"] == result.task_reward_vector
+    export_root = tmp_path / "kernel-rl-export"
+    DatasetExporter(ArtifactStore(run_root / "artifacts")).export(
+        graph,
+        export_root,
+        config=DatasetExportConfig(split="train"),
+    )
+    exported_parent = json.loads(
+        (export_root / "parent_episode.json").read_text(encoding="utf-8")
+    )
+    assert exported_parent["task_reward"] == result.task_reward
+    assert exported_parent["reward_vector"] == result.task_reward_vector
     measured = next(event for event in events if event.event_type == "measurement_result")
     bindings = {item["role"]: item["receipt"] for item in measured.payload["artifacts"]}
     assert {"raw_measurement", "measurement_execution", "harness", "kernel_grade"} <= set(bindings)
@@ -963,6 +1161,79 @@ def test_raw_measurement_commits_robust_reward_and_rl_receipts(tmp_path: Path) -
     assert transition["reward"]["vector"]["kernel_srobust"] == 1.25
 
 
+def test_showcase_offline_replays_kernel_terminal_raw_evidence(
+    tmp_path: Path,
+) -> None:
+    task, result, _ = _run(
+        tmp_path,
+        EditingAgent(),
+        measurement_values=(10.0, 8.0, 300),
+        executable="/usr/bin/python3",
+    )
+    run_root = next((task.results_dir / "runs").iterdir())
+    artifacts = ArtifactStore(run_root / "artifacts")
+    graph = EpisodeGraphMaterializer(
+        EventJournal(run_root / "events" / "run.db"), artifacts
+    ).materialize(run_root.name)
+    exported = ShowcaseExporter(artifacts).export(
+        graph,
+        tmp_path / "showcase",
+        showcase_id="kernel-raw-replay",
+    )
+
+    verified = verify_showcase(exported.output_dir)
+    assert verified.reward_replayed is True
+    assert verified.bundle_verified is True
+    assert (exported.status, exported.blockers) == ("published", ())
+    assert json.loads((exported.output_dir / "reproduce.json").read_bytes())[
+        "reproducible"
+    ] is True
+    assert json.loads((exported.output_dir / "reward.json").read_bytes())[
+        "task_reward"
+    ] == result.task_reward
+
+    episode_path = exported.output_dir / "trajectory" / "episode.json"
+    episode = json.loads(episode_path.read_bytes())
+    episode["parent"]["task_reward"] = float(result.task_reward) + 1.0
+    episode_path.write_bytes(canonical_json_bytes(episode))
+    episode_digest = sha256_bytes(episode_path.read_bytes())
+    showcase_path = exported.output_dir / "showcase.json"
+    showcase = json.loads(showcase_path.read_bytes())
+    forged_reward = float(result.task_reward) + 1.0
+    showcase["task_reward"] = forged_reward
+    showcase["source"]["exported_episode_graph_id"] = (
+        f"episode-graph-{episode_digest[:24]}"
+    )
+    showcase["source"]["episode_sha256"] = episode_digest
+    showcase_path.write_bytes(canonical_json_bytes(showcase))
+    reward_path = exported.output_dir / "reward.json"
+    reward = json.loads(reward_path.read_bytes())
+    reward["task_reward"] = forged_reward
+    reward_path.write_bytes(canonical_json_bytes(reward))
+    result_path = exported.output_dir / "result.json"
+    result_document = json.loads(result_path.read_bytes())
+    result_document["task_reward"] = forged_reward
+    result_path.write_bytes(canonical_json_bytes(result_document))
+    checksums_path = exported.output_dir / "checksums.json"
+    checksums = json.loads(checksums_path.read_bytes())
+    for relative, path in (
+        ("showcase.json", showcase_path),
+        ("reward.json", reward_path),
+        ("result.json", result_path),
+        ("trajectory/episode.json", episode_path),
+    ):
+        content = path.read_bytes()
+        checksums["files"][relative] = {
+            "sha256": sha256_bytes(content),
+            "size": len(content),
+        }
+    checksums_path.write_bytes(canonical_json_bytes(checksums))
+
+    with pytest.raises(IntegrityError) as raised:
+        verify_showcase(exported.output_dir)
+    assert raised.value.reason_code == "showcase_trajectory_mismatch"
+
+
 def test_candidate_written_measurement_cannot_create_tampering_pass_or_reward(
     tmp_path: Path,
 ) -> None:
@@ -974,6 +1245,7 @@ def test_candidate_written_measurement_cannot_create_tampering_pass_or_reward(
     use_case = KernelOptimizeUseCase(
         agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
         gpu_leases=_gpu_leases(tmp_path),
+        evaluation_authorizer=_FixtureEvaluationAuthorizer(),
     )
 
     result = use_case.run(KernelOptimizeRequest(task=task, result_json=result_json))
@@ -1006,6 +1278,7 @@ def test_candidate_report_is_ignored_when_trusted_evaluator_is_bound(
         agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
         measurement_evaluator=evaluator,
         gpu_leases=_gpu_leases(tmp_path),
+        evaluation_authorizer=_FixtureEvaluationAuthorizer(),
     )
 
     result = use_case.run(
@@ -1059,6 +1332,7 @@ def test_measurement_authority_mismatch_never_commits_reward(
         agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
         measurement_evaluator=evaluator,
         gpu_leases=_gpu_leases(tmp_path),
+        evaluation_authorizer=_FixtureEvaluationAuthorizer(),
     )
 
     result = use_case.run(
@@ -1098,7 +1372,7 @@ def test_299_samples_return_no_measurement_without_reward(tmp_path: Path) -> Non
 
 
 def test_valid_but_slower_candidate_is_no_gain_with_training_reward(tmp_path: Path) -> None:
-    _, result, _ = _run(
+    task, result, _ = _run(
         tmp_path,
         EditingAgent(),
         measurement_values=(8.0, 10.0, 300),
@@ -1108,7 +1382,102 @@ def test_valid_but_slower_candidate_is_no_gain_with_training_reward(tmp_path: Pa
     assert result.measurement_status == "valid"
     assert result.srobust == 0.8
     assert result.reward == 80.0
+    assert result.task_reward == 120.0
+    assert result.task_reward != result.reward
+    assert result.task_reward_vector is not None
+    assert result.task_reward_vector["outcome"] == "measured_noop"
+    assert result.task_trainability == "trainable"
     assert result.bundle_path is None
+    run_root = next((task.results_dir / "runs").iterdir())
+    graph = EpisodeGraphMaterializer(
+        EventJournal(run_root / "events" / "run.db"),
+        ArtifactStore(run_root / "artifacts"),
+    ).materialize(run_root.name)
+    assert graph.children[0].scalar_reward == 80.0
+    assert graph.parent.task_reward == 120.0
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_status", "expected_reward", "expected_stage"),
+    [
+        (
+            "COMPILE_FAIL = True\ndef kernel(x):\n    return x\n",
+            "compile_failed",
+            0.0,
+            "compile",
+        ),
+        (
+            "CORRECTNESS_FAIL = True\ndef kernel(x):\n    return x\n",
+            "wrong",
+            20.0,
+            "correctness",
+        ),
+    ],
+)
+def test_trusted_gate_failure_has_attempt_and_terminal_reward(
+    tmp_path: Path,
+    source: str,
+    expected_status: str,
+    expected_reward: float,
+    expected_stage: str,
+) -> None:
+    _, _, result, run_root, events = _run_sequence(
+        tmp_path,
+        (source,),
+        max_iterations=1,
+        dynamic_measurement=False,
+    )
+
+    assert result.status is TaskStatus.REJECTED
+    assert result.task_reward == expected_reward
+    assert result.task_trainability == "trainable"
+    attempt_reward = next(
+        event
+        for event in events
+        if event.event_type == "reward_committed"
+        and event.payload.get("scope") == "attempt"
+    )
+    assert attempt_reward.payload["scalar_reward"] == expected_reward
+    assert attempt_reward.payload["reward_vector"]["kernel_reward_stage"] == expected_stage
+    graph = EpisodeGraphMaterializer(
+        EventJournal(run_root / "events" / "run.db"),
+        ArtifactStore(run_root / "artifacts"),
+    ).materialize(run_root.name)
+    assert graph.children[0].status == expected_status
+    assert graph.children[0].scalar_reward == expected_reward
+    assert graph.children[0].trainability == "complete"
+    assert graph.parent.task_reward == expected_reward
+    assert graph.parent.trainability == "complete"
+
+
+def test_kernel_parent_rejects_terminal_raw_measurement_tampering(
+    tmp_path: Path,
+) -> None:
+    task, _, _ = _run(
+        tmp_path,
+        EditingAgent(),
+        measurement_values=(10.0, 8.0, 300),
+    )
+    run_root = next((task.results_dir / "runs").iterdir())
+    journal = EventJournal(run_root / "events" / "run.db")
+    events = journal.iter_events(run_root.name)
+    terminal = next(
+        event
+        for event in events
+        if event.event_type == "reward_committed"
+        and event.payload.get("scope") == "task_terminal"
+    )
+    binding = next(
+        item
+        for item in terminal.payload["artifacts"]
+        if item["role"] == "raw_measurement"
+    )
+    receipt = ArtifactReceipt.from_dict(binding["receipt"])
+    store = ArtifactStore(run_root / "artifacts")
+    (store.root / receipt.relative_path).write_bytes(b"{}")
+
+    with pytest.raises(IntegrityError):
+        EpisodeGraphMaterializer(journal, store).materialize(run_root.name)
 
 
 def test_required_inconclusive_safety_skips_normal_performance(tmp_path: Path) -> None:
@@ -1163,7 +1532,18 @@ def test_three_fresh_attempts_deliver_robust_best_not_last_candidate(
     assert "SPEED_MS = 7.0" not in patch
 
     decisions = [item for item in events if item.event_type == "decision"]
-    rewards = [item for item in events if item.event_type == "reward_committed"]
+    rewards = [
+        item
+        for item in events
+        if item.event_type == "reward_committed"
+        and item.payload.get("scope") == "attempt"
+    ]
+    terminal_rewards = [
+        item
+        for item in events
+        if item.event_type == "reward_committed"
+        and item.payload.get("scope") == "task_terminal"
+    ]
     assert len(decisions) == 3
     assert len({item.payload["attempt_id"] for item in decisions}) == 3
     assert [item.payload["verdict"] for item in decisions].count("keep") == 1
@@ -1172,6 +1552,7 @@ def test_three_fresh_attempts_deliver_robust_best_not_last_candidate(
     assert keep.payload["srobust"] == pytest.approx(10.0 / 6.0)
     assert len(rewards) == 3
     assert len({item.payload["attempt_id"] for item in rewards}) == 3
+    assert len(terminal_rewards) == 1
     graph = EpisodeGraphMaterializer(
         EventJournal(run_root / "events" / "run.db"),
         ArtifactStore(run_root / "artifacts"),

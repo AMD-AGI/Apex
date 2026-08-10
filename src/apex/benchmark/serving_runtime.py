@@ -17,7 +17,7 @@ _PATCH_PATH = re.compile(
     r"config_vllm_v0\.([1-9][0-9]*)\.0\.patch"
 )
 _CONTAINER_NAME = re.compile(r"magpie-benchmark-[A-Za-z0-9_.-]+")
-_SCHEMA = "magpie.serving-runtime-receipt/v2"
+_SCHEMA = "apex.magpie-serving-runtime-observation/v3"
 _TRACELENS_SCHEMA = "magpie.tracelens-vllm-runtime/v1"
 _KEYS = frozenset(
     {
@@ -30,7 +30,7 @@ _KEYS = frozenset(
         "resolved_image_id",
         "image_derivation",
         "container_name",
-        "docker_argv_sha256",
+        "container_spec_sha256",
         "process_succeeded",
         "verified",
         "errors",
@@ -48,7 +48,7 @@ class ServingRuntimeEvidence:
     requested_image: str | None
     resolved_image_id: str | None
     container_name: str | None
-    docker_argv_sha256: str | None
+    container_spec_sha256: str | None
     process_succeeded: bool | None
     error: str | None
     input_image: str | None = None
@@ -91,7 +91,7 @@ def parse_serving_runtime_evidence(
         _string(data.get("requested_image")),
         _string(data.get("resolved_image_id")),
         _string(data.get("container_name")),
-        _string(data.get("docker_argv_sha256")),
+        _string(data.get("container_spec_sha256")),
         (
             data.get("process_succeeded")
             if isinstance(data.get("process_succeeded"), bool)
@@ -142,8 +142,8 @@ def _receipt_error(
         or not _IMAGE_ID.fullmatch(value["resolved_image_id"])
         or not isinstance(value.get("container_name"), str)
         or not _CONTAINER_NAME.fullmatch(value["container_name"])
-        or not isinstance(value.get("docker_argv_sha256"), str)
-        or not _SHA256.fullmatch(value["docker_argv_sha256"])
+        or not isinstance(value.get("container_spec_sha256"), str)
+        or not _SHA256.fullmatch(value["container_spec_sha256"])
         or value.get("process_succeeded") is not True
         or value.get("verified") is not True
         or not _valid_errors(errors)

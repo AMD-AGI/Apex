@@ -27,6 +27,13 @@ from .e2e_validation import (
     optional_identifier,
     transaction_members,
 )
+from .episode_semantics import (
+    decision_from_type as _decision_from_type,
+    evidence_class as _evidence_class,
+    parent_status as _parent_status,
+    semantic_role as _semantic_role,
+    text as _text,
+)
 from .models import (
     CandidateEpisode,
     EpisodeArtifact,
@@ -37,9 +44,14 @@ from .models import (
     SemanticRole,
     episode_id,
 )
-from .kernel_measurement_validation import kernel_measurement_evidence_reasons
+from .kernel_measurement_validation import (
+    kernel_gate_reward_evidence_reasons,
+    kernel_measurement_evidence_reasons,
+)
 from .projection_validation import merge_projected_identifier, merge_projected_int
+from .parent_reward import project_parent_reward
 from .state_validation import validate_workload_state
+from .e2e_server_lineage_validation import validate_e2e_server_lineage
 
 
 @dataclass(slots=True)
@@ -118,26 +130,21 @@ class EpisodeGraphMaterializer:
             builder.events.append(event)
             self._update_child(builder, event, packets, workload_state)
 
-        kind = "workload" if workload_id is not None else "standalone_task"
         parent_id = episode_id(run_id, workload_id or task_id or "root")
         frozen_children = tuple(
             self._freeze_child(run_id, parent_id, item, transactions)
             for _, item in sorted(children.items())
         )
-        all_policy_ids = tuple(
-            sorted({policy for child in frozen_children for policy in child.policy_ids})
+        parent, all_policy_ids = _freeze_parent(
+            run_id,
+            records,
+            tuple(parent_events),
+            frozen_children,
+            workload_id,
+            task_id,
+            self._artifacts,
         )
-        parent = ParentEpisode(
-            episode_id=parent_id,
-            kind=kind,
-            run_id=run_id,
-            workload_id=workload_id,
-            task_id=task_id,
-            events=tuple(parent_events),
-            child_episode_ids=tuple(child.episode_id for child in frozen_children),
-            terminal_status=_parent_status(records),
-        )
-        return EpisodeGraph(
+        graph = EpisodeGraph(
             schema_version=1,
             run_id=run_id,
             high_water_mark=records[-1].sequence,
@@ -150,6 +157,15 @@ class EpisodeGraphMaterializer:
             provenance=provenance,
             policy_ids=all_policy_ids,
         )
+        lineage_events = (
+            *parent.events,
+            *(event for child in frozen_children for event in child.events),
+        )
+        validate_e2e_server_lineage(
+            run_id, tuple(sorted(lineage_events, key=lambda event: event.sequence)),
+            self._artifacts,
+        )
+        return graph
 
     def _project_event(self, record: EventRecord) -> EpisodeEvent:
         artifacts = tuple(self._extract_artifacts(record))
@@ -235,6 +251,9 @@ class EpisodeGraphMaterializer:
                 child.e2e_decision_count += 1
             child.verdict = _text(payload.get("verdict")) or _decision_from_type(event.event_type)
             child.decision_reason = _text(payload.get("reason"))
+            untrainable = _text(payload.get("untrainable_reason"))
+            if payload.get("trainability") == "untrainable" and untrainable:
+                child.validation_reasons.add(f"untrainable:{untrainable}")
         if event.semantic_role is SemanticRole.REWARD:
             self._capture_reward(child, event)
         if normalized == "experience_deferred":
@@ -359,12 +378,8 @@ class EpisodeGraphMaterializer:
     ) -> None:
         required = {
             "source": "reward_source_receipt_missing",
-            "raw_measurement": "reward_measurement_receipt_missing",
-            "measurement_execution": "reward_measurement_execution_receipt_missing",
             "reward_policy": "reward_policy_receipt_missing",
         }
-        if not ({"harness", "reference"} & roles):
-            child.validation_reasons.add("reward_harness_receipt_missing")
         for role, reason in required.items():
             if role not in roles:
                 child.validation_reasons.add(reason)
@@ -372,8 +387,43 @@ class EpisodeGraphMaterializer:
             child.validation_reasons.add("reward_policy_id_missing")
         if event.evidence_class is not EvidenceClass.MEASURED:
             child.validation_reasons.add("reward_not_measured")
+        vector = child.reward_vector
+        stage = vector.get("kernel_reward_stage") if isinstance(vector, Mapping) else None
+        if stage == "measurement":
+            self._validate_kernel_measurement_reward(child, roles)
+        elif stage in {"compile", "correctness"}:
+            self._validate_kernel_gate_reward(child, roles, str(stage))
+        else:
+            child.validation_reasons.add("kernel_reward_stage_invalid")
+
+    def _validate_kernel_measurement_reward(
+        self, child: _ChildBuilder, roles: set[str]
+    ) -> None:
+        required = {
+            "raw_measurement": "reward_measurement_receipt_missing",
+            "measurement_execution": "reward_measurement_execution_receipt_missing",
+        }
+        if not ({"harness", "reference"} & roles):
+            child.validation_reasons.add("reward_harness_receipt_missing")
+        for role, reason in required.items():
+            if role not in roles:
+                child.validation_reasons.add(reason)
         child.validation_reasons.update(
             kernel_measurement_evidence_reasons(child.events, self._artifacts)
+        )
+
+    def _validate_kernel_gate_reward(
+        self, child: _ChildBuilder, roles: set[str], stage: str
+    ) -> None:
+        required = {"compile_evidence"}
+        if stage == "correctness":
+            required.add("correctness_evidence")
+        if not required <= roles:
+            child.validation_reasons.add("reward_gate_evidence_missing")
+        child.validation_reasons.update(
+            kernel_gate_reward_evidence_reasons(
+                child.events, self._artifacts, stage
+            )
         )
 
     @staticmethod
@@ -385,7 +435,7 @@ class EpisodeGraphMaterializer:
         required = {
             "candidate_manifest": "candidate_manifest_receipt_missing",
             "decision_evidence": "decision_evidence_receipt_missing",
-            "e2e_grade": "e2e_grade_receipt_missing",
+            "e2e_reward_vector": "e2e_reward_vector_receipt_missing",
             "reward_policy": "reward_policy_receipt_missing",
         }
         for role, reason in required.items():
@@ -482,80 +532,40 @@ class EpisodeGraphMaterializer:
             validation_reasons=reasons,
         )
 
-def _semantic_role(event_type: str) -> SemanticRole:
-    normalized = event_type.replace(".", "_")
-    if normalized in {"tool_called", "tool_result"}:
-        return SemanticRole.TOOL
-    if "reward" in normalized:
-        return SemanticRole.REWARD
-    if "cost" in normalized or normalized in {"usage_recorded"}:
-        return SemanticRole.COST
-    if normalized in {"error", "run_failed", "action_failed", "agent_failed"}:
-        return SemanticRole.FAILURE
-    if normalized in {
-        "decision",
-        "e2e_candidate_decided",
-        "action_committed",
-        "action_aborted",
-    }:
-        return SemanticRole.DECISION
-    if normalized in {
-        "compile_result",
-        "correctness_result",
-        "safety_result",
-        "measurement_result",
-        "e2e_result",
-        "delivery_verified",
-        "action_verified",
-        "e2e_micro_verified",
-        "e2e_safety_verified",
-        "e2e_delivery_verified",
-        "experience_measured",
-    }:
-        return SemanticRole.OUTCOME
-    if normalized in {
-        "observation_created",
-        "context_packet_created",
-        "knowledge_read",
-        "knowledge_outcome_linked", "experience_deferred",
-        "e2e_baseline_committed",
-        "e2e_diagnostics_committed",
-        "e2e_reprofiled",
-    }:
-        return SemanticRole.OBSERVATION
-    if normalized in {
-        "prompt_sent",
-        "agent_message",
-        "candidate_materialized",
-        "candidate_frozen",
-        "delivery_materialized",
-        "action_queued",
-        "action_started",
-        "action_artifacts_ready",
-        "e2e_candidate_frozen",
-    }:
-        return SemanticRole.ACTION
-    return SemanticRole.CONTROL
 
-
-def _evidence_class(value: object) -> EvidenceClass:
-    if value is None:
-        return EvidenceClass.UNSPECIFIED
-    try:
-        return EvidenceClass(str(value))
-    except ValueError as error:
-        raise ContractError("Unknown evidence class", "invalid_evidence_class") from error
-
-
-def _parent_status(records: Sequence[EventRecord]) -> str:
-    terminal = records[-1].event_type.replace(".", "_")
-    if terminal in {"run_succeeded", "run_finished"}:
-        return str(records[-1].payload.get("status", "succeeded"))
-    if terminal == "run_failed":
-        return "failed"
-    if terminal == "run_cancelled":
-        return "cancelled"
-    return "incomplete"
+def _freeze_parent(
+    run_id: str,
+    records: Sequence[EventRecord],
+    events: tuple[EpisodeEvent, ...],
+    children: tuple[CandidateEpisode, ...],
+    workload_id: str | None,
+    task_id: str | None,
+    artifacts: ArtifactStore,
+) -> tuple[ParentEpisode, tuple[str, ...]]:
+    reward = project_parent_reward(run_id, events, artifacts)
+    policy_ids = tuple(sorted({
+        *reward.policy_ids,
+        *(policy for child in children for policy in child.policy_ids),
+    }))
+    parent = ParentEpisode(
+        episode_id=episode_id(run_id, workload_id or task_id or "root"),
+        kind="e2e_kernel_only" if workload_id is not None else "single_kernel",
+        run_id=run_id,
+        workload_id=workload_id,
+        task_id=task_id,
+        events=events,
+        child_episode_ids=tuple(child.episode_id for child in children),
+        terminal_status=_parent_status(records),
+        task_reward=reward.task_reward,
+        reward_vector=reward.reward_vector,
+        reward_policy_id=reward.reward_policy_id,
+        reward_policy_digest=reward.reward_policy_digest,
+        reward_source_receipt=reward.reward_source_receipt,
+        raw_measurement_receipts=reward.raw_measurement_receipts,
+        trainability=reward.trainability,
+        untrainable_reason=reward.untrainable_reason,
+    )
+    return parent, policy_ids
 
 
 def _child_status(child: _ChildBuilder, failure: bool) -> str:
@@ -582,19 +592,6 @@ def _child_status(child: _ChildBuilder, failure: bool) -> str:
     if child.verdict == "needs_more_measurement":
         return "no_measurement"
     return "incomplete"
-
-
-def _decision_from_type(event_type: str) -> str | None:
-    normalized = event_type.replace(".", "_")
-    if normalized == "action_committed":
-        return "keep"
-    if normalized == "action_aborted":
-        return "revert"
-    return None
-
-
-def _text(value: object) -> str | None:
-    return None if value is None or not str(value).strip() else str(value)
 
 
 __all__ = ["EpisodeGraphMaterializer"]

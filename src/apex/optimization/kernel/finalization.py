@@ -4,13 +4,20 @@ from __future__ import annotations
 
 from apex.core import ApexError, IntegrityError, TaskStatus, ValidationLevel
 from apex.delivery import TaskResult, build_kernel_bundle, write_task_result
+from apex.evaluation import EvaluationContractReceipt
 from apex.intake import TaskSpec
 from apex.orchestration import RunPhase
 from apex.storage import EventRecord
 
 from ..projections import publish_terminal_projections
 from .attempts import KernelAttemptOutcome, RunSession, representative_failure
+from .bundle_recording import record_kernel_bundle
+from .reward_recording import (
+    KernelTerminalEvidence,
+    record_kernel_terminal_reward,
+)
 from .safety_bridge import task_safety_fields
+from .terminal_reward import derive_kernel_terminal_grade
 
 
 def publish(session: RunSession) -> None:
@@ -33,7 +40,9 @@ def deliver_best(
         candidate_root=best.candidate_root,
         bundle_dir=session.run_root / "bundle",
     )
+    record_kernel_bundle(session, attempt_id=best.attempt_id, bundle=bundle)
     _record_selection(session, outcomes, best, bundle.digest)
+    terminal = _record_terminal(session, outcomes, best)
     session.record.finish(RunPhase.SUCCEEDED, best.reason_code)
     result = TaskResult(
         schema_version=1,
@@ -46,7 +55,8 @@ def deliver_best(
         bundle_digest=bundle.digest,
         changed_files=bundle.changed_files,
         validation_level=ValidationLevel.NONE,
-        **_lineage_fields(session, best, "keep"),
+        **_lineage_fields(session, best, "keep", terminal),
+        **_terminal_fields(terminal),
         **_safety_fields(best),
         **best.result_measurement_fields(),
     )
@@ -89,6 +99,7 @@ def finish_without_candidate(
         if selected.status is TaskStatus.NO_GAIN
         else RunPhase.FAILED
     )
+    terminal_evidence = _record_terminal(session, outcomes, None)
     session.record.finish(terminal, selected.reason_code)
     result = TaskResult(
         schema_version=1,
@@ -100,7 +111,13 @@ def finish_without_candidate(
         bundle_path=None,
         bundle_digest=None,
         changed_files=(),
-        **_lineage_fields(session, selected, _terminal_verdict(selected.status)),
+        **_lineage_fields(
+            session,
+            selected,
+            _terminal_verdict(selected.status),
+            terminal_evidence,
+        ),
+        **_terminal_fields(terminal_evidence),
         **_safety_fields(selected),
         **selected.result_measurement_fields(),
     )
@@ -114,6 +131,7 @@ def failure_result(
     *,
     run_id: str,
     session: RunSession | None = None,
+    evaluation_contract: EvaluationContractReceipt | None = None,
 ) -> TaskResult:
     status = (
         TaskStatus.REJECTED
@@ -131,6 +149,7 @@ def failure_result(
         bundle_digest=None,
         changed_files=(),
         **_failure_lineage(run_id, error, session),
+        **_evaluation_contract_fields(session, evaluation_contract),
     )
 
 
@@ -187,6 +206,7 @@ def _lineage_fields(
     session: RunSession,
     outcome: KernelAttemptOutcome,
     verdict: str,
+    terminal: KernelTerminalEvidence,
 ) -> dict[str, object]:
     events = session.record.iter_events()
     head = events[-1]
@@ -205,6 +225,7 @@ def _lineage_fields(
     return {
         "run_id": session.run_id,
         "baseline_lock": _baseline_lock(session),
+        **_evaluation_contract_fields(session),
         **_gpu_lease_fields(session),
         "internal_verdict": verdict,
         "internal_verdict_ref": verdict_events[-1].event_id if verdict_events else None,
@@ -215,8 +236,10 @@ def _lineage_fields(
         "artifact_store_ref": {
             "path": str(session.record.artifacts.root.resolve()),
             "receipt_digests": [
+                session.evaluation_contract_artifact.digest,
                 session.gpu_lease_artifact.digest,
                 *outcome.evidence_receipts,
+                *_terminal_artifact_digests(terminal),
             ],
         },
         "error": (
@@ -227,10 +250,83 @@ def _lineage_fields(
     }
 
 
+def _record_terminal(
+    session: RunSession,
+    outcomes: tuple[KernelAttemptOutcome, ...],
+    selected: KernelAttemptOutcome | None,
+) -> KernelTerminalEvidence:
+    grade = derive_kernel_terminal_grade(outcomes, selected)
+    return record_kernel_terminal_reward(
+        session.record,
+        task_id=session.request.task.task_id,
+        contract_digest=session.evaluation_contract.digest,
+        grade=grade,
+        outcomes=outcomes,
+    )
+
+
+def _terminal_fields(evidence: KernelTerminalEvidence) -> dict[str, object]:
+    grade = evidence.grade
+    return {
+        "task_reward": grade.scalar_reward,
+        "task_reward_vector": (
+            grade.to_dict() if grade.scalar_reward is not None else None
+        ),
+        "reward_policy_id": grade.policy_id,
+        "reward_policy_digest": grade.policy_digest,
+        "reward_source_receipt": (
+            evidence.source.digest if evidence.source is not None else None
+        ),
+        "raw_measurement_receipts": tuple(
+            item.digest for item in evidence.raw_measurements
+        ),
+        "task_trainability": grade.trainability,
+        "untrainable_reason": grade.untrainable_reason,
+    }
+
+
+def _terminal_artifact_digests(
+    evidence: KernelTerminalEvidence,
+) -> tuple[str, ...]:
+    values = [evidence.result.digest, evidence.policy.digest, evidence.vector.digest]
+    if evidence.source is not None:
+        values.append(evidence.source.digest)
+    values.extend(item.digest for item in evidence.raw_measurements)
+    return tuple(values)
+
+
 def _gpu_lease_fields(session: RunSession) -> dict[str, object]:
     return {
         "gpu_lease": session.gpu_lease.to_dict(),
         "gpu_lease_receipt_digest": session.gpu_lease.digest,
+    }
+
+
+def _evaluation_contract_fields(
+    session: RunSession | None,
+    contract: EvaluationContractReceipt | None = None,
+) -> dict[str, object]:
+    selected = session.evaluation_contract if session is not None else contract
+    return {
+        "evaluation_contract_status": (
+            selected.status if selected is not None else "not_frozen"
+        ),
+        "evaluation_contract_receipt_digest": (
+            selected.digest if selected is not None else None
+        ),
+        "evaluation_contract_unverified_reason": (
+            selected.unverified_reason if selected is not None else None
+        ),
+        "evaluation_authority_id": (
+            selected.authority.authority.authority_id
+            if selected is not None and selected.authority is not None
+            else None
+        ),
+        "evaluation_authority_kind": (
+            selected.authority.authority.kind.value
+            if selected is not None and selected.authority is not None
+            else None
+        ),
     }
 
 

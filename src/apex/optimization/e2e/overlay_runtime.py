@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 from dataclasses import asdict, dataclass
@@ -11,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol
 
 from apex.core import ContractError, IntegrityError, sha256_bytes, sha256_file
-from apex.execution import ProcessResult, SubprocessSupervisor
+from apex.execution import DOCKER_RUNTIME_ENVIRONMENT_KEYS, GPU_RUNTIME_ENVIRONMENT_KEYS, ProcessResult, SubprocessSupervisor, build_subprocess_environment
 
 
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -415,10 +414,11 @@ class DockerEngine:
     def _run(
         self, argv: tuple[str, ...], *, cwd: Path, timeout: int, stage: str
     ) -> ProcessResult:
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
         result = self._supervisor.run(
-            argv, cwd=cwd.resolve(), environment=environment, timeout_seconds=timeout
+            argv,
+            cwd=cwd.resolve(),
+            environment=build_subprocess_environment(inherit=DOCKER_RUNTIME_ENVIRONMENT_KEYS + GPU_RUNTIME_ENVIRONMENT_KEYS),
+            timeout_seconds=timeout,
         )
         if (
             result.timed_out

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
 
-from apex.core import ContractError, TaskStatus, ValidationLevel
+from apex.core import ContractError, TaskStatus, ValidationLevel, sha256_json
 
 from .e2e_models import validate_image_digest, validate_sha256
 from .git_patch import RepositoryApplyReceipt
@@ -16,6 +17,7 @@ class PrimaryVerificationEvidence:
     """Evidence produced by the promotion environment before clean replay."""
 
     environment_id: str
+    runtime_identity_sha256: str
     source_stack_sha256: str
     build_receipt_sha256: str
     engagement_receipt_sha256: str
@@ -38,6 +40,7 @@ class PrimaryVerificationEvidence:
         if not self.environment_id:
             raise ContractError("Primary verification environment is required", "invalid_primary_evidence")
         for field, value in (
+            ("runtime_identity_sha256", self.runtime_identity_sha256),
             ("source_stack_sha256", self.source_stack_sha256),
             ("build_receipt_sha256", self.build_receipt_sha256),
             ("engagement_receipt_sha256", self.engagement_receipt_sha256),
@@ -75,6 +78,7 @@ class PrimaryVerificationEvidence:
         try:
             return cls(
                 environment_id=str(value["environment_id"]),
+                runtime_identity_sha256=str(value["runtime_identity_sha256"]),
                 source_stack_sha256=str(value["source_stack_sha256"]),
                 build_receipt_sha256=str(value["build_receipt_sha256"]),
                 engagement_receipt_sha256=str(value["engagement_receipt_sha256"]),
@@ -316,13 +320,17 @@ class CleanReplayReceipt:
     replay_config_sha256: str
     benchmark_receipt_sha256: str
     source_stack_sha256: str
-    fresh_source_materialization: bool
-    fresh_runtime: bool
+    source_materialization_sha256: str
+    primary_runtime_identity_sha256: str
+    replay_runtime_identity_sha256s: tuple[str, ...]
     normal_runtime_measurement: bool
     quality_passed: bool
     accuracy_passed: bool
     latency_gates_passed: bool
     objective_improved: bool
+    paired_measurement: Mapping[str, Any]
+    paired_verdict: Mapping[str, Any]
+    raw_artifacts: tuple["ReplayArtifactReceipt", ...]
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -330,11 +338,55 @@ class CleanReplayReceipt:
             ("replay_config_sha256", self.replay_config_sha256),
             ("benchmark_receipt_sha256", self.benchmark_receipt_sha256),
             ("source_stack_sha256", self.source_stack_sha256),
+            ("source_materialization_sha256", self.source_materialization_sha256),
+            ("primary_runtime_identity_sha256", self.primary_runtime_identity_sha256),
         ):
             validate_sha256(value, field=field)
+        for value in self.replay_runtime_identity_sha256s:
+            validate_sha256(value, field="replay_runtime_identity_sha256")
         validate_image_digest(self.image_digest, field="image_digest")
         if not self.primary_environment_id or not self.replay_environment_id:
             raise ContractError("Replay environments are missing", "invalid_replay_receipt")
+        if not _valid_paired_replay(self.paired_measurement, self.paired_verdict):
+            raise ContractError("Paired replay evidence is invalid", "invalid_replay_receipt")
+        raw_ids = tuple(self.paired_measurement["raw_measurement_receipts"])
+        report_ids = tuple(
+            item.measurement_receipt
+            for item in self.raw_artifacts
+            if item.role == "benchmark_report"
+        )
+        quality_ids = {
+            item.quality_receipt
+            for item in self.raw_artifacts
+            if item.role == "quality_result"
+        }
+        attestation_ids = tuple(
+            item.measurement_receipt
+            for item in self.raw_artifacts
+            if item.role == "execution_attestation"
+        )
+        if (
+            tuple(sorted(report_ids)) != tuple(sorted(raw_ids))
+            or tuple(sorted(attestation_ids)) != tuple(sorted(raw_ids))
+            or len(self.replay_runtime_identity_sha256s) != len(raw_ids)
+            or len(set((item.role, item.relative_path, item.measurement_receipt) for item in self.raw_artifacts))
+            != len(self.raw_artifacts)
+            or any(item.quality_receipt not in quality_ids for item in self.raw_artifacts)
+        ):
+            raise ContractError("Raw replay artifacts are incomplete", "invalid_replay_receipt")
+
+    @property
+    def fresh_source_materialization(self) -> bool:
+        return bool(self.source_materialization_sha256)
+
+    @property
+    def fresh_runtime(self) -> bool:
+        identities = self.replay_runtime_identity_sha256s
+        return bool(
+            identities
+            and len(set(identities)) == len(identities)
+            and self.primary_runtime_identity_sha256 not in identities
+        )
 
     @property
     def verified(self) -> bool:
@@ -348,11 +400,21 @@ class CleanReplayReceipt:
                 self.accuracy_passed,
                 self.latency_gates_passed,
                 self.objective_improved,
+                self.paired_verdict.get("keep") is True,
             )
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "verified": self.verified}
+        return {
+            **asdict(self),
+            "replay_runtime_identity_sha256s": list(
+                self.replay_runtime_identity_sha256s
+            ),
+            "fresh_source_materialization": self.fresh_source_materialization,
+            "fresh_runtime": self.fresh_runtime,
+            "raw_artifacts": [item.to_dict() for item in self.raw_artifacts],
+            "verified": self.verified,
+        }
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "CleanReplayReceipt":
@@ -365,16 +427,99 @@ class CleanReplayReceipt:
                 replay_config_sha256=str(value["replay_config_sha256"]),
                 benchmark_receipt_sha256=str(value["benchmark_receipt_sha256"]),
                 source_stack_sha256=str(value["source_stack_sha256"]),
-                fresh_source_materialization=bool(value["fresh_source_materialization"]),
-                fresh_runtime=bool(value["fresh_runtime"]),
+                source_materialization_sha256=str(
+                    value["source_materialization_sha256"]
+                ),
+                primary_runtime_identity_sha256=str(
+                    value["primary_runtime_identity_sha256"]
+                ),
+                replay_runtime_identity_sha256s=tuple(
+                    str(item) for item in value["replay_runtime_identity_sha256s"]
+                ),
                 normal_runtime_measurement=bool(value["normal_runtime_measurement"]),
                 quality_passed=bool(value["quality_passed"]),
                 accuracy_passed=bool(value["accuracy_passed"]),
                 latency_gates_passed=bool(value["latency_gates_passed"]),
                 objective_improved=bool(value["objective_improved"]),
+                paired_measurement=dict(value["paired_measurement"]),
+                paired_verdict=dict(value["paired_verdict"]),
+                raw_artifacts=tuple(
+                    ReplayArtifactReceipt.from_mapping(dict(item))
+                    for item in value["raw_artifacts"]
+                ),
             )
-        except KeyError as error:
+        except (KeyError, TypeError) as error:
             raise ContractError("Clean replay receipt is malformed", "invalid_replay_receipt") from error
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayArtifactReceipt:
+    """Portable locator and digest for one raw clean-replay artifact."""
+
+    role: str
+    run_id: str
+    measurement_receipt: str
+    quality_receipt: str
+    relative_path: str
+    sha256: str
+    size_bytes: int
+    media_type: str
+
+    def __post_init__(self) -> None:
+        path = PurePosixPath(self.relative_path)
+        if (
+            self.role not in {
+                "benchmark_report",
+                "execution_attestation",
+                "quality_result",
+                "quality_sample",
+                "quality_raw_artifact",
+            }
+            or not self.run_id
+            or not self.measurement_receipt
+            or not self.quality_receipt
+            or path.is_absolute()
+            or not path.parts
+            or ".." in path.parts
+            or self.size_bytes < 0
+            or not self.media_type
+        ):
+            raise ContractError("Replay artifact identity is invalid", "invalid_replay_receipt")
+        validate_sha256(self.sha256, field="replay_artifact_sha256")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ReplayArtifactReceipt":
+        try:
+            return cls(
+                role=str(value["role"]),
+                run_id=str(value["run_id"]),
+                measurement_receipt=str(value["measurement_receipt"]),
+                quality_receipt=str(value["quality_receipt"]),
+                relative_path=str(value["relative_path"]),
+                sha256=str(value["sha256"]),
+                size_bytes=int(value["size_bytes"]),
+                media_type=str(value["media_type"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractError("Replay artifact is malformed", "invalid_replay_receipt") from error
+
+
+def _valid_paired_replay(
+    measurement: Mapping[str, Any], verdict: Mapping[str, Any]
+) -> bool:
+    windows = measurement.get("windows")
+    raw = measurement.get("raw_measurement_receipts")
+    return bool(
+        measurement.get("schema") == "apex.e2e-paired-measurement/v1"
+        and isinstance(windows, list)
+        and len(windows) >= 3
+        and isinstance(raw, list)
+        and len(raw) == 4 * len(windows)
+        and verdict.get("measurement_id") == sha256_json(dict(measurement))
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,6 +569,7 @@ __all__ = [
     "LoadedByteEngagementReceipt",
     "PrimaryVerificationEvidence",
     "ReplayConfigInvariantReceipt",
+    "ReplayArtifactReceipt",
     "SourceBuildReceipt",
     "source_stack_digest",
 ]

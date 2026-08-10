@@ -15,7 +15,7 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
-class E2EMeasurement:
+class E2EObservation:
     """Profiler-off serving measurement bound to one frozen protocol."""
 
     throughput: float
@@ -58,20 +58,44 @@ class E2EAcceptancePolicy:
     gates: RegressionGates = RegressionGates()
     min_throughput_gain_pct: float = 0.5
     policy_id: str = "current_anchor_throughput_v1"
+    min_paired_windows: int = 3
+    bootstrap_seed: int = 20260810
+    bootstrap_repetitions: int = 2000
+    bootstrap_confidence_level: float = 0.95
+    aa_envelope_pct: float = 0.5
+    outlier_policy_id: str = "retain_all_complete_windows_v1"
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.min_throughput_gain_pct) or self.min_throughput_gain_pct < -100:
+        if (
+            not math.isfinite(self.min_throughput_gain_pct)
+            or self.min_throughput_gain_pct < -100
+            or self.min_paired_windows < 3
+            or self.bootstrap_seed < 0
+            or self.bootstrap_repetitions < 100
+            or not 0.5 <= self.bootstrap_confidence_level < 1.0
+            or not math.isfinite(self.aa_envelope_pct)
+            or self.aa_envelope_pct < 0
+            or self.outlier_policy_id != "retain_all_complete_windows_v1"
+        ):
             raise ContractError("Minimum throughput gain is invalid", "invalid_acceptance_policy")
 
     @property
     def digest(self) -> str:
-        return sha256_json(
-            {
-                "policy_id": self.policy_id,
-                "min_throughput_gain_pct": self.min_throughput_gain_pct,
-                "gates": asdict(self.gates),
-            }
-        )
+        return sha256_json(self.to_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "apex.e2e-acceptance-policy/v1",
+            "policy_id": self.policy_id,
+            "min_throughput_gain_pct": self.min_throughput_gain_pct,
+            "min_paired_windows": self.min_paired_windows,
+            "bootstrap_seed": self.bootstrap_seed,
+            "bootstrap_repetitions": self.bootstrap_repetitions,
+            "bootstrap_confidence_level": self.bootstrap_confidence_level,
+            "aa_envelope_pct": self.aa_envelope_pct,
+            "outlier_policy_id": self.outlier_policy_id,
+            "gates": asdict(self.gates),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,8 +114,8 @@ class E2EVerdict:
 
 
 def evaluate_no_regression(
-    baseline: E2EMeasurement,
-    replay: E2EMeasurement,
+    baseline: E2EObservation,
+    replay: E2EObservation,
     policy: E2EAcceptancePolicy | None = None,
     *,
     throughput_noise_pct: float = 1.0,
@@ -121,8 +145,8 @@ def evaluate_no_regression(
 
 
 def evaluate_current_anchor(
-    anchor: E2EMeasurement,
-    candidate: E2EMeasurement,
+    anchor: E2EObservation,
+    candidate: E2EObservation,
     policy: E2EAcceptancePolicy | None = None,
 ) -> E2EVerdict:
     """KEEP only a source candidate that improves the current live anchor."""
@@ -155,7 +179,7 @@ def evaluate_current_anchor(
     )
 
 
-def validate_baseline_measurement(measurement: E2EMeasurement) -> None:
+def validate_baseline_measurement(measurement: E2EObservation) -> None:
     """Explicit semantic hook used before any agent or diagnostic work."""
 
     if not measurement.quality_receipt:
@@ -172,7 +196,7 @@ def _change_pct(value: float, baseline: float) -> float:
 
 __all__ = [
     "E2EAcceptancePolicy",
-    "E2EMeasurement",
+    "E2EObservation",
     "E2EVerdict",
     "evaluate_current_anchor",
     "evaluate_no_regression",

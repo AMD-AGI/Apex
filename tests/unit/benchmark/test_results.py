@@ -6,11 +6,115 @@ from pathlib import Path
 
 import pytest
 
-from apex.benchmark import parse_benchmark_report
+from apex.benchmark import parse_benchmark_report as _parse_benchmark_report
+from apex.benchmark.evaluator_artifact_receipt import EvaluatorArtifactReceipt
+from apex.benchmark.evaluator_execution import LmEvalExecutionReceipt
 from apex.benchmark.results import empty_result
 from apex.core import sha256_file
 from apex.ports import BenchmarkPass
 from apex.runtime import LmEvalRuntimeReceipt
+
+
+def parse_benchmark_report(report_path: Path, **kwargs):
+    """Materialize the Apex evaluator sidecar used by result-parser tests."""
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    evaluator_root = report_path.parent.parent / "evaluator"
+    unique_root = evaluator_root / report_path.parent.name
+    path = unique_root / "execution_attestation.json"
+    previous = (
+        json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    )
+    previous_runtime = previous.get("runtime", {})
+    previous_quality = previous.get("quality_gate", {}).get("receipt")
+    requested_pass = kwargs["pass_type"]
+    expected_kind = requested_pass.value
+    claimed_kind = report.pop("run_kind", expected_kind)
+    reward_eligible = report.pop(
+        "reward_eligible", requested_pass is BenchmarkPass.MEASUREMENT
+    )
+    runtime = {
+        name: report.pop(name, previous_runtime.get(name))
+        for name in (
+            "model_revision_receipt",
+            "inferencex_runtime_receipt",
+            "lm_eval_runtime_receipt",
+            "serving_runtime_receipt",
+        )
+    }
+    quality_gate = report.pop("quality_gate", previous_quality)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    unique_root.mkdir(parents=True, exist_ok=True)
+    config_sha256 = kwargs.get("expected_config_sha256") or "1" * 64
+    exit_code = kwargs.get("command_exit_code", 0)
+    timed_out = kwargs.get("timed_out", False)
+    attestation = {
+        "schema": "apex.magpie-execution-attestation/v1",
+        "authority": "apex_evaluator",
+        "official_report_path": report_path.relative_to(
+            evaluator_root.parent
+        ).as_posix(),
+        "official_report_size_bytes": report_path.stat().st_size,
+        "report_sha256": sha256_file(report_path),
+        "config_sha256": config_sha256,
+        "run_id": kwargs["run_id"],
+        "pass_type": requested_pass.value,
+        "lane_verified": claimed_kind == expected_kind,
+        "reward_eligible": reward_eligible,
+        "profiling_enabled": report.get("profiling_enabled") is True,
+        "process": {
+            "schema": "apex.magpie-process-attestation/v1",
+            "argv_sha256": "2" * 64,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "succeeded": exit_code == 0 and not timed_out,
+            "verified": True,
+        },
+        "dependencies": {
+            "schema": "apex.magpie-dependency-attestation/v1",
+            "verified": True,
+            "receipts": {
+                "lock_sha256": "3" * 64,
+                "dependencies": {
+                    name: {
+                        "root": f"/dependencies/{name}",
+                        "commit": "4" * 40,
+                        "tree": "5" * 40,
+                    }
+                    for name in ("magpie", "tracelens", "inferencex")
+                },
+            },
+        },
+        "runtime": {
+            "schema": "apex.magpie-runtime-attestation/v1",
+            "verified": True,
+            **runtime,
+        },
+        "gpu_engagement": {
+            "schema": "apex.magpie-gpu-engagement/v1",
+            "verified": True,
+            "devices": [
+                {"rsmi_index": 0, "unique_id": "GPU-0000000000000001"}
+            ],
+            "processes": [{
+                "pid": 123,
+                "uid": 1000,
+                "start_time_ticks": 456,
+                "cmdline_sha256": "6" * 64,
+                "rsmi_device_indices": [0],
+            }],
+        },
+        "quality_gate": {
+            "schema": "apex.magpie-quality-attestation/v1",
+            "verified": True,
+            "receipt": quality_gate,
+        },
+        "errors": [],
+    }
+    path.write_text(json.dumps(attestation), encoding="utf-8")
+    return _parse_benchmark_report(
+        report_path, execution_attestation_path=path, **kwargs
+    )
 
 
 def _report(
@@ -44,8 +148,56 @@ def _report(
     return report
 
 
-def _formal_gate(first, results: Path, samples: Path) -> dict:
+def _policy() -> dict[str, object]:
     return {
+        "primary_metric": "exact_match,strict-match",
+        "tasks": "gsm8k",
+        "sha256": "4" * 64,
+        "task_definition_sha256": "5" * 64,
+    }
+
+
+def _execution_receipt(results: Path, samples: Path) -> dict[str, object] | None:
+    if results.stat().st_size <= 0 or samples.stat().st_size <= 0:
+        return None
+    result = EvaluatorArtifactReceipt(
+        "lm_eval/results.json", results.stat().st_size, sha256_file(results)
+    )
+    sample = EvaluatorArtifactReceipt(
+        "lm_eval/samples_gsm8k.jsonl", samples.stat().st_size, sha256_file(samples)
+    )
+    return LmEvalExecutionReceipt(
+        contract_sha256="1" * 64,
+        config_sha256="3" * 64,
+        policy_sha256="4" * 64,
+        policy_lock_sha256="2" * 64,
+        task_definition_sha256="5" * 64,
+        effective_task_definition_sha256="d" * 64,
+        task_materialization_receipt_sha256="e" * 64,
+        dataset_receipt_sha256="6" * 64,
+        dataset_revision="f" * 40,
+        runtime_sha256="7" * 64,
+        runtime_manifest_sha256="f" * 64,
+        runtime_lock_sha256="0" * 64,
+        launcher_sha256="1" * 64,
+        image_repo_digest="example/image@sha256:" + "8" * 64,
+        image_id="sha256:" + "9" * 64,
+        container_id="a" * 64,
+        listener_receipt_sha256="b" * 64,
+        sidecar_spec_sha256="d" * 64,
+        created_observation_sha256="e" * 64,
+        exited_observation_sha256="f" * 64,
+        broker_receipt_sha256="0" * 64,
+        container_cleanup_sha256="1" * 64,
+        runtime_probe_sha256="c" * 64,
+        runtime_publication_sha256="2" * 64,
+        result_artifacts=(result,),
+        sample_artifacts=(sample,),
+    ).to_dict()
+
+
+def _formal_gate(first, results: Path, samples: Path) -> dict:
+    gate = {
         "requested": True,
         "status": "passed",
         "passed": True,
@@ -93,6 +245,10 @@ def _formal_gate(first, results: Path, samples: Path) -> dict:
         "error_count": 0,
         "errors_truncated": False,
     }
+    receipt = _execution_receipt(results, samples)
+    if receipt is not None:
+        gate["evaluator_execution_receipt"] = receipt
+    return gate
 
 
 def _add_lm_eval_runtime_evidence(report_path: Path) -> LmEvalRuntimeReceipt:
@@ -255,10 +411,7 @@ def test_strict_match_wins_and_raw_samples_are_bound(tmp_path: Path) -> None:
         run_id="baseline",
         pass_type=BenchmarkPass.MEASUREMENT,
         quality_required=True,
-        expected_evaluator_policy={
-            "primary_metric": "exact_match,strict-match",
-            "tasks": "gsm8k",
-        },
+        expected_evaluator_policy=_policy(),
     )
 
     assert result.succeeded
@@ -296,7 +449,7 @@ def test_formal_quality_rejects_tampered_outcome_digest(tmp_path: Path) -> None:
         run_id="baseline",
         pass_type=BenchmarkPass.MEASUREMENT,
         quality_required=True,
-        expected_evaluator_policy={"primary_metric": "exact_match,strict-match"},
+        expected_evaluator_policy=_policy(),
     )
 
     assert not result.succeeded
@@ -332,14 +485,54 @@ def test_formal_quality_rejects_failed_magpie_gate_with_matching_digests(
         run_id="baseline",
         pass_type=BenchmarkPass.MEASUREMENT,
         quality_required=True,
-        expected_evaluator_policy={"primary_metric": "exact_match,strict-match"},
+        expected_evaluator_policy=_policy(),
     )
 
     assert not result.succeeded
     assert result.quality.error == "quality_gate_not_passed"
+    assert result.quality.hard_failure is False
 
 
-def test_formal_quality_rejects_empty_sample_artifact(tmp_path: Path) -> None:
+def test_formal_quality_marks_explicit_bound_failure_as_hard_failure(
+    tmp_path: Path,
+) -> None:
+    eval_dir = tmp_path / "lm_eval"
+    eval_dir.mkdir()
+    results = eval_dir / "results.json"
+    results.write_text(
+        json.dumps({"results": {"gsm8k": {"exact_match,strict-match": 0.7}}}),
+        encoding="utf-8",
+    )
+    samples = eval_dir / "samples_gsm8k.jsonl"
+    samples.write_text("{}\n", encoding="utf-8")
+    first = parse_benchmark_report(
+        _report(tmp_path),
+        run_id="candidate",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+    )
+    gate = _formal_gate(first, results, samples)
+    gate.update({"status": "failed", "passed": False})
+    report_data = json.loads(first.report_path.read_text(encoding="utf-8"))
+    report_data["quality_gate"] = gate
+    first.report_path.write_text(json.dumps(report_data), encoding="utf-8")
+
+    result = parse_benchmark_report(
+        first.report_path,
+        run_id="candidate",
+        pass_type=BenchmarkPass.MEASUREMENT,
+        quality_required=True,
+        expected_evaluator_policy=_policy(),
+    )
+
+    assert not result.succeeded
+    assert result.errors == ("quality_gate_not_passed",)
+    assert result.quality.hard_failure is True
+
+
+def test_formal_quality_rejects_empty_sample_without_execution_receipt(
+    tmp_path: Path,
+) -> None:
     eval_dir = tmp_path / "lm_eval"
     eval_dir.mkdir()
     results = eval_dir / "results.json"
@@ -365,11 +558,11 @@ def test_formal_quality_rejects_empty_sample_artifact(tmp_path: Path) -> None:
         run_id="baseline",
         pass_type=BenchmarkPass.MEASUREMENT,
         quality_required=True,
-        expected_evaluator_policy={"primary_metric": "exact_match,strict-match"},
+        expected_evaluator_policy=_policy(),
     )
 
     assert not result.succeeded
-    assert result.quality.error == "quality_sample_artifact_empty"
+    assert result.quality.error == "quality_evaluator_execution_receipt_missing"
 
 
 def test_formal_quality_requires_raw_samples(tmp_path: Path) -> None:
@@ -384,7 +577,7 @@ def test_formal_quality_requires_raw_samples(tmp_path: Path) -> None:
         run_id="baseline",
         pass_type=BenchmarkPass.MEASUREMENT,
         quality_required=True,
-        expected_evaluator_policy={"primary_metric": "exact_match,strict-match"},
+        expected_evaluator_policy=_policy(),
     )
 
     assert not result.succeeded
@@ -512,8 +705,8 @@ def test_measurement_rejects_diagnostic_or_ineligible_report(
     )
 
     assert not result.succeeded
-    assert "benchmark_report_run_kind_mismatch" in result.errors
-    assert "benchmark_report_reward_eligibility_mismatch" in result.errors
+    assert "execution_attestation_lane_unverified" in result.errors
+    assert "execution_attestation_reward_eligibility_mismatch" in result.errors
 
 
 def test_diagnostic_requires_non_reward_eligible_diagnostic_report(

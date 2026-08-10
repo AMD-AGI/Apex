@@ -4,12 +4,11 @@ import pytest
 
 from apex.core import ContractError
 from apex.evaluation import (
+    E2EPairedEstimate,
+    E2EPairedVerdict,
     E2ERewardPolicy,
-    E2EVerdict,
-    e2e_comparison_selection_policy,
     grade_e2e_outcome,
     replay_e2e_reward,
-    select_conservative_e2e_verdict,
 )
 
 
@@ -21,77 +20,215 @@ def _verdict(
     accuracy: float = 0.0,
     ttft: float = 0.0,
     tpot: float = 0.0,
-    anchor_id: str = "anchor-measurement",
-    candidate_id: str = "candidate-measurement",
-) -> E2EVerdict:
-    return E2EVerdict(
-        keep=keep,
-        reason_code=reason,
-        throughput_gain_pct=throughput,
-        accuracy_regression_pct=accuracy,
-        ttft_p99_regression_pct=ttft,
-        tpot_p99_regression_pct=tpot,
-        anchor_measurement_id=anchor_id,
-        candidate_measurement_id=candidate_id,
+    measurement_id: str = "a" * 64,
+) -> E2EPairedVerdict:
+    throughput_ratio = 1.0 + throughput / 100.0
+    ttft_ratio = 1.0 / (1.0 + ttft / 100.0)
+    tpot_ratio = 1.0 / (1.0 + tpot / 100.0)
+    estimate = E2EPairedEstimate(
+        throughput_ratio,
+        ttft_ratio,
+        tpot_ratio,
+        throughput,
+        accuracy,
+        ttft,
+        tpot,
+        throughput,
+        0.5,
+        keep,
+        3,
+        6,
+    )
+    return E2EPairedVerdict(keep, reason, estimate, measurement_id)
+
+
+def _grade(verdict: E2EPairedVerdict):
+    return grade_e2e_outcome(
+        verdict="keep" if verdict.keep else "revert",
+        reason_code=verdict.reason_code,
+        candidate_present=True,
+        measurement_verdict=verdict,
     )
 
 
-def _selected(comparisons: tuple[E2EVerdict, ...]) -> E2EVerdict:
-    return comparisons[select_conservative_e2e_verdict(comparisons)]
+def test_ten_percent_throughput_gain_and_unchanged_latency_is_136() -> None:
+    vector = _grade(_verdict(keep=True, reason="accepted", throughput=10.0))
+
+    assert vector.policy_id == "e2e_throughput_qos_v1"
+    assert vector.outcome_class == "accepted"
+    assert vector.runtime_component == 20.0
+    assert vector.eligible_base_component == 100.0
+    assert vector.throughput_component == pytest.approx(16.0)
+    assert vector.ttft_p99_component == 0.0
+    assert vector.tpot_p99_component == 0.0
+    assert vector.scalar_reward == pytest.approx(136.0)
+    assert replay_e2e_reward(vector.to_dict()) == pytest.approx(136.0)
 
 
-def test_keep_reward_combines_acceptance_with_clipped_throughput_gain() -> None:
-    grade = grade_e2e_outcome(
+def test_unchanged_eligible_runtime_is_120_even_when_not_promoted() -> None:
+    vector = _grade(
+        _verdict(
+            keep=False,
+            reason="insufficient_throughput_gain",
+            throughput=0.0,
+        )
+    )
+
+    assert vector.outcome_class == "no_gain"
+    assert vector.eligible is True
+    assert vector.scalar_reward == 120.0
+
+
+def test_terminal_scope_uses_same_formula_without_summing_attempts() -> None:
+    verdict = _verdict(keep=True, reason="accepted", throughput=10.0)
+
+    vector = grade_e2e_outcome(
         verdict="keep",
         reason_code="accepted",
         candidate_present=True,
-        measurement_verdict=_verdict(
-            keep=True,
-            reason="accepted",
-            throughput=3.0,
-        ),
+        measurement_verdict=verdict,
+        scope="task_terminal",
     )
 
-    assert grade.outcome_class == "accepted"
-    assert grade.outcome_base == 100.0
-    assert grade.throughput_component == 30.0
-    assert grade.scalar_reward == 130.0
-    assert replay_e2e_reward(grade.to_dict()) == 130.0
+    assert vector.scope == "task_terminal"
+    assert vector.scalar_reward == pytest.approx(136.0)
+    assert replay_e2e_reward(vector.to_dict()) == pytest.approx(136.0)
 
 
-def test_hard_gate_regression_cannot_be_offset_by_throughput() -> None:
-    grade = grade_e2e_outcome(
+def test_terminal_noop_without_selected_candidate_is_120() -> None:
+    verdict = _verdict(
+        keep=False,
+        reason="insufficient_throughput_gain",
+        throughput=0.0,
+    )
+    vector = grade_e2e_outcome(
         verdict="revert",
-        reason_code="accuracy_regression",
-        candidate_present=True,
-        measurement_verdict=_verdict(
-            keep=False,
-            reason="accuracy_regression",
-            throughput=8.0,
-        ),
+        reason_code=verdict.reason_code,
+        candidate_present=False,
+        measurement_verdict=verdict,
+        scope="task_terminal",
     )
 
-    assert grade.outcome_class == "hard_gate_regression"
-    assert grade.throughput_component == 0.0
-    assert grade.scalar_reward == -100.0
+    assert vector.scalar_reward == 120.0
+    assert replay_e2e_reward(vector.to_dict()) == 120.0
 
 
-def test_source_free_agent_outcome_has_explicit_smaller_penalty() -> None:
+@pytest.mark.parametrize(
+    ("reason", "accuracy", "ttft", "tpot"),
+    (
+        ("accuracy_regression", 0.01, 0.0, 0.0),
+        ("ttft_p99_regression", 0.0, 5.0001, 0.0),
+        ("tpot_p99_regression", 0.0, 0.0, 2.0001),
+    ),
+)
+def test_hard_gate_is_20_and_cannot_be_offset_by_throughput(
+    reason: str, accuracy: float, ttft: float, tpot: float
+) -> None:
+    vector = _grade(
+        _verdict(
+            keep=False,
+            reason=reason,
+            throughput=100.0,
+            accuracy=accuracy,
+            ttft=ttft,
+            tpot=tpot,
+        )
+    )
+
+    assert vector.outcome_class == "hard_gate_regression"
+    assert vector.runtime_verified is True
+    assert vector.eligible is False
+    assert vector.scalar_reward == 20.0
+
+
+def test_trusted_quality_failure_is_20_with_performance_skipped() -> None:
+    vector = grade_e2e_outcome(
+        verdict="revert",
+        reason_code="quality_gate_failed",
+        candidate_present=True,
+        performance_skipped="quality_gate",
+    )
+
+    assert vector.outcome_class == "hard_gate_regression"
+    assert vector.runtime_verified is True
+    assert vector.eligible is False
+    assert vector.performance_skipped == "quality_gate"
+    assert vector.throughput_ratio is None
+    assert vector.scalar_reward == 20.0
+    assert replay_e2e_reward(vector.to_dict()) == 20.0
+
+
+def test_quality_failure_cannot_claim_runtime_without_skip_semantics() -> None:
+    with pytest.raises(ContractError) as failure:
+        grade_e2e_outcome(
+            verdict="revert",
+            reason_code="quality_gate_failed",
+            candidate_present=True,
+        )
+
+    assert failure.value.reason_code == "missing_e2e_reward_measurement"
+
+
+def test_pre_runtime_rejects_are_zero_not_negative_training_penalties() -> None:
     no_source = grade_e2e_outcome(
         verdict="reject",
         reason_code="agent_made_no_source_change",
         candidate_present=False,
     )
-    unusable_source = grade_e2e_outcome(
+    candidate = grade_e2e_outcome(
         verdict="reject",
-        reason_code="agent_made_no_source_change",
+        reason_code="correctness_failed",
         candidate_present=True,
     )
 
     assert no_source.outcome_class == "no_source"
-    assert no_source.scalar_reward == -20.0
-    assert unusable_source.outcome_class == "candidate_rejected"
-    assert unusable_source.scalar_reward == -100.0
+    assert candidate.outcome_class == "candidate_rejected"
+    assert no_source.scalar_reward == candidate.scalar_reward == 0.0
+    assert no_source.runtime_verified is candidate.runtime_verified is False
+
+
+def test_latency_improvements_have_separate_ten_percent_components() -> None:
+    vector = _grade(
+        _verdict(
+            keep=True,
+            reason="accepted",
+            throughput=0.5,
+            ttft=-50.0,
+            tpot=-50.0,
+        )
+    )
+
+    assert vector.throughput_ratio == pytest.approx(1.005)
+    assert vector.ttft_p99_ratio == 2.0
+    assert vector.tpot_p99_ratio == 2.0
+    assert vector.throughput_component == pytest.approx(0.8)
+    assert vector.ttft_p99_component == 20.0
+    assert vector.tpot_p99_component == 20.0
+    assert vector.scalar_reward == pytest.approx(160.8)
+
+
+def test_eligible_upper_and_clipped_lower_are_bounded() -> None:
+    upper = _grade(
+        _verdict(
+            keep=True,
+            reason="accepted",
+            throughput=300.0,
+            ttft=-75.0,
+            tpot=-75.0,
+        )
+    )
+    lower = _grade(
+        _verdict(
+            keep=False,
+            reason="insufficient_throughput_gain",
+            throughput=-75.0,
+            ttft=300.0,
+            tpot=300.0,
+        )
+    )
+
+    assert upper.scalar_reward == 320.0
+    assert lower.scalar_reward == 70.0
 
 
 def test_measured_decision_requires_evaluator_verdict() -> None:
@@ -106,20 +243,11 @@ def test_measured_decision_requires_evaluator_verdict() -> None:
 
 
 def test_replay_rejects_tampered_components_and_policy() -> None:
-    grade = grade_e2e_outcome(
-        verdict="keep",
-        reason_code="accepted",
-        candidate_present=True,
-        measurement_verdict=_verdict(
-            keep=True,
-            reason="accepted",
-            throughput=1.0,
-        ),
-    ).to_dict()
-    grade["components"]["throughput"] = 99.0
+    vector = _grade(_verdict(keep=True, reason="accepted", throughput=1.0)).to_dict()
+    vector["components"]["total_token_throughput"] = 99.0
 
     with pytest.raises(ContractError) as component_failure:
-        replay_e2e_reward(grade)
+        replay_e2e_reward(vector)
     assert component_failure.value.reason_code == "e2e_reward_replay_mismatch"
 
     clean = grade_e2e_outcome(
@@ -133,114 +261,27 @@ def test_replay_rejects_tampered_components_and_policy() -> None:
     assert policy_failure.value.reason_code == "e2e_reward_policy_mismatch"
 
 
-def test_comparison_selection_is_conservative_and_permutation_invariant() -> None:
-    no_gain = _verdict(
-        keep=False,
-        reason="insufficient_throughput_gain",
-        throughput=-1.0220958655,
-        accuracy=-0.3187,
-        tpot=1.1461,
-        anchor_id="anchor-a",
-        candidate_id="candidate-a",
-    )
-    hard_gate = _verdict(
-        keep=False,
-        reason="accuracy_regression",
-        throughput=-2.2649212451,
-        accuracy=0.5560,
-        anchor_id="anchor-b",
-        candidate_id="candidate-b",
-    )
+def test_replay_rejects_tampered_gate_and_metric_semantics() -> None:
+    vector = _grade(
+        _verdict(keep=True, reason="accepted", throughput=10.0)
+    ).to_dict()
+    vector["eligible"] = False
+    vector["components"] = {
+        "runtime": 20.0,
+        "eligible_base": 0.0,
+        "total_token_throughput": 0.0,
+        "ttft_p99": 0.0,
+        "tpot_p99": 0.0,
+        "ge2e": None,
+    }
+    vector["scalar_reward"] = 20.0
 
-    for comparisons in ((no_gain, hard_gate), (hard_gate, no_gain)):
-        selected = _selected(comparisons)
-        grade = grade_e2e_outcome(
-            verdict="revert",
-            reason_code=selected.reason_code,
-            candidate_present=True,
-            measurement_verdict=selected,
-        )
-        assert selected is hard_gate
-        assert grade.scalar_reward == pytest.approx(-122.649212451)
+    with pytest.raises(ContractError) as gate_failure:
+        replay_e2e_reward(vector)
+    assert gate_failure.value.reason_code == "e2e_reward_replay_mismatch"
 
-
-def test_comparison_selection_never_hides_a_failure() -> None:
-    passing = _verdict(keep=True, reason="accepted", throughput=0.6)
-    failing = _verdict(
-        keep=False,
-        reason="ttft_p99_regression",
-        throughput=8.0,
-        ttft=5.1,
-    )
-
-    assert _selected((passing, failing)) is failing
-    assert _selected((failing, passing)) is failing
-
-
-def test_passing_comparisons_select_the_lower_throughput_gain() -> None:
-    lower = _verdict(
-        keep=True,
-        reason="accepted",
-        throughput=0.6,
-        anchor_id="anchor-low",
-    )
-    higher = _verdict(
-        keep=True,
-        reason="accepted",
-        throughput=2.0,
-        anchor_id="anchor-high",
-    )
-
-    assert _selected((higher, lower)) is lower
-    assert _selected((lower, higher)) is lower
-
-
-def test_comparison_selection_has_stable_semantic_tie_breakers() -> None:
-    worse_gain = _verdict(
-        keep=False,
-        reason="accuracy_regression",
-        throughput=0.5,
-        accuracy=0.1,
-        anchor_id="anchor-z",
-    )
-    better_gain = _verdict(
-        keep=False,
-        reason="accuracy_regression",
-        throughput=1.5,
-        accuracy=0.2,
-        anchor_id="anchor-a",
-    )
-    id_a = _verdict(
-        keep=False,
-        reason="accuracy_regression",
-        throughput=1.0,
-        accuracy=0.2,
-        anchor_id="anchor-a",
-    )
-    id_z = _verdict(
-        keep=False,
-        reason="accuracy_regression",
-        throughput=1.0,
-        accuracy=0.2,
-        anchor_id="anchor-z",
-    )
-
-    assert _selected((better_gain, worse_gain)) is worse_gain
-    assert _selected((worse_gain, better_gain)) is worse_gain
-    assert _selected((id_z, id_a)) is id_a
-    assert _selected((id_a, id_z)) is id_a
-
-
-def test_comparison_selection_policy_is_explicit_and_replayable() -> None:
-    document = e2e_comparison_selection_policy()
-
-    assert document["policy_id"] == "conservative_e2e_reward_v1"
-    assert document["reward_policy_digest"] == E2ERewardPolicy().digest
-    assert document["ordering"][0] == "failure_before_keep"
-
-
-def test_empty_comparison_set_fails_closed() -> None:
-    with pytest.raises(ContractError) as failure:
-        select_conservative_e2e_verdict(())
-
-    assert failure.value.reason_code == "invalid_e2e_comparison_set"
+    clean = _grade(_verdict(keep=True, reason="accepted", throughput=10.0)).to_dict()
+    clean["metrics"]["throughput_gain_pct"] = 50.0
+    with pytest.raises(ContractError) as metric_failure:
+        replay_e2e_reward(clean)
+    assert metric_failure.value.reason_code == "e2e_reward_replay_mismatch"

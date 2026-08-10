@@ -12,7 +12,6 @@ from apex.runtime import DependencyReceipt
 
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_SERVING_FRAMEWORKS = frozenset({"vllm", "sglang", "atom"})
 
 
 def _environment(benchmark: dict[str, Any]) -> dict[str, Any]:
@@ -36,8 +35,8 @@ def _pin_inferencex(benchmark: dict[str, Any], receipt: DependencyReceipt) -> No
 
 
 def _pin_lm_eval(benchmark: dict[str, Any], receipt: DependencyReceipt) -> None:
-    framework = str(benchmark.get("framework", "")).strip().lower()
-    if framework not in _SERVING_FRAMEWORKS:
+    envs = benchmark.get("envs")
+    if not isinstance(envs, dict) or "RUN_EVAL" not in envs:
         return
     runtime = receipt.lm_eval_runtime
     if runtime is None:

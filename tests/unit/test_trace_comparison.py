@@ -147,6 +147,39 @@ def test_pinned_adapter_runs_report_diff_without_claiming_attribution(
     )
 
 
+def test_loaded_tracelens_api_cannot_write_dependency_progress_to_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dependency = tmp_path / "dependency"
+    module = (
+        dependency / "TraceLens" / "Reporting" / "compare_perf_reports_pytorch.py"
+    )
+    module.parent.mkdir(parents=True)
+    module.write_text(
+        """from pathlib import Path
+def generate_compare_perf_reports_pytorch(**kwargs):
+    print('dependency progress must stay off MCP stdout')
+    output_csvs = Path(kwargs['output_csvs_dir'])
+    output_csvs.mkdir(parents=True)
+    (output_csvs / 'comparison.csv').write_text('metric,delta\\nlatency,-1\\n')
+    output = Path(kwargs['output'])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b'workbook')
+    return {'gpu_timeline': object()}
+""",
+        encoding="utf-8",
+    )
+    adapter = PinnedTraceLensComparisonAdapter(
+        root=dependency,
+        commit="a" * 40,
+    )
+
+    result = adapter.compare(_request(tmp_path))
+
+    assert result.status is TraceComparisonStatus.PARTIAL
+    assert capsys.readouterr().out == ""
+
+
 def test_grouped_ops_selector_accepts_one_present_member(tmp_path: Path) -> None:
     comparator = _Comparator()
     request = _request(tmp_path, report_name="ops_unique_args.csv")

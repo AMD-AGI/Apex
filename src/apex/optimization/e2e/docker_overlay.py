@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
@@ -21,6 +20,7 @@ from .candidate import (
     materialize_frozen_sources,
     validate_frozen_sources,
 )
+from .candidate_fingerprint import git_environment
 from .kernel_lane import KernelOpportunity
 from .overlay_lineage import (
     capture_overlay_build_receipt,
@@ -79,11 +79,11 @@ class GitSourceLockVerifier:
         }
 
     def _git(self, cwd: Path, argv: tuple[str, ...]) -> str:
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
         result = self._supervisor.run(
-            argv, cwd=cwd, environment=environment, timeout_seconds=60
+            argv,
+            cwd=cwd,
+            environment=git_environment(),
+            timeout_seconds=60,
         )
         if result.timed_out or result.exit_code != 0 or result.stdout_truncated:
             raise IntegrityError("Cannot verify source lock", "source_lock_inspection_failed")
@@ -92,6 +92,10 @@ class GitSourceLockVerifier:
 
 class DockerOverlayDeployment:
     """Install one frozen Python file into an immutable derived container image."""
+
+    adapter_id = "docker-python-overlay-v1"
+    supported_components = frozenset({"vllm", "aiter"})
+    supported_run_modes = frozenset({"docker"})
 
     def __init__(
         self,
@@ -103,7 +107,8 @@ class DockerOverlayDeployment:
 
     def supports(self, opportunity: KernelOpportunity, provenance: RunProvenance) -> bool:
         return bool(
-            opportunity.eligible
+            provenance.run_mode == "docker"
+            and opportunity.eligible
             and opportunity.language in {"python", "triton"}
             and opportunity.origin_library in {"vllm", "aiter"}
             and opportunity.source_root
@@ -441,7 +446,7 @@ def _matching_lock(
         return None
     matches = [
         lock
-        for lock in provenance.source_locks
+        for lock in provenance.component_sources.locks
         if lock.name.lower() == opportunity.origin_library
         and lock.exact
         and Path(lock.path).resolve() == root

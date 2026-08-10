@@ -26,10 +26,19 @@ Only names exported from `apex.delivery.__all__` are supported:
   `apply_verified_kernel_bundle` is the explicit exact-clean-baseline mutation.
 - `capture_repository_patch`, `CleanPatchMaterializer`, and the E2E bundle
   functions capture and verify exact Git source changes.
-- `E2EBundleVerifier`, `SupervisedRecipeBuildBackend`, and their build,
-  engagement, and replay ports perform independent source-delivery verification.
+- `E2EBundleVerifierRouter` selects a reviewed profile only from the exact frozen
+  recipe digest. `E2EBundleVerifier`, `SupervisedRecipeBuildBackend`, and their
+  build, engagement, and replay ports then perform independent source-delivery
+  verification.
 - Receipt and lock dataclasses are immutable evidence values. Callers should not
   import private module helpers or infer a verdict from presentation text.
+- `capture_portable_bundle` first runs the kind-specific official loader, stores
+  every verified bundle file in CAS, and emits exact `winner_bundle` and
+  `bundle_verification` receipts. `verify_portable_bundle` reconstructs those
+  bytes and reruns the same loader offline.
+- `kernel_reproduction_declaration` and `e2e_reproduction_declaration` project
+  only bundle-bound source, recipe, image, config, authority, and fixed-argv
+  identities. The two task kinds deliberately have different replay gates.
 
 For standalone measurement, the evaluator writes a fresh regular JSON file with
 schema `apex.kernel-measurement/v1`, policy
@@ -107,6 +116,30 @@ Runtime-overlay evidence may truthfully retain
 verified source-rebuild success. Advisory safety gaps remain visible as
 `safety_certified=false`.
 
+A successful clean-replay receipt enumerates each raw benchmark and quality file
+with role, run identity, measurement/quality identity, digest, size, and media
+type. Verification rejects path escapes, symlinks, missing files, and byte drift.
+Optimization copies verified E2E files into the main CAS before publishing its
+unique task-terminal reward. Standalone delivery similarly carries the terminal
+result/vector/source/policy identities produced by evaluation; selected/no-op
+grades bind raw invocation evidence while trusted gate failures bind their exact
+command receipts. Delivery cannot replace raw proof with a summary, aggregate
+attempt rewards, or infer a terminal scalar itself.
+
+Delivery carries either the exact receipt supplied by an independent trusted
+safety evaluator or the explicit uncertified no-tool state. It cannot infer tool
+coverage, promote not-applicable/inconclusive to clean, or manufacture a safety
+receipt from correctness output. Instrumented or simulated artifacts are
+`timing_eligible=false` and can become neither delivery runtime bytes nor scoring
+measurements. See the [primary safety contract](../evaluation/safety/README.md).
+
+A role label is not bundle evidence. Showcase qualification requires one event
+with the portable bundle declaration, its delivery-owned verification receipt,
+and a contiguous binding for every declared file. Export verifies this contract
+against the source CAS; offline verification reconstructs the exported tree and
+reruns `load_and_verify_kernel_bundle` or `load_and_verify_e2e_bundle`. Missing
+or invalid portable evidence cannot be published.
+
 ## Dependencies
 
 Delivery depends inward on `core`, intake contracts, the shell-free execution
@@ -118,6 +151,17 @@ Build, runtime engagement, and clean replay are injected ports. The composition
 root owns the trusted repository and recipe registries: bundle content may not
 authorize its own clone URL or command. Commands are argv arrays with
 `shell=False` semantics; there is no arbitrary shell-string fallback.
+
+The trusted recipe registry also supplies each component's language,
+engagement kind, and build-ID requirement. `SourceComponentCapability` is
+compared with every frozen source lock; a bundle cannot lower this policy by
+declaring weaker loaded-byte or build-ID requirements. Built and loaded artifact
+sets must match exactly when engagement is verified.
+
+Concrete workload profiles are composed lazily after static bundle verification.
+An unrelated recipe cannot silently use the reviewed Qwen vertical-slice
+backends; an unknown recipe fails with `e2e_verifier_profile_unavailable`, and
+two profiles may not claim the same recipe digest.
 
 ## Failure semantics
 
@@ -160,6 +204,11 @@ dirty or wrong bases; path, symlink, submodule, manifest, recipe, and config
 attacks; image/SBOM and loaded-byte mismatch; clean replay; and terminal status
 policy. Temporary Git repositories and fake ports keep this suite independent of
 Docker and GPUs.
+
+Fresh replay evidence binds a distinct clean-source materialization digest, the
+primary runtime identity, and a unique runtime identity for every A/B/B/A
+observation. Every raw replay measurement also binds its protected execution
+attestation artifact; caller-provided `fresh=true` flags are not proof.
 
 `apex.optimization.e2e.SourceRebuildFinalDelivery` owns the authoring-side
 composition: cumulative clean source materialization, canonical patch capture,

@@ -5,11 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
-from apex.benchmark import MagpieBenchmarkAdapter, QWEN_CONFIG_SHA256
-from apex.core import ContractError, IntegrityError, sha256_file
+from apex.benchmark import MagpieBenchmarkAdapter
+from apex.core import ContractError, IntegrityError
 from apex.delivery import BuildRecipeLock, BuildStep, E2EBundleVerifier
 from apex.runtime import (
     DependencyReceipt,
+    MagpieConfigContract,
     ProvenanceResolver,
     RunProvenance,
     canonical_repository,
@@ -30,17 +31,15 @@ from .source_delivery import FormalDeliveryBinding, SourceRebuildFinalDelivery
 from .source_delivery_models import FormalRepositoryProfile, FormalSourceDeliveryProfile
 from .source_delivery_provenance import ExactRequestProvenance
 from .source_delivery_adapters import (
-    QwenIndependentEngagement,
-    QwenIndependentReplay,
-    QwenIndependentSourceBuild,
-    QwenPrimarySourceBuilder,
+    IndependentCleanReplay,
+    IndependentSourceImageBuild,
+    IndependentSourceImageEngagement,
+    SourceImagePrimaryBuilder,
 )
 from .source_image_runtime import DockerPythonSourceImageBuilder
-from .qwen_qualification import QwenCompositeMicroQualifier
+from .component_micro import ComponentMicroBinding, ComponentMicroQualifierRegistry
 
 
-QWEN_MODEL_ID = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-QWEN_MODEL_REVISION = "c5f5f263bdd5cc134092897864e8905d8fe7b928"
 QWEN_PARENT_REFERENCE = "vllm/vllm-openai-rocm:v0.19.1"
 QWEN_PARENT_LOCATOR = (
     "vllm/vllm-openai-rocm@"
@@ -51,12 +50,13 @@ QWEN_PARENT_REPO_DIGEST = (
 )
 QWEN_PARENT_IMAGE_ID = "sha256:b599932816fe09f9ea2541655f5388457ac2494b87b551cefdbf2a207b0ed3a9"
 QWEN_SOURCE_DATE_EPOCH = 1776474762
+QWEN_ACCEPTANCE_PROFILE_ID = "qwen3-next-80b-fp8-v1"
 
 
 class ProvenanceResolverPort(Protocol):
     def resolve(
         self,
-        config_path: Path,
+        resolved: MagpieConfigContract,
         *,
         gpu_arch: str,
         hints: Mapping[str, Any] | None = None,
@@ -64,7 +64,7 @@ class ProvenanceResolverPort(Protocol):
 
 
 class QwenAcceptanceProvenanceResolver:
-    """Inject reviewed locks only when the exact acceptance config is selected."""
+    """Inject reviewed locks for the matching source/runtime capability profile."""
 
     def __init__(
         self,
@@ -81,27 +81,28 @@ class QwenAcceptanceProvenanceResolver:
 
     def resolve(
         self,
-        config_path: Path,
+        resolved: MagpieConfigContract,
         *,
         gpu_arch: str,
         hints: Mapping[str, Any] | None = None,
     ) -> RunProvenance:
         chosen = dict(hints or {})
-        if not config_path.is_file() or sha256_file(config_path) != QWEN_CONFIG_SHA256:
+        if not _supports_profile(resolved):
             return self.delegate.resolve(
-                config_path, gpu_arch=gpu_arch, hints=chosen
+                resolved, gpu_arch=gpu_arch, hints=chosen
             )
-        _validate_hint_overrides(chosen, self.source_roots)
-        chosen.update(_reviewed_provenance_hints(self.source_roots))
+        active = tuple(resolved.requested_components)
+        _validate_hint_overrides(chosen, self.source_roots, active)
+        chosen.update(_reviewed_provenance_hints(self.source_roots, active))
         observed = self.delegate.resolve(
-            config_path, gpu_arch=gpu_arch, hints=chosen
+            resolved, gpu_arch=gpu_arch, hints=chosen
         )
         QwenAcceptanceProvenance(self.source_roots)._validate_run(observed)
         return observed
 
 
 class QwenAcceptanceProvenance(ExactRequestProvenance):
-    """Reject every workload or source identity outside the reviewed profile."""
+    """Reject source/runtime identities outside the reviewed capability profile."""
 
     def __init__(self, source_roots: Mapping[str, Path]) -> None:
         self.source_roots = {
@@ -115,26 +116,27 @@ class QwenAcceptanceProvenance(ExactRequestProvenance):
     def _validate_run(self, provenance: RunProvenance) -> None:
         container = provenance.container
         expected_repo = f"vllm/vllm-openai-rocm@{QWEN_PARENT_REPO_DIGEST}"
+        active = set(provenance.active_components)
         if (
-            provenance.benchmark_config_sha256 != QWEN_CONFIG_SHA256
-            or provenance.framework != "vllm"
-            or provenance.model_id != QWEN_MODEL_ID
-            or provenance.model_revision != QWEN_MODEL_REVISION
+            provenance.framework != "vllm"
+            or provenance.run_mode != "docker"
             or provenance.gpu_arch != "gfx950"
             or container.requested_image != QWEN_PARENT_REFERENCE
             or container.image_id != QWEN_PARENT_IMAGE_ID
             or expected_repo not in container.repo_digests
-            or provenance.active_components != ("vllm", "aiter")
+            or not active
+            or not active.issubset(_source_identities())
         ):
             raise ContractError(
-                "Run does not match the reviewed Qwen acceptance identity",
+                "Run does not match the reviewed source/runtime profile",
                 "untrusted_build_recipe",
             )
-        locks = {item.name: item for item in provenance.source_locks}
+        locks = {item.name: item for item in provenance.component_sources.locks}
         identities = _source_identities()
-        if set(locks) != set(identities):
-            raise ContractError("Qwen source locks are incomplete", "source_lock_unresolved")
-        for name, identity in identities.items():
+        if set(locks) != active:
+            raise ContractError("Source-profile locks are incomplete", "source_lock_unresolved")
+        for name in sorted(active):
+            identity = identities[name]
             lock = locks[name]
             if (
                 not lock.exact
@@ -144,7 +146,7 @@ class QwenAcceptanceProvenance(ExactRequestProvenance):
                 != canonical_repository(identity["url"])
                 or Path(lock.path).resolve() != self.source_roots[name]
             ):
-                raise IntegrityError("Reviewed Qwen source lock drifted", "source_lock_drift")
+                raise IntegrityError("Reviewed source-profile lock drifted", "source_lock_drift")
 
 
 def build_qwen_acceptance_delivery(
@@ -157,7 +159,7 @@ def build_qwen_acceptance_delivery(
     roots = _validated_source_roots(source_roots)
     profiles = _profiles()
     primary_images = _image_builder()
-    primary = QwenPrimarySourceBuilder(
+    primary = SourceImagePrimaryBuilder(
         primary_images, MagpieBenchmarkAdapter(dependency_receipt)
     )
     verifier = build_qwen_acceptance_bundle_verifier(
@@ -194,14 +196,21 @@ def build_qwen_acceptance_bundle_verifier(
     return E2EBundleVerifier(
         trusted_recipes={item.recipe.computed_sha256: item.recipe for item in profiles},
         trusted_source_urls={name: value["url"] for name, value in identities.items()},
-        build_backend=QwenIndependentSourceBuild(images),
-        engagement_backend=QwenIndependentEngagement(images, _project_root()),
-        replay_backend=QwenIndependentReplay(MagpieBenchmarkAdapter(dependency_receipt)),
-        default_source_overrides=roots,
-        trusted_recipe_repositories={
-            item.recipe.computed_sha256: item.repository_ids for item in profiles
+        trusted_recipe_capabilities={
+            item.recipe.computed_sha256: item.component_capabilities
+            for item in profiles
         },
+        build_backend=IndependentSourceImageBuild(images),
+        engagement_backend=IndependentSourceImageEngagement(images, _project_root()),
+        replay_backend=IndependentCleanReplay(MagpieBenchmarkAdapter(dependency_receipt)),
+        default_source_overrides=roots,
     )
+
+
+def qwen_acceptance_recipe_sha256s() -> frozenset[str]:
+    """Return the exact recipes claimed by the reviewed Qwen verifier profile."""
+
+    return frozenset(item.recipe.computed_sha256 for item in _profiles())
 
 
 def default_qwen_source_roots() -> Mapping[str, Path]:
@@ -314,27 +323,46 @@ def _qwen_oracle_bindings() -> tuple[CorrectnessOracleBinding, ...]:
 
 def build_qwen_oracle_micro_qualifier(
     oracles: CorrectnessOracleRegistry,
-) -> QwenCompositeMicroQualifier:
+) -> ComponentMicroQualifierRegistry:
     """Bind strict vLLM and deferred AITER lanes to the reviewed Qwen parent."""
 
     identities = _source_identities()
-    return QwenCompositeMicroQualifier(
-        vllm=DockerOracleMicroQualifier(
-            oracles=oracles,
-            policy=DockerOraclePolicy(
-                QWEN_PARENT_LOCATOR,
-                QWEN_PARENT_IMAGE_ID,
-                tuple(
-                    OracleSourceLock(name, identity["commit"], identity["tree"])
-                    for name, identity in sorted(identities.items())
+    downstream = (
+        "evaluator_owned_safety_gate",
+        "unchanged_magpie_quality_gate",
+        "unchanged_magpie_e2e_performance_gate",
+    )
+    return ComponentMicroQualifierRegistry(
+        (
+            ComponentMicroBinding(
+                "vllm",
+                "reviewed-vllm-docker-oracle",
+                DockerOracleMicroQualifier(
+                    oracles=oracles,
+                    policy=DockerOraclePolicy(
+                        QWEN_PARENT_LOCATOR,
+                        QWEN_PARENT_IMAGE_ID,
+                        tuple(
+                            OracleSourceLock(
+                                name, identity["commit"], identity["tree"]
+                            )
+                            for name, identity in sorted(identities.items())
+                        ),
+                        (
+                            OracleDependencyLock("pytest", "9.0.2"),
+                            OracleDependencyLock("einops", "0.8.2"),
+                        ),
+                    ),
                 ),
-                (
-                    OracleDependencyLock("pytest", "9.0.2"),
-                    OracleDependencyLock("einops", "0.8.2"),
-                ),
+                downstream,
             ),
-        ),
-        aiter=E2EDeferredMicroQualifier(),
+            ComponentMicroBinding(
+                "aiter",
+                "frozen-source-deferred",
+                E2EDeferredMicroQualifier(),
+                downstream,
+            ),
+        )
     )
 
 
@@ -358,10 +386,10 @@ def _oracle_argv(*node_ids: str) -> tuple[str, ...]:
 
 def _reviewed_provenance_hints(
     roots: Mapping[str, Path],
+    active: tuple[str, ...],
 ) -> dict[str, Any]:
     identities = _source_identities()
     return {
-        "model_revision": QWEN_MODEL_REVISION,
         "source_repositories": [
             {
                 "name": name,
@@ -369,44 +397,58 @@ def _reviewed_provenance_hints(
                 "commit": str(identity["commit"]),
             }
             for name, identity in identities.items()
+            if name in active
         ],
     }
 
 
 def _validate_hint_overrides(
-    hints: Mapping[str, Any], roots: Mapping[str, Path]
+    hints: Mapping[str, Any],
+    roots: Mapping[str, Path],
+    active: tuple[str, ...],
 ) -> None:
     identities = _source_identities()
-    revision = hints.get("model_revision")
-    if revision is not None and revision != QWEN_MODEL_REVISION:
-        raise ContractError(
-            "Qwen model revision override differs from the reviewed lock",
-            "source_lock_drift",
-        )
     repositories = hints.get("source_repositories")
     if repositories is None:
         return
     if not isinstance(repositories, (list, tuple)):
-        raise ContractError("Qwen source override is invalid", "source_lock_drift")
+        raise ContractError("Source-profile override is invalid", "source_lock_drift")
     observed = {}
     for item in repositories:
         if not isinstance(item, Mapping):
-            raise ContractError("Qwen source override is invalid", "source_lock_drift")
+            raise ContractError("Source-profile override is invalid", "source_lock_drift")
         name = str(item.get("name", ""))
         observed[name] = item
     if (
         len(observed) != len(repositories)
-        or set(observed) != set(identities)
+        or set(observed) != set(active)
     ):
-        raise ContractError("Qwen source override is incomplete", "source_lock_drift")
-    for name, identity in identities.items():
+        raise ContractError("Source-profile override is incomplete", "source_lock_drift")
+    for name in active:
+        identity = identities[name]
         item = observed[name]
         commit = item.get("commit")
         if (
             Path(str(item.get("path", ""))).expanduser().resolve() != roots[name]
             or (commit is not None and commit != identity["commit"])
         ):
-            raise ContractError("Qwen source override drifted", "source_lock_drift")
+            raise ContractError("Source-profile override drifted", "source_lock_drift")
+
+
+def _supports_profile(resolved: MagpieConfigContract) -> bool:
+    identity = resolved.plan.get("identity")
+    runtime = resolved.plan.get("source_runtime")
+    if not isinstance(identity, Mapping) or not isinstance(runtime, Mapping):
+        return False
+    components = runtime.get("requested_components")
+    return (
+        identity.get("framework") == "vllm"
+        and identity.get("run_mode") == "docker"
+        and runtime.get("requested_image") == QWEN_PARENT_REFERENCE
+        and isinstance(components, list)
+        and bool(components)
+        and set(components).issubset(_source_identities())
+    )
 
 
 def _profiles() -> tuple[FormalSourceDeliveryProfile, ...]:
@@ -476,16 +518,14 @@ def _source_identities() -> Mapping[str, Mapping[str, str]]:
     }
     if set(identities) != {"vllm", "aiter"}:
         raise ContractError(
-            "Qwen source lock must contain exactly vllm and aiter",
+            "Source profile must contain exactly vllm and aiter",
             "source_lock_unresolved",
         )
     return identities
 
 
 __all__ = [
-    "QWEN_CONFIG_SHA256",
-    "QWEN_MODEL_ID",
-    "QWEN_MODEL_REVISION",
+    "QWEN_ACCEPTANCE_PROFILE_ID",
     "QWEN_PARENT_IMAGE_ID",
     "QWEN_PARENT_LOCATOR",
     "QWEN_PARENT_REFERENCE",
@@ -499,4 +539,5 @@ __all__ = [
     "build_qwen_correctness_oracles",
     "build_qwen_oracle_micro_qualifier",
     "default_qwen_source_roots",
+    "qwen_acceptance_recipe_sha256s",
 ]

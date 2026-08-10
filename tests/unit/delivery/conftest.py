@@ -107,14 +107,27 @@ class BundleFixture:
 
 @pytest.fixture
 def make_e2e_bundle(tmp_path: Path) -> Callable[..., BundleFixture]:
-    def make(*, count: int = 1, overlay: bool = False) -> BundleFixture:
+    def make(
+        *,
+        count: int = 1,
+        overlay: bool = False,
+        engagement_kind: str = "python_import",
+        build_id_required: bool = False,
+    ) -> BundleFixture:
         derived_digest = "sha256:" + "5" * 64
         derived_locator = "apex-derived@" + derived_digest
         recipe = BuildRecipeLock(
             "vllm-python-source-v1",
             "sha256:" + "1" * 64,
             derived_locator,
-            (BuildStep(("python3", "build.py"), "repo0", timeout_seconds=60),),
+            tuple(
+                BuildStep(
+                    ("python3", "build.py"),
+                    f"repo{index}",
+                    timeout_seconds=60,
+                )
+                for index in range(count)
+            ),
         )
         captures = []
         bases: dict[str, Path] = {}
@@ -137,6 +150,8 @@ def make_e2e_bundle(tmp_path: Path) -> Callable[..., BundleFixture]:
                     anchor_generation=index,
                     license_id="Apache-2.0",
                     runtime_component=name,
+                    engagement_kind=engagement_kind,
+                    build_id_required=build_id_required,
                 )
             )
         stack = source_stack_digest(tuple(item.lock for item in captures))
@@ -153,6 +168,7 @@ def make_e2e_bundle(tmp_path: Path) -> Callable[..., BundleFixture]:
             primary_receipts[role] = path
         primary = PrimaryVerificationEvidence(
             environment_id="primary-environment",
+            runtime_identity_sha256="d" * 64,
             source_stack_sha256=stack,
             build_receipt_sha256=sha256_file(primary_receipts["primary_build_receipt"]),
             engagement_receipt_sha256=sha256_file(primary_receipts["primary_engagement_receipt"]),

@@ -13,11 +13,55 @@ from .agent import (
     AgentUsage,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
 )
+from .agent_authority import (
+    AgentExecutionAuthorityReceipt,
+    BACKEND_CREDENTIAL_POLICY,
+    FORMAL_AGENT_PERMISSION_POLICY,
+    FORMAL_PROMPT_TRANSPORT_POLICY,
+)
 from .agent_containment import (
     AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentProcessContainmentReceipt,
 )
-from .benchmark import BenchmarkPass, BenchmarkPort, BenchmarkRequest, BenchmarkResult
+from .benchmark import (
+    BenchmarkPass,
+    BenchmarkPort,
+    BenchmarkRequest,
+    BenchmarkResult,
+    MagpieAttestationRequest,
+    MagpieExecutionAttestor,
+    MagpieFormalMeasurementSupport,
+    MagpieReportLocation,
+    RayArtifactClaim,
+    RayExecutionContract,
+    RayNodeEvidenceAuthority,
+    RayNodeEvidenceBinding,
+    RayNodeEvidenceReceipt,
+)
+from .capability import (
+    CapabilityAuthority,
+    CapabilityAvailability,
+    CapabilityDescriptor,
+    CapabilityGpuRequirement,
+    CapabilityHandler,
+    CapabilityKind,
+    CapabilityPort,
+    CapabilityRequest,
+    CapabilityResult,
+    CapabilityRewardRole,
+    CapabilitySideEffect,
+)
+from .capability_grant import (
+    CapabilityGrantAuthority,
+    CapabilityGrantReceipt,
+    validate_capability_grant,
+)
+from .coding_session import (
+    CodingSessionLauncher,
+    CodingSessionOutput,
+    CodingSessionRequest,
+    KernelEnhancement,
+)
 from .diagnostics import (
     DiagnosticsPort,
     DiagnosticsRequest,
@@ -28,6 +72,10 @@ from .diagnostics import (
     TraceComparisonResult,
     TraceComparisonStatus,
     TraceDiagnosticEvidence,
+)
+from .evaluation_contract import (
+    WorkspaceRepositoryIdentity,
+    WorkspaceRepositoryIdentityPort,
 )
 from .knowledge import KnowledgePort, KnowledgeQuery, KnowledgeResult
 from .kernel_measurement import (
@@ -41,12 +89,18 @@ from .safety import (
     SafetyToolRunner,
     SafetyVerificationPort,
 )
+from .release_qualification import (
+    QualificationAuthorityPort,
+    QualificationAuthorityReceipt,
+    build_qualification_authority_receipt,
+)
 
 __all__ = [
     "AGENT_PROCESS_CONTAINMENT_POLICY",
     "AgentBackend",
     "AgentCaptureStatus",
     "AgentCost",
+    "AgentExecutionAuthorityReceipt",
     "AgentInvocationReceipt",
     "AgentProcessContainmentReceipt",
     "AgentRequest",
@@ -55,10 +109,36 @@ __all__ = [
     "AgentTranscriptEvent",
     "AgentTerminationKind",
     "AgentUsage",
+    "BACKEND_CREDENTIAL_POLICY",
     "BenchmarkPass",
     "BenchmarkPort",
     "BenchmarkRequest",
     "BenchmarkResult",
+    "MagpieAttestationRequest",
+    "MagpieExecutionAttestor",
+    "MagpieFormalMeasurementSupport",
+    "MagpieReportLocation",
+    "RayArtifactClaim",
+    "RayExecutionContract",
+    "RayNodeEvidenceAuthority",
+    "RayNodeEvidenceBinding",
+    "RayNodeEvidenceReceipt",
+    "CapabilityAuthority",
+    "CapabilityAvailability",
+    "CapabilityDescriptor",
+    "CapabilityGpuRequirement",
+    "CapabilityGrantAuthority",
+    "CapabilityGrantReceipt",
+    "CapabilityHandler",
+    "CapabilityKind",
+    "CapabilityPort",
+    "CapabilityRequest",
+    "CapabilityResult",
+    "CapabilityRewardRole",
+    "CapabilitySideEffect",
+    "CodingSessionLauncher",
+    "CodingSessionOutput",
+    "CodingSessionRequest",
     "DiagnosticsPort",
     "DiagnosticsRequest",
     "DiagnosticsResult",
@@ -68,15 +148,24 @@ __all__ = [
     "TraceComparisonResult",
     "TraceComparisonStatus",
     "TraceDiagnosticEvidence",
+    "WorkspaceRepositoryIdentity",
+    "WorkspaceRepositoryIdentityPort",
     "KnowledgePort",
     "KnowledgeQuery",
     "KnowledgeResult",
+    "QualificationAuthorityPort",
+    "QualificationAuthorityReceipt",
+    "KernelEnhancement",
     "KernelMeasurementOutput",
     "KernelMeasurementPort",
     "KernelMeasurementRequest",
+    "FORMAL_AGENT_PERMISSION_POLICY",
+    "FORMAL_PROMPT_TRANSPORT_POLICY",
     "SafetyToolRunRequest",
     "SafetyToolRunResult",
     "SafetyToolRunner",
     "SafetyVerificationPort",
     "STRUCTURED_TURN_CHECKPOINT_POLICY",
+    "build_qualification_authority_receipt",
+    "validate_capability_grant",
 ]

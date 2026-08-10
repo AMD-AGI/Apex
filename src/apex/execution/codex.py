@@ -56,6 +56,7 @@ class CodexBackend:
             executable=executable,
             argv=argv,
             environment=environment,
+            credential_environment_key="OPENAI_API_KEY",
             prompt_transport="stdin",
             isolation={
                 "approval": "never_via_strict_config",

@@ -40,7 +40,6 @@ class CursorBackend:
         ]
         if request.model:
             argv.extend(["--model", request.model])
-        argv.append(request.prompt)
         environment = invocation_environment(
             request.environment,
             credential_key="CURSOR_API_KEY",
@@ -53,7 +52,8 @@ class CursorBackend:
             executable=executable,
             argv=argv,
             environment=environment,
-            prompt_transport="argv",
+            credential_environment_key="CURSOR_API_KEY",
+            prompt_transport="stdin",
             isolation={
                 "approval": "default_non_force",
                 "config_sources": "backend_default_may_load",
@@ -64,4 +64,5 @@ class CursorBackend:
                 "workspace_trust": "explicit_headless_trust",
             },
             effort=None,
+            stdin_text=request.prompt,
         )

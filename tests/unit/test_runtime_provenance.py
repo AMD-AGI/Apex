@@ -6,9 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from apex.core import IntegrityError
+from apex.core import ContractError, IntegrityError
 from apex.execution import ProcessResult
-from apex.runtime import ProvenanceResolver
+from apex.runtime import (
+    ComponentSourceLockSet,
+    DependencyReceipt,
+    ProvenanceResolver,
+    RepositoryLock,
+)
+from tests.support.magpie_contract import resolved_contract
 
 
 class ImageOnlySupervisor:
@@ -50,24 +56,119 @@ def _config(tmp_path: Path) -> Path:
     return path
 
 
+def _config_without_image(tmp_path: Path, *, run_mode: str, framework: str) -> Path:
+    path = tmp_path / f"benchmark-{run_mode}.yaml"
+    path.write_text(
+        f"""benchmark:
+  framework: {framework}
+  model: example/model
+  run_mode: {run_mode}
+  envs: {{}}
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _resolved(config: Path, tmp_path: Path):
+    roots = {}
+    for name in ("magpie", "tracelens", "inferencex"):
+        root = tmp_path / name
+        root.mkdir(exist_ok=True)
+        roots[name] = root
+    receipt = DependencyReceipt(
+        "apex.dependencies.receipt/v1",
+        "e" * 64,
+        Path("/verified/python"),
+        roots,
+        {"magpie": "1" * 40, "tracelens": "2" * 40, "inferencex": "3" * 40},
+        {},
+    )
+    return resolved_contract(config, receipt)
+
+
 def test_tag_only_input_is_observed_but_remains_partial(tmp_path: Path) -> None:
+    config = _config(tmp_path)
     provenance = ProvenanceResolver(ImageOnlySupervisor()).resolve(
-        _config(tmp_path), gpu_arch="gfx950"
+        _resolved(config, tmp_path), gpu_arch="gfx950"
     )
     assert provenance.container.image_id == "sha256:" + "a" * 64
     assert provenance.active_components == ("vllm", "aiter")
     assert provenance.status == "partial"
     assert "model_revision" in provenance.missing_evidence
     assert "source_lock:vllm" in provenance.missing_evidence
+    assert provenance.component_sources.to_dict()["schema"] == (
+        "apex.component-source-lock-set/v1"
+    )
+    assert provenance.component_sources.missing_exact_components == (
+        "vllm",
+        "aiter",
+    )
+    assert "source_locks" not in provenance.to_dict()
     assert not provenance.source_delivery_ready
 
 
+def test_component_source_lock_set_is_exact_and_component_owned(tmp_path: Path) -> None:
+    lock = RepositoryLock(
+        "vllm",
+        str(tmp_path.resolve()),
+        "https://example.invalid/vllm.git",
+        "a" * 40,
+        "b" * 40,
+        True,
+    )
+    sources = ComponentSourceLockSet(("vllm", "aiter"), (lock,))
+
+    assert sources.lock_for("vllm") == lock
+    assert sources.lock_for("aiter") is None
+    assert sources.exact_components == frozenset({"vllm"})
+    assert sources.missing_exact_components == ("aiter",)
+    assert sources.ready is False
+
+    with pytest.raises(ContractError) as inactive:
+        ComponentSourceLockSet(("aiter",), (lock,))
+    assert inactive.value.reason_code == "invalid_component_source_locks"
+
+    with pytest.raises(ContractError) as duplicate:
+        ComponentSourceLockSet(("vllm",), (lock, lock))
+    assert duplicate.value.reason_code == "invalid_component_source_locks"
+
+
 def test_missing_local_image_is_unresolved_not_an_intake_crash(tmp_path: Path) -> None:
+    config = _config(tmp_path)
     provenance = ProvenanceResolver(ImageOnlySupervisor(None)).resolve(
-        _config(tmp_path), gpu_arch="gfx950"
+        _resolved(config, tmp_path), gpu_arch="gfx950"
     )
     assert provenance.status == "unresolved"
     assert "image_digest" in provenance.missing_evidence
+
+
+@pytest.mark.parametrize(
+    ("run_mode", "framework", "missing"),
+    (
+        ("docker", "sglang", "runtime_image_selection"),
+        ("local", "atom", "local_runtime_identity"),
+        ("ray", "vllm", "ray_worker_runtime_identity"),
+    ),
+)
+def test_runtime_selected_local_and_ray_configs_remain_honestly_partial(
+    tmp_path: Path, run_mode: str, framework: str, missing: str
+) -> None:
+    supervisor = ImageOnlySupervisor()
+
+    config = _config_without_image(
+        tmp_path, run_mode=run_mode, framework=framework
+    )
+    provenance = ProvenanceResolver(supervisor).resolve(
+        _resolved(config, tmp_path), gpu_arch="gfx950"
+    )
+
+    assert provenance.status == "partial"
+    assert missing in provenance.missing_evidence
+    assert provenance.container.image_id is None
+    assert provenance.active_components == (framework,)
+    assert supervisor.environments == []
+    assert not provenance.source_delivery_ready
 
 
 def test_provenance_docker_environment_has_explicit_connection_policy(
@@ -81,7 +182,10 @@ def test_provenance_docker_environment_has_explicit_connection_policy(
     monkeypatch.setenv("BASH_ENV", "/tmp/injected-startup")
     supervisor = ImageOnlySupervisor()
 
-    ProvenanceResolver(supervisor).resolve(_config(tmp_path), gpu_arch="gfx950")
+    config = _config(tmp_path)
+    ProvenanceResolver(supervisor).resolve(
+        _resolved(config, tmp_path), gpu_arch="gfx950"
+    )
 
     environment = supervisor.environments[0]
     assert environment["DOCKER_HOST"] == "unix:///run/user/1000/docker.sock"
@@ -107,8 +211,9 @@ def test_asserted_source_commit_mismatch_fails_closed(tmp_path: Path) -> None:
     subprocess.run(("git", "-C", str(repository), "commit", "-q", "-m", "baseline"), check=True)
 
     with pytest.raises(IntegrityError) as failure:
+        config = _config(tmp_path)
         ProvenanceResolver().resolve(
-            _config(tmp_path),
+            _resolved(config, tmp_path),
             gpu_arch="gfx950",
             hints={
                 "model_revision": "revision-1",

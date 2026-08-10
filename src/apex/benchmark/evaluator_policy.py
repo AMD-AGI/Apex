@@ -1,15 +1,16 @@
-"""Typed evaluator-only policy derived from an immutable workload identity."""
+"""Typed Apex evaluator policy consumed from the frozen scoring view."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import re
 from typing import Any, Mapping
 
 from apex.core import ConfigurationError, sha256_json
 
 
-QWEN_CONFIG_SHA256 = "f97bda8e04655fbd1410bafb34072ec072de416ea7e24551d2618281e75deafb"
-QWEN_MODEL_ID = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_GIT = re.compile(r"[0-9a-f]{40}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +19,11 @@ class EvaluatorPolicy:
 
     policy_id: str
     tasks: str
+    task_definition_path: str
+    task_definition_sha256: str
+    dataset_path: str
+    dataset_name: str
+    dataset_revision: str
     primary_metric: str
     max_length: int
     max_gen_tokens: int
@@ -26,6 +32,11 @@ class EvaluatorPolicy:
         if (
             not self.policy_id
             or not self.tasks
+            or not self.task_definition_path
+            or not _SHA256.fullmatch(self.task_definition_sha256)
+            or not self.dataset_path
+            or not self.dataset_name
+            or not _GIT.fullmatch(self.dataset_revision)
             or not self.primary_metric
             or self.max_length < 1
             or self.max_gen_tokens < 1
@@ -37,12 +48,17 @@ class EvaluatorPolicy:
 
     @property
     def digest(self) -> str:
-        return sha256_json({"schema": "apex.evaluator-policy/v1", **asdict(self)})
+        return sha256_json({"schema": "apex.evaluator-policy/v2", **asdict(self)})
 
     def env(self) -> dict[str, str]:
         return {
             "MAGPIE_EVAL_POLICY_ID": self.policy_id,
             "MAGPIE_EVAL_TASKS": self.tasks,
+            "MAGPIE_EVAL_TASK_DEFINITION_PATH": self.task_definition_path,
+            "MAGPIE_EVAL_TASK_DEFINITION_SHA256": self.task_definition_sha256,
+            "MAGPIE_EVAL_DATASET_PATH": self.dataset_path,
+            "MAGPIE_EVAL_DATASET_NAME": self.dataset_name,
+            "MAGPIE_EVAL_DATASET_REVISION": self.dataset_revision,
             "MAGPIE_EVAL_PRIMARY_METRIC": self.primary_metric,
             "MAGPIE_EVAL_MAX_LENGTH": str(self.max_length),
             "MAGPIE_EVAL_MAX_GEN_TOKENS": str(self.max_gen_tokens),
@@ -52,45 +68,56 @@ class EvaluatorPolicy:
         return {**asdict(self), "sha256": self.digest}
 
 
-def qwen_evaluator_policy() -> EvaluatorPolicy:
-    """Construct the reviewed policy without import-time object creation."""
-
-    return EvaluatorPolicy(
-        policy_id="qwen3-next-80b-gsm8k-strict-v1",
-        tasks="gsm8k",
-        primary_metric="exact_match,strict-match",
-        max_length=2248,
-        max_gen_tokens=480,
-    )
-
-
-def resolve_evaluator_policy(
-    original_sha256: str, benchmark: Mapping[str, Any]
+def evaluator_policy_from_scoring(
+    benchmark: Mapping[str, Any],
 ) -> EvaluatorPolicy | None:
-    """Resolve only reviewed identities; never infer an output budget."""
+    """Parse explicit Apex-owned fields without model or config routing."""
 
-    if original_sha256 != QWEN_CONFIG_SHA256:
-        return None
     envs = benchmark.get("envs")
-    valid = (
-        benchmark.get("framework") == "vllm"
-        and benchmark.get("model") == QWEN_MODEL_ID
-        and isinstance(envs, Mapping)
-        and int(envs.get("MAX_MODEL_LEN", 0)) == 2248
-        and str(envs.get("MAGPIE_EVAL_TASKS", "gsm8k")) == "gsm8k"
-    )
-    if not valid:
-        raise ConfigurationError(
-            "Reviewed Qwen evaluator policy does not match workload fields",
-            "qwen_evaluator_policy_mismatch",
+    if not isinstance(envs, Mapping) or "RUN_EVAL" not in envs:
+        return None
+    fields = {
+        "policy_id": envs.get("MAGPIE_EVAL_POLICY_ID"),
+        "tasks": envs.get("MAGPIE_EVAL_TASKS"),
+        "task_definition_path": envs.get("MAGPIE_EVAL_TASK_DEFINITION_PATH"),
+        "task_definition_sha256": envs.get("MAGPIE_EVAL_TASK_DEFINITION_SHA256"),
+        "dataset_path": envs.get("MAGPIE_EVAL_DATASET_PATH"),
+        "dataset_name": envs.get("MAGPIE_EVAL_DATASET_NAME"),
+        "dataset_revision": envs.get("MAGPIE_EVAL_DATASET_REVISION"),
+        "primary_metric": envs.get("MAGPIE_EVAL_PRIMARY_METRIC"),
+        "max_length": envs.get("MAGPIE_EVAL_MAX_LENGTH"),
+        "max_gen_tokens": envs.get("MAGPIE_EVAL_MAX_GEN_TOKENS"),
+    }
+    try:
+        return EvaluatorPolicy(
+            policy_id=str(fields["policy_id"] or ""),
+            tasks=str(fields["tasks"] or ""),
+            task_definition_path=str(fields["task_definition_path"] or ""),
+            task_definition_sha256=str(fields["task_definition_sha256"] or ""),
+            dataset_path=str(fields["dataset_path"] or ""),
+            dataset_name=str(fields["dataset_name"] or ""),
+            dataset_revision=str(fields["dataset_revision"] or ""),
+            primary_metric=str(fields["primary_metric"] or ""),
+            max_length=_strict_int(fields["max_length"]),
+            max_gen_tokens=_strict_int(fields["max_gen_tokens"]),
         )
-    return qwen_evaluator_policy()
+    except (ConfigurationError, TypeError, ValueError) as error:
+        raise ConfigurationError(
+            "Apex scoring view lacks an explicit evaluator policy",
+            "invalid_evaluator_policy",
+        ) from error
+
+
+def _strict_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("evaluator integer field is invalid")
+    text = str(value)
+    if not text.isdigit() or text.startswith("0"):
+        raise ValueError("evaluator integer field is invalid")
+    return int(text)
 
 
 __all__ = [
     "EvaluatorPolicy",
-    "QWEN_CONFIG_SHA256",
-    "QWEN_MODEL_ID",
-    "qwen_evaluator_policy",
-    "resolve_evaluator_policy",
+    "evaluator_policy_from_scoring",
 ]

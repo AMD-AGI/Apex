@@ -161,6 +161,14 @@ class ParentEpisode:
     events: tuple[EpisodeEvent, ...]
     child_episode_ids: tuple[str, ...]
     terminal_status: str
+    task_reward: float | None
+    reward_vector: Mapping[str, Any] | None
+    reward_policy_id: str | None
+    reward_policy_digest: str | None
+    reward_source_receipt: str | None
+    raw_measurement_receipts: tuple[str, ...]
+    trainability: str
+    untrainable_reason: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +180,16 @@ class ParentEpisode:
             "events": [event.to_dict() for event in self.events],
             "child_episode_ids": list(self.child_episode_ids),
             "terminal_status": self.terminal_status,
+            "task_reward": self.task_reward,
+            "reward_vector": (
+                dict(self.reward_vector) if self.reward_vector is not None else None
+            ),
+            "reward_policy_id": self.reward_policy_id,
+            "reward_policy_digest": self.reward_policy_digest,
+            "reward_source_receipt": self.reward_source_receipt,
+            "raw_measurement_receipts": list(self.raw_measurement_receipts),
+            "trainability": self.trainability,
+            "untrainable_reason": self.untrainable_reason,
         }
 
 

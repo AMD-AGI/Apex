@@ -2,23 +2,21 @@
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
-import yaml
-
 from apex.core import AgentBackendName, ContractError, validate_identifier
+
+from .descriptor_loader import load_mapping_document
+from .template_authority import TemplateTaskAuthority
 
 
 _TRUSTED_RECIPE_PROVENANCE = {"trusted_registry", "external_evaluator"}
 _RECOGNIZED_LANGUAGES = {"python", "triton", "hip"}
 _DATASET_SPLITS = {"train", "validation", "heldout"}
 _DATA_VISIBILITIES = {"public", "private", "heldout_private"}
-
-
 def _relative_source_path(value: str, *, field_name: str) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or not path.parts or ".." in path.parts:
@@ -29,8 +27,6 @@ def _relative_source_path(value: str, *, field_name: str) -> str:
     if any(part in {"", "."} for part in path.parts):
         raise ContractError(f"Invalid {field_name}: {value!r}", "unsafe_source_path")
     return path.as_posix()
-
-
 def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -40,16 +36,12 @@ def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
     if any(not item for item in result):
         raise ContractError(f"{field_name} contains an empty value", "invalid_task_spec")
     return result
-
-
 def _mapping(value: Any, *, field_name: str) -> Mapping[str, Any]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
         raise ContractError(f"{field_name} must be an object", "invalid_task_spec")
     return value
-
-
 def _scope_terms(value: Any, *, field_name: str) -> tuple[str, ...]:
     return tuple(
         sorted(
@@ -59,8 +51,6 @@ def _scope_terms(value: Any, *, field_name: str) -> tuple[str, ...]:
             }
         )
     )
-
-
 @dataclass(frozen=True, slots=True)
 class CommandSpec:
     """A subprocess argv contract; shell strings are deliberately unsupported."""
@@ -98,11 +88,9 @@ class CommandSpec:
             "cwd": self.cwd,
             "env": dict(sorted(self.env.items())),
         }
-
-
 @dataclass(frozen=True, slots=True)
 class TaskRecipe:
-    """Trusted recipe identity; ``fixed_hip`` is reserved but not executable in V1."""
+    """Trusted recipe identity; caller-authored ``fixed_hip`` remains inert."""
 
     kind: str
     recipe_id: str
@@ -135,8 +123,6 @@ class TaskRecipe:
             "sha256": self.sha256,
             "provenance": self.provenance,
         }
-
-
 @dataclass(frozen=True, slots=True)
 class DeliverySpec:
     """Delivery is always a bundle; applying it is a trusted CLI action."""
@@ -413,19 +399,26 @@ class TaskSpec:
     delivery: DeliverySpec = field(default_factory=DeliverySpec)
     dataset_split: str = "train"
     data_visibility: str = "public"
+    template_authority: TemplateTaskAuthority | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise ContractError("Unsupported TaskSpec schema_version", "unsupported_schema")
         validate_identifier(self.task_id, field_name="task_id")
-        if self.mode != "optimize_existing":
+        if self.mode not in {"optimize_existing", "template_bound_image_kernel"}:
             raise ContractError(f"Unsupported task mode: {self.mode}", "unsupported_task_mode")
         if self.language not in _RECOGNIZED_LANGUAGES:
             raise ContractError(f"Unsupported language: {self.language}", "unsupported_language")
-        if self.language == "hip":
+        template_bound = self.mode == "template_bound_image_kernel"
+        if self.language == "hip" and not (template_bound and self.template_authority):
             raise ContractError(
                 "Standalone HIP execution is unavailable in V1",
                 "hip_execution_unavailable",
+            )
+        if template_bound != bool(self.template_authority):
+            raise ContractError(
+                "Template-bound execution requires internal reviewed authority",
+                "template_authority_required",
             )
         if not self.workspace.is_absolute() or not self.results_dir.is_absolute():
             raise ContractError("workspace and results_dir must be absolute", "path_not_absolute")
@@ -463,11 +456,36 @@ class TaskSpec:
             )
 
     def _validate_recipe(self) -> None:
+        if self.mode == "template_bound_image_kernel":
+            expected = "fixed_hip" if self.language == "hip" else "python_triton"
+            if (
+                self.recipe is None
+                or self.recipe.kind != expected
+                or self.recipe.provenance != "trusted_registry"
+            ):
+                raise ContractError(
+                    "Template-bound task requires its reviewed registry recipe",
+                    "recipe_language_mismatch",
+                )
+            if self.template_authority and (
+                self.recipe.sha256.removeprefix("sha256:")
+                != self.template_authority.evaluator_recipe_sha256
+            ):
+                raise ContractError(
+                    "Template recipe does not match its authority receipt",
+                    "invalid_template_authority",
+                )
+            return
         if self.recipe is not None and self.recipe.kind != "python_triton":
             raise ContractError("Python/Triton requires a python_triton recipe", "recipe_language_mismatch")
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "TaskSpec":
+        if data.get("template_authority") is not None:
+            raise ContractError(
+                "Template authority is created only by the reviewed materializer",
+                "template_authority_internal_only",
+            )
         commands_data = _mapping(data.get("commands"), field_name="commands")
         agent_data = _mapping(data.get("agent_options"), field_name="agent_options")
         budget_data = _mapping(data.get("budget"), field_name="budget")
@@ -519,14 +537,15 @@ class TaskSpec:
 
     @classmethod
     def from_file(cls, path: Path) -> "TaskSpec":
-        content = path.read_text(encoding="utf-8")
-        data = yaml.safe_load(content) if path.suffix.lower() in {".yaml", ".yml"} else json.loads(content)
-        if not isinstance(data, Mapping):
-            raise ContractError("TaskSpec document must contain an object", "invalid_task_spec")
+        data = load_mapping_document(
+            path,
+            reason_code="invalid_task_spec",
+            document_name="TaskSpec document",
+        )
         return cls.from_mapping(data)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "schema_version": self.schema_version,
             "task_id": self.task_id,
             "workspace": str(self.workspace),
@@ -556,6 +575,9 @@ class TaskSpec:
             "dataset_split": self.dataset_split,
             "data_visibility": self.data_visibility,
         }
+        if self.template_authority is not None:
+            value["template_authority"] = self.template_authority.to_dict()
+        return value
 
 
 @dataclass(frozen=True, slots=True)

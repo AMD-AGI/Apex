@@ -149,6 +149,18 @@ def _report_document(
         "task_id": graph.parent.task_id,
         "workload_state_hash": graph.workload_state_hash,
         "policy_ids": list(graph.policy_ids),
+        "terminal_reward": {
+            "task_reward": graph.parent.task_reward,
+            "reward_vector": _redact(graph.parent.reward_vector),
+            "policy_id": graph.parent.reward_policy_id,
+            "policy_digest": graph.parent.reward_policy_digest,
+            "source_receipt": graph.parent.reward_source_receipt,
+            "raw_measurement_receipts": list(
+                graph.parent.raw_measurement_receipts
+            ),
+            "trainability": graph.parent.trainability,
+            "untrainable_reason": graph.parent.untrainable_reason,
+        },
         "provenance": _redact(graph.provenance),
         "headline_measured_results": measured_results,
         "attempts": attempts,
@@ -186,6 +198,12 @@ def _is_headline_measurement(event: Any) -> bool:
 
 def _render_markdown(document: Mapping[str, Any]) -> str:
     summary = document["summary"]
+    terminal = document["terminal_reward"]
+    task_reward = (
+        "null"
+        if terminal["task_reward"] is None
+        else f"{terminal['task_reward']:.6g}"
+    )
     lines = [
         "# Apex optimization report",
         "",
@@ -193,6 +211,9 @@ def _render_markdown(document: Mapping[str, Any]) -> str:
         f"- Episode graph: `{document['episode_graph_id']}`",
         f"- Journal high-water mark: `{document['high_water_mark']}`",
         f"- Terminal status: `{document['terminal_status']}`",
+        f"- Task reward: `{task_reward}`",
+        f"- Reward policy: `{terminal['policy_id'] or 'unscored'}`",
+        f"- Reward trainability: `{terminal['trainability']}`",
         f"- Attempts: {summary['attempt_count']} ({summary['kept_count']} kept, "
         f"{summary['reverted_count']} reverted, {summary['failure_count']} failures)",
         "",

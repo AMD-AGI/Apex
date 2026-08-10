@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -16,6 +15,12 @@ from apex.evaluation import GateVerdict, kernel_reward
 from apex.storage import ArtifactReceipt, ArtifactStore
 
 from .e2e_validation import allows_source_free_e2e, validate_e2e_export_reward
+from .export_sanitization import (
+    HOST_PATH_POLICY,
+    encode_public_artifact,
+    redact_host_paths,
+    summarize_export,
+)
 from .models import CandidateEpisode, EpisodeArtifact, EpisodeGraph, SemanticRole
 
 
@@ -60,7 +65,7 @@ class DatasetExportConfig:
     policy_id: str | None = None
     on_incomplete: str = "fail"
     include_sft: bool = True
-    exporter_version: str = "apex_rl_export_v2"
+    exporter_version: str = "apex_rl_export_v3"
 
     def __post_init__(self) -> None:
         if self.on_incomplete not in {"fail", "skip"}:
@@ -94,7 +99,7 @@ class DatasetExporter:
     ) -> DatasetExportResult:
         chosen = config or DatasetExportConfig()
         _validate_export_partition(graph, chosen)
-        parent_document = graph.parent.to_dict()
+        parent_document = redact_host_paths(graph.parent.to_dict())
         _reject_secrets(parent_document)
         records, sft, skipped = self._select_records(graph, chosen)
         payloads = _dataset_payloads(parent_document, records, sft, skipped, chosen)
@@ -123,7 +128,6 @@ class DatasetExporter:
             if reason is not None:
                 if chosen.on_incomplete == "fail" and reason not in {
                     "split_filtered",
-                    "private_excluded_from_train",
                     "policy_filtered",
                 }:
                     raise ContractError(
@@ -154,10 +158,6 @@ class DatasetExporter:
             and config.policy_id not in child.policy_ids
         ):
             return "policy_filtered"
-        if config.split == "train" and (
-            child.split == "heldout" or child.visibility in {"private", "heldout_private"}
-        ):
-            return "private_excluded_from_train"
         if child.trainability != "complete":
             return ",".join(child.validation_reasons) or "episode_truncated"
         return None
@@ -177,7 +177,7 @@ class DatasetExporter:
             raise IntegrityError("ContextPacket is not JSON", "invalid_context_packet_artifact") from error
         _reject_secrets(observation)
         artifact_values, candidate_text = self._materialize_artifacts(child)
-        events = [event.to_dict() for event in child.events]
+        events = redact_host_paths([event.to_dict() for event in child.events])
         _reject_secrets(events)
         self._validate_reward(graph, child)
         roles: dict[str, list[Mapping[str, Any]]] = {}
@@ -201,7 +201,7 @@ class DatasetExporter:
             "observation": {
                 "context_packet_id": child.context_packet_id,
                 "receipt": child.context_packet_receipt.to_dict(),
-                "content": observation,
+                "content": redact_host_paths(observation),
             },
             "observations": _events_with_roles(child, {SemanticRole.OBSERVATION}),
             "actions": _events_with_roles(child, {SemanticRole.ACTION}),
@@ -223,7 +223,7 @@ class DatasetExporter:
             },
             "failures": _events_with_roles(child, {SemanticRole.FAILURE}),
             "artifacts_by_role": {key: roles[key] for key in sorted(roles)},
-            "provenance": dict(graph.provenance),
+            "provenance": redact_host_paths(dict(graph.provenance)),
             "termination": {"status": child.status, "verdict": child.verdict},
             "split": child.split,
             "visibility": child.visibility,
@@ -242,12 +242,18 @@ class DatasetExporter:
         for (role, _), artifact in sorted(unique.items()):
             content = self._artifacts.read_bytes(artifact.receipt)
             _reject_artifact_secrets(content, artifact.receipt.media_type)
-            encoding, body = _encode_artifact(content, artifact.receipt)
+            encoding, body, redaction_policy = encode_public_artifact(
+                content, artifact.receipt
+            )
             value = {
                 "role": role,
                 "receipt": artifact.receipt.to_dict(),
                 "encoding": encoding,
                 "content": body,
+                "redaction_policy_id": redaction_policy,
+                "export_sha256": sha256_bytes(
+                    body.encode("utf-8") if encoding == "utf-8" else content
+                ),
             }
             values.append(value)
             if role in {
@@ -277,7 +283,7 @@ class DatasetExporter:
     ) -> None:
         if not child.policy_ids:
             return
-        if "e2e_kernel_candidate_v1" in child.policy_ids:
+        if "e2e_throughput_qos_v1" in child.policy_ids:
             validate_e2e_export_reward(graph, child, self._artifacts)
             return
         if "kernel_robust_v1" not in child.policy_ids:
@@ -328,6 +334,17 @@ class DatasetExporter:
 def _validate_export_partition(
     graph: EpisodeGraph, config: DatasetExportConfig
 ) -> None:
+    private = tuple(
+        child.attempt_id
+        for child in graph.children
+        if child.visibility != "public" or child.split == "heldout"
+    )
+    if private:
+        raise ContractError(
+            "Private episode evidence cannot enter a public dataset export",
+            "private_dataset_evidence",
+            {"attempt_ids": private},
+        )
     if len(graph.policy_ids) > 1 and config.policy_id is None:
         raise ContractError(
             "Mixed reward policies require an explicit export partition",
@@ -346,14 +363,14 @@ def _dataset_payloads(
     sft_jsonl = b"".join(canonical_json_bytes(item) + b"\n" for item in sft)
     document = {
         "schema_name": "apex.rl_dataset",
-        "schema_version": 1,
+        "schema_version": 2,
         "exporter_version": config.exporter_version,
         "parent_episode": parent,
         "records": records,
     }
     validation = {
         "schema_name": "apex.rl_dataset_validation",
-        "schema_version": 1,
+        "schema_version": 2,
         "valid": True,
         "record_count": len(records),
         "sft_count": len(sft),
@@ -383,7 +400,7 @@ def _dataset_manifest(
 ) -> dict[str, Any]:
     return {
         "schema_name": "apex.rl_dataset_manifest",
-        "schema_version": 1,
+        "schema_version": 2,
         "exporter_version": config.exporter_version,
         "episode_graph_id": graph.graph_id,
         "episode_graph_sha256": sha256_bytes(graph.canonical_bytes),
@@ -398,6 +415,35 @@ def _dataset_manifest(
         ),
         "split_filter": config.split,
         "policy_filter": config.policy_id,
+        "visibility_policy": {
+            "policy_id": "public_episode_only_fail_closed_v1",
+            "summary": (
+                "Only public episode evidence is exportable; private and "
+                "heldout_private evidence aborts the entire export."
+            ),
+        },
+        "redaction_policy": {
+            "policy_id": HOST_PATH_POLICY,
+            "summary": (
+                "Credentials abort export; private host absolute paths are "
+                "deterministically replaced while original CAS receipts remain bound."
+            ),
+        },
+        "license_policy": {
+            "policy_id": "source_terms_preserved_no_relicense_v1",
+            "summary": (
+                "The export does not relicense source or evidence; consumers must "
+                "honor the licenses attached to the originating run and artifacts."
+            ),
+        },
+        "retention_policy": {
+            "policy_id": "manifest_bound_export_retention_v1",
+            "summary": (
+                "All exported projections are retained as one immutable digest-bound "
+                "inventory; original evaluator evidence remains in the source CAS."
+            ),
+        },
+        "summary": summarize_export(records),
         "files": {
             name: sha256_bytes(content) for name, content in sorted(payloads.items())
         },
@@ -407,21 +453,9 @@ def _dataset_manifest(
 def _events_with_roles(
     child: CandidateEpisode, roles: set[SemanticRole]
 ) -> list[dict[str, Any]]:
-    return [event.to_dict() for event in child.events if event.semantic_role in roles]
-
-
-def _encode_artifact(content: bytes, receipt: ArtifactReceipt) -> tuple[str, str]:
-    textual = receipt.media_type.startswith("text/") or receipt.media_type in {
-        "application/json",
-        "application/x-ndjson",
-        "application/yaml",
-    }
-    if textual:
-        try:
-            return "utf-8", content.decode("utf-8")
-        except UnicodeDecodeError:
-            pass
-    return "base64", base64.b64encode(content).decode("ascii")
+    return redact_host_paths(
+        [event.to_dict() for event in child.events if event.semantic_role in roles]
+    )
 
 
 def _reject_artifact_secrets(content: bytes, media_type: str) -> None:

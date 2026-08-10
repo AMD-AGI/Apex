@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from apex.core import DependencyError
 
 from .dependencies import DependencyBootstrapper, PythonEnvironment, load_lock
+from .evaluator_lock import EvaluatorPolicyLock, load_evaluator_policy_lock
 from .lm_eval_lock import load_lm_eval_runtime_lock
 from .lm_eval_runtime import (
     LmEvalRuntimeReceipt,
@@ -37,6 +38,7 @@ class DependencyReceipt:
     raw: Mapping[str, Any]
     lm_eval_runtime: LmEvalRuntimeReceipt | None = None
     source_locks: SourceLockReceipt | None = None
+    evaluator_policy: EvaluatorPolicyLock | None = None
 
     def root(self, name: str) -> Path:
         try:
@@ -81,6 +83,11 @@ def verify_runtime_dependencies(*, apex_root: Path | None = None) -> DependencyR
         )
         environment = PythonEnvironment(Path(sys.prefix), sys.executable, offline=True)
         raw = DependencyBootstrapper(lock, resolver, environment).verify()
+        dependencies = raw["dependencies"]
+        evaluator_policy = load_evaluator_policy_lock(
+            root / "scripts" / "evaluator_policy.lock.json",
+            inferencex_root=Path(str(dependencies["inferencex"]["root"])),
+        )
         lm_eval_runtime = _optional_lm_eval_runtime(root)
         source_locks = _verify_e2e_source_locks(root)
     except BootstrapError as error:
@@ -88,9 +95,9 @@ def verify_runtime_dependencies(*, apex_root: Path | None = None) -> DependencyR
             f"Pinned dependency verification failed: {error}",
             "dependency_receipt_invalid",
         ) from error
-    dependencies = raw["dependencies"]
     combined = dict(raw)
     combined["e2e_source_locks"] = source_locks.to_dict()
+    combined["evaluator_policy"] = evaluator_policy.to_dict()
     return DependencyReceipt(
         schema=str(raw["schema"]),
         lock_sha256=str(raw["lock_sha256"]),
@@ -100,6 +107,7 @@ def verify_runtime_dependencies(*, apex_root: Path | None = None) -> DependencyR
         raw=combined,
         lm_eval_runtime=lm_eval_runtime,
         source_locks=source_locks,
+        evaluator_policy=evaluator_policy,
     )
 
 

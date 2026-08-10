@@ -69,6 +69,12 @@ class KernelMeasurementEvaluation:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class KernelMeasurementCapture:
+    artifact: KernelMeasurementArtifact
+    execution: KernelMeasurementExecutionReceipt
+
+
 def evaluate_kernel_measurement(
     resolved: ResolvedTaskSpec,
     *,
@@ -79,6 +85,29 @@ def evaluate_kernel_measurement(
     evaluator: KernelMeasurementPort | None,
 ) -> KernelMeasurementEvaluation:
     """Measure through a trusted port and recompute the grade from its sealed output."""
+
+    return grade_kernel_measurement(
+        capture_kernel_measurement(
+            resolved,
+            candidate_root=candidate_root,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            output_root=output_root,
+            evaluator=evaluator,
+        )
+    )
+
+
+def capture_kernel_measurement(
+    resolved: ResolvedTaskSpec,
+    *,
+    candidate_root: Path,
+    run_id: str,
+    attempt_id: str,
+    output_root: Path,
+    evaluator: KernelMeasurementPort | None,
+) -> KernelMeasurementCapture:
+    """Capture and validate raw evidence without committing a grade or reward."""
 
     contract = resolved.task.measurement
     if contract is None:
@@ -122,6 +151,15 @@ def evaluate_kernel_measurement(
         measurement_policy=policy,
     )
     _validate_artifact_binding(artifact, execution, contract)
+    return KernelMeasurementCapture(artifact, execution)
+
+
+def grade_kernel_measurement(
+    capture: KernelMeasurementCapture,
+) -> KernelMeasurementEvaluation:
+    """Recompute the canonical grade from one already validated raw capture."""
+
+    artifact = capture.artifact
     grade = grade_kernel(
         GateVerdict(
             compiled=True,
@@ -134,7 +172,36 @@ def evaluate_kernel_measurement(
         measurement_policy=artifact.policy,
         aggregation=artifact.aggregation,
     )
-    return KernelMeasurementEvaluation(artifact, execution, grade)
+    return KernelMeasurementEvaluation(artifact, capture.execution, grade)
+
+
+def load_kernel_measurement_capture(
+    resolved: ResolvedTaskSpec,
+    *,
+    report_path: Path,
+    execution: KernelMeasurementExecutionReceipt,
+) -> KernelMeasurementCapture:
+    """Reload a CAS report and independently revalidate its frozen policy binding."""
+
+    contract = resolved.task.measurement
+    if contract is None:
+        raise ContractError(
+            "No trusted standalone kernel measurement contract is configured",
+            "measurement_contract_missing",
+        )
+    policy = _measurement_policy(contract)
+    if execution.measurement_policy_sha256 != sha256_json(policy.to_dict()):
+        raise IntegrityError(
+            "Measurement execution receipt binds another grading policy",
+            "measurement_policy_mismatch",
+        )
+    artifact = load_kernel_measurement_report(
+        report_path,
+        aggregation=GradeAggregation(contract.aggregation),
+        measurement_policy=policy,
+    )
+    _validate_artifact_binding(artifact, execution, contract)
+    return KernelMeasurementCapture(artifact, execution)
 
 
 def _execute(
@@ -397,4 +464,11 @@ def _measurement_policy(contract: KernelMeasurementSpec) -> MeasurementPolicy:
     )
 
 
-__all__ = ["KernelMeasurementEvaluation", "evaluate_kernel_measurement"]
+__all__ = [
+    "KernelMeasurementCapture",
+    "KernelMeasurementEvaluation",
+    "capture_kernel_measurement",
+    "evaluate_kernel_measurement",
+    "grade_kernel_measurement",
+    "load_kernel_measurement_capture",
+]

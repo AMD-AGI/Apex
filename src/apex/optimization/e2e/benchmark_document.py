@@ -70,6 +70,14 @@ def benchmark_document(result: NormalizedBenchmarkResult) -> dict[str, Any]:
             ),
         },
         "serving_runtime": asdict(result.serving_runtime),
+        "local_runtime": {
+            **asdict(result.local_runtime),
+            "source_root": (
+                str(result.local_runtime.source_root)
+                if result.local_runtime.source_root
+                else None
+            ),
+        },
         "artifacts": [str(path) for path in result.artifacts],
         "errors": list(result.errors),
         "command_exit_code": result.command_exit_code,

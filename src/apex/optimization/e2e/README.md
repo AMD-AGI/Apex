@@ -18,9 +18,16 @@ Concrete adapters implement the typed ports in `services.py` and the
 
 Production composition uses `AgentCandidateWorker` with the default Codex-first
 registry, `E2EDeferredMicroQualifier` when no trusted raw-sample micro harness is
-available, and `DockerOverlayDeployment` for runtime-only vLLM/AITER experiments.
-The reviewed Qwen profile uses `QwenCompositeMicroQualifier`: vLLM routes to
-`DockerOracleMicroQualifier`, which executes a small source-relative subset of
+available, and `CandidateDeploymentRegistry` around the reviewed
+`DockerOverlayDeployment` for runtime-only vLLM/AITER experiments. The registry
+routes only by the kernel opportunity's source component and delegates the exact
+component/run-mode capability check to its adapter; model names and config
+filenames are never routing keys. It persists the selected adapter ID in the
+deployment receipt so rollback and recovery do not depend on mutable process
+state. An unowned component fails with `delivery_adapter_unavailable`.
+The reviewed Qwen qualification data composes the generic
+`ComponentMicroQualifierRegistry`: vLLM routes to `DockerOracleMicroQualifier`,
+which executes a small source-relative subset of
 the exact locked vLLM tests in an immutable candidate-overlay image, while AITER
 routes to frozen-source-only `E2EDeferredMicroQualifier` because no equivalent
 reviewed micro oracle exists. Both lanes still continue through evaluator safety
@@ -47,7 +54,9 @@ the exact ID and re-inspects it both before and after the build. It never falls 
 to a caller-supplied mutable tag.
 
 Formal delivery is an explicit reviewed capability, never an inference from a
-runtime overlay. `SourceRebuildFinalDelivery` accepts only a
+runtime overlay. The general production composition defaults to
+`UnavailableFinalDelivery`; it never selects a model/config-specific recipe.
+`SourceRebuildFinalDelivery` accepts only a
 controller-owned `FormalSourceDeliveryProfile` for the exact immutable parent
 image and exact changed repository set. A profile binds vLLM/AITER source URLs,
 editable allowlists, dependency order, licensing metadata, and a fixed-argv
@@ -55,16 +64,13 @@ editable allowlists, dependency order, licensing metadata, and a fixed-argv
 boundaries: a `PrimarySourceBuildPort` for the first clean source build,
 loaded-byte/quality/performance validation and SBOM, and an `E2EBundleVerifier`
 whose separate backends perform the second clone, rebuild, engagement probe, and
-unchanged replay. The production default selects this binding only for the exact
-reviewed Qwen3-Next 80B FP8 Magpie acceptance config, parent image, model revision,
-and vLLM/AITER source locks; every identity drift fails closed. Other workloads
-remain ineligible until they receive their own reviewed binding.
-For that one config, composition injects the reviewed model revision and local
-source-lock paths before provenance resolution; conflicting user hints are
-rejected rather than silently replaced.
+unchanged replay. The Qwen qualification helper can be injected explicitly for
+its exact reviewed acceptance config, parent image, model revision, and
+vLLM/AITER source locks; every identity drift fails closed. It is not the default
+E2E controller and cannot be selected by a model name or config filename.
 
-`deployment_hints.hf_cache_path` may bind an existing absolute Hugging Face
-cache. Set `deployment_hints.hf_offline: true` as a YAML boolean to freeze
+The CLI's `--hf-cache-path` may bind an existing absolute Hugging Face cache.
+Set `--hf-offline` to freeze
 `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, and `HF_DATASETS_OFFLINE` in every
 benchmark view; string or numeric coercions are rejected, and offline mode is
 invalid without the verified cache path.
@@ -72,11 +78,32 @@ invalid without the verified cache path.
 Internal responsibilities are intentionally narrow:
 
 - `benchmarking.py` binds measurements and TraceLens diagnostics to journal/CAS.
+- `benchmark_recording.py` publishes a benchmark observation only after its
+  normalized evidence and optional local-server lineage are in CAS.
+- `server_lineage.py` replays local reuse/cleanup generations from canonical
+  events. Server source/compatibility/process identity is separate from the
+  client config, so client-only shape changes do not invent a new server.
+  Cleanup must consume the exact active generation, is always
+  `reward_eligible=false`, carries no attempt/candidate/opportunity identity,
+  and produces `cleanup_succeeded=true`; stale-anchor, old-lease, REVERT without
+  cleanup, and reuse of a retired generation fail closed.
 - `benchmark_document.py` serializes the complete normalized benchmark evidence,
   including the verified Magpie serving-runtime receipt.
 - `benchmark_artifacts.py` stores the exact input config, normalized result,
-  evaluator-owned quality document, raw report, quality results/samples, and side
-  evidence as distinct CAS artifacts; no local Magpie workspace is recovery truth.
+  evaluator-owned quality document, unchanged public report, Apex execution
+  attestation, and quality results/samples as distinct CAS roles; no local
+  Magpie workspace is recovery truth and the report cannot supply Apex-private
+  lane or runtime fields.
+- `preflight.py` resolves intake provenance and freezes/validates all benchmark
+  views before a GPU lease is requested; resume repeats those identity checks
+  before reacquiring a device. Its GPU-free receipt records orthogonal
+  framework/run-mode/lifecycle/precision/source-component dimensions and the
+  separately truthful benchmark, micro, source-optimization, formal-delivery,
+  and sanitizer capability states.
+- Runtime provenance supplies one `ComponentSourceLockSet` for the active
+  framework/toolchain components. Its exact and missing component sets are
+  frozen into both provenance and GPU-free preflight; deployment/final delivery
+  query that set instead of assuming a vLLM/AITER tuple.
 - `kernel_lane.py` turns measured evidence into source-only opportunities.
 - `oracles.py` resolves version-locked source paths to reviewed correctness tests.
 - `oracle_preflight.py` owns Qwen tests-only policy, source locks, and qualification.
@@ -84,6 +111,8 @@ Internal responsibilities are intentionally narrow:
 - `context.py` compiles a fresh bounded `ContextPacket` from durable state and
   identity-compatible measured experience projected from the same canonical journal.
 - `candidate.py` materializes the isolated checkout and owns agent outcome routing.
+- `agent_request.py` binds controller-issued permission to the exact E2E run,
+  provenance, context packet, opportunity, candidate projection, and source anchor.
 - `candidate_fingerprint.py` owns bounded tree/Git traversal, source fingerprints,
   and pre-hash entry, depth, file-size, and changed-byte budgets.
 - `candidate_snapshot.py` owns bounded source identity, immutable byte capture,
@@ -91,11 +120,17 @@ Internal responsibilities are intentionally narrow:
   agent workspace.
 - `candidate_record.py` persists frozen candidate bytes and their CAS manifest.
 - `deferred.py` represents the no-micro-harness truth boundary without reward.
+- `component_micro.py` owns model-neutral, source-component routing between
+  reviewed micro authorities and emits the selected route in durable evidence.
 - `overlay_runtime.py` owns fixed-argv Docker inspection, build, and byte probes.
 - `overlay_config.py` derives immutable image-only benchmark views.
 - `overlay_lineage.py` validates the committed KEEP ancestry and hashed per-layer
   build receipts before an exact derived image ID can become a Docker parent.
 - `docker_overlay.py` binds source locks, runtime engagement, and overlay receipts.
+- `component_deployment.py` owns the `(source component, run mode)` deployment
+  registry, rejects only overlapping pairs, and emits its model-neutral
+  capability receipt. One component may therefore have distinct Docker, local,
+  and Ray adapters without a model/config branch.
 - `deployment_artifacts.py` records the three derived measurement, diagnostic, and
   replay configs in CAS against the deployment's typed SHA-256 identities.
 - `source_delivery_models.py` defines trusted repository/profile and primary-build ports.
@@ -104,8 +139,15 @@ Internal responsibilities are intentionally narrow:
 - `source_image_runtime.py` builds a reproducible source-baked image, SPDX SBOM, and byte probes.
 - `source_image_sbom.py` emits the deterministic file-level SPDX 2.3 inventory.
 - `source_delivery_adapters.py` owns primary measurement and independent rebuild/replay adapters.
-- `qwen_profile.py` binds the one reviewed Qwen acceptance config and immutable source/image locks.
-- `qwen_qualification.py` routes vLLM and AITER to distinct reviewed truth boundaries.
+- `qwen_profile.py` retains the reviewed vLLM/AITER qualification recipes and
+  immutable source/image locks. Its resolver selects by Magpie-declared
+  framework, requested components, and runtime image capability; model identity,
+  filename, and config digest remain provenance only.
+
+The production composition root installs that exact-lock capability profile for
+both initial execution and resume: reviewed correctness routes, strict/deferred
+micro routes, provenance injection, and source-rebuild final delivery cannot
+silently disappear after a process restart.
 - `search.py` consumes the bounded queue and closes every non-infrastructure
   attempt with one evaluator decision/reward outcome.
 - `promotion.py` runs the counterbalanced `A, B, B, A` promotion window under one
@@ -113,6 +155,10 @@ Internal responsibilities are intentionally narrow:
   one content-addressed matched-pair receipt.
 - `promotion_recovery.py` recomputes that receipt from canonical observation
   evidence and rejects role, order, config, image, anchor, or lease substitution.
+- `quality_failure_recovery.py` replays the distinct quality-hard-stop path from
+  the normalized result, unchanged report, Apex execution attestation, raw
+  quality artifacts, deployment receipt, decision, and reward; it cannot infer a
+  failed quality gate from a summary or absent paired-promotion window.
 - `search_support.py` owns immutable attempt records and deployment/runtime
   identity validation; `outcomes.py` owns outcome grading and atomic commit.
 - `learning.py` appends the post-decision measured experience and associates each
@@ -130,14 +176,30 @@ Internal responsibilities are intentionally narrow:
   `recovery_bindings.py` cross-checks config/quality/measurement event-to-CAS
   joins. `recovery_search.py` projects the accepted chain, live anchor, active
   configs, current diagnosis, and in-flight attempt from canonical events and CAS.
+- `recovery_context.py` and `recovery_outcome.py` keep the small anchor/view and
+  decision/reward transaction checks pure; `run_contracts.py` centralizes resume
+  GPU scope, optimizable-config, objective/accuracy, artifact, and terminal-phase
+  invariants used by composition.
+- `recovery_plan.py` serializes and restores the exact opportunity order plus its
+  kernel-family GPU-time coverage receipt.
+- `source_delivery_receipts.py` is the strict primary source-benchmark receipt
+  reader/writer; `terminal_reward.py` is the only task-terminal E2E reward
+  publisher and requires raw second-clean-replay evidence.
 - `result.py` owns the terminal result schema and atomic write.
 
 ## Invariants
 
 Only regular Python/Triton source inside a resolved root and backed by an
 independent correctness oracle enters the candidate lane. Config-only proposals
-cannot be constructed. The run root contains a CAS-bound `run.request.json`,
-per-action completion receipts, and a CAS-bound full opportunity plan. `apex run
+cannot be constructed. Before an agent starts, the selected kernel families must
+cover at least 90% of measured GPU time under
+`kernel_family_gpu_time_coverage_v1`; any single family whose operation and
+runtime identity all remain unclassified may account for at most 2%. Insufficient
+coverage fails diagnosis and requires broader or targeted recapture instead of
+silently optimizing the retained trace prefix. The run root contains a CAS-bound `run.request.json` for
+private recovery plus a path-free `apex.e2e-reward-contract/v1` artifact for
+acceptance/reward replay, per-action completion receipts, and a CAS-bound full
+opportunity plan. `apex run
 resume --run ...` replays the canonical journal (never the disposable snapshot),
 rebuilds every accepted candidate and the current anchor from immutable evidence,
 then reconciles BASELINING, DIAGNOSING, agent generation, micro, safety, delivery,
@@ -190,6 +252,10 @@ candidate and is prohibited.
 After every candidate worker exits, `run_record.py` writes one canonical
 `apex.agent-transcript/v3` CAS artifact and projects its normalized actions into
 attempt-scoped `agent_message`, `tool_called`, and `tool_result` journal events.
+The transcript's v4 invocation receipt includes explicit E2E-controller
+execution authority and an stdin-only prompt policy. Missing/mismatched
+authority or any redacted backend credential echo rejects the attempt before
+candidate freeze and cannot produce a decision or reward.
 Structured usage and explicit provider cost become separate `usage_recorded` and
 `cost_recorded` events before `agent_completed`/`agent_failed`; all are marked
 `self_reported` and carry source-event indexes plus the transcript receipt. They
@@ -231,6 +297,15 @@ isolated immutable deployment with loaded-byte proof, and unchanged Magpie
 quality plus normal performance. This is deliberately not presented as strict
 micro ordering or as a kernel-level correctness/reward result.
 
+The safety step does not launch a sanitizer. Every Magpie configuration can run
+under `VerificationPolicy.no_tools()`, which records
+`sanitizer_runtime=not_implemented` and `safety_certified=false`. Only a complete
+receipt from an independent trusted evaluator may establish a finding or satisfy
+a required safety gate. Advisory missing/unsupported/inconclusive evidence may
+continue without certification; formal delivery carries that uncertified state
+and cannot infer clean coverage. The detailed truth table lives only in the
+[primary safety contract](../../evaluation/safety/README.md).
+
 The reviewed Qwen preflight adds a candidate-rejection check between freeze and
 safety. Passing means only that the exact pinned pytest node IDs executed with
 the expected JUnit case count; it does not upgrade the deferred claim. The
@@ -271,13 +346,43 @@ Every selected opportunity has one explicit attempt child. Candidate E2E
 measurements carry that attempt, candidate, and opportunity lineage; they do not
 reuse action IDs as episode identity. Compile/correctness/safety/delivery rejects,
 invalid candidate measurement, and measured KEEP/REVERT outcomes each close with
-exactly one decision and one `e2e_kernel_candidate_v1` reward in the same journal
+exactly one decision and one `e2e_throughput_qos_v1` reward in the same journal
 transaction. Retrying a used attempt ID fails closed.
+
+A trusted candidate quality failure is a separate hard-stop outcome. Apex stores
+the candidate's normalized benchmark, unchanged Magpie report, independent
+execution attestation, quality result/sample files, deployed runtime identity,
+and decision inputs, skips the remaining performance legs, atomically commits
+`REVERT` with reason `quality_gate_failed`, and records the policy-defined runtime-
+only reward `20` with `performance_skipped=quality_gate`. It does not manufacture
+an A/B/B/A receipt or throughput comparison. Recovery and RL export reconstruct
+that exact evidence set and reward; a missing raw quality artifact, mismatched
+deployment, official-report private field, or summary-only claim is an integrity
+failure, not a quality stop.
+
+The run also has one distinct task-terminal reward. After source-rebuild
+verification, the second fresh clean replay runs at least three paired A/B/B/A
+windows against the original baseline. Its report and quality files are copied
+into the main Apex CAS, the evaluator recomputes `e2e_throughput_qos_v1`, and the
+result records `task_reward`, vector, policy, source receipt, and raw measurement
+identities. This terminal value is not derived from the attempt rewards. Invalid
+or incomplete final proof is explicitly untrainable with `task_reward=null`.
+
+Source-rebuild policy is component-driven rather than model-driven. The trusted
+composition profile freezes repository, language, engagement kind, and whether
+a build ID is mandatory for each component. Clean replay recomputes the clean
+materialization and primary runtime identities, requires a distinct runtime
+identity per observation, and retains each raw measurement's evaluator-owned
+execution-attestation role. Self-declared bundle capabilities or freshness
+booleans cannot authorize final delivery.
 
 A successful `CandidateDeployment` names one immutable `deployed_image_id` and
 must carry the same ID in its derived-image evidence. Before any candidate E2E
-grade, Apex requires Magpie's serving-runtime receipt to prove both the requested
-and actually resolved container image equal that exact deployment ID. Missing,
+grade, Apex requires the evaluator-owned
+`apex.magpie-serving-runtime-observation/v3` to prove both the requested and
+actually resolved container image equal that exact deployment ID. Its
+`container_spec_sha256` names the canonical Docker-inspect process spec, never a
+Docker launch argv. Missing,
 mutable, or drifted identity rolls back the candidate and terminates as
 infrastructure failure without a decision or reward; agent text and derived YAML
 are not runtime-engagement proof.
@@ -305,7 +410,12 @@ a policy fingerprint, is intentionally ineligible for formal success.
 
 The GPU lease spans the entire run and its full receipt is bound to every promotion
 pair. The initial run request freezes the physical device scope; resume must acquire
-the same scope and fails before journal mutation if it changed. Ownership evidence
+the same scope under a new receipt and fails before journal mutation if the device
+changed or the interrupted receipt was reused. Every measurement leg stores an
+Apex-owned pre/post heartbeat bracket in CAS; missing, expired, owner-drifted, or
+device-drifted brackets stop evidence recording, reward, and delivery. RL replay
+reconstructs each bracket and binds it to the exact promotion action and lease.
+Ownership evidence
 with a foreign process is not promotion evidence. Leases remain cooperative and
 fail-fast; this package does not discover or kill unrelated processes.
 
@@ -315,7 +425,8 @@ Benchmark execution and diagnostic analysis enter through ports. Context assembl
 depends on `apex.context` and the curated `apex.knowledge` retrieval API. Control
 state is owned by `apex.orchestration`; evidence bytes are owned by `apex.storage`.
 Source materialization uses Git without initializing or traversing submodules.
-Safety and final delivery remain evaluator-owned boundaries.
+Safety receipt validation and final delivery remain evaluator-owned boundaries;
+this package does not schedule a sanitizer process.
 Docker overlays require one exact clean vLLM/AITER source lock whose repository
 bytes match the installed parent image. They do not mount or modify host
 site-packages, and rollback merely selects the previous immutable config/image.
@@ -340,6 +451,12 @@ failure receipt and terminate as `infrastructure_error`; they do not commit a
 candidate reject, rotate to another opportunity, or run a final baseline replay.
 Missing source provenance or second-clean-replay proof can retain primary
 evidence but cannot produce formal success.
+
+A verified quality-gate failure is not infrastructure failure: it closes the
+active attempt as the explicit runtime-only REVERT above and never runs candidate
+performance. If the quality failure cannot be reconstructed from evaluator-owned
+raw artifacts and the deployed runtime identity, the attempt is untrainable or
+fails integrity validation rather than receiving the hard-stop reward.
 
 If the search accepts no source candidate, Apex still runs and records the final
 normal measurement so baseline-versus-replay drift remains observable. That
@@ -379,6 +496,37 @@ are not retroactively rewritten when later loaded-byte checks succeed. The
 separate `formal_delivery_verified` field becomes true only for
 `succeeded/source_rebuild_verified`, so a truthful partial intake cannot be
 mistaken for an unverified final delivery.
+Raw-config, runtime-hint, dependency/view, provenance, and resume-oracle failures
+occur before GPU acquisition. A config that delegates Docker image selection to
+Magpie, or uses local/Ray execution, may proceed with honest partial intake
+provenance; it cannot enter source deployment or formal delivery until its
+runtime, source, and engagement evidence is complete.
+New formal CLI runs also carry the non-circular campaign baseline receipt in the
+typed E2E spec. `_prepare` stores it in CAS and emits the shared
+`campaign_baseline` dependency event before workload initialization; the durable
+run request retains the same bytes. Resume accepts only a currently reconstructed
+receipt byte-identical to the original. CPU fixtures may omit it without making
+a live qualification claim.
+`apex optimize e2e --config ... --results /new/path --dry-run` writes a
+canonical `preflight.json` without creating a run or acquiring a GPU. A
+`config_compatible` receipt means only that the Apex adapter projected the
+frozen config through the pinned published Magpie main model; it is not execution evidence.
+Only that status authorizes Apex to reconstruct and freeze executable phase
+views. A `capability_upgrade_required` dry run returns the exact Apex blockers
+with `view_status=capability_upgrade_required` and null measurement/semantics
+hashes; a real run rejects it before provenance observation or GPU acquisition.
+The preflight's framework, run mode, lifecycle, precision, model identity,
+requirements, source-runtime components, and reward contract are projections of
+the Apex plan over Magpie's public effective model rather than a second runtime
+workload implementation. Release collection separately requires Apex plan and
+capability-receipt digests for every config in the frozen corpus. The generated
+27-row ledger cannot satisfy a live qualification gate by itself.
+`source_optimization.status` independently
+distinguishes `ready`, `evidence_pending`, and
+`capability_upgrade_required`. When production uses the component registry,
+`source_optimization.routing` records the exact adapter, source-component, and
+run-mode ownership without carrying model identity. None of these receipts is a
+workflow, GPU, winner, or formal-delivery qualification.
 Terminal result bytes are written to CAS and linked from a `delivery_result`
 journal event before the run transitions to a terminal phase. `result.json` is
 only a byte-checked projection; resume never trusts modified metrics or details.
@@ -392,10 +540,12 @@ closed.
 
 CPU-only tests cover dynamic eligibility, config exclusion, safe symlink/gitlink
 handling, 300-sample enforcement, retry and fresh-context history, safety blocking,
+component-owned deployment routing, duplicate ownership rejection, durable
+rollback routing, model-neutral capability receipts,
 immutable parent binding for tag, image-ID, and repo-digest inputs, bounded Docker
 retry/failure evidence, candidate-versus-infrastructure deployment failure,
 current-overlay chaining, KEEP/REVERT rollback, atomic decision/reward lineage,
-explicit no-source reward, GPU lease scope/contention,
+explicit no-source and trusted quality-hard-stop rewards, GPU lease scope/contention,
 attempt-scoped message/tool/usage/cost lineage, final provenance failure, crash
 recovery injected after every candidate gate and after one, two, or three promotion
 observations, complete-pair reuse, physical-scope drift before journal mutation,
@@ -426,6 +576,9 @@ hashes, anchor/state generations, candidate source digests, opportunity identity
 benchmark semantics, and agent transcript events bind their exact structured
 source indexes. Runtime-overlay evidence is explicitly weaker than
 `SOURCE_REBUILD_VERIFIED` and is never relabeled as formal delivery.
+Quality-hard-stop provenance retains the unchanged public report separately from
+the Apex attestation and raw evaluator files; it is not synthesized from the
+decision or scalar reward.
 
 No implementation in this package was copied from GEAK, HyperLoom, Magpie, or
 TraceLens. Their externally integrated evidence/knowledge remains identified by

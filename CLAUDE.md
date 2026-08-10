@@ -16,7 +16,7 @@ apex dependencies verify --json
 Authenticate the `claude` CLI separately. Apex does not install credentials or
 bundle access to Anthropic services.
 
-Select Claude for a run with `--agent-backend claude`; omitting the option selects
+Select Claude for a run with `--backend claude`; omitting the option selects
 Codex. Backend selection must not change the trusted task descriptor, context
 semantics, evaluator policy, iteration budget, timeout, or delivery contract. A
 comparison with Codex or Cursor is fair only when those inputs remain identical.

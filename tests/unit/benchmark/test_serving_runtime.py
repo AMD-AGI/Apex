@@ -59,7 +59,7 @@ def _report(*, derived: bool = False) -> dict[str, object]:
     return {
         "framework": "vllm",
         "serving_runtime_receipt": {
-            "schema": "magpie.serving-runtime-receipt/v2",
+            "schema": "apex.magpie-serving-runtime-observation/v3",
             "execution_mode": "docker",
             "input_config_sha256": CONFIG,
             "input_image": input_image,
@@ -74,7 +74,7 @@ def _report(*, derived: bool = False) -> dict[str, object]:
                 resolved_image_id=resolved_image_id,
             ),
             "container_name": "magpie-benchmark-attempt-1",
-            "docker_argv_sha256": "c" * 64,
+            "container_spec_sha256": "c" * 64,
             "process_succeeded": True,
             "verified": True,
             "errors": [],
@@ -107,6 +107,7 @@ def test_accepts_exact_direct_config_image_and_process_binding() -> None:
     assert evidence.input_image_id == IMAGE
     assert evidence.requested_image == IMAGE
     assert evidence.resolved_image_id == IMAGE
+    assert evidence.container_spec_sha256 == "c" * 64
     assert evidence.image_derivation == _lineage()
 
 
@@ -186,7 +187,7 @@ def test_rejects_unverified_malformed_or_legacy_receipt() -> None:
     for key, value in (
         ("process_succeeded", False),
         ("verified", False),
-        ("docker_argv_sha256", "not-a-digest"),
+        ("container_spec_sha256", "not-a-digest"),
         ("errors", ["docker_image_inspect_failed"]),
     ):
         report = copy.deepcopy(_report())
@@ -201,7 +202,7 @@ def test_rejects_unverified_malformed_or_legacy_receipt() -> None:
     receipt["extra"] = True
     assert _parse(report).error == "serving_runtime_receipt_key_set_mismatch"
     del receipt["extra"]
-    receipt["schema"] = "magpie.serving-runtime-receipt/v1"
+    receipt["schema"] = "magpie.serving-runtime-receipt/v2"
     assert _parse(report).error == "serving_runtime_receipt_invalid"
 
 

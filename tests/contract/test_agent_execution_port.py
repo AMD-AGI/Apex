@@ -9,6 +9,7 @@ from apex.ports import (
     AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
     AgentCost,
+    AgentExecutionAuthorityReceipt,
     AgentInvocationReceipt,
     AgentProcessContainmentReceipt,
     AgentResult,
@@ -83,6 +84,18 @@ def test_normalized_agent_evidence_validates_lineage_and_numeric_domain() -> Non
 
 
 def _invocation(max_turns: int = 2) -> AgentInvocationReceipt:
+    authority = AgentExecutionAuthorityReceipt(
+        authority_id="test-formal-controller-v1",
+        authority_kind="evaluation_contract",
+        run_id="run-1",
+        attempt_id="attempt-1",
+        backend="codex",
+        workspace="/tmp/workspace",
+        allowed_files=("kernel.py",),
+        requested_environment_keys=(),
+        parent_receipt_sha256="c" * 64,
+        source_anchor_sha256="d" * 64,
+    )
     return AgentInvocationReceipt(
         cli_name="codex",
         cli_version="test",
@@ -92,6 +105,8 @@ def _invocation(max_turns: int = 2) -> AgentInvocationReceipt:
         argv=("codex", "exec"),
         workspace="/tmp/workspace",
         prompt_transport="stdin",
+        execution_authority=authority,
+        credential_environment_key="OPENAI_API_KEY",
         requested_allowed_files=("kernel.py",),
         allowed_files_enforced_by_cli=False,
         max_turns=max_turns,

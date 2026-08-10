@@ -16,7 +16,7 @@ from apex.benchmark import (
     QualityMetric,
     ThroughputMetrics,
 )
-from apex.core import ConfigurationError, IntegrityError, TaskStatus
+from apex.core import ConfigurationError, ContractError, IntegrityError, TaskStatus
 from apex.diagnostics import (
     AcquisitionCoverage,
     EvidenceArtifacts,
@@ -29,10 +29,15 @@ from apex.diagnostics import (
     derive_candidate_id,
 )
 from apex.intake import E2EOptimizeSpec
-from apex.optimization.e2e import E2EOptimizeUseCase
+from apex.optimization.e2e import E2EOptimizeUseCase, write_preflight_result
 from apex.orchestration import RunController, RunPhase
-from apex.ports import BenchmarkPass, DiagnosticsResult
+from apex.ports import (
+    BenchmarkPass,
+    DiagnosticsResult,
+    MagpieFormalMeasurementSupport,
+)
 from apex.runtime import (
+    ComponentSourceLockSet,
     ContainerIdentity,
     DependencyReceipt,
     GpuDeviceIdentity,
@@ -46,6 +51,8 @@ from apex.runtime import (
     RunProvenance,
 )
 from apex.storage import EventJournal, SnapshotStore
+from tests.support.magpie_contract import ResolvedPlanStub
+from tests.support.gpu_evidence import StaticGpuDoctorInspector
 
 
 class _FakeOwnershipInspector:
@@ -81,10 +88,15 @@ class _FakeOwnershipInspector:
         )
 
 
+class _ForbiddenLeaseManager:
+    def acquire(self, *_args, **_kwargs):
+        raise AssertionError("GPU lease must not be requested before preflight passes")
+
+
 def _gpu_leases(tmp_path: Path) -> LocalGpuLeaseManager:
     return LocalGpuLeaseManager(
         lock_root=tmp_path / "gpu-leases",
-        ownership_inspector=_FakeOwnershipInspector(),
+        doctor_inspector=StaticGpuDoctorInspector(_FakeOwnershipInspector()),
     )
 
 
@@ -92,6 +104,12 @@ class FakeBenchmark:
     def __init__(self, final_throughput: float = 99.5) -> None:
         self.calls = 0
         self.final_throughput = final_throughput
+
+    def formal_measurement_support(
+        self, execution_mode: str, lifecycle: str
+    ) -> MagpieFormalMeasurementSupport:
+        del execution_mode, lifecycle
+        return MagpieFormalMeasurementSupport(True, None, "test")
 
     def run_normalized(self, request):
         self.calls += 1
@@ -139,6 +157,19 @@ class FakeBenchmark:
         )
 
 
+class UnavailableQualityBenchmark(FakeBenchmark):
+    def formal_measurement_support(
+        self, execution_mode: str, lifecycle: str
+    ) -> MagpieFormalMeasurementSupport:
+        del execution_mode, lifecycle
+        return MagpieFormalMeasurementSupport(
+            False,
+            "magpie_local_quality_execution_unavailable",
+            None,
+            ("magpie_inferencex_eval_argument_mismatch",),
+        )
+
+
 class FakeDiagnostics:
     def analyze(self, request):
         kernel = KernelEvidence("unknown_kernel", "triton", "aiter")
@@ -159,7 +190,7 @@ class FakeDiagnostics:
             OperationEvidence("unknown", "unknown_kernel"),
             kernel,
             shape,
-            KernelVolume(10, 10.0, 10.0),
+            KernelVolume(10, 95.0, 95.0),
             PerformanceModelEvidence(),
             EvidenceArtifacts(
                 "torch_profiler_summary",
@@ -189,21 +220,26 @@ class CrashDiagnostics:
 
 
 class FakeProvenance:
-    def resolve(self, config_path, *, gpu_arch, hints=None):
+    def resolve(self, resolved, *, gpu_arch, hints=None):
         return RunProvenance(
-            1,
-            str(config_path),
+            2,
+            str(resolved.config_path),
             "a" * 64,
             "vllm",
             "Qwen/example",
             None,
             gpu_arch,
+            "docker",
             ContainerIdentity("example:v1", "sha256:" + "d" * 64, (), ()),
-            ("vllm", "aiter"),
-            (),
+            ComponentSourceLockSet(("vllm", "aiter"), ()),
             "partial",
             ("model_revision", "source_lock:vllm", "source_lock:aiter"),
         )
+
+
+class ForbiddenProvenance:
+    def resolve(self, *_args, **_kwargs):
+        raise AssertionError("provenance must not run for an unsupported config")
 
 
 def _receipt(tmp_path: Path) -> DependencyReceipt:
@@ -246,11 +282,13 @@ def _spec(tmp_path: Path, results: Path) -> E2EOptimizeSpec:
 
 def test_e2e_vertical_slice_records_trace_and_no_regression(tmp_path: Path) -> None:
     results = tmp_path / "run"
+    receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
-        dependency_receipt=_receipt(tmp_path),
+        dependency_receipt=receipt,
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
         gpu_leases=_gpu_leases(tmp_path),
     )
     result = use_case.run(_spec(tmp_path, results))
@@ -299,7 +337,8 @@ def test_intake_config_failure_does_not_leave_a_running_run(tmp_path: Path) -> N
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
-        gpu_leases=_gpu_leases(tmp_path),
+        resolved_plans=ResolvedPlanStub(receipt),
+        gpu_leases=_ForbiddenLeaseManager(),
     )
 
     with pytest.raises(ConfigurationError) as failure:
@@ -308,6 +347,179 @@ def test_intake_config_failure_does_not_leave_a_running_run(tmp_path: Path) -> N
     assert failure.value.reason_code == "lm_eval_runtime_missing"
     assert not results.exists()
     assert not tuple(tmp_path.glob(".apex-e2e-configs-*"))
+
+
+def test_live_results_overlapping_dependency_fail_before_gpu(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    results = receipt.root("magpie") / "ignored-formal-results"
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=FakeBenchmark(),
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+
+    with pytest.raises(ContractError) as failure:
+        use_case.run(_spec(tmp_path, results))
+
+    assert failure.value.reason_code == "formal_results_overlap"
+    assert not results.exists()
+
+
+def test_e2e_preflight_emits_capability_receipt_without_gpu_lease(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "preflight"
+    receipt = _receipt(tmp_path)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=FakeBenchmark(),
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+
+    preview = use_case.preview(_spec(tmp_path, results))
+
+    assert preview.to_dict()["status"] == "config_compatible"
+    assert preview.to_dict()["gpu_acquired"] is False
+    assert preview.to_dict()["dimensions"]["framework"] == "vllm"
+    source = preview.to_dict()["capabilities"]["source_optimization"]
+    assert source["status"] == "capability_upgrade_required"
+    assert source["routing"] is None
+    assert preview.to_dict()["provenance"]["component_source_locks"] == {
+        "schema": "apex.component-source-lock-set/v1",
+        "required_components": ["vllm", "aiter"],
+        "locks": [],
+        "exact_components": [],
+        "missing_exact_components": ["vllm", "aiter"],
+    }
+    assert not results.exists()
+    path = write_preflight_result(preview, results)
+    assert path == results / "preflight.json"
+    assert json.loads(path.read_text())["gpu_acquired"] is False
+    assert not tuple(tmp_path.glob(".apex-e2e-preflight-*"))
+
+
+def test_e2e_preflight_reports_default_execution_attestor_unavailable(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+
+    preview = use_case.preview(_spec(tmp_path, tmp_path / "preflight")).to_dict()
+
+    assert preview["capabilities"]["benchmark_execution"] == {
+        "adapter_id": "pinned-magpie-benchmark-v1",
+        "available": False,
+        "reason": "magpie_execution_attestor_unavailable",
+    }
+    assert preview["capabilities"]["formal_measurement"] == {
+        "available": False,
+        "reason": "magpie_execution_attestor_unavailable",
+        "evaluator_execution_mode": None,
+        "blockers": ["magpie_execution_attestor_unavailable"],
+    }
+
+
+def test_e2e_run_rejects_missing_attestor_before_gpu_lease(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+
+    with pytest.raises(ContractError) as caught:
+        use_case.run(_spec(tmp_path, tmp_path / "formal-results"))
+
+    assert caught.value.reason_code == "magpie_execution_attestor_unavailable"
+
+
+def test_e2e_run_rejects_missing_quality_authority_before_gpu_lease(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=UnavailableQualityBenchmark(),
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+
+    with pytest.raises(ContractError) as caught:
+        use_case.run(_spec(tmp_path, tmp_path / "formal-results"))
+
+    assert caught.value.reason_code == "magpie_local_quality_execution_unavailable"
+
+
+def test_e2e_preflight_reports_capability_upgrade_without_materializing_views(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "upgrade-preflight"
+    receipt = _receipt(tmp_path)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        benchmark=FakeBenchmark(),
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(
+            receipt,
+            status="capability_upgrade_required",
+            blockers=("framework:future-serving",),
+        ),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+
+    preview = use_case.preview(_spec(tmp_path, results)).to_dict()
+
+    assert preview["schema"] == "apex.e2e-preflight/v2"
+    assert preview["status"] == "capability_upgrade_required"
+    assert preview["config"]["view_status"] == "capability_upgrade_required"
+    assert preview["config"]["effective_measurement_sha256"] is None
+    assert preview["config"]["workload_semantics_sha256"] is None
+    assert preview["magpie_contract"]["blockers"] == [
+        "framework:future-serving"
+    ]
+    assert not results.exists()
+
+
+def test_e2e_run_rejects_capability_upgrade_before_provenance_or_gpu(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        provenance=ForbiddenProvenance(),
+        resolved_plans=ResolvedPlanStub(
+            receipt,
+            status="capability_upgrade_required",
+            blockers=("framework:future-serving",),
+        ),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+
+    with pytest.raises(ContractError) as caught:
+        use_case.run(_spec(tmp_path, tmp_path / "upgrade-run"))
+
+    assert caught.value.reason_code == "capability_upgrade_required"
 
 
 def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Path) -> None:
@@ -319,6 +531,7 @@ def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Pat
         benchmark=benchmark,
         diagnostics=CrashDiagnostics(),
         provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
         gpu_leases=_gpu_leases(tmp_path),
     )
     with pytest.raises(RuntimeError, match="simulated process loss"):
@@ -335,6 +548,7 @@ def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Pat
         benchmark=benchmark,
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
         gpu_leases=_gpu_leases(tmp_path),
     ).resume(results)
 
@@ -366,6 +580,7 @@ def test_resume_rejects_mutated_run_request_projection(tmp_path: Path) -> None:
         benchmark=FakeBenchmark(),
         diagnostics=CrashDiagnostics(),
         provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
         gpu_leases=_gpu_leases(tmp_path),
     )
     with pytest.raises(RuntimeError, match="simulated process loss"):
@@ -382,6 +597,7 @@ def test_resume_rejects_mutated_run_request_projection(tmp_path: Path) -> None:
             benchmark=FakeBenchmark(),
             diagnostics=FakeDiagnostics(),
             provenance=FakeProvenance(),
+            resolved_plans=ResolvedPlanStub(receipt),
             gpu_leases=_gpu_leases(tmp_path),
         ).resume(results)
     assert failure.value.reason_code == "run_request_projection_mismatch"
@@ -395,6 +611,7 @@ def test_terminal_resume_rejects_unbound_result_projection(tmp_path: Path) -> No
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
         gpu_leases=_gpu_leases(tmp_path),
     )
     use_case.run(_spec(tmp_path, results))
@@ -413,11 +630,13 @@ def test_e2e_no_winner_final_replay_drift_remains_observed_evidence(
     tmp_path: Path,
 ) -> None:
     results = tmp_path / "run-regression"
+    receipt = _receipt(tmp_path)
     result = E2EOptimizeUseCase(
-        dependency_receipt=_receipt(tmp_path),
+        dependency_receipt=receipt,
         benchmark=FakeBenchmark(final_throughput=98.0),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
         gpu_leases=_gpu_leases(tmp_path),
     ).run(_spec(tmp_path, results))
     assert result.status is TaskStatus.NO_GAIN

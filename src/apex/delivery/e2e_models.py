@@ -94,6 +94,33 @@ def _matches_allowlist(path: str, allowlist: Sequence[str]) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceComponentCapability:
+    """Trusted source-to-runtime engagement policy for one repository."""
+
+    repository_id: str
+    runtime_component: str
+    engagement_kind: str
+    build_id_required: bool = False
+
+    def __post_init__(self) -> None:
+        validate_identifier(self.repository_id, field_name="repository_id")
+        validate_identifier(self.runtime_component, field_name="runtime_component")
+        if (
+            self.engagement_kind
+            not in {"python_import", "process_map", "linker_build_id"}
+            or self.build_id_required
+            and self.engagement_kind == "python_import"
+        ):
+            raise ContractError(
+                "Source component engagement capability is invalid",
+                "invalid_source_delivery_profile",
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class SourceFileChange:
     """Exact before/after identity for one Git source change."""
 
@@ -187,6 +214,8 @@ class SourceRepositoryLock:
     clean_base: bool
     license_id: str
     runtime_component: str
+    engagement_kind: str = "python_import"
+    build_id_required: bool = False
 
     def __post_init__(self) -> None:
         validate_identifier(self.repository_id, field_name="repository_id")
@@ -205,6 +234,15 @@ class SourceRepositoryLock:
             raise ContractError("Formal source locks require a clean base", "dirty_source_base")
         if not self.license_id.strip() or not self.runtime_component.strip():
             raise ContractError("Source license/runtime provenance is missing", "invalid_source_lock")
+        if (
+            self.engagement_kind
+            not in {"python_import", "process_map", "linker_build_id"}
+            or self.build_id_required
+            and self.engagement_kind == "python_import"
+        ):
+            raise ContractError(
+                "Source engagement capability is invalid", "invalid_source_lock"
+            )
         if self.repository_id in self.dependencies or len(set(self.dependencies)) != len(self.dependencies):
             raise ContractError("Repository dependencies are invalid", "invalid_source_lock")
         for dependency in self.dependencies:
@@ -231,6 +269,15 @@ class SourceRepositoryLock:
         value["changes"] = [item.to_dict() for item in self.changes]
         return value
 
+    @property
+    def component_capability(self) -> SourceComponentCapability:
+        return SourceComponentCapability(
+            self.repository_id,
+            self.runtime_component,
+            self.engagement_kind,
+            self.build_id_required,
+        )
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "SourceRepositoryLock":
         try:
@@ -255,6 +302,8 @@ class SourceRepositoryLock:
                 clean_base=value["clean_base"] is True,
                 license_id=str(value["license_id"]),
                 runtime_component=str(value["runtime_component"]),
+                engagement_kind=str(value["engagement_kind"]),
+                build_id_required=value["build_id_required"] is True,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ContractError("Source repository lock is malformed", "invalid_source_lock") from error
@@ -482,6 +531,7 @@ __all__ = [
     "BuildStep",
     "BundleProvenanceLock",
     "DerivedImageIdentity",
+    "SourceComponentCapability",
     "SourceFileChange",
     "SourceRepositoryLock",
     "replay_semantics",

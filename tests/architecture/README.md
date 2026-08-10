@@ -15,7 +15,9 @@ sections that violate the contract.
 
 Every Python package is documented, imports point down an acyclic layer graph,
 package exports are explicit, cross-package consumers avoid private names, and
-source files/functions remain below the reviewability caps.
+source files/functions remain below the reviewability caps. E2E production
+behavior cannot branch on model-family strings, benchmark filenames, or literal
+config hashes; it must consume Magpie's resolved capability contract.
 
 ## Dependencies
 

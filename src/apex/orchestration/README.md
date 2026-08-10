@@ -31,12 +31,26 @@ Each selected opportunity also creates one explicit, globally unique `attempt_id
 That ID is carried through candidate, qualification, measurement, decision, and
 reward events; it is never inferred from an action or substituted with a candidate
 ID. Failed pre-measurement gates enter `DECIDING` without manufacturing a decision.
-The evaluator then commits exactly one `e2e.candidate_decided` plus one
-`reward_committed` in a single journal transaction. A transaction fault therefore
+After any authoritative `measurement_result`, the evaluator commits exactly one
+`reward_committed` followed by one `e2e.candidate_decided` in a single journal
+transaction. A transaction fault therefore
 leaves both absent, never a half-committed training outcome. Source-free agent
 outcomes retain a null candidate ID and an explicit REJECT.
 `atomic.py` owns the short causal append/reduce transaction primitive; the
 controller remains the only production caller and snapshot publisher.
+
+Task finalization records one separate `scope=task_terminal` reward only after
+the second clean replay and before the terminal result projection. It does not
+advance the live anchor and is never synthesized by the reducer from prior
+attempts. If terminal proof is absent, the run can retain its honest delivery
+status while the parent task reward remains null and untrainable.
+
+Safety state records the external receipt, policy and plan fingerprint, candidate
+and deployed digests, case set, and anchor/state generation. Resume rebuilds that
+fingerprint and rejects stale-generation evidence instead of checking only for an
+old result file. The state machine validates receipts and applies the pure policy;
+it never schedules a sanitizer process. The full state vocabulary and truth table
+are centralized in [the primary safety contract](../evaluation/safety/README.md).
 
 ## Purpose
 

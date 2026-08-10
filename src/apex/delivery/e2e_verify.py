@@ -17,11 +17,17 @@ from apex.core import (
     sha256_bytes,
     sha256_json,
 )
-from apex.execution import SubprocessSupervisor
+from apex.execution import (
+    DOCKER_RUNTIME_ENVIRONMENT_KEYS,
+    GPU_RUNTIME_ENVIRONMENT_KEYS,
+    HF_RUNTIME_ENVIRONMENT_KEYS,
+    SubprocessSupervisor,
+    build_subprocess_environment,
+)
 from apex.runtime import canonical_repository
 
 from .e2e_bundle import E2EPatchBundle, finalize_verified_e2e_bundle, load_and_verify_e2e_bundle, verify_replay_config_invariants
-from .e2e_models import BuildRecipeLock, DerivedImageIdentity
+from .e2e_models import BuildRecipeLock, DerivedImageIdentity, SourceComponentCapability
 from .e2e_receipts import (
     CleanReplayReceipt,
     BuildStepReceipt,
@@ -31,6 +37,11 @@ from .e2e_receipts import (
     SourceBuildReceipt,
 )
 from .git_patch import CleanPatchMaterializer, RepositoryApplyReceipt
+from .e2e_verify_validation import (
+    validate_build_receipt,
+    validate_engagement_receipt,
+    validate_replay_receipt,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +69,7 @@ class ReplayRequest:
     source_stack_sha256: str
     primary_environment_id: str
     expected_image: DerivedImageIdentity
+    baseline_config: Path
     replay_config: Path
     config_receipt: ReplayConfigInvariantReceipt
     engagement_receipt: LoadedByteEngagementReceipt
@@ -69,14 +81,11 @@ class ReplayRequest:
 class SourceBuildBackend(Protocol):
     def build(self, request: SourceBuildRequest) -> SourceBuildReceipt: ...
 
-
 class EngagementBackend(Protocol):
     def verify_loaded_bytes(self, request: EngagementRequest) -> LoadedByteEngagementReceipt: ...
 
-
 class CleanReplayBackend(Protocol):
     def replay(self, request: ReplayRequest) -> CleanReplayReceipt: ...
-
 
 class BuildAttestor(Protocol):
     def attest(self, request: SourceBuildRequest) -> SourceBuildReceipt: ...
@@ -99,8 +108,6 @@ class SupervisedRecipeBuildBackend:
         self._supervisor = supervisor or SubprocessSupervisor(max_output_bytes=16 * 1024 * 1024)
 
     def build(self, request: SourceBuildRequest) -> SourceBuildReceipt:
-        environment = os.environ.copy()
-        environment.pop("PYTHONPATH", None)
         receipts: list[BuildStepReceipt] = []
         for index, step in enumerate(request.recipe.steps):
             root = request.repository_roots.get(step.repository_id)
@@ -110,8 +117,21 @@ class SupervisedRecipeBuildBackend:
             resolved = cwd.resolve(strict=True)
             if resolved != root.resolve() and root.resolve() not in resolved.parents or not resolved.is_dir():
                 raise IntegrityError("Build step cwd escapes source root", "unsafe_build_cwd")
-            step_environment = dict(environment)
-            step_environment.update(dict(step.environment))
+            step_environment = build_subprocess_environment(
+                dict(step.environment),
+                inherit=(
+                    *DOCKER_RUNTIME_ENVIRONMENT_KEYS,
+                    *GPU_RUNTIME_ENVIRONMENT_KEYS,
+                    *HF_RUNTIME_ENVIRONMENT_KEYS,
+                ),
+                fixed={
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_SYSTEM": os.devnull,
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                },
+            )
             result = self._supervisor.run(
                 step.argv,
                 cwd=resolved,
@@ -212,21 +232,40 @@ class E2EBundleVerifier:
         *,
         trusted_recipes: Mapping[str, BuildRecipeLock],
         trusted_source_urls: Mapping[str, str],
+        trusted_recipe_capabilities: Mapping[
+            str, tuple[SourceComponentCapability, ...]
+        ],
         build_backend: SourceBuildBackend,
         engagement_backend: EngagementBackend,
         replay_backend: CleanReplayBackend,
         materializer: CleanPatchMaterializer | None = None,
         default_source_overrides: Mapping[str, Path] | None = None,
-        trusted_recipe_repositories: Mapping[str, frozenset[str]] | None = None,
     ) -> None:
         self._trusted_recipes = dict(trusted_recipes)
         self._trusted_source_urls = dict(trusted_source_urls)
+        self._trusted_recipe_capabilities = {
+            key: tuple(value) for key, value in trusted_recipe_capabilities.items()
+        }
+        if set(self._trusted_recipe_capabilities) != set(self._trusted_recipes):
+            raise ContractError(
+                "Every trusted recipe requires component capabilities",
+                "invalid_source_delivery_profile",
+            )
+        for digest, recipe in self._trusted_recipes.items():
+            repository_ids = {
+                item.repository_id
+                for item in self._trusted_recipe_capabilities[digest]
+            }
+            if repository_ids != {item.repository_id for item in recipe.steps}:
+                raise ContractError(
+                    "Recipe capabilities do not match its source steps",
+                    "invalid_source_delivery_profile",
+                )
         self._build = build_backend
         self._engagement = engagement_backend
         self._replay = replay_backend
         self._materializer = materializer or CleanPatchMaterializer()
         self._default_source_overrides = dict(default_source_overrides or {})
-        self._trusted_recipe_repositories = dict(trusted_recipe_repositories or {})
 
     def verify(
         self,
@@ -272,14 +311,15 @@ class E2EBundleVerifier:
         trusted = self._trusted_recipes.get(recipe_sha)
         if trusted is None or trusted.to_dict() != candidate.recipe.to_dict():
             return "untrusted_build_recipe"
-        trusted_repositories = self._trusted_recipe_repositories.get(recipe_sha)
-        candidate_repositories = frozenset(
-            item.repository_id for item in candidate.repositories
-        )
-        if (
-            trusted_repositories is not None
-            and trusted_repositories != candidate_repositories
-        ):
+        trusted_capabilities = {
+            item.repository_id: item.to_dict()
+            for item in self._trusted_recipe_capabilities[recipe_sha]
+        }
+        observed_capabilities = {
+            item.repository_id: item.component_capability.to_dict()
+            for item in candidate.repositories
+        }
+        if trusted_capabilities != observed_capabilities:
             return "untrusted_build_recipe"
         urls_match = all(
             repository.repository_id in self._trusted_source_urls
@@ -313,7 +353,7 @@ class E2EBundleVerifier:
             results_dir / "source-build",
         )
         evidence.build = self._build.build(request)
-        _validate_build_receipt(candidate, evidence.build)
+        validate_build_receipt(candidate, evidence.build)
         evidence.engagement = self._engagement.verify_loaded_bytes(
             EngagementRequest(
                 candidate.digest,
@@ -322,7 +362,7 @@ class E2EBundleVerifier:
                 evidence.build,
             )
         )
-        _validate_engagement_receipt(candidate, evidence.build, evidence.engagement)
+        validate_engagement_receipt(candidate, evidence.build, evidence.engagement)
         measurement_sha, replay_sha, semantics_sha = verify_replay_config_invariants(
             candidate.config_paths["benchmark_measurement"],
             candidate.config_paths["benchmark_replay"],
@@ -341,6 +381,7 @@ class E2EBundleVerifier:
                 candidate.primary_evidence.source_stack_sha256,
                 candidate.primary_evidence.environment_id,
                 candidate.derived_image,
+                candidate.config_paths["benchmark_original"],
                 candidate.config_paths["benchmark_replay"],
                 evidence.config,
                 evidence.engagement,
@@ -349,7 +390,13 @@ class E2EBundleVerifier:
                 results_dir / "clean-replay",
             )
         )
-        _validate_replay_receipt(candidate, evidence.config, evidence.replay)
+        validate_replay_receipt(
+            candidate,
+            evidence.config,
+            evidence.replay,
+            evidence.repositories,
+            results_dir / "clean-replay",
+        )
 
 
 def _verification_result(
@@ -357,6 +404,7 @@ def _verification_result(
     evidence: _VerificationEvidence,
     reason_code: str | None = None,
 ) -> DeliveryVerificationResult:
+    evidence_valid = reason_code is None
     verdict = delivery_terminal_policy(
         source_locks_resolved=bool(candidate.repositories),
         overlay_verified=candidate.primary_evidence.overlay_verified,
@@ -365,7 +413,9 @@ def _verification_result(
         build_verified=bool(evidence.build and evidence.build.verified),
         engagement_verified=bool(evidence.engagement and evidence.engagement.verified),
         config_verified=bool(evidence.config and evidence.config.verified),
-        clean_replay_verified=bool(evidence.replay and evidence.replay.verified),
+        clean_replay_verified=bool(
+            evidence_valid and evidence.replay and evidence.replay.verified
+        ),
     )
     return DeliveryVerificationResult(
         candidate.digest,
@@ -398,83 +448,6 @@ def _publish_outcome(
         else None
     )
     return BundleVerifyOutcome(result, result_path, final)
-
-
-def _validate_build_receipt(bundle: E2EPatchBundle, receipt: SourceBuildReceipt) -> None:
-    if (
-        receipt.bundle_digest != bundle.digest
-        or receipt.recipe_sha256 != bundle.recipe.computed_sha256
-        or receipt.expected_parent_digest != bundle.derived_image.parent_digest
-        or receipt.observed_parent_digest != bundle.derived_image.parent_digest
-        or receipt.expected_image_digest != bundle.derived_image.image_digest
-        or receipt.observed_image_digest != bundle.derived_image.image_digest
-        or receipt.expected_sbom_sha256 != bundle.derived_image.sbom_sha256
-        or receipt.observed_sbom_sha256 != bundle.derived_image.sbom_sha256
-        or receipt.source_stack_sha256 != bundle.primary_evidence.source_stack_sha256
-        or not receipt.verified
-    ):
-        raise IntegrityError("Source build receipt does not match bundle", "source_build_receipt_mismatch")
-    changed_components = {item.runtime_component for item in bundle.repositories}
-    engaged_components = {item.component for item in receipt.artifacts}
-    if not changed_components.issubset(engaged_components):
-        raise IntegrityError(
-            "Build receipt does not identify an artifact for every changed repository",
-            "source_build_receipt_mismatch",
-        )
-    if len(receipt.step_receipts) != len(bundle.recipe.steps):
-        raise IntegrityError("Build receipt is missing fixed recipe steps", "source_build_receipt_mismatch")
-    for index, (observed, expected) in enumerate(
-        zip(receipt.step_receipts, bundle.recipe.steps, strict=True)
-    ):
-        if (
-            observed.index != index
-            or observed.repository_id != expected.repository_id
-            or observed.cwd != expected.cwd
-            or observed.argv_sha256 != sha256_json(list(expected.argv))
-            or not observed.verified
-        ):
-            raise IntegrityError("Build step receipt differs from recipe", "source_build_receipt_mismatch")
-
-
-def _validate_engagement_receipt(
-    bundle: E2EPatchBundle,
-    build: SourceBuildReceipt,
-    receipt: LoadedByteEngagementReceipt,
-) -> None:
-    if (
-        receipt.bundle_digest != bundle.digest
-        or receipt.image_digest != bundle.derived_image.image_digest
-        or receipt.source_stack_sha256 != bundle.primary_evidence.source_stack_sha256
-        or not receipt.verified
-    ):
-        raise IntegrityError("Runtime engagement does not match bundle", "loaded_byte_engagement_failed")
-    built = {
-        (item.component, item.runtime_path, item.sha256, item.build_id)
-        for item in build.artifacts
-    }
-    loaded = {
-        (item.component, item.runtime_path, item.expected_sha256, item.expected_build_id)
-        for item in receipt.artifacts
-        if item.verified
-    }
-    if built != loaded or len(loaded) != len(receipt.artifacts):
-        raise IntegrityError("Runtime loaded old or unexpected bytes", "loaded_byte_engagement_failed")
-
-
-def _validate_replay_receipt(
-    bundle: E2EPatchBundle,
-    config: ReplayConfigInvariantReceipt,
-    receipt: CleanReplayReceipt,
-) -> None:
-    if (
-        receipt.bundle_digest != bundle.digest
-        or receipt.primary_environment_id != bundle.primary_evidence.environment_id
-        or receipt.image_digest != bundle.derived_image.image_digest
-        or receipt.replay_config_sha256 != config.replay_config_sha256
-        or receipt.source_stack_sha256 != bundle.primary_evidence.source_stack_sha256
-        or not receipt.verified
-    ):
-        raise IntegrityError("Second clean replay does not match bundle", "second_clean_replay_failed")
 
 
 def _atomic_write(path: Path, content: bytes) -> None:

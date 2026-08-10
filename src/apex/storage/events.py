@@ -67,7 +67,24 @@ class EventJournal:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fault_hook = fault_hook
+        self._read_only = False
         self._initialize()
+
+    @classmethod
+    def open_read_only(cls, path: Path) -> "EventJournal":
+        """Open an existing canonical journal without schema or WAL mutation."""
+
+        selected = Path(path)
+        if selected.is_symlink() or not selected.is_file():
+            raise ContractError(
+                "Read-only event journal must be an existing regular file",
+                "invalid_event_journal",
+            )
+        journal = cls.__new__(cls)
+        journal.path = selected.resolve(strict=True)
+        journal._fault_hook = None
+        journal._read_only = True
+        return journal
 
     def append(
         self,
@@ -90,6 +107,8 @@ class EventJournal:
         run_id: str,
         events: Sequence[EventInput],
     ) -> TransactionReceipt:
+        if self._read_only:
+            raise ContractError("Event journal is read-only", "event_journal_read_only")
         validate_identifier(run_id, field_name="run_id")
         normalized = self._normalize_inputs(events)
         event_ids = tuple(derive_event_id(run_id, item.idempotency_key) for item in normalized)
@@ -171,11 +190,18 @@ class EventJournal:
         fsync_directory(self.path.parent)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, isolation_level=None, timeout=30)
+        target = f"{self.path.as_uri()}?mode=ro" if self._read_only else self.path
+        connection = sqlite3.connect(
+            target,
+            isolation_level=None,
+            timeout=30,
+            uri=self._read_only,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
+        if not self._read_only:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
 

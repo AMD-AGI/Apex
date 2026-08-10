@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any
 
 from apex.benchmark import (
     BenchmarkConfigViews,
     MagpieBenchmarkAdapter,
-    build_config_views,
-    validate_resolved_view,
 )
 from apex.core import (
     ApexError,
@@ -20,7 +18,6 @@ from apex.core import (
     IntegrityError,
     TaskStatus,
     new_identifier,
-    sha256_json,
 )
 from apex.diagnostics import (
     MagpieTraceEvidenceAdapter,
@@ -29,17 +26,25 @@ from apex.diagnostics import (
 from apex.evaluation import E2EAcceptancePolicy
 from apex.intake import E2EOptimizeSpec
 from apex.orchestration import RunPhase, SearchStage
-from apex.ports import BenchmarkPass, TraceComparisonPort
+from apex.ports import TraceComparisonPort
 from apex.runtime import (
     DependencyReceipt,
+    FormalResultsRootValidator,
+    GpuLease,
     GpuLeaseManager,
     GpuLeaseReceipt,
     LocalGpuLeaseManager,
+    MagpieMainConfigAdapter,
     ProvenanceResolver,
+    ReleaseCandidateReceipt,
     RunProvenance,
+    formal_results_validator,
 )
-from apex.storage import ArtifactReceipt
 
+from ..baseline_recording import (
+    record_campaign_baseline,
+    validate_resume_campaign_baseline,
+)
 from .benchmarking import (
     BenchmarkAdapter,
     Diagnosis,
@@ -51,6 +56,19 @@ from .candidate import CandidateWorker
 from .context import E2EContextBuilder
 from .finalization import E2EFinalizer
 from .oracles import CorrectnessOracleRegistry
+from .preflight import (
+    E2EPreflightResult,
+    MagpieConfigResolutionPort,
+    ProvenancePort,
+    build_preflight_views,
+    compose_preflight_result,
+    gpu_devices,
+    resolve_preflight_provenance,
+    resolve_preflight_contract,
+    require_benchmark_execution_available,
+    require_formal_measurement_available,
+    validate_resume_preflight,
+)
 from .result import E2EOptimizationResult, load_bound_terminal_result
 from .recovery import (
     RecoveredRunRequest,
@@ -62,6 +80,15 @@ from .recovery import (
     recover_uncommitted_diagnosis,
 )
 from .run_record import E2ERunRecord
+from .run_contracts import (
+    accuracy_hash as _accuracy_hash,
+    artifact_binding as _binding,
+    objective_hash as _objective_hash,
+    relocate_views as _relocate_views,
+    require_optimizable_contract as _require_optimizable_contract,
+    verify_resume_gpu_lease as _verify_resume_gpu_lease,
+    verify_terminal_phase as _verify_terminal_phase,
+)
 from .recovery_search import recover_search
 from .search import E2ESearchLoop
 from .services import (
@@ -76,16 +103,6 @@ from .services import (
 )
 
 
-class ProvenancePort(Protocol):
-    def resolve(
-        self,
-        config_path: Path,
-        *,
-        gpu_arch: str,
-        hints: Mapping[str, Any] | None = None,
-    ) -> RunProvenance: ...
-
-
 @dataclass(frozen=True, slots=True)
 class _PreparedRun:
     spec: E2EOptimizeSpec
@@ -98,7 +115,6 @@ class _PreparedRun:
 
 class E2EOptimizeUseCase:
     """Own one GPU lease while state, search, and final proof remain modular."""
-
     def __init__(
         self,
         *,
@@ -107,6 +123,7 @@ class E2EOptimizeUseCase:
         diagnostics: DiagnosticsAdapter | None = None,
         trace_comparison: TraceComparisonPort | None = None,
         provenance: ProvenancePort | None = None,
+        resolved_plans: MagpieConfigResolutionPort | None = None,
         candidate_worker: CandidateWorker | None = None,
         contexts: E2EContextBuilder | None = None,
         micro: MicroQualificationPort | None = None,
@@ -115,6 +132,7 @@ class E2EOptimizeUseCase:
         final_delivery: FinalDeliveryPort | None = None,
         gpu_leases: GpuLeaseManager | None = None,
         correctness_oracles: CorrectnessOracleRegistry | None = None,
+        results_validator: FormalResultsRootValidator | None = None,
     ) -> None:
         self._receipt = dependency_receipt
         self._benchmark = benchmark or MagpieBenchmarkAdapter(dependency_receipt)
@@ -124,6 +142,9 @@ class E2EOptimizeUseCase:
             commit=dependency_receipt.commits["tracelens"],
         )
         self._provenance = provenance or ProvenanceResolver()
+        self._resolved_plans = resolved_plans or MagpieMainConfigAdapter(
+            dependency_receipt
+        )
         self._candidate_worker = candidate_worker
         self._contexts = contexts or E2EContextBuilder()
         self._micro = micro or UnavailableMicroQualifier()
@@ -132,18 +153,79 @@ class E2EOptimizeUseCase:
         self._final_delivery = final_delivery or UnavailableFinalDelivery()
         self._gpu_leases = gpu_leases or LocalGpuLeaseManager()
         self._correctness_oracles = correctness_oracles
+        self._results_validator = results_validator or _results_policy(
+            dependency_receipt
+        )
+
+    def preview(self, spec: E2EOptimizeSpec) -> E2EPreflightResult:
+        """Resolve config/capabilities without creating a run or acquiring a GPU."""
+
+        resolved = resolve_preflight_contract(self._resolved_plans, spec)
+        provenance = resolve_preflight_provenance(
+            self._provenance, spec, resolved
+        )
+        parent = spec.results_dir.expanduser().resolve().parent
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".apex-e2e-preflight-", dir=parent
+        ) as root:
+            views = (
+                build_preflight_views(
+                    self._receipt, spec, provenance, resolved, Path(root)
+                )
+                if resolved.status == "config_compatible"
+                else None
+            )
+            return compose_preflight_result(
+                self._receipt,
+                views,
+                provenance,
+                resolved,
+                benchmark=self._benchmark,
+                deployment=self._deployments,
+                micro=self._micro,
+                final_delivery=self._final_delivery,
+            )
 
     def run(self, spec: E2EOptimizeSpec) -> E2EOptimizationResult:
+        self._results_validator.validate(spec.results_dir, require_new=True)
         run_id = new_identifier("e2e")
-        with self._gpu_leases.acquire(
-            run_id, requested_devices=_gpu_devices(spec)
-        ) as lease:
-            return self._run_leased(spec, run_id, lease.receipt)
+        resolved = resolve_preflight_contract(self._resolved_plans, spec)
+        _require_optimizable_contract(resolved)
+        require_benchmark_execution_available(self._benchmark, resolved)
+        require_formal_measurement_available(self._benchmark, resolved)
+        provenance = resolve_preflight_provenance(
+            self._provenance, spec, resolved
+        )
+        staging_parent = spec.results_dir.expanduser().resolve().parent
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".apex-e2e-configs-", dir=staging_parent
+        ) as staging_root:
+            staged = build_preflight_views(
+                self._receipt, spec, provenance, resolved, Path(staging_root)
+            )
+            with self._gpu_leases.acquire(
+                run_id, requested_devices=gpu_devices(spec)
+            ) as lease:
+                return self._run_leased(
+                    spec, run_id, lease, provenance, staged
+                )
 
-    def resume(self, run_root: Path) -> E2EOptimizationResult:
+    def resume(
+        self,
+        run_root: Path,
+        *,
+        campaign_baseline: ReleaseCandidateReceipt | None = None,
+    ) -> E2EOptimizationResult:
         """Resume a crash at a durable baseline/diagnostic boundary."""
 
+        self._results_validator.validate(run_root)
         request = load_run_request(run_root)
+        validate_resume_campaign_baseline(
+            request.spec.campaign_baseline_receipt,
+            campaign_baseline,
+        )
         if request.dependency_lock_sha256 != self._receipt.lock_sha256:
             raise ContractError(
                 "Runtime dependency lock differs from the interrupted run",
@@ -170,27 +252,43 @@ class E2EOptimizeUseCase:
                 "Terminal run has no journal-bound result",
                 "e2e_result_binding_missing",
             )
+        resolved = resolve_preflight_contract(self._resolved_plans, request.spec)
+        provenance = validate_resume_preflight(
+            self._provenance,
+            self._resolved_plans,
+            self._receipt,
+            request,
+            getattr(self._correctness_oracles, "policy_sha256", None),
+        )
+        require_benchmark_execution_available(self._benchmark, resolved)
+        require_formal_measurement_available(self._benchmark, resolved)
         with self._gpu_leases.acquire(
-            request.run_id, requested_devices=_gpu_devices(request.spec)
+            request.run_id, requested_devices=gpu_devices(request.spec)
         ) as lease:
-            return self._resume_leased(request, record, lease.receipt)
+            return self._resume_leased(
+                request, record, lease, provenance
+            )
 
     def _run_leased(
         self,
         spec: E2EOptimizeSpec,
         run_id: str,
-        gpu_lease: GpuLeaseReceipt,
+        gpu_lease: GpuLease,
+        provenance: RunProvenance,
+        staged_views: BenchmarkConfigViews,
     ) -> E2EOptimizationResult:
         prepared: _PreparedRun | None = None
         baseline = None
         diagnosis: Diagnosis | None = None
         try:
-            prepared = self._prepare(spec, run_id, gpu_lease)
+            prepared = self._prepare(
+                spec, run_id, gpu_lease, provenance, staged_views
+            )
             result, baseline, receipt = prepared.session.measure(
                 "baseline-measurement", prepared.views.measurement
             )
             if not result.succeeded or baseline is None:
-                return self._finalizer(prepared, gpu_lease).failure(
+                return self._finalizer(prepared, gpu_lease.receipt).failure(
                     initial=None,
                     baseline=None,
                     status=TaskStatus.BASELINE_INVALID,
@@ -213,7 +311,7 @@ class E2EOptimizeUseCase:
                 ),
             )
             search = self._search(spec, prepared).run(diagnosis, baseline)
-            return self._finalizer(prepared, gpu_lease).run(
+            return self._finalizer(prepared, gpu_lease.receipt).run(
                 initial=diagnosis,
                 baseline=baseline,
                 search=search,
@@ -221,7 +319,7 @@ class E2EOptimizeUseCase:
         except ApexError as error:
             if prepared is None:
                 raise
-            return self._finalizer(prepared, gpu_lease).failure(
+            return self._finalizer(prepared, gpu_lease.receipt).failure(
                 initial=diagnosis,
                 baseline=baseline,
                 status=TaskStatus.INFRASTRUCTURE_ERROR,
@@ -233,41 +331,31 @@ class E2EOptimizeUseCase:
             )
 
     def _prepare(
-        self, spec: E2EOptimizeSpec, run_id: str, gpu_lease: GpuLeaseReceipt
+        self,
+        spec: E2EOptimizeSpec,
+        run_id: str,
+        gpu_lease: GpuLease,
+        provenance: RunProvenance,
+        staged: BenchmarkConfigViews,
     ) -> _PreparedRun:
-        provenance = self._provenance.resolve(
-            spec.config_path,
-            gpu_arch=spec.gpu_arch,
-            hints=spec.deployment_hints,
+        record = E2ERunRecord.create(
+            run_id=run_id,
+            root=spec.results_dir,
+            initial_anchor_id=f"anchor-{provenance.digest[:16]}",
+            dataset_split=spec.dataset_split,
+            data_visibility=spec.data_visibility,
         )
-        staging_parent = spec.results_dir.expanduser().resolve().parent
-        staging_parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=".apex-e2e-configs-", dir=staging_parent
-        ) as staging_root:
-            staged = build_config_views(
-                spec.config_path,
-                Path(staging_root) / "configs",
-                dependency_receipt=self._receipt,
-                source_repository_roots=tuple(
-                    Path(lock.path) for lock in provenance.source_locks if lock.exact
-                ),
-                model_revision=provenance.model_revision,
-                hf_cache_path=_hf_cache_path(spec),
-                gpu_devices=_gpu_devices(spec),
-                hf_offline=_hf_offline(spec),
+        destination = record.root / "configs"
+        os.replace(staged.original.parent, destination)
+        views = _relocate_views(staged, destination)
+        receipt = gpu_lease.receipt
+        self._record_run_identity(record, receipt, provenance)
+        if spec.campaign_baseline_receipt is not None:
+            record_campaign_baseline(
+                record.artifacts,
+                record.controller,
+                spec.campaign_baseline_receipt,
             )
-            record = E2ERunRecord.create(
-                run_id=run_id,
-                root=spec.results_dir,
-                initial_anchor_id=f"anchor-{provenance.digest[:16]}",
-                dataset_split=spec.dataset_split,
-                data_visibility=spec.data_visibility,
-            )
-            destination = record.root / "configs"
-            os.replace(staged.original.parent, destination)
-            views = _relocate_views(staged, destination)
-        self._record_run_identity(record, gpu_lease, provenance)
         record.controller.initialize_e2e(
             workload_id=f"workload-{provenance.benchmark_config_sha256[:16]}",
             provenance_hash=provenance.digest,
@@ -288,7 +376,7 @@ class E2EOptimizeUseCase:
             correctness_oracle_policy_sha256=getattr(
                 self._correctness_oracles, "policy_sha256", None
             ),
-            gpu_device_scope=gpu_lease.execution_scope,
+            gpu_device_scope=receipt.execution_scope,
         )
         session = E2EBenchmarkSession(
             benchmark=self._benchmark,
@@ -298,20 +386,22 @@ class E2EOptimizeUseCase:
             protocol_hash=views.workload_semantics_sha256,
             max_kernels=spec.max_kernels,
             trace_comparison=self._trace_comparison,
+            gpu_lease=gpu_lease,
             correctness_oracles=self._correctness_oracles,
         )
-        return _PreparedRun(spec, record, views, provenance, session, gpu_lease)
+        return _PreparedRun(spec, record, views, provenance, session, receipt)
 
     def _resume_leased(
         self,
         request: RecoveredRunRequest,
         record: E2ERunRecord,
-        gpu_lease: GpuLeaseReceipt,
+        gpu_lease: GpuLease,
+        provenance: RunProvenance,
     ) -> E2EOptimizationResult:
-        _verify_resume_gpu_scope(request, gpu_lease)
-        self._record_resume_lease(record, gpu_lease)
+        _verify_resume_gpu_lease(request, gpu_lease.receipt, record.iter_events())
+        self._record_resume_lease(record, gpu_lease.receipt)
         prepared = self._recover_prepared(
-            request, record, gpu_lease=gpu_lease
+            request, record, gpu_lease=gpu_lease, provenance=provenance
         )
         if record.controller.state.pending_action is not None:
             record.controller.abort_pending("interrupted_before_completion_receipt")
@@ -325,7 +415,7 @@ class E2EOptimizeUseCase:
                 prepared.views.measurement,
             )
             if not result.succeeded or baseline is None:
-                return self._finalizer(prepared, gpu_lease).failure(
+                return self._finalizer(prepared, gpu_lease.receipt).failure(
                     initial=None,
                     baseline=None,
                     status=TaskStatus.BASELINE_INVALID,
@@ -372,7 +462,7 @@ class E2EOptimizeUseCase:
             baseline,
             recovery=projection,
         )
-        return self._finalizer(prepared, gpu_lease).run(
+        return self._finalizer(prepared, gpu_lease.receipt).run(
             initial=diagnosis,
             baseline=baseline,
             search=outcome,
@@ -387,25 +477,10 @@ class E2EOptimizeUseCase:
         request: RecoveredRunRequest,
         record: E2ERunRecord,
         *,
-        gpu_lease: GpuLeaseReceipt,
+        gpu_lease: GpuLease,
+        provenance: RunProvenance,
     ) -> _PreparedRun:
         spec = request.spec
-        provenance = self._provenance.resolve(
-            spec.config_path, gpu_arch=spec.gpu_arch, hints=spec.deployment_hints
-        )
-        if provenance.digest != request.provenance_digest:
-            raise ContractError("Run provenance changed", "resume_provenance_mismatch")
-        observed_oracle = getattr(self._correctness_oracles, "policy_sha256", None)
-        if observed_oracle != request.correctness_oracle_policy_sha256:
-            raise ContractError("Oracle policy changed", "resume_oracle_policy_mismatch")
-        for path, pass_type in (
-            (request.views.measurement, BenchmarkPass.MEASUREMENT),
-            (request.views.diagnostic, BenchmarkPass.DIAGNOSTIC),
-            (request.views.replay, BenchmarkPass.MEASUREMENT),
-        ):
-            validate_resolved_view(
-                path, pass_type=pass_type, dependency_receipt=self._receipt
-            )
         session = E2EBenchmarkSession(
             benchmark=self._benchmark,
             diagnostics=self._diagnostics,
@@ -414,10 +489,11 @@ class E2EOptimizeUseCase:
             protocol_hash=request.views.workload_semantics_sha256,
             max_kernels=spec.max_kernels,
             trace_comparison=self._trace_comparison,
+            gpu_lease=gpu_lease,
             correctness_oracles=self._correctness_oracles,
         )
         return _PreparedRun(
-            spec, record, request.views, provenance, session, gpu_lease
+            spec, record, request.views, provenance, session, gpu_lease.receipt
         )
 
     @staticmethod
@@ -505,86 +581,17 @@ class E2EOptimizeUseCase:
         )
 
 
-def _relocate_views(
-    staged: BenchmarkConfigViews, destination: Path
-) -> BenchmarkConfigViews:
-    return replace(
-        staged,
-        original=destination / staged.original.name,
-        measurement=destination / staged.measurement.name,
-        diagnostic=destination / staged.diagnostic.name,
-        replay=destination / staged.replay.name,
-    )
-
-
-def _verify_resume_gpu_scope(
-    request: RecoveredRunRequest, gpu_lease: GpuLeaseReceipt
-) -> None:
-    if gpu_lease.execution_scope != request.gpu_device_scope:
-        raise ContractError(
-            "GPU execution scope differs from the interrupted run",
-            "resume_gpu_scope_mismatch",
-        )
-
-
-def _objective_hash(spec: E2EOptimizeSpec) -> str:
-    return sha256_json(spec.to_dict()["goal"])
-
-
-def _hf_cache_path(spec: E2EOptimizeSpec) -> Path | None:
-    raw = spec.deployment_hints.get("hf_cache_path")
-    if raw is None:
-        return None
-    path = Path(str(raw))
-    if not path.is_absolute():
-        raise ContractError(
-            "deployment_hints.hf_cache_path must be absolute",
-            "invalid_hf_cache_path",
-        )
-    return path
-
-
-def _gpu_devices(spec: E2EOptimizeSpec) -> str | None:
-    raw = spec.deployment_hints.get("gpu_devices")
-    return str(raw) if raw is not None else None
-
-
-def _hf_offline(spec: E2EOptimizeSpec) -> bool:
-    raw = spec.deployment_hints.get("hf_offline", False)
-    if not isinstance(raw, bool):
-        raise ContractError(
-            "deployment_hints.hf_offline must be a boolean",
-            "invalid_hf_offline",
-        )
-    return raw
-
-
-def _accuracy_hash(
-    views: BenchmarkConfigViews,
-    spec: E2EOptimizeSpec,
-    correctness_oracles: CorrectnessOracleRegistry | None = None,
-) -> str:
-    policy = {
-        "schema": "apex.e2e-quality-policy-binding.v1",
-        "quality_tasks": views.quality_tasks,
-        "evaluator_policy_sha256": views.evaluator_policy_sha256,
-        "regression_gates": asdict(spec.goal.gates),
-    }
-    if correctness_oracles is not None:
-        policy["correctness_oracle_policy_sha256"] = (
-            correctness_oracles.policy_sha256
-        )
-    return sha256_json(policy)
-
-
-def _binding(role: str, receipt: ArtifactReceipt) -> dict[str, object]:
-    return {"role": role, "receipt": receipt.to_dict()}
-
-
-def _verify_terminal_phase(phase: RunPhase, status: TaskStatus) -> None:
-    successful = {TaskStatus.SUCCEEDED, TaskStatus.NO_GAIN}
-    if (phase is RunPhase.SUCCEEDED) != (status in successful):
-        raise ContractError("Terminal result conflicts with run state", "e2e_result_binding_mismatch")
-
-
 __all__ = ["BenchmarkAdapter", "E2EOptimizeUseCase", "ProvenancePort"]
+
+
+def _results_policy(receipt: DependencyReceipt) -> FormalResultsRootValidator:
+    source_roots = (
+        tuple(receipt.source_locks.roots.values())
+        if receipt.source_locks is not None
+        else ()
+    )
+    return formal_results_validator(
+        apex_root=Path(__file__).resolve().parents[4],
+        dependency_roots=receipt.roots.values(),
+        source_roots=source_roots,
+    )

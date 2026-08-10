@@ -17,12 +17,13 @@ from apex.diagnostics import (
     TraceEvidence,
     derive_candidate_id,
 )
-from apex.core import IntegrityError
+from apex.core import ContractError, IntegrityError
 from apex.optimization.e2e import (
     CorrectnessOracleBinding,
     CorrectnessOracleRegistry,
     build_kernel_opportunity_plan,
 )
+from apex.optimization.e2e.recovery_plan import plan_dict, plan_from_mapping
 
 
 def _evidence(tmp_path: Path, name: str, share: float, *, resolved: bool) -> TraceEvidence:
@@ -84,13 +85,15 @@ def _evidence(tmp_path: Path, name: str, share: float, *, resolved: bool) -> Tra
 
 
 def test_dynamic_plan_preserves_unresolved_and_selects_by_measured_share(tmp_path: Path) -> None:
-    unresolved = _evidence(tmp_path, "large_unknown", 40, resolved=False)
-    eligible = _evidence(tmp_path, "smaller", 20, resolved=True)
+    unresolved = _evidence(tmp_path, "large_unknown", 70, resolved=False)
+    eligible = _evidence(tmp_path, "smaller", 25, resolved=True)
     plan = build_kernel_opportunity_plan((eligible, unresolved), max_kernels=10)
     assert plan.opportunities[0].runtime_name == "large_unknown"
     assert plan.opportunities[0].reason_code == "source_unresolved"
     assert [item.runtime_name for item in plan.eligible] == ["smaller"]
     assert all(item.opportunity_id.startswith("kernel-") for item in plan.opportunities)
+    assert plan.coverage.satisfied
+    assert plan.coverage.selected_gpu_pct == 95
 
 
 def test_config_or_non_source_candidates_cannot_enter_lane(tmp_path: Path) -> None:
@@ -105,7 +108,9 @@ def test_config_or_non_source_candidates_cannot_enter_lane(tmp_path: Path) -> No
         shape=evidence.shape,
     )
     evidence = replace(evidence, kernel=kernel, candidate_id=candidate)
-    plan = build_kernel_opportunity_plan((evidence,), max_kernels=1)
+    plan = build_kernel_opportunity_plan(
+        (evidence,), max_kernels=1, require_coverage=False
+    )
     assert plan.eligible == ()
     assert plan.opportunities[0].reason_code == "unsupported_kernel_language"
 
@@ -138,7 +143,10 @@ def test_source_locked_oracle_makes_dynamically_ranked_source_eligible(
     )
 
     plan = build_kernel_opportunity_plan(
-        (evidence,), max_kernels=1, correctness_oracles=registry
+        (evidence,),
+        max_kernels=1,
+        correctness_oracles=registry,
+        require_coverage=False,
     )
 
     assert [item.runtime_name for item in plan.eligible] == [
@@ -148,6 +156,57 @@ def test_source_locked_oracle_makes_dynamically_ranked_source_eligible(
     assert plan.eligible[0].test_command == "python -m pytest test_kernel.py -q"
     assert len(plan.eligible[0].correctness_oracle_sha256 or "") == 64
     assert plan.correctness_oracle_policy_sha256 == registry.policy_sha256
+
+
+def test_formal_plan_rejects_insufficient_gpu_time_coverage(tmp_path: Path) -> None:
+    evidence = _evidence(tmp_path, "partial", 89.9, resolved=True)
+
+    with pytest.raises(ContractError) as failure:
+        build_kernel_opportunity_plan((evidence,), max_kernels=1)
+
+    assert failure.value.reason_code == "insufficient_kernel_family_coverage"
+
+
+def test_formal_plan_rejects_one_large_unclassified_family(tmp_path: Path) -> None:
+    classified = _evidence(tmp_path, "classified", 92, resolved=True)
+    unknown = _evidence(tmp_path, "unknown", 3, resolved=False)
+    unknown = replace(unknown, op=OperationEvidence("unknown", "unknown"))
+
+    with pytest.raises(ContractError) as failure:
+        build_kernel_opportunity_plan((classified, unknown), max_kernels=10)
+
+    assert failure.value.reason_code == "unclassified_kernel_family_too_large"
+
+
+def test_formal_plan_rejects_unresolved_trace_semantics(tmp_path: Path) -> None:
+    evidence = _evidence(tmp_path, "classified", 95, resolved=True)
+    artifacts = replace(
+        evidence.evidence,
+        warnings=("semantic_coverage_unresolved:missing:source",),
+    )
+    evidence = replace(evidence, evidence=artifacts)
+
+    with pytest.raises(ContractError) as failure:
+        build_kernel_opportunity_plan((evidence,), max_kernels=1)
+
+    assert failure.value.reason_code == "trace_semantic_coverage_unresolved"
+
+
+def test_formal_plan_allows_bounded_unclassified_tail(tmp_path: Path) -> None:
+    classified = _evidence(tmp_path, "classified", 92, resolved=True)
+    unknown = _evidence(tmp_path, "unknown", 1, resolved=False)
+    unknown = replace(unknown, op=OperationEvidence("unknown", "unknown"))
+
+    plan = build_kernel_opportunity_plan((classified, unknown), max_kernels=10)
+
+    assert plan.coverage.satisfied
+    assert plan.coverage.unclassified_families == (("unknown:unknown:unknown", 1.0),)
+
+    serialized = plan_dict(plan)
+    assert plan_from_mapping(serialized) == plan
+    serialized["coverage"]["selected_gpu_pct"] = 89.0
+    with pytest.raises(ContractError, match="verdict differs"):
+        plan_from_mapping(serialized)
 
 
 def test_oracle_rejects_a_different_source_root(tmp_path: Path) -> None:

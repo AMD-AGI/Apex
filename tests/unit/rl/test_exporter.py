@@ -159,7 +159,11 @@ def test_incomplete_episode_fails_or_skips_with_reason(canonical_run, tmp_path: 
         canonical_run["journal"],
         canonical_run["run_id"],
         "candidate_frozen",
-        {"attempt_id": "attempt-incomplete", "split": "train"},
+        {
+            "attempt_id": "attempt-incomplete",
+            "split": "train",
+            "visibility": "public",
+        },
         "incomplete-candidate",
     )
     graph = _graph(canonical_run)
@@ -175,6 +179,62 @@ def test_incomplete_episode_fails_or_skips_with_reason(canonical_run, tmp_path: 
     assert result.record_count == 2
     assert result.skipped[0]["attempt_id"] == "attempt-incomplete"
     assert "context_packet_missing" in result.skipped[0]["reason"]
+
+
+@pytest.mark.parametrize("visibility", ("private", "heldout_private"))
+def test_public_export_rejects_private_evidence_for_every_split(
+    canonical_run, tmp_path: Path, visibility: str
+) -> None:
+    graph = _graph(canonical_run)
+    private = replace(graph.children[0], visibility=visibility, split="validation")
+
+    with pytest.raises(ContractError) as error:
+        DatasetExporter(canonical_run["artifacts"]).export(
+            replace(graph, children=(private, *graph.children[1:])),
+            tmp_path / visibility,
+            config=DatasetExportConfig(split="train", on_incomplete="skip"),
+        )
+
+    assert error.value.reason_code == "private_dataset_evidence"
+    assert not (tmp_path / visibility).exists()
+
+
+def test_export_manifest_self_describes_policy_and_host_path_redaction(
+    canonical_run, tmp_path: Path
+) -> None:
+    private_path = canonical_run["artifacts"].put_bytes(
+        b'{"lease_path":"/tmp/apex/lease.lock"}',
+        media_type="application/json",
+    )
+    append_event(
+        canonical_run["journal"],
+        canonical_run["run_id"],
+        "tool_result",
+        {
+            "attempt_id": "attempt-1",
+            "artifacts": [artifact_binding("tool_result", private_path)],
+        },
+        "dataset-private-host-path",
+    )
+    output = tmp_path / "redacted"
+
+    DatasetExporter(canonical_run["artifacts"]).export(_graph(canonical_run), output)
+
+    manifest = json.loads((output / "export_manifest.json").read_bytes())
+    dataset = (output / "dataset.json").read_text(encoding="utf-8")
+    assert manifest["schema_version"] == 2
+    assert manifest["visibility_policy"]["policy_id"] == (
+        "public_episode_only_fail_closed_v1"
+    )
+    assert manifest["redaction_policy"]["policy_id"] == (
+        "host_absolute_path_redaction_v1"
+    )
+    assert manifest["license_policy"]["summary"]
+    assert manifest["retention_policy"]["summary"]
+    assert manifest["summary"]["visibility_counts"] == {"public": 2}
+    assert manifest["summary"]["redacted_artifact_count"] == 1
+    assert "/tmp/apex" not in dataset
+    assert "[REDACTED_PATH]" in dataset
 
 
 def test_secret_in_artifact_fails_export(canonical_run, tmp_path: Path):
@@ -232,14 +292,14 @@ def test_exports_source_free_e2e_reject_without_sft(
     result = DatasetExporter(e2e_no_source_run["artifacts"]).export(
         graph,
         tmp_path / "e2e-no-source",
-        config=DatasetExportConfig(policy_id="e2e_kernel_candidate_v1"),
+        config=DatasetExportConfig(policy_id="e2e_throughput_qos_v1"),
     )
 
     assert result.record_count == 1
     assert result.sft_count == 0
     record = json.loads((tmp_path / "e2e-no-source" / "dataset.jsonl").read_text())
     assert record["candidate_id"] is None
-    assert record["reward"]["scalar"] == -20.0
+    assert record["reward"]["scalar"] == 0.0
     assert record["artifacts_by_role"]["candidate_manifest"]
     assert "candidate_source" not in record["artifacts_by_role"]
     assert (tmp_path / "e2e-no-source" / "sft.jsonl").read_bytes() == b""
@@ -278,7 +338,7 @@ def test_measured_e2e_export_replays_raw_cas_evidence(tmp_path: Path):
     assert result.record_count == 1
 
 
-def test_measured_e2e_export_replays_four_leg_conservative_selection(
+def test_measured_e2e_export_replays_multi_window_point_and_confidence(
     tmp_path: Path,
 ) -> None:
     run = build_measured_run(
@@ -287,12 +347,12 @@ def test_measured_e2e_export_replays_four_leg_conservative_selection(
     )
     pair = run["pair"]
 
-    assert pair["schema"] == "apex.e2e-matched-promotion/v2"
-    assert pair["order"] == ["anchor", "candidate", "candidate", "anchor"]
-    assert len(pair["observations"]) == 4
-    assert len(pair["comparisons"]) == 2
-    assert run["selected_comparison"] == 1
-    assert pair["verdict"] == pair["comparisons"][1]
+    assert pair["schema"] == "apex.e2e-paired-promotion/v1"
+    assert pair["window_order"] == ["anchor", "candidate", "candidate", "anchor"]
+    assert len(pair["observations"]) == 12
+    assert len(pair["measurement"]["windows"]) == 3
+    assert pair["verdict"]["keep"] is True
+    assert pair["verdict"]["confidence"]["passed"] is True
 
     graph = EpisodeGraphMaterializer(run["journal"], run["artifacts"]).materialize(
         run["run_id"]
@@ -355,6 +415,8 @@ def test_measured_e2e_export_rejects_decision_from_different_gates(tmp_path: Pat
         {"raw_candidate_accuracy": 0.79},
         {"report_candidate_throughput": 102.0},
         {"objective_hash_matches_request": False},
+        {"official_private_fields": True},
+        {"attestation_run_id_drift": True},
     ),
 )
 def test_measured_e2e_export_rejects_unbound_or_fabricated_evidence(
@@ -388,11 +450,12 @@ def test_measured_e2e_export_rejects_unbound_or_fabricated_evidence(
         "duplicate_pair",
         "gpu_scope",
         "gpu_inventory",
+        "missing_measurement_bracket",
         "reward_pair_missing",
         "legacy_benchmark_receipt",
     ),
 )
-def test_measured_e2e_export_rejects_malformed_matched_promotion_v2(
+def test_measured_e2e_export_rejects_malformed_paired_promotion(
     tmp_path: Path,
     tamper: str,
 ) -> None:
@@ -432,7 +495,7 @@ def test_legacy_e2e_raw_measurement_role_is_not_trainable(tmp_path: Path):
     assert "legacy_raw_measurement_role" in child.validation_reasons
 
 
-def test_e2e_grade_artifact_must_equal_reward_vector(
+def test_e2e_reward_vector_artifact_must_equal_reward_event(
     e2e_no_source_run, tmp_path: Path
 ):
     graph = EpisodeGraphMaterializer(
@@ -451,4 +514,4 @@ def test_e2e_grade_artifact_must_equal_reward_vector(
             graph, tmp_path / "bad-e2e-grade"
         )
 
-    assert error.value.reason_code == "e2e_reward_artifact_mismatch"
+    assert error.value.reason_code == "reward_replay_mismatch"

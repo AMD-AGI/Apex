@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-import yaml
-
-from apex.core import AgentBackendName, ContractError
+from apex.core import (
+    AgentBackendName,
+    ContractError,
+    canonical_json_bytes,
+    sha256_bytes,
+)
 
 
 _DATASET_SPLITS = {"train", "validation", "heldout"}
@@ -78,6 +80,7 @@ class E2EOptimizeSpec:
     context_response_token_allocation: int = 8_000
     dataset_split: str = "train"
     data_visibility: str = "public"
+    campaign_baseline_receipt: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -108,6 +111,7 @@ class E2EOptimizeSpec:
                 "heldout_private visibility requires the heldout split",
                 "invalid_data_partition",
             )
+        _validate_campaign_baseline(self.campaign_baseline_receipt)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "E2EOptimizeSpec":
@@ -149,15 +153,8 @@ class E2EOptimizeSpec:
             ),
             dataset_split=str(data.get("dataset_split", "train")),
             data_visibility=str(data.get("data_visibility", "public")),
+            campaign_baseline_receipt=_campaign_baseline_from_mapping(data),
         )
-
-    @classmethod
-    def from_file(cls, path: Path) -> "E2EOptimizeSpec":
-        content = path.read_text(encoding="utf-8")
-        data = yaml.safe_load(content) if path.suffix.lower() in {".yaml", ".yml"} else json.loads(content)
-        if not isinstance(data, Mapping):
-            raise ContractError("E2E spec document must contain an object", "invalid_e2e_spec")
-        return cls.from_mapping(data)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -187,4 +184,42 @@ class E2EOptimizeSpec:
             "context_response_token_allocation": self.context_response_token_allocation,
             "dataset_split": self.dataset_split,
             "data_visibility": self.data_visibility,
+            "campaign_baseline_receipt": (
+                dict(self.campaign_baseline_receipt)
+                if self.campaign_baseline_receipt is not None
+                else None
+            ),
         }
+
+
+def _validate_campaign_baseline(value: Mapping[str, Any] | None) -> None:
+    if value is None:
+        return
+    digest = value.get("receipt_sha256")
+    payload = {key: item for key, item in value.items() if key != "receipt_sha256"}
+    valid = (
+        value.get("schema") == "apex.release-candidate-receipt/v2"
+        and value.get("baseline_status") == "ready"
+        and value.get("baseline_blockers") == []
+        and isinstance(digest, str)
+        and sha256_bytes(canonical_json_bytes(payload)) == digest
+    )
+    if not valid:
+        raise ContractError(
+            "E2E campaign baseline receipt is invalid or blocked",
+            "campaign_baseline_receipt_invalid",
+        )
+
+
+def _campaign_baseline_from_mapping(
+    data: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    value = data.get("campaign_baseline_receipt")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ContractError(
+            "E2E campaign baseline receipt must be an object",
+            "campaign_baseline_receipt_invalid",
+        )
+    return dict(value)

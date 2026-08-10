@@ -17,6 +17,7 @@ from apex.runtime import (
     RsmiDeviceIdentity,
     collect_gpu_ownership,
 )
+from tests.support.gpu_evidence import StaticGpuDoctorInspector
 
 
 _UUID_ONE = "GPU-0000000000000001"
@@ -295,6 +296,18 @@ def test_kfd_owner_intersection_uses_rsmi_index(tmp_path: Path) -> None:
     assert receipt.foreign_owners[0].rsmi_device_indices == (1,)
 
 
+def test_kfd_process_without_mapped_gpu_is_not_a_device_owner(
+    tmp_path: Path,
+) -> None:
+    proc = tmp_path / "proc"
+    _proc_process(proc, 4242)
+    snapshots = [{4100: (), 4242: (1,)}, {4100: (), 4242: (1,)}]
+
+    receipt = _collect(_FakeApi(snapshots), tmp_path)
+
+    assert tuple(owner.pid for owner in receipt.foreign_owners) == (4242,)
+
+
 def test_current_runner_may_be_recorded_as_an_allowed_owner(tmp_path: Path) -> None:
     _proc_process(tmp_path / "proc", 4242)
     receipt = _collect(
@@ -503,7 +516,9 @@ class _ForeignInspector:
 def test_lease_refuses_foreign_owner_without_terminating_it(tmp_path: Path) -> None:
     manager = LocalGpuLeaseManager(
         lock_root=tmp_path / "leases",
-        ownership_inspector=_ForeignInspector(tmp_path / "inspection"),
+        doctor_inspector=StaticGpuDoctorInspector(
+            _ForeignInspector(tmp_path / "inspection")
+        ),
     )
 
     with pytest.raises(ContractError) as raised:

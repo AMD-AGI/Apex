@@ -271,6 +271,8 @@ class ValidatedTargetedTrace:
     coverage: AcquisitionCoverage
     artifacts: tuple[EvidenceArtifactReceipt, ...]
     warnings: tuple[str, ...]
+    semantic_coverage_claimed: bool
+    semantic_unresolved_reasons: tuple[str, ...]
 
 
 __all__ = [

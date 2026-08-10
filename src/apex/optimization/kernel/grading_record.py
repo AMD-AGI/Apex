@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from apex.evaluation import KernelGrade, KernelMeasurementArtifact, MeasurementPolicy
+from apex.evaluation import KernelGrade, KernelMeasurementArtifact
 
 
 def measurement_payload(
@@ -55,6 +55,7 @@ def grade_statistics(grade: KernelGrade) -> dict[str, object]:
 
 def reward_vector(grade: KernelGrade) -> dict[str, object]:
     return {
+        "kernel_reward_stage": "measurement",
         "compile": grade.gates.compiled,
         "correctness": grade.gates.correct,
         "integrity": grade.gates.integrity_passed,
@@ -65,39 +66,8 @@ def reward_vector(grade: KernelGrade) -> dict[str, object]:
     }
 
 
-def kernel_reward_policy_source(policy: MeasurementPolicy) -> dict[str, object]:
-    return {
-        "schema": "apex.kernel-reward-policy/v1",
-        "measurement_schema": "apex.kernel-measurement/v1",
-        "policy_id": "kernel_robust_v1",
-        "measurement_policy": policy.to_dict(),
-        "timing_protocol": {
-            "execution_receipt": "apex.kernel-measurement-execution/v1",
-            "writer": "trusted_evaluator_adapter",
-            "phase": "measurement",
-            "protected_harness_digest_required": True,
-            "ordering": "seeded_paired_abba_blocks",
-            "inner_repeats": 1,
-            "timer_resolution_required": True,
-            "measurement_method_sha256_required": True,
-            "gpu_health_before_after_each_block_required": True,
-        },
-        "formula": (
-            "20*Icompile + Icorrect*(100 + "
-            "200*clip(min(S50,S99)-1,-0.25,1.00))"
-        ),
-        "promotion": {
-            "point_threshold": "Srobust > keep_srobust_threshold",
-            "confidence": "Srobust_CI_lower > confidence_srobust_floor",
-            "noise": "max_case_cv <= max_cv",
-            "worst_case": "worst_case_srobust >= worst_case_srobust_floor",
-        },
-    }
-
-
 __all__ = [
     "grade_statistics",
-    "kernel_reward_policy_source",
     "measurement_payload",
     "reward_vector",
 ]

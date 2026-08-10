@@ -1,0 +1,23 @@
+{
+  "entries": [
+    {
+      "manifest_sha256": "4a47cf207cb4f3a56a379fa8cbb598febdd74d7bfdab9c85ec04d0ba82a51ab2",
+      "showcase_id": "kernel-ck-moe-2stage",
+      "status": "pending",
+      "template_id": "kernel-ck-moe-2stage"
+    },
+    {
+      "manifest_sha256": "646f5c963705317d1ca045b1e1206aa8822c99a68315f203f3f1a67f523e92fe",
+      "showcase_id": "kernel-cktile-moe-2stage",
+      "status": "pending",
+      "template_id": "kernel-cktile-moe-2stage"
+    },
+    {
+      "manifest_sha256": "5a5865aff2463585174fd833dcc7dece7696c5a5821c7f7bc66fac04180ef740",
+      "showcase_id": "kernel-triton-paged-attention-2d",
+      "status": "pending",
+      "template_id": "kernel-triton-paged-attention-2d"
+    }
+  ],
+  "schema": "apex.kernel-template-registry/v1"
+}

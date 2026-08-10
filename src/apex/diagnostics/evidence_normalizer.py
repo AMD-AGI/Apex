@@ -63,7 +63,13 @@ class TraceEvidenceNormalizer:
         rows_by_name = _index_kernel_rows(report)
         groups, validated = self._validate_targeted(report, workspace)
         all_artifacts = tuple(artifacts) + validated.artifacts
-        warnings = _coverage_warnings(validated.coverage, validated.warnings)
+        semantic_warnings = tuple(
+            f"semantic_coverage_unresolved:{reason}"
+            for reason in validated.semantic_unresolved_reasons
+        )
+        warnings = _coverage_warnings(
+            validated.coverage, validated.warnings + semantic_warnings
+        )
         normalized, matched = self._normalize_groups(
             groups,
             rows_by_name,

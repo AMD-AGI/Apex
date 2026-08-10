@@ -1,10 +1,20 @@
 """Kernel-only adaptive E2E optimization."""
 
 from .candidate import AgentCandidateWorker, CandidateWorker, E2ECandidate, E2ECandidateRequest
+from .component_deployment import (
+    CandidateDeploymentRegistry,
+    ComponentDeploymentBinding,
+)
+from .component_micro import ComponentMicroBinding, ComponentMicroQualifierRegistry
 from .context import E2EContextBuilder
 from .deferred import E2EDeferredMicroQualifier
 from .docker_overlay import DockerOverlayDeployment, OverlayOnlyFinalDelivery
-from .kernel_lane import KernelOpportunity, KernelOpportunityPlan, build_kernel_opportunity_plan
+from .kernel_lane import (
+    KernelOpportunity,
+    KernelOpportunityPlan,
+    KernelPlanningCoverage,
+    build_kernel_opportunity_plan,
+)
 from .oracles import (
     CorrectnessOracleBinding,
     CorrectnessOracleRegistry,
@@ -43,14 +53,16 @@ from .source_delivery_models import (
 )
 from .source_delivery_provenance import ExactRequestProvenance
 from .qwen_profile import (
+    QWEN_ACCEPTANCE_PROFILE_ID,
     build_qwen_acceptance_bundle_verifier,
     build_qwen_acceptance_delivery,
     build_qwen_acceptance_provenance_resolver,
     build_qwen_correctness_oracles,
     build_qwen_oracle_micro_qualifier,
     default_qwen_source_roots,
+    qwen_acceptance_recipe_sha256s,
 )
-from .qwen_qualification import QwenCompositeMicroQualifier
+from .preflight import E2EPreflightResult, write_preflight_result
 from .use_case import BenchmarkAdapter, E2EOptimizeUseCase, ProvenancePort
 
 __all__ = [
@@ -58,10 +70,14 @@ __all__ = [
     "AgentCandidateWorker",
     "BenchmarkAdapter",
     "CandidateDeployment",
+    "CandidateDeploymentRegistry",
     "CandidateDeploymentPort",
     "CandidateDeploymentRequest",
     "CandidateSafetyPort",
     "CandidateWorker",
+    "ComponentDeploymentBinding",
+    "ComponentMicroBinding",
+    "ComponentMicroQualifierRegistry",
     "CorrectnessOracleBinding",
     "CorrectnessOracleRegistry",
     "DockerOverlayDeployment",
@@ -73,6 +89,7 @@ __all__ = [
     "E2EDeferredMicroQualifier",
     "E2EOptimizationResult",
     "E2EOptimizeUseCase",
+    "E2EPreflightResult",
     "FinalDeliveryPort",
     "FinalDeliveryRequest",
     "FinalDeliveryResult",
@@ -81,6 +98,7 @@ __all__ = [
     "FormalSourceDeliveryProfile",
     "KernelOpportunity",
     "KernelOpportunityPlan",
+    "KernelPlanningCoverage",
     "MicroQualification",
     "MicroQualificationPort",
     "MicroQualificationRequest",
@@ -91,7 +109,7 @@ __all__ = [
     "PrimarySourceBuildPort",
     "PrimarySourceBuildRequest",
     "ProvenancePort",
-    "QwenCompositeMicroQualifier",
+    "QWEN_ACCEPTANCE_PROFILE_ID",
     "ResolvedCorrectnessOracle",
     "DeliveryProvenancePort",
     "SafetyQualification",
@@ -106,5 +124,7 @@ __all__ = [
     "build_qwen_correctness_oracles",
     "build_qwen_oracle_micro_qualifier",
     "default_qwen_source_roots",
+    "qwen_acceptance_recipe_sha256s",
     "write_e2e_result",
+    "write_preflight_result",
 ]

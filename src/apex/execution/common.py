@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 from typing import Mapping
 
-from apex.core import AgentBackendName, DependencyError, sha256_file
+from apex.core import AgentBackendName, ContractError, DependencyError, sha256_file
 from apex.ports import (
     AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
@@ -24,8 +24,16 @@ from .environment import (
     build_subprocess_environment,
 )
 from .supervisor import ProcessResult, SubprocessSupervisor
+from .secret_redaction import redact_secret_values
 from .transcript import parse_agent_output
 from .turn_budget import AgentTurnBudget, TURN_POLICY
+
+
+_BACKEND_CREDENTIAL_KEYS = {
+    AgentBackendName.CODEX: "OPENAI_API_KEY",
+    AgentBackendName.CLAUDE: "ANTHROPIC_API_KEY",
+    AgentBackendName.CURSOR: "CURSOR_API_KEY",
+}
 
 
 def require_executable(name: str) -> str:
@@ -60,11 +68,13 @@ def invocation_receipt(
     executable: str,
     argv: list[str],
     prompt_transport: str,
+    credential_environment_key: str,
     turn_policy: str,
     isolation: Mapping[str, str],
 ) -> AgentInvocationReceipt:
     """Bind an invocation to exact entrypoint bytes and explicit policy claims."""
 
+    assert request.execution_authority is not None
     discovered = Path(executable).absolute()
     resolved = discovered.resolve(strict=True)
     metadata = resolved.stat()
@@ -82,6 +92,8 @@ def invocation_receipt(
         argv=tuple(argv),
         workspace=str(request.workspace),
         prompt_transport=prompt_transport,
+        execution_authority=request.execution_authority,
+        credential_environment_key=credential_environment_key,
         requested_allowed_files=request.allowed_files,
         allowed_files_enforced_by_cli=False,
         max_turns=request.max_turns,
@@ -105,6 +117,7 @@ def resolve_cli_version(
     workspace: Path,
     environment: Mapping[str, str],
     timeout_seconds: int,
+    secret_values: tuple[str, ...],
 ) -> str:
     """Return the CLI's own bounded version output or fail provenance closed."""
 
@@ -115,7 +128,10 @@ def resolve_cli_version(
         timeout_seconds=min(timeout_seconds, 30),
         require_pid_namespace=True,
     )
-    output = result.stdout.strip() or result.stderr.strip()
+    safe_stdout = redact_secret_values(result.stdout, secret_values)
+    safe_stderr = redact_secret_values(result.stderr, secret_values)
+    output = safe_stdout.text.strip() or safe_stderr.text.strip()
+    redaction_count = safe_stdout.replacements + safe_stderr.replacements
     if (
         result.exit_code != 0
         or result.timed_out
@@ -124,6 +140,7 @@ def resolve_cli_version(
         or not result.cleanup_succeeded
         or not output
         or len(output) > 512
+        or redaction_count
     ):
         raise DependencyError(
             "Agent CLI version could not be identified",
@@ -142,6 +159,7 @@ def execute_agent_cli(
     executable: str,
     argv: list[str],
     environment: Mapping[str, str],
+    credential_environment_key: str,
     prompt_transport: str,
     isolation: Mapping[str, str],
     effort: str | None,
@@ -149,12 +167,27 @@ def execute_agent_cli(
 ) -> AgentResult:
     """Execute one isolated structured CLI stream with common budget evidence."""
 
+    _validate_execution_authority(
+        request,
+        backend,
+        credential_environment_key,
+        prompt_transport,
+        argv,
+        stdin_text,
+    )
+    secret_values = _secret_values(environment, credential_environment_key)
+    if redact_secret_values("\0".join(argv), secret_values).replacements:
+        raise ContractError(
+            "Backend credential is present in formal process argv",
+            "agent_credential_in_argv",
+        )
     cli_version = resolve_cli_version(
         supervisor,
         executable=executable,
         workspace=request.workspace,
         environment=environment,
         timeout_seconds=request.timeout_seconds,
+        secret_values=secret_values,
     )
     budget = AgentTurnBudget(request.max_turns)
     invocation = invocation_receipt(
@@ -164,6 +197,7 @@ def execute_agent_cli(
         executable=executable,
         argv=argv,
         prompt_transport=prompt_transport,
+        credential_environment_key=credential_environment_key,
         turn_policy=TURN_POLICY,
         isolation=isolation,
     )
@@ -180,8 +214,32 @@ def execute_agent_cli(
         process_succeeded=process.exit_code == 0 and not process.timed_out,
         observer_stopped=process.observer_stopped,
     )
-    parsed = parse_agent_output(process.stdout)
-    capture_status = _capture_status(process)
+    return _agent_result(
+        request=request,
+        backend=backend,
+        effort=effort,
+        process=process,
+        budget=budget,
+        invocation=invocation,
+        secret_values=secret_values,
+    )
+
+
+def _agent_result(
+    *,
+    request: AgentRequest,
+    backend: AgentBackendName,
+    effort: str | None,
+    process: ProcessResult,
+    budget: AgentTurnBudget,
+    invocation: AgentInvocationReceipt,
+    secret_values: tuple[str, ...],
+) -> AgentResult:
+    stdout = redact_secret_values(process.stdout, secret_values)
+    stderr = redact_secret_values(process.stderr, secret_values)
+    redaction_count = stdout.replacements + stderr.replacements
+    parsed = parse_agent_output(stdout.text)
+    capture_status = _capture_status(process, redaction_count)
     termination_kind, termination_reason = _termination(process, budget)
     return AgentResult(
         backend=backend,
@@ -189,8 +247,8 @@ def execute_agent_cli(
         exit_code=process.exit_code,
         timed_out=process.timed_out,
         events=parsed.events,
-        stdout=process.stdout,
-        stderr=process.stderr,
+        stdout=stdout.text,
+        stderr=stderr.text,
         duration_seconds=process.duration_seconds,
         semantic_events=parsed.semantic_events,
         usage=parsed.usage,
@@ -206,15 +264,61 @@ def execute_agent_cli(
         discarded_stdout_lines=process.discarded_stdout_lines,
         discarded_stdout_bytes=process.discarded_stdout_bytes,
         discarded_stdout_sha256=process.discarded_stdout_sha256,
+        credential_redaction_count=redaction_count,
     )
 
 
-def _capture_status(process: ProcessResult) -> AgentCaptureStatus:
+def _capture_status(
+    process: ProcessResult, credential_redaction_count: int
+) -> AgentCaptureStatus:
+    if credential_redaction_count:
+        return AgentCaptureStatus.CREDENTIAL_REDACTED
     if not process.cleanup_succeeded:
         return AgentCaptureStatus.CLEANUP_FAILED
     if process.stdout_truncated or process.stderr_truncated:
         return AgentCaptureStatus.OUTPUT_TRUNCATED
     return AgentCaptureStatus.COMPLETE
+
+
+def _validate_execution_authority(
+    request: AgentRequest,
+    backend: AgentBackendName,
+    credential_environment_key: str,
+    prompt_transport: str,
+    argv: list[str],
+    stdin_text: str | None,
+) -> None:
+    authority = request.execution_authority
+    if authority is None:
+        raise ContractError(
+            "Formal agent execution authority is missing",
+            "agent_execution_authority_missing",
+        )
+    expected = (
+        authority.run_id == request.run_id,
+        authority.attempt_id == request.attempt_id,
+        authority.backend == request.backend.value == backend.value,
+        credential_environment_key == _BACKEND_CREDENTIAL_KEYS[backend],
+        authority.workspace == str(request.workspace),
+        authority.allowed_files == request.allowed_files,
+        authority.requested_environment_keys
+        == tuple(sorted(request.environment)),
+        prompt_transport == "stdin",
+        stdin_text == request.prompt,
+        not any(value == request.prompt for value in argv),
+    )
+    if not all(expected):
+        raise ContractError(
+            "Formal agent execution authority does not bind this invocation",
+            "agent_execution_authority_mismatch",
+        )
+
+
+def _secret_values(
+    environment: Mapping[str, str], credential_environment_key: str
+) -> tuple[str, ...]:
+    value = environment.get(credential_environment_key)
+    return (value,) if value else ()
 
 
 def _termination(

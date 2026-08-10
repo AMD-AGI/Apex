@@ -4,6 +4,29 @@
 contract, and the canonical `kernel_robust_v1` grade. It does not run agents or
 decide E2E deployment.
 
+`EvaluationContractDraft` binds repository URL/commit/tree, dirty paths, and an
+opaque SHA-256 identity for the absolute repository root (the host path itself is
+not serialized), editable source and harness hashes, fixed command
+argv/cwd/env/timeouts, source
+scope, budget, measurement method, recipe claim, and parser/repository/safety/
+grading policy identities. A recipe claim inside TaskSpec is inert; only a
+composition-root `EvaluationContractAuthorizer` can issue authority. The
+digest-bound user-confirmation authorizer accepts exactly one draft previously
+emitted by CLI preview. Any source, harness, repository, command, or policy
+change fails before GPU acquisition. Its `user_confirmation` kind remains
+distinct from `reviewed_template` and `external_evaluator`, so downstream
+validators can require stronger authority.
+The reviewed-template authorizer accepts only the task digest created by the
+materializer and exposes the manifest/recipe identity in the frozen source
+scope. Changing instructions, budget, source, commands, runtime, or the
+materialization receipt invalidates authority before GPU acquisition.
+
+`E2ERewardContract` is the separate path-free scoring contract. It freezes the
+`throughput` objective, regression gates, complete paired-window/bootstrap/A-A
+acceptance policy, and workload protocol hash. The durable E2E recovery request
+may contain private config/results paths, but reward and offline showcase replay
+read only this evaluator contract.
+
 Reward is
 `20*Icompile + Icorrect*(100 + 200*clip(Srobust-1,-0.25,1))`, where
 `S50=Tref,p50/Topt,p50`, `S99=Tref,p99/Topt,p99`, and
@@ -38,20 +61,35 @@ live anchor. Accuracy cannot regress; by default TTFT p99 may regress by at most
 5%, TPOT p99 by at most 2%, and throughput must improve by at least 0.5% before
 a kernel patch is kept. A diagnostic pass is rejected if presented for scoring.
 
-`e2e_reward.py` owns the separate `e2e_kernel_candidate_v1` attempt reward. A
-KEEP starts at `100` and adds only positive throughput shaping; an ordinary
-measured REVERT starts at `-10` and keeps signed throughput shaping; an
-accuracy/TTFT/TPOT hard-gate REVERT starts at `-100` and can only become more
-negative. Throughput shaping is `10 * clip(gain_pct, -10, 10)`. A rejected
-candidate receives `-100`, while the explicit source-free outcome
-`agent_made_no_source_change` receives `-20`; inconclusive measurement receives
-`0`. The final scalar is clipped to `[-200, 200]`. These values grade one E2E
-candidate outcome and must not be confused with canonical kernel raw-sample
-reward. A matched A/B/B/A window uses the frozen
+`e2e_reward.py` owns the separate `e2e_throughput_qos_v1` workload reward:
+
+```text
+Sthr  = Ttotal,c / Ttotal,a
+Sttft = TTFTa,p99 / TTFTc,p99
+Stpot = TPOTa,p99 / TPOTc,p99
+Ge2e  = .80*clip(Sthr-1,-.25,1) + .10*clip(Sttft-1,-.25,1)
+      + .10*clip(Stpot-1,-.25,1)
+reward = 20*Iruntime + Ieligible*(100 + 200*Ge2e)
+```
+
+Runtime failure is `0`, a trusted quality/accuracy/latency hard gate after an
+engaged runtime is `20`, unchanged eligible behavior is `120`, and the eligible
+range is `[70,320]`. Accuracy and the 5% TTFT/2% TPOT limits are hard gates and
+cannot be traded for throughput. These values grade one E2E candidate outcome
+and must not be confused with canonical kernel raw-sample reward. The current
+matched A/B/B/A transition uses the frozen
 `conservative_e2e_reward_v1` selector: any failing comparison sorts before a
 KEEP, then the lowest scalar reward and stable worst-metric/measurement-ID
 tie-breakers select the recorded grade. This is permutation-invariant and never
 averages away a hard-gate regression.
+
+Attempt grades compare a candidate with the current live anchor. The unique
+task-terminal grade instead compares the second fresh clean replay of the final
+accepted source stack with the original baseline. It is never the sum or maximum
+of attempt rewards. Missing replay, provenance, protocol, raw report, quality, or
+paired-window evidence produces `reward=null`; an explicit, fully bound evaluator
+quality failure after runtime engagement produces `20` with
+`performance_skipped=true`.
 
 Tests: `pytest tests/unit/evaluation tests/gpu -q`.
 
@@ -64,6 +102,8 @@ integration, and E2E no-regression decisions.
 
 Use immutable policy/result types and pure functions exported by
 `apex.evaluation`; safety-specific contracts live in `apex.evaluation.safety`.
+The detailed safety contract and current non-implementation status are defined
+only in [safety/README.md](safety/README.md).
 
 ## Invariants
 
@@ -84,6 +124,11 @@ reward.
 The evaluator alone emits `measurement_result` after validating the raw report,
 and emits `reward_committed` only for an eligible valid grade. Command stdout or
 an agent-provided summary cannot create a grade or reward.
+
+Safety is neither correctness nor a reward bonus. Only a complete receipt from
+an independent trusted evaluator can affect the safety gate. The production
+default has no sanitizer tool and remains `safety_certified=false`; an absent,
+not-applicable, or inconclusive check is never rewritten as clean.
 
 ## Dependencies
 
@@ -108,3 +153,9 @@ be replayed independently of the agent transcript. E2E reward commits retain the
 policy and grade artifacts, current-anchor and candidate measurement identities,
 decision evidence, and explicit attempt/candidate lineage; `replay_e2e_reward`
 recomputes the scalar without trusting the stored scalar field.
+E2E task-terminal commits additionally bind every second-clean-replay benchmark
+and quality file in the main CAS. Standalone task-terminal commits bind the
+frozen contract/source plus either trusted gate commands or the raw invocation
+report, execution receipt, harness, measured-attempt policy, and grade. Parent RL
+projection independently replays the applicable formula before accepting
+`task_reward`; attempt rewards are never aggregated.

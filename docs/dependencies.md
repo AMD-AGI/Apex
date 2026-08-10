@@ -137,6 +137,31 @@ method, exact commit, version rule, observed installed version, import file, and
 the environment variable used by runtime adapters. A successful receipt has
 schema `apex.dependencies.receipt/v1` and `status: verified`.
 
+The receipt also contains `magpie_corpus` and `magpie_compatibility`. The first
+binds the exact benchmark subtree/path/hash inventory; the second joins every
+config to its phase-view and orthogonal capability result under
+`e2e_throughput_qos_v1`. Regenerate the latter with
+`python scripts/build_magpie_compatibility_ledger.py` after a reviewed Magpie pin
+change. A missing row, config hash drift, or `capability_upgrade_required` blocks
+dependency verification. Workflow and formal-delivery qualification remain
+separate live receipts and are not inferred by this CPU ledger.
+
+For a release or live-campaign baseline, dependency verification is one input to
+`apex.release-candidate-receipt/v1`. Build the deterministic snapshot with
+`scripts/build_release_candidate_receipt.py`; it also binds the clean Apex tree,
+fresh reviewed Apex/Magpie remote tips, full CPU/static gate, installed CLI,
+immutable images, live qualifications, and all four canonical showcase
+verifications. The command never fetches, launches an agent/GPU, builds an image,
+or upgrades a pending claim. Without separately supplied typed evidence it emits
+a truthful `blocked` receipt. `--require-ready` fails unless current source and
+lock bytes reconstruct a blocker-free receipt.
+
+The receipt separates `baseline_status` from final release `status`.
+`--require-baseline` checks only evidence that must exist before a live campaign;
+`--require-ready` additionally checks the live qualifications and showcase
+outputs. This avoids making a completed showcase a circular prerequisite for the
+campaign that produces it.
+
 The same JSON contains `e2e_source_locks`, with nested receipt schema
 `apex.e2e-source-locks.receipt/v1`. Production `apex optimize e2e` consumes these
 verified roots from `DependencyReceipt`; it no longer reconstructs unverified cache

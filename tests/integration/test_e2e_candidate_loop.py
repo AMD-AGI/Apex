@@ -19,6 +19,7 @@ from apex.benchmark import (
     QualityMetric,
     ServingRuntimeEvidence,
     ThroughputMetrics,
+    expected_attestation_path,
 )
 from apex.core import (
     AgentBackendName,
@@ -46,6 +47,8 @@ from apex.diagnostics import (
 from apex.evaluation import (
     CaseTiming,
     E2EAcceptancePolicy,
+    E2EPairedMeasurement,
+    E2EPairedWindow,
     GateVerdict,
     PairedTimingUnit,
     SampleSeries,
@@ -79,12 +82,15 @@ from apex.ports import (
     AgentTranscriptEvent,
     AgentUsage,
     BenchmarkPass,
+    MagpieFormalMeasurementSupport,
     DiagnosticsResult,
 )
 from apex.rl import (
     EpisodeGraphMaterializer,
     SemanticRole,
 )
+from apex.rl.e2e_validation import validate_e2e_export_reward
+from apex.reporting import ShowcaseExporter, verify_showcase
 
 
 def _agent_containment() -> AgentProcessContainmentReceipt:
@@ -114,6 +120,7 @@ def _agent_containment() -> AgentProcessContainmentReceipt:
         live_namespace_members_after=(),
     )
 from apex.runtime import (
+    ComponentSourceLockSet,
     ContainerIdentity,
     DependencyReceipt,
     GpuDeviceIdentity,
@@ -132,6 +139,12 @@ from apex.storage import (
     EventJournal,
     EventRecord,
     SnapshotStore,
+)
+from tests.support.magpie_contract import ResolvedPlanStub
+from tests.support.gpu_evidence import (
+    SyntheticGpuMeasurementGuard,
+    clean_gpu_doctor,
+    synthetic_gpu_heartbeat,
 )
 
 
@@ -179,15 +192,17 @@ class _Lease:
             foreign_owners=(),
         )
         self.receipt = GpuLeaseReceipt(
-            2,
+            3,
             run_id,
             ownership.execution_scope,
             ownership.physical_scope,
-            1,
+            2,
             float(generation),
             "/tmp/test.lock",
             ownership,
+            clean_gpu_doctor(ownership),
         )
+        self._heartbeat_sequence = 0
 
     def __enter__(self):
         assert not self.state.active
@@ -197,6 +212,17 @@ class _Lease:
     def __exit__(self, *_args):
         assert self.state.active
         self.state.active = False
+
+    def measurement(self, action_id: str) -> SyntheticGpuMeasurementGuard:
+        return SyntheticGpuMeasurementGuard(self.receipt, action_id)
+
+    def heartbeat(self, reason: str = "manual"):
+        self._heartbeat_sequence += 1
+        return synthetic_gpu_heartbeat(
+            self.receipt,
+            reason=reason,
+            sequence=self._heartbeat_sequence,
+        )
 
 
 class _LeaseManager:
@@ -228,6 +254,7 @@ class _Benchmark:
         resolved_candidate_image_id: str = _CANDIDATE_IMAGE_ID,
         mutate_candidate_config: bool = False,
         matched_measurements: list[float] | None = None,
+        quality_gate_failure: bool = False,
     ) -> None:
         self.state = state
         self.measurements = iter(measurements)
@@ -238,14 +265,21 @@ class _Benchmark:
         self.matched_measurements = (
             iter(matched_measurements) if matched_measurements is not None else None
         )
+        self.quality_gate_failure = quality_gate_failure
         self.calls = []
         self.index = 0
+
+    def formal_measurement_support(
+        self, execution_mode: str, lifecycle: str
+    ) -> MagpieFormalMeasurementSupport:
+        del execution_mode, lifecycle
+        return MagpieFormalMeasurementSupport(True, None, "test")
 
     def run_normalized(self, request):
         assert self.state.active
         self.calls.append(request)
         self.index += 1
-        workspace = request.output_dir / f"benchmark-{self.index}"
+        workspace = request.output_dir / f"benchmark-{self.index}" / "workspace"
         workspace.mkdir(parents=True)
         report = workspace / "benchmark_report.json"
         quality_path = workspace / "quality.json"
@@ -281,29 +315,82 @@ class _Benchmark:
                 else None
             ),
             container_name="magpie-benchmark-test" if promotion_run else None,
-            docker_argv_sha256="b" * 64 if promotion_run else None,
+            container_spec_sha256="b" * 64 if promotion_run else None,
             process_succeeded=True if promotion_run else None,
             error=None,
+            input_image=image if promotion_run else None,
+            input_image_id=image if promotion_run else None,
+            image_derivation=(
+                _direct_image_derivation(image) if promotion_run else None
+            ),
         )
         latency = LatencyDistribution(1.0, 1.0, 1.0, 0.0)
+        hard_failure = candidate_run and self.quality_gate_failure
+        quality = QualityEvidence(
+            True,
+            "framework_quality_gate" if hard_failure else "lm_eval",
+            not hard_failure,
+            (QualityMetric("framework_quality_gate" if hard_failure else "gsm8k", "ssim" if hard_failure else "exact_match,strict-match", 0.7 if hard_failure else 0.8, True),),
+            (report if hard_failure else quality_path,),
+            "quality_gate_not_passed" if hard_failure else None,
+            hard_failure=hard_failure,
+        )
+        if hard_failure:
+            report.write_text(
+                json.dumps(
+                    {
+                        "success": True,
+                        "errors": [],
+                        "framework": "vllm",
+                        "model": "Qwen/example",
+                        "profiling_enabled": False,
+                        "workspace_dir": str(workspace),
+                        "throughput": {
+                            "request_throughput": 1.0,
+                            "output_throughput": throughput,
+                            "total_token_throughput": throughput,
+                            "completed_requests": 100,
+                            "duration_seconds": 1.0,
+                        },
+                        "latency": {
+                            name: {"mean_ms": 1.0, "median_ms": 1.0, "p99_ms": 1.0}
+                            for name in ("ttft", "tpot")
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+        attestation = expected_attestation_path(report)
+        attestation.parent.mkdir()
+        attestation.write_text(
+            json.dumps(
+                _execution_attestation(
+                    report,
+                    config_sha256=sha256_file(request.config_path),
+                    run_id=request.run_id,
+                    pass_type=request.pass_type,
+                    serving_runtime=serving_runtime,
+                    quality_gate=(
+                        {"passed": False, "ssim": 0.7}
+                        if hard_failure
+                        else {"passed": True}
+                    ),
+                )
+            ),
+            encoding="utf-8",
+        )
         return NormalizedBenchmarkResult(
             schema_version=1,
             run_id=request.run_id,
             pass_type=request.pass_type,
-            succeeded=True,
+            succeeded=not hard_failure,
             framework="vllm",
             model="Qwen/example",
             workspace_path=workspace,
             report_path=report,
             throughput=ThroughputMetrics(1.0, throughput, throughput, 100, 1.0),
             latency=LatencyMetrics(latency, latency, latency, latency),
-            quality=QualityEvidence(
-                True,
-                "lm_eval",
-                True,
-                (QualityMetric("gsm8k", "exact_match,strict-match", 0.8, True),),
-                (quality_path,),
-            ),
+            quality=quality,
             profiling_enabled=request.pass_type is BenchmarkPass.DIAGNOSTIC,
             run_kind=request.pass_type.value,
             reward_eligible=request.pass_type is BenchmarkPass.MEASUREMENT,
@@ -313,8 +400,12 @@ class _Benchmark:
             inferencex_runtime=InferenceXRuntimeEvidence(
                 False, True, None, None, None, None, None
             ),
-            artifacts=(report, quality_path),
-            errors=(),
+            artifacts=(report, attestation) if hard_failure else (
+                report,
+                quality_path,
+                attestation,
+            ),
+            errors=("quality_gate_not_passed",) if hard_failure else (),
             command_exit_code=0,
             serving_runtime=serving_runtime,
         )
@@ -336,7 +427,7 @@ class _Benchmark:
                     self.candidate_throughput[attempt] = float(next(self.measurements))
                 return self.candidate_throughput[attempt]
             assert self.anchor_throughput is not None
-            if action.endswith("ba-anchor"):
+            if action.endswith("-2-ba-anchor"):
                 attempt = action.split("-window-", 1)[0]
                 candidate = self.candidate_throughput.get(attempt)
                 if candidate is not None and candidate >= self.anchor_throughput * 1.005:
@@ -345,6 +436,126 @@ class _Benchmark:
                     return prior
             return self.anchor_throughput
         return float(next(self.measurements))
+
+
+def _execution_attestation(
+    report: Path,
+    *,
+    config_sha256: str,
+    run_id: str,
+    pass_type: BenchmarkPass,
+    serving_runtime: ServingRuntimeEvidence,
+    quality_gate: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema": "apex.magpie-execution-attestation/v1",
+        "authority": "apex_evaluator",
+        "official_report_path": report.relative_to(report.parent.parent).as_posix(),
+        "official_report_size_bytes": report.stat().st_size,
+        "report_sha256": sha256_file(report),
+        "config_sha256": config_sha256,
+        "run_id": run_id,
+        "pass_type": pass_type.value,
+        "lane_verified": True,
+        "reward_eligible": pass_type is BenchmarkPass.MEASUREMENT,
+        "profiling_enabled": pass_type is BenchmarkPass.DIAGNOSTIC,
+        "process": _process_attestation(),
+        "dependencies": {
+            "schema": "apex.magpie-dependency-attestation/v1",
+            "verified": True,
+            "receipts": {
+                "lock_sha256": "b" * 64,
+                "dependencies": {
+                    name: {
+                        "root": f"/dependencies/{name}",
+                        "commit": "c" * 40,
+                        "tree": "d" * 40,
+                    }
+                    for name in ("magpie", "tracelens", "inferencex")
+                },
+            },
+        },
+        "runtime": {
+            "schema": "apex.magpie-runtime-attestation/v1",
+            "verified": True,
+            "model_revision_receipt": None,
+            "inferencex_runtime_receipt": None,
+            "lm_eval_runtime_receipt": None,
+            "serving_runtime_receipt": _serving_receipt(serving_runtime),
+        },
+        "gpu_engagement": {
+            "schema": "apex.magpie-gpu-engagement/v1",
+            "verified": True,
+            "devices": [
+                {"rsmi_index": 0, "unique_id": "GPU-0000000000000001"}
+            ],
+            "processes": [{
+                "pid": 123,
+                "uid": 1000,
+                "start_time_ticks": 456,
+                "cmdline_sha256": "e" * 64,
+                "rsmi_device_indices": [0],
+            }],
+        },
+        "quality_gate": {
+            "schema": "apex.magpie-quality-attestation/v1",
+            "verified": True,
+            "receipt": quality_gate,
+        },
+        "errors": [],
+    }
+
+
+def _process_attestation() -> dict[str, object]:
+    return {
+        "schema": "apex.magpie-process-attestation/v1",
+        "argv_sha256": "a" * 64,
+        "exit_code": 0,
+        "timed_out": False,
+        "succeeded": True,
+        "verified": True,
+    }
+
+
+def _serving_receipt(value: ServingRuntimeEvidence) -> dict[str, object] | None:
+    if not value.required:
+        return None
+    return {
+        "schema": "apex.magpie-serving-runtime-observation/v3",
+        "execution_mode": "docker",
+        "input_config_sha256": value.input_config_sha256,
+        "input_image": value.input_image,
+        "input_image_id": value.input_image_id,
+        "requested_image": value.requested_image,
+        "resolved_image_id": value.resolved_image_id,
+        "image_derivation": value.image_derivation,
+        "container_name": value.container_name,
+        "container_spec_sha256": value.container_spec_sha256,
+        "process_succeeded": value.process_succeeded,
+        "verified": True,
+        "errors": [],
+    }
+
+
+def _direct_image_derivation(image_id: str) -> dict[str, object]:
+    return {
+        "kind": "direct",
+        "framework": "vllm",
+        "runtime_schema": None,
+        "base_image": image_id,
+        "base_image_id": image_id,
+        "base_image_locator": image_id,
+        "derived_image": image_id,
+        "derived_image_id": image_id,
+        "tracelens_source_commit": None,
+        "tracelens_source_tree": None,
+        "patch_version": None,
+        "patch_path": None,
+        "patch_sha256": None,
+        "dependency_wheel_manifest_sha256": None,
+        "validator": "docker-image-id",
+        "verified": True,
+    }
 
 
 class _Diagnostics:
@@ -377,18 +588,18 @@ class _Diagnostics:
 
 
 class _Provenance:
-    def resolve(self, config_path, *, gpu_arch, hints=None):
+    def resolve(self, resolved, *, gpu_arch, hints=None):
         return RunProvenance(
-            1,
-            str(config_path),
+            2,
+            str(resolved.config_path),
             "a" * 64,
             "vllm",
             "Qwen/example",
             None,
             gpu_arch,
+            "docker",
             ContainerIdentity("example:v1", "sha256:" + "d" * 64, (), ()),
-            ("vllm",),
-            (),
+            ComponentSourceLockSet(("vllm",), ()),
             "partial",
             ("model_revision", "source_lock:vllm"),
         )
@@ -673,6 +884,81 @@ class _FinalDelivery:
         request.artifact_root.mkdir(parents=True)
         bundle = request.artifact_root / "bundle.json"
         bundle.write_text("{}\n", encoding="utf-8")
+        policy = E2EAcceptancePolicy()
+        raw_root = request.artifact_root / "terminal-raw"
+        raw_root.mkdir()
+        raw_artifacts = []
+        windows = []
+        for window in range(3):
+            observations = []
+            for slot, source in (
+                ("anchor-before", request.baseline),
+                ("candidate-forward", request.final),
+                ("candidate-reverse", request.final),
+                ("anchor-after", request.baseline),
+            ):
+                run_id = f"terminal-{window}-{slot}"
+                report = raw_root / f"{run_id}-report.json"
+                quality = raw_root / f"{run_id}-quality.json"
+                report.write_text(
+                    json.dumps(
+                        {
+                            "throughput": {
+                                "total_token_throughput": source.throughput,
+                                "completed_requests": source.completed_requests,
+                            },
+                            "latency": {
+                                "ttft": {"p99_ms": source.ttft_p99_ms},
+                                "tpot": {"p99_ms": source.tpot_p99_ms},
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                quality.write_text(
+                    json.dumps(
+                        {
+                            "results": {
+                                "quality": {
+                                    "exact_match,strict-match": source.accuracy
+                                }
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                measurement_id = sha256_json(
+                    {"run_id": run_id, "sha256": sha256_file(report)}
+                )
+                quality_id = sha256_json(
+                    {"run_id": run_id, "sha256": sha256_file(quality)}
+                )
+                observations.append(
+                    replace(
+                        source,
+                        measurement_receipt=measurement_id,
+                        quality_receipt=quality_id,
+                    )
+                )
+                for role, path in (
+                    ("benchmark_report", report),
+                    ("quality_result", quality),
+                ):
+                    raw_artifacts.append(
+                        {
+                            "role": role,
+                            "run_id": run_id,
+                            "measurement_receipt": measurement_id,
+                            "quality_receipt": quality_id,
+                            "relative_path": path.name,
+                            "path": str(path),
+                            "sha256": sha256_file(path),
+                            "size_bytes": path.stat().st_size,
+                            "media_type": "application/json",
+                        }
+                    )
+            windows.append(E2EPairedWindow(f"terminal-window-{window}", *observations))
+        terminal = E2EPairedMeasurement(tuple(windows), policy.digest, 3)
         return FinalDeliveryResult(
             True,
             TaskStatus.SUCCEEDED,
@@ -682,6 +968,8 @@ class _FinalDelivery:
             str(bundle),
             "f" * 64,
             {"second_environment": True},
+            terminal,
+            tuple(raw_artifacts),
         )
 
 
@@ -720,7 +1008,7 @@ def _eligible_evidence(
         OperationEvidence("attention", "kernel"),
         kernel,
         shape,
-        KernelVolume(100, 10.0, 10.0),
+        KernelVolume(100, 95.0, 95.0),
         PerformanceModelEvidence(),
         EvidenceArtifacts(
             "TargetedKernelTrace",
@@ -828,6 +1116,7 @@ def _system(
     resolved_candidate_image_id: str = _CANDIDATE_IMAGE_ID,
     mutate_candidate_config: bool = False,
     matched_measurements: list[float] | None = None,
+    quality_gate_failure: bool = False,
     contexts: E2EContextBuilder | None = None,
 ):
     state = _LeaseState()
@@ -839,6 +1128,7 @@ def _system(
         resolved_candidate_image_id=resolved_candidate_image_id,
         mutate_candidate_config=mutate_candidate_config,
         matched_measurements=matched_measurements,
+        quality_gate_failure=quality_gate_failure,
     )
     diagnostics = _Diagnostics(state, source)
     worker = _Worker(
@@ -854,11 +1144,13 @@ def _system(
         infrastructure_failure=deployment_infrastructure_failure,
     )
     final = _FinalDelivery(state, succeed=final_succeeds)
+    receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
-        dependency_receipt=_receipt(tmp_path),
+        dependency_receipt=receipt,
         benchmark=benchmark,
         diagnostics=diagnostics,
         provenance=_Provenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
         candidate_worker=worker,
         contexts=contexts,
         micro=micro,
@@ -882,6 +1174,12 @@ def test_two_keeps_use_current_overlay_and_require_clean_delivery(tmp_path: Path
 
     assert result.status is TaskStatus.SUCCEEDED
     assert result.validation_level is ValidationLevel.SOURCE_REBUILD_VERIFIED
+    assert result.task_kind == "e2e_kernel_only"
+    assert result.task_reward == pytest.approx(126.4)
+    assert result.reward_vector is not None
+    assert result.reward_vector["scope"] == "task_terminal"
+    assert result.trainability == "trainable"
+    assert result.untrainable_reason is None
     assert result.intake_provenance_status == "partial"
     assert result.intake_missing_evidence == ("model_revision", "source_lock:vllm")
     assert result.formal_delivery_verified is True
@@ -938,6 +1236,22 @@ def test_two_keeps_use_current_overlay_and_require_clean_delivery(tmp_path: Path
         EventJournal(tmp_path / "results" / "events" / "run.db"),
         ArtifactStore(tmp_path / "results" / "artifacts"),
     ).materialize(result.run_id, workload_state=recovered.state)
+    assert graph.parent.task_reward == pytest.approx(result.task_reward)
+    assert graph.parent.reward_vector == result.reward_vector
+    assert graph.parent.reward_policy_id == "e2e_throughput_qos_v1"
+    assert graph.parent.reward_source_receipt == result.reward_source_receipt
+    assert graph.parent.raw_measurement_receipts == result.raw_measurement_receipts
+    assert graph.parent.trainability == "complete"
+    assert graph.parent.untrainable_reason is None
+    assert "e2e_throughput_qos_v1" in graph.policy_ids
+    showcase = ShowcaseExporter(
+        ArtifactStore(tmp_path / "results" / "artifacts")
+    ).export(
+        graph,
+        tmp_path / "e2e-showcase",
+        showcase_id="e2e-terminal-raw-replay",
+    )
+    assert verify_showcase(showcase.output_dir).reward_replayed is True
     projected_comparison = next(
         event
         for event in graph.parent.events
@@ -953,13 +1267,14 @@ def test_two_keeps_use_current_overlay_and_require_clean_delivery(tmp_path: Path
             "promotion-"
         )
     )
-    assert len(promotion_measurements) == 8
+    assert len(promotion_measurements) == 24
     expected_measurement_roles = {
         "benchmark_config",
         "normalized_benchmark",
         "quality_evidence",
         "benchmark_report",
         "quality_result",
+        "gpu_measurement_bracket",
     }
     for event in promotion_measurements:
         roles = {item["role"] for item in event.payload["artifacts"]}
@@ -970,19 +1285,25 @@ def test_two_keeps_use_current_overlay_and_require_clean_delivery(tmp_path: Path
             for item in event.payload["artifacts"]
             if item["role"] == "benchmark_config"
         )
+        assert event.payload["gpu_measurement_bracket_digest"] == next(
+            item["receipt"]["digest"]
+            for item in event.payload["artifacts"]
+            if item["role"] == "gpu_measurement_bracket"
+        )
     pairs = tuple(
         event
         for event in events
         if event.event_type == "measurement_result"
-        and event.payload.get("measurement_kind") == "matched_promotion_ab_ba"
+        and event.payload.get("measurement_kind") == "paired_promotion_abba"
     )
     assert len(pairs) == 2
     assert all(
-        event.payload["order"] == ["anchor", "candidate", "candidate", "anchor"]
+        event.payload["window_order"]
+        == ["anchor", "candidate", "candidate", "anchor"]
         for event in pairs
     )
     assert all(
-        {"matched_promotion_pair", "promotion_gpu_lease"}
+        {"paired_promotion", "promotion_gpu_lease"}
         <= {item["role"] for item in event.payload["artifacts"]}
         for event in pairs
     )
@@ -1017,8 +1338,26 @@ def test_two_keeps_use_current_overlay_and_require_clean_delivery(tmp_path: Path
     decisions = tuple(
         event for event in events if event.event_type == "e2e.candidate_decided"
     )
-    rewards = tuple(event for event in events if event.event_type == "reward_committed")
+    rewards = tuple(
+        event
+        for event in events
+        if event.event_type == "reward_committed"
+        and event.payload.get("scope") == "attempt"
+    )
+    terminal_rewards = tuple(
+        event
+        for event in events
+        if event.event_type == "reward_committed"
+        and event.payload.get("scope") == "task_terminal"
+    )
     assert len(decisions) == len(rewards) == 2
+    assert len(terminal_rewards) == 1
+    terminal_raw_roles = tuple(
+        item["role"]
+        for item in terminal_rewards[0].payload["artifacts"]
+        if str(item["role"]).startswith("terminal_raw_")
+    )
+    assert terminal_raw_roles == tuple(f"terminal_raw_{index}" for index in range(24))
     assert all(
         decision.transaction_id == reward.transaction_id
         for decision, reward in zip(decisions, rewards, strict=True)
@@ -1047,6 +1386,21 @@ def test_two_keeps_use_current_overlay_and_require_clean_delivery(tmp_path: Path
     # The second diagnosis selects kernel2.py; the kernel.py experience must not leak
     # across the exact source/harness identity boundary.
     assert packet["relevant_history"]["attempts"] == []
+
+    raw_binding = next(
+        item
+        for item in terminal_rewards[0].payload["artifacts"]
+        if item["role"] == "terminal_raw_0"
+    )
+    raw_receipt = ArtifactReceipt.from_dict(raw_binding["receipt"])
+    raw_path = tmp_path / "results" / "artifacts" / raw_receipt.relative_path
+    raw_path.write_bytes(b'{"tampered":true}\n')
+    with pytest.raises(IntegrityError) as error:
+        EpisodeGraphMaterializer(
+            EventJournal(tmp_path / "results" / "events" / "run.db"),
+            ArtifactStore(tmp_path / "results" / "artifacts"),
+        ).materialize(result.run_id, workload_state=recovered.state)
+    assert error.value.reason_code == "artifact_digest_mismatch"
 
 
 def test_agent_transcript_usage_and_cost_are_attempt_scoped(tmp_path: Path) -> None:
@@ -1120,12 +1474,68 @@ def test_e2e_revert_rolls_back_and_returns_no_gain(tmp_path: Path) -> None:
     reward = next(event for event in events if event.event_type == "reward_committed")
     assert decision.transaction_id == reward.transaction_id
     assert decision.payload["attempt_id"] == reward.payload["attempt_id"] == "attempt-1"
-    assert reward.payload["scalar_reward"] == -10.0
+    assert reward.payload["scalar_reward"] == 120.0
     experience = next(
         event for event in events if event.event_type == "experience.measured"
     )
     assert experience.payload["outcome"] == "no_gain"
     assert experience.payload["evidence_receipts"] == [decision.payload["receipt"]]
+    recovered = RunController.recover(
+        result.run_id,
+        EventJournal(tmp_path / "results/events/run.db"),
+        SnapshotStore(tmp_path / "results/state.snapshot.json"),
+    )
+    graph = EpisodeGraphMaterializer(
+        EventJournal(tmp_path / "results/events/run.db"),
+        ArtifactStore(tmp_path / "results/artifacts"),
+    ).materialize(result.run_id, workload_state=recovered.state)
+    assert graph.parent.task_reward is None
+    assert graph.parent.reward_vector is None
+    assert graph.parent.trainability == "untrainable"
+    assert graph.parent.untrainable_reason == "terminal_paired_replay_missing"
+
+
+def test_trusted_quality_failure_commits_runtime_only_reward(tmp_path: Path) -> None:
+    system = _system(
+        tmp_path,
+        [100.0, 100.0, 100.0],
+        [True],
+        quality_gate_failure=True,
+    )
+    result = system[0].run(_spec(tmp_path, iterations=1))
+
+    assert result.status is TaskStatus.NO_GAIN
+    events = EventJournal(tmp_path / "results/events/run.db").iter_events(result.run_id)
+    decision = next(
+        event for event in events if event.event_type == "e2e.candidate_decided"
+    )
+    reward = next(
+        event
+        for event in events
+        if event.event_type == "reward_committed"
+        and event.payload.get("scope") == "attempt"
+    )
+    assert decision.payload["verdict"] == "revert"
+    assert decision.payload["reason"] == "quality_gate_failed"
+    assert reward.payload["scalar_reward"] == 20.0
+    assert reward.payload["reward_vector"]["performance_skipped"] == "quality_gate"
+    assert not any(
+        event.payload.get("measurement_kind") == "paired_promotion_abba"
+        for event in events
+    )
+
+    journal = EventJournal(tmp_path / "results/events/run.db")
+    artifacts = ArtifactStore(tmp_path / "results/artifacts")
+    recovered = RunController.recover(
+        result.run_id,
+        journal,
+        SnapshotStore(tmp_path / "results/state.snapshot.json"),
+    )
+    graph = EpisodeGraphMaterializer(journal, artifacts).materialize(
+        result.run_id,
+        workload_state=recovered.state,
+    )
+    validate_e2e_export_reward(graph, graph.children[0], artifacts)
 
 
 def test_e2e_throughput_loss_records_regression_experience(tmp_path: Path) -> None:
@@ -1461,7 +1871,7 @@ def test_returned_candidate_failure_remains_a_search_rejection(tmp_path: Path) -
     assert recovered.state.e2e.decisions[0].verdict == "reject"
 
 
-def test_source_free_agent_attempt_commits_explicit_no_source_reward(
+def test_source_free_agent_attempt_commits_zero_pre_runtime_reward(
     tmp_path: Path,
 ) -> None:
     system = _system(
@@ -1483,7 +1893,7 @@ def test_source_free_agent_attempt_commits_explicit_no_source_reward(
     assert decision.payload["verdict"] == "reject"
     assert "candidate_id" not in decision.payload
     assert reward.payload["reward_vector"]["outcome_class"] == "no_source"
-    assert reward.payload["scalar_reward"] == -20.0
+    assert reward.payload["scalar_reward"] == 0.0
 
 
 def test_deployment_infrastructure_failure_is_not_candidate_no_gain(
@@ -1733,7 +2143,7 @@ def test_resume_reuses_recorded_candidate_measurement_and_commits_once(
     assert result.status is TaskStatus.SUCCEEDED
     assert len(
         [call for call in benchmark.calls if call.run_id.startswith("promotion-")]
-    ) == 4
+    ) == 12
     assert diagnostics.calls == 3
     _assert_one_decision_reward_pair(tmp_path / "results", result.run_id)
 
@@ -1900,7 +2310,10 @@ def test_resume_from_planning_preserves_keep_chain_and_continues_search(
         event for event in events if event.event_type == "e2e.candidate_decided"
     )
     rewards = tuple(
-        event for event in events if event.event_type == "reward_committed"
+        event
+        for event in events
+        if event.event_type == "reward_committed"
+        and event.payload.get("scope") == "attempt"
     )
     assert len(decisions) == len(rewards) == 2
     assert {item.transaction_id for item in decisions} == {
@@ -1966,16 +2379,17 @@ def test_resume_discards_partial_matched_window_and_starts_fresh(
     promotion_calls = [
         call for call in benchmark.calls if call.run_id.startswith("promotion-")
     ]
-    assert len(promotion_calls) == crash_after + 4
+    assert len(promotion_calls) == crash_after + 12
     events = EventJournal(tmp_path / "results/events/run.db").iter_events(result.run_id)
     pairs = [
         event
         for event in events
-        if event.payload.get("measurement_kind") == "matched_promotion_ab_ba"
+        if event.payload.get("measurement_kind") == "paired_promotion_abba"
     ]
     assert len(pairs) == 1
-    window = pairs[0].payload["window_id"]
-    assert sum(window in call.run_id for call in promotion_calls) == 4
+    windows = pairs[0].payload["window_ids"]
+    assert len(windows) == 3
+    assert all(sum(window in call.run_id for call in promotion_calls) == 4 for window in windows)
     resume_lease = next(
         event
         for event in events
@@ -2017,12 +2431,40 @@ def test_resume_rejects_changed_physical_gpu_before_recording_new_lease(
     assert not any(event.payload.get("kind") == "gpu_lease_resume" for event in events)
 
 
-def test_keep_requires_both_ab_and_ba_comparisons(tmp_path: Path) -> None:
+def test_resume_rejects_reused_old_lease_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedProcessLoss(BaseException):
+        pass
+
+    system = _system(tmp_path, [100.0, 102.0, 102.0], [True])
+    use_case, _, lease, benchmark, *_ = system
+    original = benchmark.run_normalized
+
+    def crash(request):
+        if request.run_id.startswith("promotion-"):
+            raise SimulatedProcessLoss("promotion-process-lost")
+        return original(request)
+
+    monkeypatch.setattr(benchmark, "run_normalized", crash)
+    with pytest.raises(SimulatedProcessLoss):
+        use_case.run(_spec(tmp_path, iterations=1))
+    monkeypatch.setattr(benchmark, "run_normalized", original)
+    lease.calls = 0
+
+    with pytest.raises(ContractError) as raised:
+        use_case.resume(tmp_path / "results")
+
+    assert raised.value.reason_code == "resume_gpu_lease_reused"
+
+
+def test_keep_requires_all_paired_observations_to_support_gain(tmp_path: Path) -> None:
     system = _system(
         tmp_path,
         [100.0, 100.0],
         [True],
-        matched_measurements=[100.0, 102.0, 99.0, 100.0],
+        matched_measurements=[100.0, 102.0, 99.0, 100.0] * 3,
     )
 
     result = system[0].run(_spec(tmp_path, iterations=1))
@@ -2033,19 +2475,19 @@ def test_keep_requires_both_ab_and_ba_comparisons(tmp_path: Path) -> None:
     pair = next(
         event
         for event in events
-        if event.payload.get("measurement_kind") == "matched_promotion_ab_ba"
+        if event.payload.get("measurement_kind") == "paired_promotion_abba"
     )
     receipt = ArtifactReceipt.from_dict(
         next(
             item["receipt"]
             for item in pair.payload["artifacts"]
-            if item["role"] == "matched_promotion_pair"
+            if item["role"] == "paired_promotion"
         )
     )
     document = json.loads(ArtifactStore(tmp_path / "results/artifacts").read_bytes(receipt))
-    assert document["schema"] == "apex.e2e-matched-promotion/v2"
-    assert document["selection_policy"]["policy_id"] == "conservative_e2e_reward_v1"
-    assert [item["keep"] for item in document["comparisons"]] == [True, False]
+    assert document["schema"] == "apex.e2e-paired-promotion/v1"
+    assert len(document["measurement"]["windows"]) == 3
+    assert document["measurement"]["estimator_id"] == "paired_log_ratio_geomean_v1"
     assert document["verdict"]["keep"] is False
     decision = next(event for event in events if event.event_type == "e2e.candidate_decided")
     assert decision.payload["verdict"] == "revert"
@@ -2063,13 +2505,13 @@ def test_recovery_rejects_malicious_anchor_candidate_receipt_swap(
     pair = next(
         event
         for event in events
-        if event.payload.get("measurement_kind") == "matched_promotion_ab_ba"
+        if event.payload.get("measurement_kind") == "paired_promotion_abba"
     )
     pair_receipt = ArtifactReceipt.from_dict(
         next(
             item["receipt"]
             for item in pair.payload["artifacts"]
-            if item["role"] == "matched_promotion_pair"
+            if item["role"] == "paired_promotion"
         )
     )
     document = json.loads(record.artifacts.read_bytes(pair_receipt))
@@ -2085,7 +2527,7 @@ def test_recovery_rejects_malicious_anchor_candidate_receipt_swap(
             **item,
             "receipt": (
                 forged_receipt.to_dict()
-                if item["role"] == "matched_promotion_pair"
+                if item["role"] == "paired_promotion"
                 else item["receipt"]
             ),
         }
@@ -2115,7 +2557,10 @@ def _assert_one_decision_reward_pair(root: Path, run_id: str) -> None:
         event for event in events if event.event_type == "e2e.candidate_decided"
     )
     rewards = tuple(
-        event for event in events if event.event_type == "reward_committed"
+        event
+        for event in events
+        if event.event_type == "reward_committed"
+        and event.payload.get("scope") == "attempt"
     )
     assert len(decisions) == len(rewards) == 1
     assert decisions[0].transaction_id == rewards[0].transaction_id

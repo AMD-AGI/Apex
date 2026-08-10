@@ -5,13 +5,16 @@ from __future__ import annotations
 from typing import Sequence
 
 from apex.core import (
-    AgentBackendName,
     ApexError,
     ContractError,
     TaskStatus,
     new_identifier,
 )
 from apex.delivery import TaskResult, write_task_result
+from apex.evaluation import (
+    EvaluationContractAuthorizer,
+    EvaluationContractReceipt,
+)
 from apex.evaluation.safety import (
     SafetyGate,
     SafetyGateRequest,
@@ -22,18 +25,24 @@ from apex.evaluation.safety import (
     VerificationPolicy,
 )
 from apex.execution import AgentRegistry
-from apex.intake import TaskResolver, TaskSpec
+from apex.intake import ResolvedTaskSpec, TaskSpec
 from apex.ports import (
-    AgentRequest,
     AgentTerminationKind,
     KernelMeasurementPort,
     SafetyToolRunRequest,
     SafetyToolRunResult,
     SafetyVerificationPort,
+    WorkspaceRepositoryIdentityPort,
 )
-from apex.runtime import GpuLeaseManager, GpuLeaseReceipt, LocalGpuLeaseManager
+from apex.runtime import (
+    GpuLease,
+    GpuLeaseManager,
+    LocalGpuLeaseManager,
+    require_gpu_lease_heartbeat,
+)
 from apex.storage import ArtifactReceipt
 
+from ..baseline_recording import record_campaign_baseline
 from .attempts import (
     AttemptSession,
     CompileCorrectnessReceipts,
@@ -45,16 +54,22 @@ from .attempts import (
     SafetyEvidence,
     select_best,
 )
+from .agent_request import agent_failure_status, build_agent_request
 from .context import KernelContextBuilder
+from .contract_recording import record_evaluation_contract
 from .finalization import deliver_best, failure_result, finish_without_candidate, publish
+from .formal_contract import KernelFormalContractResolver
+from .gate_verification import verify_compile_correctness
 from .lifecycle import (
     close_attempt,
     close_prepared,
     phase_isolation_receipt,
     safety_gate_request,
 )
-from .measurement import evaluate_kernel_measurement
-from .run_record import KernelRunRecord, candidate_file_bytes
+from .formal_measurement_recording import record_measurement_error
+from .gpu_recording import record_gpu_lease_heartbeat
+from .lease_measurement import LeaseMeasurementExecution, execute_lease_measurement
+from .run_record import KernelRunRecord
 from .safety_bridge import (
     baseline_source_digest,
     materialize_safety_candidate,
@@ -63,7 +78,7 @@ from .safety_bridge import (
     validate_safety_result,
 )
 from .verification import CandidateVerifier, candidate_source_digest
-from .workspace import CandidateWorkspace
+from .workspace import CandidateWorkspace, candidate_file_bytes
 
 
 class _UnexpectedSafetyRunner:
@@ -85,6 +100,8 @@ class KernelOptimizeUseCase:
         safety_tools: Sequence[ToolVerificationPlan] = (),
         gpu_leases: GpuLeaseManager | None = None,
         measurement_evaluator: KernelMeasurementPort | None = None,
+        evaluation_authorizer: EvaluationContractAuthorizer | None = None,
+        repository_identities: WorkspaceRepositoryIdentityPort | None = None,
     ) -> None:
         self._agents = agents
         self._verifier = verifier or CandidateVerifier()
@@ -104,6 +121,10 @@ class KernelOptimizeUseCase:
         self._safety_gate = safety_gate or SafetyGate(_UnexpectedSafetyRunner())
         self._gpu_leases = gpu_leases or LocalGpuLeaseManager()
         self._measurement_evaluator = measurement_evaluator
+        self._formal_contracts = KernelFormalContractResolver(
+            evaluation_authorizer,
+            repository_identities,
+        )
 
     @property
     def measurement_adapter_id(self) -> str | None:
@@ -112,23 +133,48 @@ class KernelOptimizeUseCase:
         evaluator = self._measurement_evaluator
         return evaluator.adapter_id if evaluator is not None else None
 
+    def preview_evaluation_contract(
+        self, task: TaskSpec
+    ) -> EvaluationContractReceipt:
+        """Discover/freeze formal inputs without acquiring a GPU or invoking an agent."""
+
+        _, contract = self._formal_contracts.freeze(task)
+        return contract
+
     def run(self, request: KernelOptimizeRequest) -> TaskResult:
         run_id = new_identifier("run")
+        contract: EvaluationContractReceipt | None = None
         try:
+            resolved, contract = self._formal_contracts.freeze(request.task)
+            if not contract.verified:
+                raise ContractError(
+                    "Formal kernel campaign lacks evaluator authority",
+                    contract.unverified_reason or "evaluation_authority_missing",
+                    {"evaluation_contract_digest": contract.digest},
+                )
             with self._gpu_leases.acquire(run_id) as lease:
-                return self._run(request, run_id, lease.receipt)
+                return self._run(request, resolved, contract, run_id, lease)
         except ApexError as error:
-            result = failure_result(request.task, error, run_id=run_id)
+            result = failure_result(
+                request.task,
+                error,
+                run_id=run_id,
+                evaluation_contract=contract,
+            )
             write_task_result(result, request.result_json)
             return result
 
     def _run(
         self,
         request: KernelOptimizeRequest,
+        resolved: ResolvedTaskSpec,
+        evaluation_contract: EvaluationContractReceipt,
         run_id: str,
-        gpu_lease: GpuLeaseReceipt,
+        gpu_lease: GpuLease,
     ) -> TaskResult:
-        session = self._start_session(request, run_id, gpu_lease)
+        session = self._start_session(
+            request, resolved, evaluation_contract, run_id, gpu_lease
+        )
         try:
             result = self._execute_search(session)
             publish(session)
@@ -148,10 +194,11 @@ class KernelOptimizeUseCase:
     def _start_session(
         self,
         request: KernelOptimizeRequest,
+        resolved: ResolvedTaskSpec,
+        evaluation_contract: EvaluationContractReceipt,
         run_id: str,
-        gpu_lease: GpuLeaseReceipt,
+        gpu_lease: GpuLease,
     ) -> RunSession:
-        resolved = TaskResolver().resolve(request.task)
         run_root = request.task.results_dir / "runs" / run_id
         record = KernelRunRecord.create(
             run_id=run_id,
@@ -160,15 +207,30 @@ class KernelOptimizeUseCase:
             dataset_split=request.task.dataset_split,
             data_visibility=request.task.data_visibility,
         )
-        lease_artifact = record.record_gpu_lease(gpu_lease)
+        contract_artifact = record_evaluation_contract(
+            artifacts=record.artifacts,
+            controller=record.controller,
+            contract=evaluation_contract,
+        )
+        receipt = gpu_lease.receipt
+        lease_artifact = record.record_gpu_lease(receipt)
+        if request.campaign_baseline is not None:
+            record_campaign_baseline(
+                record.artifacts,
+                record.controller,
+                request.campaign_baseline.to_dict(),
+            )
         return RunSession(
             request,
             resolved,
             run_id,
             run_root,
             record,
-            gpu_lease,
+            evaluation_contract,
+            contract_artifact,
+            receipt,
             lease_artifact,
+            gpu_lease,
         )
 
     def _execute_search(self, session: RunSession) -> TaskResult:
@@ -181,6 +243,14 @@ class KernelOptimizeUseCase:
                 break
         frozen = tuple(outcomes)
         best = select_best(frozen)
+        terminal_attempt = best or frozen[-1]
+        heartbeat = require_gpu_lease_heartbeat(session.gpu_lease_guard)
+        record_gpu_lease_heartbeat(
+            session.record,
+            heartbeat,
+            attempt_id=terminal_attempt.attempt_id,
+            phase="terminal",
+        )
         if best is not None:
             return deliver_best(session, frozen, best)
         return finish_without_candidate(session, frozen)
@@ -207,7 +277,9 @@ class KernelOptimizeUseCase:
         prepared = self._prepare_candidate(attempt, agent_evidence)
         if isinstance(prepared, KernelAttemptOutcome):
             return prepared
-        verified = self._verify_compile_correctness(attempt, prepared, agent_evidence)
+        verified = verify_compile_correctness(
+            self._verifier, attempt, prepared, agent_evidence
+        )
         if isinstance(verified, KernelAttemptOutcome):
             return verified
         safety = self._verify_safety(attempt, prepared, verified)
@@ -221,13 +293,13 @@ class KernelOptimizeUseCase:
         run = attempt.run
         backend_name = run.request.backend_override or run.request.task.agent_backend
         result = self._agents.get(backend_name).run(
-            self._agent_request(attempt, backend_name)
+            build_agent_request(attempt, backend_name)
         )
         receipts = run.record.record_agent(attempt.attempt_id, result=result)
         evidence = (attempt.context.packet_receipt, *receipts)
         if result.candidate_capture_allowed:
             return evidence
-        status = _agent_failure_status(result.termination_kind)
+        status = agent_failure_status(result.termination_kind)
         reason = result.candidate_rejection_reason or "agent_failed"
         return close_attempt(
             attempt,
@@ -297,51 +369,6 @@ class KernelOptimizeUseCase:
             plan,
         )
 
-    def _verify_compile_correctness(
-        self,
-        attempt: AttemptSession,
-        prepared: PreparedCandidate,
-        prior: tuple[ArtifactReceipt, ...],
-    ) -> CompileCorrectnessReceipts | KernelAttemptOutcome:
-        run = attempt.run
-        compile_result = self._verifier.compile(
-            run.resolved,
-            candidate_root=attempt.candidate.root,
-            expected_source_digest=prepared.normal_source_digest,
-        )
-        compile_receipt = run.record.record_command(attempt.attempt_id, compile_result)
-        evidence = (*prior, *prepared.candidate_receipts, compile_receipt)
-        if not compile_result.passed:
-            return close_prepared(
-                attempt,
-                prepared,
-                TaskStatus.REJECTED,
-                "compile_failed",
-                evidence,
-                closure="reject",
-            )
-        correctness = self._verifier.correctness(
-            run.resolved,
-            candidate_root=attempt.candidate.root,
-            expected_source_digest=prepared.normal_source_digest,
-        )
-        correctness_receipt = run.record.record_command(attempt.attempt_id, correctness)
-        evidence = (*evidence, correctness_receipt)
-        if not correctness.passed:
-            return close_prepared(
-                attempt,
-                prepared,
-                TaskStatus.REJECTED,
-                "correctness_failed",
-                evidence,
-                closure="reject",
-            )
-        return CompileCorrectnessReceipts(
-            compile_receipt,
-            correctness_receipt,
-            evidence,
-        )
-
     def _verify_safety(
         self,
         attempt: AttemptSession,
@@ -386,15 +413,19 @@ class KernelOptimizeUseCase:
         verified: CompileCorrectnessReceipts,
         safety: SafetyEvidence,
     ) -> KernelAttemptOutcome:
-        run = attempt.run
-        performance = self._verifier.performance(
-            run.resolved,
-            candidate_root=attempt.candidate.root,
-            expected_source_digest=prepared.normal_source_digest,
+        capture = execute_lease_measurement(
+            attempt,
+            prepared,
+            verifier=self._verifier,
+            evaluator=self._measurement_evaluator,
+            capture_measurement=(attempt.run.resolved.task.measurement is not None),
         )
-        performance_receipt = run.record.record_command(attempt.attempt_id, performance)
-        evidence = (*safety.evidence, performance_receipt)
-        if not performance.passed:
+        evidence = (
+            *safety.evidence,
+            capture.performance_receipt,
+            capture.bracket_receipt,
+        )
+        if not capture.performance_passed:
             return close_prepared(
                 attempt,
                 prepared,
@@ -411,7 +442,7 @@ class KernelOptimizeUseCase:
             prepared,
             verified,
             safety,
-            performance_receipt,
+            capture,
             evidence,
         )
 
@@ -421,10 +452,12 @@ class KernelOptimizeUseCase:
         prepared: PreparedCandidate,
         verified: CompileCorrectnessReceipts,
         safety: SafetyEvidence,
-        performance_receipt: ArtifactReceipt,
+        capture: LeaseMeasurementExecution,
         evidence: tuple[ArtifactReceipt, ...],
     ) -> KernelAttemptOutcome:
-        evaluated = self._evaluate_measurement(attempt, prepared, safety, evidence)
+        evaluated = self._commit_measurement(
+            attempt, prepared, safety, capture, evidence
+        )
         if isinstance(evaluated, KernelAttemptOutcome):
             return evaluated
         measurement = evaluated.measurement
@@ -433,7 +466,7 @@ class KernelOptimizeUseCase:
             compile_receipt=verified.compile,
             correctness_receipt=verified.correctness,
             safety_receipt=safety.receipt,
-            performance_receipt=performance_receipt,
+            performance_receipt=capture.performance_receipt,
             measurement_receipt=evaluated.receipt,
         )
         complete_evidence = (*evaluated.evidence, verification)
@@ -468,11 +501,12 @@ class KernelOptimizeUseCase:
             eligible=True,
         )
 
-    def _evaluate_measurement(
+    def _commit_measurement(
         self,
         attempt: AttemptSession,
         prepared: PreparedCandidate,
         safety: SafetyEvidence,
+        capture: LeaseMeasurementExecution,
         evidence: tuple[ArtifactReceipt, ...],
     ) -> MeasurementEvidence | KernelAttemptOutcome:
         if attempt.run.resolved.task.measurement is None:
@@ -489,33 +523,24 @@ class KernelOptimizeUseCase:
                 closure="defer",
                 measurement_fields={"measurement_status": "not_configured"},
             )
-        try:
-            measurement = evaluate_kernel_measurement(
-                attempt.run.resolved,
-                candidate_root=attempt.candidate.root,
-                run_id=attempt.run.run_id,
-                attempt_id=attempt.attempt_id,
-                output_root=(
-                    attempt.run.run_root / "measurements" / attempt.attempt_id
-                ),
-                evaluator=self._measurement_evaluator,
-            )
-        except ApexError as error:
-            attempt.run.record.record_measurement_error(
+        if capture.measurement_error is not None:
+            record_measurement_error(
+                attempt.run.record,
                 attempt.attempt_id,
-                reason_code=error.reason_code,
+                reason_code=capture.measurement_error,
             )
             return close_prepared(
                 attempt,
                 prepared,
                 TaskStatus.NO_MEASUREMENT,
-                error.reason_code,
+                capture.measurement_error,
                 evidence,
                 safety=safety.result,
                 safety_receipt=safety.receipt,
                 closure="defer",
                 measurement_fields={"measurement_status": "error"},
             )
+        measurement = capture.measurement
         measurement_receipt: ArtifactReceipt | None = None
         if measurement is not None:
             measurement_receipt = attempt.run.record.record_measurement(
@@ -541,39 +566,9 @@ class KernelOptimizeUseCase:
                 )
         return MeasurementEvidence(measurement, measurement_receipt, evidence)
 
-    def _agent_request(
-        self,
-        attempt: AttemptSession,
-        backend: AgentBackendName,
-    ) -> AgentRequest:
-        request = attempt.run.request
-        task = request.task
-        return AgentRequest(
-            run_id=attempt.run.run_id,
-            attempt_id=attempt.attempt_id,
-            backend=backend,
-            prompt=attempt.context.prompt,
-            workspace=attempt.candidate.root,
-            allowed_files=task.editable_files,
-            model=request.model_override or task.agent_options.model,
-            effort=request.effort_override or task.agent_options.effort,
-            max_turns=task.budget.max_turns,
-            timeout_seconds=task.budget.timeout_seconds,
-            runtime_closure_sha256=task.agent_options.runtime_closure_sha256,
-        )
-
-
 def _uses_external_evaluator(task: TaskSpec) -> bool:
     recipe = task.recipe
     return recipe is not None and recipe.provenance == "external_evaluator"
-
-
-def _agent_failure_status(kind: AgentTerminationKind) -> TaskStatus:
-    if kind is AgentTerminationKind.TIMEOUT:
-        return TaskStatus.TIMEOUT
-    if kind is AgentTerminationKind.TURN_OVERRUN:
-        return TaskStatus.BUDGET_EXHAUSTED
-    return TaskStatus.INFRASTRUCTURE_ERROR
 
 
 __all__ = ["KernelOptimizeRequest", "KernelOptimizeUseCase"]

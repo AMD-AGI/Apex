@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterator, Mapping
 
 from apex.core import IntegrityError, sha256_bytes, sha256_file, sha256_json
-from apex.execution import SubprocessSupervisor
+from apex.execution import SubprocessSupervisor, build_subprocess_environment
 
 
 IGNORED_DIRECTORIES = {
@@ -315,10 +315,15 @@ def git_output(root: Path, argv: tuple[str, ...], *, timeout: int) -> str:
 def git_environment() -> dict[str, str]:
     """Return an environment that excludes ambient Git and Python injection."""
 
-    environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
-    environment["GIT_CONFIG_NOSYSTEM"] = "1"
-    return environment
+    return build_subprocess_environment(
+        fixed={
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+    )
 
 
 __all__ = [

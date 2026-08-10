@@ -8,20 +8,21 @@ from typing import Mapping
 
 from apex.benchmark import BenchmarkConfigViews
 from apex.core import ApexError, ContractError, IntegrityError
-from apex.evaluation import (
-    E2EAcceptancePolicy,
-    E2EMeasurement,
-)
+from apex.evaluation import E2EAcceptancePolicy, E2EObservation
 from apex.intake import E2EOptimizeSpec
 from apex.orchestration import SearchStage
 from apex.runtime import GpuLeaseReceipt, RunProvenance
 from apex.storage import ArtifactReceipt
 
 from .benchmarking import Diagnosis, E2EBenchmarkSession
-from .candidate import CandidateWorker, E2ECandidate, E2ECandidateRequest
+from .agent_request import build_e2e_candidate_request
+from .candidate import CandidateWorker, E2ECandidate
 from .context import E2EContextBuilder
 from .kernel_lane import KernelOpportunity
-from .outcomes import commit_e2e_reject, commit_measured_e2e_outcome
+from .outcomes import (
+    commit_e2e_reject,
+    commit_measured_e2e_outcome,
+)
 from .promotion import MatchedPromotion, MatchedPromotionRunner
 from .recovery_search import RecoveredSearch
 from .run_record import E2ERunRecord
@@ -29,7 +30,7 @@ from .search_recovery import SearchRecovery
 from .search_support import (
     QualifiedAttempt as _QualifiedAttempt,
     candidate_id as _candidate_id,
-    commit_qualified_reject as _commit_qualified_reject,
+    commit_failed_promotion as _commit_failed_promotion,
     opportunity_map as _opportunity_map,
     promotion_artifacts as _promotion_artifacts,
     promotion_receipts as _promotion_receipts,
@@ -57,7 +58,7 @@ class SearchOutcome:
     """Durable search output consumed by finalization."""
 
     accepted: tuple[AcceptedCandidate, ...]
-    anchor: E2EMeasurement
+    anchor: E2EObservation
     measurement_config: Path
     diagnostic_config: Path
     replay_config: Path
@@ -103,7 +104,7 @@ class E2ESearchLoop:
     def run(
         self,
         initial: Diagnosis,
-        baseline: E2EMeasurement,
+        baseline: E2EObservation,
         *,
         recovery: RecoveredSearch | None = None,
     ) -> SearchOutcome:
@@ -177,7 +178,7 @@ class E2ESearchLoop:
     def _attempt(
         self,
         opportunity: KernelOpportunity,
-        anchor: E2EMeasurement,
+        anchor: E2EObservation,
         diagnostic_receipt: ArtifactReceipt,
         configs: tuple[Path, Path, Path],
         anchor_image_id: str | None,
@@ -214,7 +215,7 @@ class E2ESearchLoop:
     def _generate(
         self,
         opportunity: KernelOpportunity,
-        anchor: E2EMeasurement,
+        anchor: E2EObservation,
         diagnostic_receipt: ArtifactReceipt,
     ) -> tuple[str, E2ECandidate, ArtifactReceipt] | None:
         search = self.record.controller.state.e2e
@@ -238,7 +239,14 @@ class E2ESearchLoop:
         )
         try:
             candidate = self.worker.generate(
-                self._candidate_request(attempt_id, opportunity, context.prompt)
+                build_e2e_candidate_request(
+                    spec=self.spec,
+                    record=self.record,
+                    attempt_id=attempt_id,
+                    opportunity=opportunity,
+                    prompt=context.prompt,
+                    context_packet_sha256=context.packet_receipt.digest,
+                )
             )
         except ApexError:
             raise
@@ -280,22 +288,6 @@ class E2ESearchLoop:
             artifact_ref=receipt.digest,
         )
         return attempt_id, candidate, receipt
-
-    def _candidate_request(
-        self, attempt_id: str, opportunity: KernelOpportunity, prompt: str
-    ) -> E2ECandidateRequest:
-        return E2ECandidateRequest(
-            run_id=self.record.run_id,
-            attempt_id=attempt_id,
-            opportunity=opportunity,
-            prompt=prompt,
-            destination=self.record.root / "worktrees" / attempt_id,
-            backend=self.spec.agent_backend,
-            model=self.spec.agent_model,
-            effort=self.spec.agent_effort,
-            max_turns=self.spec.max_turns,
-            timeout_seconds=self.spec.agent_timeout_seconds,
-        )
 
     def _micro_gate(
         self,
@@ -515,7 +507,7 @@ class E2ESearchLoop:
             self.deployments.rollback(attempt.deployment)
             raise
         if result.promotion is None:
-            _commit_qualified_reject(
+            _commit_failed_promotion(
                 self.record, attempt, result.evidence_receipt, result.reason_code
             )
             return self._rollback(attempt, result.reason_code)
@@ -536,6 +528,7 @@ class E2ESearchLoop:
             candidate_id=candidate_id,
             candidate_manifest=attempt.candidate_receipt,
             verdict=verdict,
+            safety_certified=attempt.safety.safety_certified,
             evidence_receipts=_promotion_receipts(attempt, promotion.receipt),
             evidence_artifacts=_promotion_artifacts(attempt, promotion.receipt),
             new_anchor_id=(
