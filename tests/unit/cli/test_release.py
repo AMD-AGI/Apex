@@ -22,7 +22,9 @@ def test_release_check_reports_distinct_baseline_and_final_gates(capsys) -> None
     assert value["schema"] == "apex.release-candidate-receipt/v2"
     assert (value["baseline_status"], value["status"]) == ("blocked", "blocked")
     assert value["static"]["magpie"]["config_compatible_count"] == 27
-    assert "apex_source_dirty" in value["baseline_blockers"]
+    assert ("apex_source_dirty" in value["baseline_blockers"]) is (
+        not value["static"]["apex_checkout"]["clean"]
+    )
     assert "showcase_missing:e2e-qwen3-next-80b-fp8" in value["blockers"]
 
 

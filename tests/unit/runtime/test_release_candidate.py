@@ -377,7 +377,9 @@ def test_checked_in_ledger_requires_config_resolution_evidence() -> None:
         "legacy_apex_projection_not_release_evidence"
     )
     assert (magpie["workflow_qualified_count"], magpie["formal_delivery_qualified_count"]) == (0, 0)
-    assert "apex_source_dirty" in first.blockers
+    assert ("apex_source_dirty" in first.blockers) is (
+        not first.document["static"]["apex_checkout"]["clean"]
+    )
     assert "magpie_config_resolution_evidence_missing" in first.blockers
     assert "qualification_missing:magpie-corpus-live" in first.blockers
     assert "showcase_missing:e2e-qwen3-next-80b-fp8" in first.blockers
