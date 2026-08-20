@@ -427,8 +427,7 @@ def _register_planned_capabilities(
     )
     for descriptor in planned_capability_descriptors():
         if (
-            descriptor.capability_id.startswith("amd-kernel-")
-            and skill_package is not None
+            skill_package is not None
             and descriptor.capability_id in skill_package.skill_paths
         ):
             registry.register_presentation(descriptor)

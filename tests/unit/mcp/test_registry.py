@@ -12,6 +12,7 @@ from apex.core import ContractError
 from apex.knowledge import KnowledgeRetriever, load_knowledge_catalog
 from apex.mcp import (
     CapabilityRegistry,
+    KernelDraftSessionGrantAuthority,
     KnowledgeExplainHandler,
     KnowledgeSearchHandler,
     build_low_level_server,
@@ -217,6 +218,29 @@ def test_mcp_active_tool_without_grant_never_reaches_handler() -> None:
     assert handler.calls == 0
 
 
+def test_kernel_session_grant_exposes_only_unverified_campaign_start() -> None:
+    registry = CapabilityRegistry()
+    for descriptor in planned_capability_descriptors():
+        if descriptor.kind is CapabilityKind.SKILL:
+            continue
+        registry.register(
+            descriptor,
+            _Handler(CapabilityResult(descriptor.capability_id, {})),
+        )
+    server = build_low_level_server(
+        registry,
+        grant_authority=KernelDraftSessionGrantAuthority(),
+        session_id="kernel-session-1",
+    )
+
+    async def project():
+        request = types.ListToolsRequest(method="tools/list")
+        return await server.request_handlers[types.ListToolsRequest](request)
+
+    names = {tool.name for tool in anyio.run(project).root.tools}
+    assert names == {"campaign.start"}
+
+
 def test_presented_skill_is_available_but_not_an_mcp_tool() -> None:
     registry = CapabilityRegistry()
     descriptor = next(
@@ -267,6 +291,7 @@ def test_application_inventory_does_not_verify_workload_dependencies(
     }
     assert inventory["workload.inspect"].available is True
     assert inventory["trace.compare"].available is True
+    assert inventory["amd-hip-kernel-optimization"].available is True
     assert inventory["amd-kernel-debugging"].available is True
     assert inventory["amd-kernel-optimization"].available is True
     assert inventory["benchmark.run"].available is True
@@ -354,6 +379,7 @@ def test_planned_catalog_is_typed_unique_and_excludes_sanitizer_runtime() -> Non
 
     assert len(identities) == len(set(identities))
     assert {
+        "amd-hip-kernel-optimization",
         "amd-kernel-optimization",
         "benchmark.run",
         "profile.capture",

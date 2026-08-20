@@ -13,7 +13,11 @@ from apex.core import IntegrityError, sha256_file, sha256_json
 
 
 _PLUGIN_NAME = "apex-amd-kernel"
-_SKILL_NAMES = ("amd-kernel-debugging", "amd-kernel-optimization")
+_SKILL_NAMES = (
+    "amd-hip-kernel-optimization",
+    "amd-kernel-debugging",
+    "amd-kernel-optimization",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +43,7 @@ def load_kernel_skill_package(root: Path | None = None) -> KernelSkillPackage:
     }
     for name, path in skill_paths.items():
         _validate_skill(path, name)
-    files = (*manifests, *skill_paths.values())
+    files = (*manifests, *_skill_asset_files(tuple(skill_paths.values())))
     digest = sha256_json(
         {
             path.relative_to(selected).as_posix(): sha256_file(path)
@@ -47,6 +51,22 @@ def load_kernel_skill_package(root: Path | None = None) -> KernelSkillPackage:
         }
     )
     return KernelSkillPackage(selected, skill_paths, digest)
+
+
+def _skill_asset_files(skill_paths: tuple[Path, ...]) -> tuple[Path, ...]:
+    files: list[Path] = []
+    for skill_path in skill_paths:
+        root = skill_path.parent
+        if root.is_symlink() or not root.is_dir():
+            raise IntegrityError("Kernel skill asset is unavailable", "skill_asset_invalid")
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise IntegrityError(
+                    "Kernel skill asset is unavailable", "skill_asset_invalid"
+                )
+            if path.is_file():
+                files.append(path)
+    return tuple(files)
 
 
 def _validate_manifest(path: Path) -> None:

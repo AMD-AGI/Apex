@@ -72,10 +72,25 @@ def require_optimizable_contract(resolved: MagpieConfigContract) -> None:
             "capability_upgrade_required",
             {"blockers": list(resolved.capability_receipt["blockers"])},
         )
+    require_docker_one_shot_contract(resolved)
     if resolved.capability_receipt["optimization_applicable"] is not True:
         raise ContractError(
             "Magpie cleanup lifecycle is not an independent optimization task",
             "cleanup_lifecycle_not_optimizable",
+        )
+
+
+def require_docker_one_shot_contract(resolved: MagpieConfigContract) -> None:
+    """Keep the V2 product boundary ahead of provenance, GPU, and agent work."""
+
+    identity = resolved.plan["identity"]
+    run_mode = str(identity["run_mode"])
+    lifecycle = str(resolved.plan["lifecycle"])
+    if run_mode != "docker" or lifecycle != "one_shot":
+        raise ContractError(
+            "Apex E2E V2 supports Docker one-shot workloads only",
+            "e2e_docker_only",
+            {"run_mode": run_mode, "lifecycle": lifecycle},
         )
 
 
@@ -119,6 +134,7 @@ __all__ = [
     "artifact_binding",
     "objective_hash",
     "relocate_views",
+    "require_docker_one_shot_contract",
     "require_optimizable_contract",
     "verify_resume_gpu_scope",
     "verify_resume_gpu_lease",

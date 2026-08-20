@@ -1,7 +1,7 @@
 {
   "name": "apex-amd-kernel",
-  "version": "0.1.0",
-  "description": "Evidence-first AMD GPU kernel optimization and debugging skills for Apex.",
+  "version": "0.2.0",
+  "description": "Evidence-first AMD GPU and HIP kernel optimization and debugging skills for Apex.",
   "author": {
     "name": "Advanced Micro Devices, Inc."
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Apex AMD Kernel",
     "shortDescription": "Optimize AMD kernels with evidence",
-    "longDescription": "Guides agents through Apex's typed, evaluator-owned AMD kernel optimization and debugging workflow.",
+    "longDescription": "Guides agents through Apex's typed, evaluator-owned AMD kernel workflow plus instruction-only HIP optimization methods.",
     "developerName": "Advanced Micro Devices, Inc.",
     "category": "Developer Tools",
     "capabilities": [],

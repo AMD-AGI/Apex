@@ -85,6 +85,7 @@ from .run_contracts import (
     artifact_binding as _binding,
     objective_hash as _objective_hash,
     relocate_views as _relocate_views,
+    require_docker_one_shot_contract as _require_docker_one_shot_contract,
     require_optimizable_contract as _require_optimizable_contract,
     verify_resume_gpu_lease as _verify_resume_gpu_lease,
     verify_terminal_phase as _verify_terminal_phase,
@@ -101,8 +102,6 @@ from .services import (
     UnavailableFinalDelivery,
     UnavailableMicroQualifier,
 )
-
-
 @dataclass(frozen=True, slots=True)
 class _PreparedRun:
     spec: E2EOptimizeSpec
@@ -161,6 +160,8 @@ class E2EOptimizeUseCase:
         """Resolve config/capabilities without creating a run or acquiring a GPU."""
 
         resolved = resolve_preflight_contract(self._resolved_plans, spec)
+        if resolved.status == "config_compatible":
+            _require_docker_one_shot_contract(resolved)
         provenance = resolve_preflight_provenance(
             self._provenance, spec, resolved
         )
@@ -253,6 +254,7 @@ class E2EOptimizeUseCase:
                 "e2e_result_binding_missing",
             )
         resolved = resolve_preflight_contract(self._resolved_plans, request.spec)
+        _require_optimizable_contract(resolved)
         provenance = validate_resume_preflight(
             self._provenance,
             self._resolved_plans,

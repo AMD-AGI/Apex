@@ -280,6 +280,37 @@ def _spec(tmp_path: Path, results: Path) -> E2EOptimizeSpec:
     )
 
 
+def _out_of_scope_spec(
+    tmp_path: Path,
+    results: Path,
+    *,
+    run_mode: str = "local",
+    lifecycle: str = "one_shot",
+) -> E2EOptimizeSpec:
+    config = tmp_path / f"benchmark-{run_mode}-{lifecycle}.yaml"
+    lifecycle_yaml = ""
+    if lifecycle != "one_shot":
+        cleanup = "true" if lifecycle == "cleanup" else "false"
+        lifecycle_yaml = (
+            "  server_lifecycle:\n"
+            "    enabled: true\n"
+            f"    cleanup: {cleanup}\n"
+        )
+    config.write_text(
+        "benchmark:\n"
+        "  framework: vllm\n"
+        "  model: Qwen/example\n"
+        f"  run_mode: {run_mode}\n"
+        "  envs: {TP: 1, RUN_EVAL: true}\n"
+        "  docker_image: example:v1\n"
+        f"{lifecycle_yaml}",
+        encoding="utf-8",
+    )
+    return E2EOptimizeSpec.from_mapping(
+        {"config_path": str(config), "results_dir": str(results)}
+    )
+
+
 def test_e2e_vertical_slice_records_trace_and_no_regression(tmp_path: Path) -> None:
     results = tmp_path / "run"
     receipt = _receipt(tmp_path)
@@ -520,6 +551,41 @@ def test_e2e_run_rejects_capability_upgrade_before_provenance_or_gpu(
         use_case.run(_spec(tmp_path, tmp_path / "upgrade-run"))
 
     assert caught.value.reason_code == "capability_upgrade_required"
+
+
+@pytest.mark.parametrize(
+    ("run_mode", "lifecycle"),
+    (("local", "one_shot"), ("ray", "one_shot"), ("docker", "reuse"), ("docker", "cleanup")),
+)
+def test_e2e_v2_rejects_non_docker_one_shot_before_provenance_or_gpu(
+    tmp_path: Path, run_mode: str, lifecycle: str
+) -> None:
+    receipt = _receipt(tmp_path)
+    use_case = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        provenance=ForbiddenProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+    spec = _out_of_scope_spec(
+        tmp_path,
+        tmp_path / f"unsupported-{run_mode}-{lifecycle}",
+        run_mode=run_mode,
+        lifecycle=lifecycle,
+    )
+
+    with pytest.raises(ContractError) as preview_failure:
+        use_case.preview(spec)
+    with pytest.raises(ContractError) as run_failure:
+        use_case.run(spec)
+
+    assert preview_failure.value.reason_code == "e2e_docker_only"
+    assert run_failure.value.reason_code == "e2e_docker_only"
+    assert preview_failure.value.details == {
+        "run_mode": run_mode,
+        "lifecycle": lifecycle,
+    }
+    assert not spec.results_dir.exists()
 
 
 def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Path) -> None:

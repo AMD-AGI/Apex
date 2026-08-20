@@ -9,7 +9,8 @@ The root command is a backend-native coding session: `apex`,
 create a formal task, require a descriptor, probe a GPU, or compute reward.
 Codex is the default; `--backend` selects Claude or Cursor. `--plain` disables
 kernel augmentation and `--kernel` requests it explicitly. Auto mode mounts the
-two packaged AMD kernel skills plus the run-scoped MCP façade only for
+three packaged AMD kernel skills, including instruction-only HIP guidance, plus
+the run-scoped MCP façade only for
 kernel-related prompts. Codex uses session-local `skills.config`; Claude and
 Cursor use the same local plugin path. Cursor lacks the MCP bridge and emits a
 typed notice while retaining the instruction-only skills.
@@ -33,6 +34,16 @@ composed without the formal optimizer and explicitly carries no evaluation
 authorization. `--non-interactive`, `--json`, `--dry-run`, and `--result-json`
 instead return the atomic typed `needs_input` result immediately; callers can
 add an explicit source path/target symbol and retry.
+
+An explicit root `apex "..." --kernel` session may call only the host-authorized
+`campaign.start` mutation in addition to inert knowledge tools. It can create an
+unverified descriptor-free task draft, but Magpie acquisition and formal
+compile/correctness/measurement/grade tools stay hidden. After the backend exits,
+the user continues with `apex optimize kernel --campaign <run> --workspace <repo>
+--results <root> --evaluation-contract-draft-digest <digest>
+--release-candidate-receipt <receipt>`. The CLI reloads canonical draft bytes,
+checks that the campaign is results-scoped, recomputes the current contract, and
+delegates once to `KernelOptimizeUseCase`. Drift fails before GPU acquisition.
 
 `apex optimize kernel ... --dry-run` emits the complete unverified Evaluation
 Contract draft and digest without a GPU or agent. A local user can confirm
@@ -148,6 +159,8 @@ Magpie/TraceLens/InferenceX receipt before constructing the E2E use case. The
 raw Magpie config is the sole workload document; Apex constructs its internal
 budget/backend spec from CLI flags and never asks users to duplicate workload
 fields in an Apex-specific wrapper.
+V2 accepts Docker one-shot configs only. Local, Ray, reuse, and cleanup inputs
+return `e2e_docker_only` before provenance resolution, GPU lease, or agent work.
 Add `--dry-run` to write `preflight.json` without creating a canonical run or
 requesting a GPU lease. The receipt separates config compatibility from source-
 optimization and formal-delivery readiness, so Atom/SGLang/local/Ray gaps remain

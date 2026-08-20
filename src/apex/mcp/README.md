@@ -106,7 +106,12 @@ draft digest plus a results-scoped candidate projection only when that baseline
 verifies. It never invokes an agent,
 acquires a GPU, trusts self-declared evaluator authority, or awards reward;
 trusted local confirmation and the formal composition boundary still own execution. E2E remains
-the explicit long-running `apex optimize e2e` workflow. `campaign.stop` applies
+the explicit long-running `apex optimize e2e` workflow. An explicit
+kernel-enhanced native session receives a one-shot authority that supports only
+`campaign.start`; it cannot expose acquisition, compile, correctness,
+measurement, grade, stop, resume, or bundle mutations. The supported measured
+continuation is the host CLI's `apex optimize kernel --campaign ...` path after
+the native backend exits. `campaign.stop` applies
 only to these standalone formal campaigns. It closes pending work, records
 REVERT for an unselected verified candidate, and derives one evidence-bound
 terminal reward or an explicit untrainable/null result; replaying it adds no

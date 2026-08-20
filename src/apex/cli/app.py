@@ -38,6 +38,7 @@ from .formal import (
     regular_e2e_config as _regular_e2e_config,
     status_exit_code as _status_exit_code,
 )
+from .kernel_handoff import run_kernel_campaign_handoff
 from .projection_commands import (
     export_rl_command as _export_rl,
     report_command as _report,
@@ -64,8 +65,7 @@ _NEEDS_INPUT_REASONS = {
 }
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="apex",
-        description="Evidence-driven AMD GPU kernel optimization environment",
+        prog="apex", description="Evidence-driven AMD GPU kernel optimization environment",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     optimize = commands.add_parser("optimize", help="Run an optimization use case")
@@ -73,6 +73,7 @@ def _parser() -> argparse.ArgumentParser:
     kernel = optimize_commands.add_parser("kernel", help="Optimize one existing kernel")
     kernel.add_argument("request", nargs="?", help="Natural-language task (with discovery flags)")
     kernel.add_argument("--task-spec", type=Path, help="Caller-neutral TaskSpec JSON/YAML")
+    kernel.add_argument("--campaign", type=Path, help="Chat-created campaign draft")
     kernel.add_argument(
         "--template",
         type=Path,
@@ -197,6 +198,8 @@ def _mcp_server(args: argparse.Namespace) -> int:
 
 
 def _kernel(args: argparse.Namespace) -> int:
+    if args.campaign is not None:
+        return run_kernel_campaign_handoff(args, build_application)
     if args.template is not None:
         return _kernel_template(args)
     if bool(args.task_spec) == bool(args.request):

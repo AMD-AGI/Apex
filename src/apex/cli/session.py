@@ -9,6 +9,7 @@ from pathlib import Path
 
 from apex.core import AgentBackendName, ApexError
 from apex.execution import default_capability_results
+from apex.mcp import KernelDraftSessionGrantAuthority
 from apex.ports import CodingSessionOutput, CodingSessionRequest, KernelEnhancement
 
 
@@ -103,6 +104,9 @@ def add_capability_commands(commands) -> None:
     mcp_server.add_argument("--knowledge-catalog", type=Path)
     mcp_server.add_argument("--workspace", type=Path)
     mcp_server.add_argument("--results", type=Path)
+    mcp_server.add_argument(
+        "--session-kernel-draft-grants", action="store_true", help=argparse.SUPPRESS
+    )
 
 
 def launch_session(args: argparse.Namespace, build_application) -> int:
@@ -314,7 +318,12 @@ def serve_mcp(args: argparse.Namespace, build_application) -> int:
     )
     if application.capabilities is None:
         raise ApexError("Capability registry is unavailable", "capability_registry_unavailable")
-    run_stdio_server(application.capabilities)
+    authority = (
+        KernelDraftSessionGrantAuthority()
+        if args.session_kernel_draft_grants
+        else None
+    )
+    run_stdio_server(application.capabilities, grant_authority=authority)
     return 0
 
 

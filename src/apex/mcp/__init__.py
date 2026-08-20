@@ -34,6 +34,7 @@ from .grants import (
 from .catalog import planned_capability_descriptors
 from .scope import CapabilityScope
 from .server import build_low_level_server, run_stdio_server
+from .session_grants import KernelDraftSessionGrantAuthority
 from .workload import WorkloadInspectHandler, workload_inspect_descriptor
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "CampaignStopHandler",
     "KnowledgeSearchHandler",
     "KernelEvaluatorHandler",
+    "KernelDraftSessionGrantAuthority",
     "KnowledgeExplainHandler",
     "ExperienceRetrieveHandler",
     "HotspotRankHandler",

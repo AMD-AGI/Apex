@@ -30,3 +30,8 @@ licensed under Apache-2.0. Each template retains the complete upstream license,
 per-file hashes, task-tree identity, source path, import date, and a modified-file
 notice. Apex does not copy AgentKernelArena runners, Forge adapters, scorers,
 validators, hidden tests, optimized vLLM/AITER source, or historical results.
+
+The instruction-only `amd-hip-kernel-optimization` skill is also a modified,
+method-level synthesis of the reviewed `tasks/hip2hip` tree at that exact commit.
+It attributes the source and records reusable review lessons, but copies no HIP
+kernel implementation, task runner, evaluator, scorer, validator, or result.

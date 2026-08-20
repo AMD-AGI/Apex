@@ -25,6 +25,16 @@ speedup into a grade.
    when its trusted task/evaluation contract can be resolved. Standalone HIP is
    unavailable unless it is one of the exact reviewed template-bound campaigns.
 
+## Hand off chat to formal optimization
+
+When the user asks to optimize and prove a standalone Python or Triton kernel,
+inspect the editable source plus an independent compile, correctness, and raw
+measurement harness, then call `campaign.start` with those typed fields. This
+creates an unverified draft only. Return its run locator and exact Evaluation
+Contract draft digest, tell the user to exit the chat, and use the printed
+`apex optimize kernel --campaign ...` command. Never call evaluator phases from
+the still-running chat or treat your own digest echo as user confirmation.
+
 ## Form and test a hypothesis
 
 1. Inspect shapes, dtypes, strides, launch geometry, source boundaries, runtime

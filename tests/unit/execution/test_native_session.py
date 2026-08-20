@@ -82,12 +82,15 @@ def test_kernel_hint_lazily_mounts_read_only_mcp_for_codex(tmp_path: Path) -> No
     assert "--json" in argv
     assert any("mcp_servers.apex.command" in value for value in argv)
     skill_config = next(value for value in argv if value.startswith("skills.config="))
+    assert "amd-hip-kernel-optimization/SKILL.md" in skill_config
     assert "amd-kernel-debugging/SKILL.md" in skill_config
     assert "amd-kernel-optimization/SKILL.md" in skill_config
     assert any("--workspace" in value for value in argv)
     assert any(str(default_capability_results(tmp_path)) in value for value in argv)
+    assert any("--session-kernel-draft-grants" in value for value in argv)
     assert runner.invocation.kernel_capabilities_enabled is True
     assert runner.invocation.kernel_skill_ids == (
+        "amd-hip-kernel-optimization",
         "amd-kernel-debugging",
         "amd-kernel-optimization",
     )
@@ -138,6 +141,9 @@ def test_claude_kernel_session_uses_native_permissions_and_explicit_mcp(
     )
 
     assert "--mcp-config" in invocation.argv
+    assert "--session-kernel-draft-grants" in invocation.argv[
+        invocation.argv.index("--mcp-config") + 1
+    ]
     assert "--plugin-dir" in invocation.argv
     assert "--bare" not in invocation.argv
     assert "--safe-mode" not in invocation.argv

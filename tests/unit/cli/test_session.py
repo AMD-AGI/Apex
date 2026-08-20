@@ -54,6 +54,38 @@ def test_root_request_dispatches_native_session_without_formal_optimizer(
     assert launcher.request.prompt == "Refactor parser.py"
 
 
+def test_chat_campaign_handoff_dispatches_without_natural_language_resolution(
+    tmp_path, monkeypatch
+) -> None:
+    captured = []
+
+    def handoff(args, build_application):
+        captured.append((args, build_application))
+        return 19
+
+    monkeypatch.setattr(app, "run_kernel_campaign_handoff", handoff)
+    status = app.main(
+        [
+            "optimize",
+            "kernel",
+            "--campaign",
+            str(tmp_path / "results" / "campaigns" / "campaign-1"),
+            "--workspace",
+            str(tmp_path),
+            "--results",
+            str(tmp_path / "results"),
+            "--evaluation-contract-draft-digest",
+            "a" * 64,
+            "--release-candidate-receipt",
+            str(tmp_path / "release.json"),
+        ]
+    )
+
+    assert status == 19
+    assert len(captured) == 1
+    assert captured[0][0].campaign.name == "campaign-1"
+
+
 def test_interactive_unresolved_kernel_enters_native_discovery_only(
     tmp_path, monkeypatch
 ) -> None:

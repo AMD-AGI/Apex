@@ -13,6 +13,7 @@ def test_packaged_kernel_skills_have_exact_identity() -> None:
     package = load_kernel_skill_package()
 
     assert tuple(sorted(package.skill_paths)) == (
+        "amd-hip-kernel-optimization",
         "amd-kernel-debugging",
         "amd-kernel-optimization",
     )
@@ -32,3 +33,20 @@ def test_kernel_skill_tampering_fails_closed(tmp_path: Path) -> None:
         load_kernel_skill_package(copied)
 
     assert error.value.reason_code == "skill_asset_invalid"
+
+
+def test_kernel_skill_reference_tampering_changes_package_digest(tmp_path: Path) -> None:
+    source = load_kernel_skill_package().root
+    copied = tmp_path / "apex-amd-kernel"
+    shutil.copytree(source, copied)
+    before = load_kernel_skill_package(copied).digest
+    reference = (
+        copied
+        / "skills"
+        / "amd-hip-kernel-optimization"
+        / "references"
+        / "hip2hip-patterns.md"
+    )
+    reference.write_text(reference.read_text() + "\nDiagnostic note.\n")
+
+    assert load_kernel_skill_package(copied).digest != before

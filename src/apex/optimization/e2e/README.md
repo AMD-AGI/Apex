@@ -16,6 +16,12 @@ auditable dynamic plan, and `E2EOptimizationResult` is the terminal machine resu
 Concrete adapters implement the typed ports in `services.py` and the
 `CandidateWorker` protocol in `candidate.py`.
 
+The V2 product entry supports Docker one-shot configs only. A compatible Local,
+Ray, reuse, or cleanup contract fails preview, run, and resume with
+`e2e_docker_only` before provenance resolution, GPU leasing, or agent invocation.
+Lower-level observer contracts remain available for future iterations but are
+not reachable through `apex optimize e2e` in this version.
+
 Production composition uses `AgentCandidateWorker` with the default Codex-first
 registry, `E2EDeferredMicroQualifier` when no trusted raw-sample micro harness is
 available, and `CandidateDeploymentRegistry` around the reviewed

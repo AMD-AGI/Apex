@@ -119,33 +119,22 @@ apex doctor gpu --gpu-devices 0 --json
 
 Codex is the default. `--plain` disables kernel augmentation, while `--kernel`
 forces lazy mounting of the available Apex capability façade and the packaged
-`amd-kernel-optimization`/`amd-kernel-debugging` skills. Auto mode mounts them
+`amd-kernel-optimization`, `amd-kernel-debugging`, and
+`amd-hip-kernel-optimization` skills. Auto mode mounts them
 only for kernel-related requests. The skills are instruction-only, have no
-scripts, and cannot create evaluator or sanitizer authority. Implemented tools
-include the read-only, attributed `knowledge.search`, scoped `trace.analyze`
-over an existing Magpie diagnostic workspace, receipt-bound `trace.compare`
-over two existing diagnostic CAS sets, and explicit GPU-leased
-`benchmark.run`/`profile.capture` acquisition. Acquisition lazily verifies the
-pinned Magpie dependency and returns ownership plus byte receipts, but never a
-grade or KEEP/REVERT decision. Analysis remains reward-ineligible and never
-launches profiling itself. `campaign.checkpoint` rebuilds only a disposable
-snapshot from canonical events; status and bundle verification remain read-only.
-`campaign.start` accepts agent-discovered typed kernel scope/commands directly,
+scripts, and cannot create evaluator or sanitizer authority. A native kernel
+session exposes attributed read-only knowledge plus one narrow `campaign.start`
+handoff. That handoff accepts agent-discovered typed kernel scope/commands,
 records an unverified Evaluation Contract draft without a descriptor file, and
-returns the exact digest needed for explicit formal confirmation. It does not
-run an agent, acquire a GPU, or grant evaluator authority.
-After that confirmation, `kernel.compile`, `kernel.correctness`,
-`kernel.measure`, and `kernel.grade` operate on evaluator-owned projections;
-only grade can append reward. `bundle.build` accepts only a verified improving
-attempt and emits an immutable unapplied bundle.
+returns its locator and exact digest. It does not run an agent, acquire a GPU,
+or grant evaluator authority. Active Magpie/TraceLens and formal evaluator
+capabilities remain hidden from the live chat because its MCP channel cannot
+mint trusted evaluation authority.
 `campaign.stop` closes a standalone formal campaign without selecting a
 candidate. It records any missing REVERT/terminal decision, derives exactly one
 task-terminal reward from evidence already sealed by the evaluator (including
 the measured baseline no-op), and otherwise records an explicit null reward.
 Repeated stop requests are journal-idempotent.
-`campaign.resume` delegates to the same E2E recovery use case as
-`apex run resume`, after revalidating a results-scoped campaign-baseline receipt
-against current source and re-running dependency/provenance/GPU preflight.
 All capability artifacts stay under `--results` (or the lazy hidden sibling
 default outside the source workspace).
 `apex capabilities --json` shows exact schemas, authority, side effects, GPU
@@ -176,6 +165,24 @@ Use `--print` for headless text and `--json` for the backend's structured stream
 sessions may edit the user-authorized workspace according to backend-native
 approval and sandbox behavior, but their text and tool output are not evaluator
 evidence. `apex optimize ...` is the separate formal boundary.
+
+For a descriptor-free Python/Triton optimization, let the kernel session create
+the unverified draft, exit the chat, then confirm exactly those bytes:
+
+```bash
+apex "Optimize this kernel and prove it is faster" --kernel \
+  --workspace /absolute/path/to/repo --results /absolute/path/to/results
+
+apex optimize kernel \
+  --campaign /absolute/path/to/results/campaigns/<campaign-id> \
+  --workspace /absolute/path/to/repo --results /absolute/path/to/results \
+  --evaluation-contract-draft-digest <digest-from-campaign.start> \
+  --release-candidate-receipt /absolute/path/to/campaign-baseline.json
+```
+
+The second command revalidates the exact draft and clean repository, then uses
+the same bounded formal optimizer as descriptor-backed tasks. The chat process
+must have exited first; agent text or a tool call cannot confirm the digest.
 
 ## Kernel optimization CLI
 
@@ -285,6 +292,8 @@ The raw Magpie benchmark config is the only workload document. Apex freezes its
 exact bytes and constructs the internal kernel-only budget/backend request from
 CLI flags; users do not copy model, image, metric, or shape fields into another
 spec.
+This V2 entry supports Docker one-shot configs only. Local, Ray, reuse, and
+cleanup return `e2e_docker_only` before provenance, GPU, or agent work.
 
 ```bash
 apex optimize e2e \
@@ -420,7 +429,7 @@ measurement, and GPU-lease receipts. See [tests/README.md](tests/README.md).
 The operator sequence and typed receipt ownership are documented in
 [docs/live_qualification_runbook.md](docs/live_qualification_runbook.md).
 
-Release/live baselines additionally use `apex.release-candidate-receipt/v1`.
+Release/live baselines additionally use `apex.release-candidate-receipt/v2`.
 `scripts/build_release_candidate_receipt.py` recomputes current Apex Git, lock,
 Magpie 27-config corpus/ledger, lm-eval, and attributed-template identity, then
 joins only explicit fresh-fetch, dependency, CPU-gate, CLI, immutable-image,

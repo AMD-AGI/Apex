@@ -209,7 +209,9 @@ The acquisition receipt is not a timeless permission to measure. Each active
 lease has a finite TTL (10,800 seconds by default). A heartbeat can renew it
 only before expiry and only after rereading the Apex holder's PID/UID/Linux
 start-time/cmdline identity plus the complete doctor observation for the same
-physical inventory. Clock regression, expiry, PID reuse, owner drift, foreign
+physical inventory. The fixed RSMI health snapshot uses the junction temperature
+sensor supported by MI-series datacenter GPUs together with system clock, busy
+percentage, and VRAM usage. Clock regression, expiry, PID reuse, owner drift, foreign
 KFD ownership, health loss, or device/visibility drift fails closed. Every
 formal measurement is enclosed by typed `measurement_pre` and
 `measurement_post` heartbeats; the resulting V1 bracket binds the action, lease

@@ -15,7 +15,7 @@ from .gpu_ownership import GpuOwnershipReceipt
 
 
 _MAX_FREQUENCIES = 33
-_RSMI_TEMP_EDGE = 0
+_RSMI_TEMP_JUNCTION = 1
 _RSMI_TEMP_CURRENT = 0
 _RSMI_CLK_SYS = 0
 _RSMI_MEM_VRAM = 0
@@ -235,7 +235,7 @@ class _CtypesRocmHealthApi:
         used = ctypes.c_uint64(0)
         total = ctypes.c_uint64(0)
         statuses = (
-            self._library.rsmi_dev_temp_metric_get(index, _RSMI_TEMP_EDGE, _RSMI_TEMP_CURRENT, ctypes.byref(temperature)),
+            self._library.rsmi_dev_temp_metric_get(index, _RSMI_TEMP_JUNCTION, _RSMI_TEMP_CURRENT, ctypes.byref(temperature)),
             self._library.rsmi_dev_gpu_clk_freq_get(index, _RSMI_CLK_SYS, ctypes.byref(frequencies)),
             self._library.rsmi_dev_busy_percent_get(index, ctypes.byref(busy)),
             self._library.rsmi_dev_memory_usage_get(index, _RSMI_MEM_VRAM, ctypes.byref(used)),

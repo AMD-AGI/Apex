@@ -21,6 +21,11 @@ and results roots, resolves and hashes the baseline, and records an explicitly
 unverified contract in canonical journal/CAS. It performs no agent, GPU,
 evaluation, or reward work. The later formal command must re-resolve the same
 draft digest under explicit user or reviewed-template authority.
+The supported host-owned continuation is `apex optimize kernel --campaign ...`.
+It runs only after the discovery backend has exited, reloads the CAS-bound draft,
+requires the exact digest and release baseline from the CLI caller, recomputes
+the contract, and delegates to the existing `KernelOptimizeUseCase`; it does not
+introduce another optimizer or state writer.
 `FormalKernelCampaign` and `KernelFormalEvaluator` implement that later
 chat-to-formal bridge without starting a second optimization loop. They recover
 the draft from canonical events/CAS, require its original Git identity to have
@@ -100,7 +105,7 @@ missing lifecycle implementation, PID reuse, or device/owner drift leaves the
 attempt without measured reward or delivery. Offline RL validation reconstructs
 this bracket before treating a kernel reward as trainable.
 
-The current chat-started formal bridge cannot attest termination of the
+The phased MCP evaluator for a still-running chat cannot attest termination of the
 external chat agent's process tree, credential revocation, tool-channel
 revocation, or concealment of the evaluator report directory. It records those
 four isolation facts as false and records only the locally verified read-only
@@ -110,7 +115,8 @@ lease, normal performance command, raw timing capture, reward, or delivery.
 Compile and correctness receipts produced before that boundary remain
 provisional. A future trusted isolation authority must supply real evidence for
 all required facts before this formal lane can measure; agent text or a no-tool
-safety policy cannot supply it.
+safety policy cannot supply it. The host-owned `--campaign` continuation avoids
+that lane by ending discovery first and entering the normal bounded optimizer.
 
 “Agent exits” includes a controlled exact-turn-boundary checkpoint. Apex stops
 the structured stream exactly at `max_turns`; if the invocation receipt names

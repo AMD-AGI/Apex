@@ -86,7 +86,11 @@ class NativeCodingSessionLauncher:
         requested_enhancement = _should_enable_kernel_capabilities(request)
         enhanced = requested_enhancement
         notices: tuple[str, ...] = ()
-        mcp_command = _scoped_mcp_command(self._mcp_command, request)
+        mcp_command = _scoped_mcp_command(
+            self._mcp_command,
+            request,
+            allow_kernel_draft=enhanced,
+        )
         skills = self._skill_package if enhanced else None
         if request.backend is AgentBackendName.CODEX:
             executable = self._resolve("codex")
@@ -142,15 +146,23 @@ class NativeCodingSessionLauncher:
 
 
 def _scoped_mcp_command(
-    command: Sequence[str], request: CodingSessionRequest
+    command: Sequence[str],
+    request: CodingSessionRequest,
+    *,
+    allow_kernel_draft: bool,
 ) -> tuple[str, ...]:
     results = request.results_dir or default_capability_results(request.workspace)
-    return (
+    scoped = (
         *command,
         "--workspace",
         str(request.workspace),
         "--results",
         str(results),
+    )
+    return (
+        (*scoped, "--session-kernel-draft-grants")
+        if allow_kernel_draft
+        else scoped
     )
 
 

@@ -53,8 +53,16 @@ configuration pointing to the local Apex server; user configuration is not
 mutated. Non-kernel and `--plain` sessions do not start that server. Cursor has no
 equivalent run-scoped MCP flag in the supported surface, so the launcher reports
 that typed difference.
+The scoped server receives a host grant authority that supports only
+`campaign.start`: it may freeze an unverified chat-discovered draft under the
+selected results root, but it cannot expose GPU acquisition or evaluator tools.
+Measured work resumes through the host-owned `apex optimize kernel --campaign`
+CLI after the native backend exits and the user confirms the exact draft digest.
 Kernel-related sessions also receive the same integrity-checked, instruction-only
-`amd-kernel-optimization` and `amd-kernel-debugging` skills. Codex receives
+`amd-kernel-optimization`, `amd-kernel-debugging`, and
+`amd-hip-kernel-optimization` skills. The HIP-specific method is an attributed
+synthesis of reviewed AgentKernelArena hip2hip tasks; it copies no runner or
+evaluator and does not make generic HIP execution available. Codex receives
 session-local `skills.config` paths; Claude and Cursor receive the packaged local
 plugin through `--plugin-dir`. The skills guide typed capability selection and
 evidence boundaries, contain no executable scripts, and cannot award reward or

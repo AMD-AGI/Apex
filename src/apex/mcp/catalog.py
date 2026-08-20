@@ -28,6 +28,14 @@ def planned_capability_descriptors() -> tuple[CapabilityDescriptor, ...]:
 def _guidance_descriptors() -> tuple[CapabilityDescriptor, ...]:
     return (
         _descriptor(
+            "amd-hip-kernel-optimization",
+            "AMD HIP kernel optimization method",
+            "Attributed HIP-specific guidance; no executable HIP evaluator.",
+            CapabilityKind.SKILL,
+            {},
+            {},
+        ),
+        _descriptor(
             "amd-kernel-optimization",
             "AMD kernel optimization method",
             "Attributed optimization workflow guidance; no executable sanitizer step.",

@@ -37,6 +37,13 @@ fixtures, malformed receipts, nondeterminism, or architecture drift.
 Use the following CPU gate; narrow failures by running the owning directory or
 file, and do not weaken a shared assertion to accommodate stale code.
 
+The descriptor-free standalone journey is covered by native-session mounting,
+draft-only MCP grants, exact-digest `--campaign` handoff, path tampering, and the
+existing formal optimizer's 300/299-sample KEEP/REVERT/bundle fixtures. The E2E
+V2 scope is covered both with synthetic preview/run/resume cases and the frozen
+27-row corpus partition (21 Docker one-shot, 6 `e2e_docker_only`). Live GPU/model
+receipts remain outside this CPU tree.
+
 ```bash
 pytest -q -p no:cacheprovider \
   tests/unit tests/contract tests/integration tests/architecture
