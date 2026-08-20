@@ -237,10 +237,14 @@ the quality gate may be marked verified.
 These paths are implemented and covered by CPU contract tests and production
 composition. A real exact-image smoke has verified root-owned listener binding
 and sidecar `create/inspect/remove` with every bind source under the run-scoped
-results tree. The representative Qwen workload has produced real baseline
-performance, but the updated evaluator path has not yet completed full lm-eval
-model quality or candidate/reward qualification. A lifecycle smoke or prepared
-contract is not measured quality, reward, winner, or release evidence.
+results tree. A representative Qwen workload produced real baseline performance
+and completed the full 1,319-sample GSM8K sidecar with a verified quality gate.
+Its execution attestation remained fail-closed because a live GPU observation
+was still draining after the former two-second observer join. Shutdown now
+allows a bounded 20-second drain while preserving the same fail-closed timeout;
+a fresh updated-tree run is still required before candidate/reward
+qualification. A lifecycle smoke, isolated quality receipt, or prepared
+contract is not reward, winner, or release evidence.
 
 Production composition injects `DockerOneShotMagpieExecutionAttestor` for the
 published Docker one-shot path. Before Magpie starts, it freezes the config,

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
+import apex.benchmark.docker_magpie_attestor as docker_magpie_attestor
 from apex.benchmark.docker_magpie_attestor import (
     DockerOneShotMagpieExecutionAttestor,
 )
@@ -92,6 +94,18 @@ class FakeGpu:
                 "container_id": _CONTAINER,
             }],
         }
+
+
+class DelayedGpu(FakeGpu):
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__()
+        self.delay_seconds = delay_seconds
+        self.entered = threading.Event()
+
+    def observe(self, container, gpu_lease):
+        self.entered.set()
+        time.sleep(self.delay_seconds)
+        return super().observe(container, gpu_lease)
 
 
 def _receipt(tmp_path: Path) -> DependencyReceipt:
@@ -234,6 +248,78 @@ def test_observes_container_gpu_and_writes_bound_sidecar(tmp_path: Path) -> None
     )
     assert "docker_argv_sha256" not in evidence.runtime["serving_runtime_receipt"]
     assert "execution_attestation_quality_unverified" in evidence.verdict_errors()
+
+
+def test_completion_waits_for_bounded_inflight_gpu_observation(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt(tmp_path)
+    root = tmp_path / "run"
+    root.mkdir()
+    workspace = root / "workspace"
+    config = tmp_path / "config.yaml"
+    config.write_text("benchmark: {}\n", encoding="utf-8")
+    docker = FakeDocker(_container(workspace, receipt.root("inferencex")))
+    gpu = DelayedGpu(2.2)
+    attestor = DockerOneShotMagpieExecutionAttestor(
+        receipt,
+        docker=docker,
+        gpu=gpu,
+        dependency_observer=_dependency_snapshot,
+        poll_seconds=0.001,
+    )
+
+    session = attestor.prepare(_request(root, config))
+    report = _report(workspace)
+    docker.running = True
+    assert gpu.entered.wait(timeout=2.0)
+    path = attestor.complete(
+        session, report_path=report, command_exit_code=0, timed_out=False
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+
+    assert "docker_observer_thread_did_not_stop" not in value["errors"]
+    assert value["process"]["verified"] is True
+    assert value["runtime"]["serving_runtime_receipt"]["verified"] is True
+
+
+def test_completion_remains_fail_closed_past_observer_drain_grace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        docker_magpie_attestor, "_OBSERVER_STOP_TIMEOUT_SECONDS", 0.01
+    )
+    receipt = _receipt(tmp_path)
+    root = tmp_path / "run"
+    root.mkdir()
+    workspace = root / "workspace"
+    config = tmp_path / "config.yaml"
+    config.write_text("benchmark: {}\n", encoding="utf-8")
+    docker = FakeDocker(_container(workspace, receipt.root("inferencex")))
+    gpu = DelayedGpu(0.1)
+    attestor = DockerOneShotMagpieExecutionAttestor(
+        receipt,
+        docker=docker,
+        gpu=gpu,
+        dependency_observer=_dependency_snapshot,
+        poll_seconds=0.001,
+    )
+
+    session = attestor.prepare(_request(root, config))
+    report = _report(workspace)
+    docker.running = True
+    assert gpu.entered.wait(timeout=2.0)
+    path = attestor.complete(
+        session, report_path=report, command_exit_code=0, timed_out=False
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    session.thread.join(timeout=1.0)
+
+    assert "docker_observer_thread_did_not_stop" in value["errors"]
+    assert value["process"]["verified"] is False
+    assert value["runtime"]["serving_runtime_receipt"]["verified"] is False
+    assert value["reward_eligible"] is False
 
 
 @pytest.mark.parametrize(

@@ -85,10 +85,12 @@ Docker composition also includes an exact-image lm-eval sidecar authority. It
 locks an offline dataset and private InferenceX task projection, starts a bounded
 Unix handoff to the observed Magpie listener, and executes one no-network/no-GPU,
 read-only-root evaluator container whose result, sample, runtime, lifecycle, and
-cleanup receipts are independently bound. This is implemented composition and
-CPU-tested contract evidence only: no live Docker/GPU/model campaign has yet
-qualified the sidecar, so it cannot clear a workflow, quality, reward, showcase,
-or release gate.
+cleanup receipts are independently bound. A representative live Qwen run has
+completed all 1,319 GSM8K samples through this sidecar and produced a verified
+quality gate. That run still failed closed because an in-flight GPU observer
+exceeded the former two-second shutdown grace, so it did not clear a workflow,
+reward, showcase, or release gate. The observer now gets a bounded 20-second
+drain grace; qualification still requires a fresh run on the updated tree.
 See [docs/dependencies.md](docs/dependencies.md) for offline and path overrides.
 
 Install only Apex development dependencies when external runtime adapters are not
@@ -413,7 +415,7 @@ dependencies, failure semantics, provenance, and focused tests. Architecture tes
 enforce layer direction, file/function size limits, import purity, and public surface.
 The [capability matrix](docs/capability_matrix.md) distinguishes implemented CPU
 contracts, real Docker lifecycle smokes, live GPU terminal results, and still
-pending model-quality/reward qualification. The
+pending end-to-end reward qualification. The
 [Qwen3-Next 80B FP8 report](docs/validation_qwen3_next_80b_fp8.md) records the
 completed E2E no-gain/no-regression campaign without overstating it as a formal
 source-delivery winner. The clean-cut migration is tracked in

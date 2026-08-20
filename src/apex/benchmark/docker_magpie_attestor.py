@@ -55,6 +55,9 @@ from .magpie_attestation import expected_attestation_path, locate_local_magpie_r
 from .quality import build_lm_eval_quality_gate
 
 
+_OBSERVER_STOP_TIMEOUT_SECONDS = 20.0
+
+
 @dataclass(slots=True)
 class _ObservationState:
     request: MagpieAttestationRequest
@@ -273,7 +276,9 @@ class DockerOneShotMagpieExecutionAttestor:
         state.stop.set()
         if state.thread is None:
             raise ContractError("Magpie observer did not start", "docker_observer_failed")
-        state.thread.join(timeout=max(2.0, self._poll_seconds * 4))
+        state.thread.join(
+            timeout=max(_OBSERVER_STOP_TIMEOUT_SECONDS, self._poll_seconds * 4)
+        )
         if state.thread.is_alive():
             state.errors.append("docker_observer_thread_did_not_stop")
 
