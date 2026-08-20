@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -19,6 +19,10 @@ from .evaluator_inferencex_projection import (
     EvaluatorInferenceXProjectionReceipt,
     PreparedInferenceXProjection,
     materialize_inferencex_projection,
+)
+from .evaluator_input_projection import (
+    EvaluatorSidecarInputProjection,
+    materialize_evaluator_sidecar_inputs,
 )
 from .evaluator_task_materialization import (
     EvaluatorTaskMaterializationReceipt,
@@ -39,6 +43,7 @@ class PreparedLmEvalExecution:
     dataset_mount: Path
     runtime_mount: Path
     runtime_receipt: LmEvalRuntimeReceipt
+    input_projection: EvaluatorSidecarInputProjection
     sidecar_root: Path
     output_root: Path
     task_receipt: EvaluatorTaskMaterializationReceipt
@@ -169,6 +174,15 @@ def _finish_preparation(
     launch_path: Path,
     launch_receipt: MagpieLaunchConfigReceipt,
 ) -> PreparedLmEvalExecution:
+    inputs = materialize_evaluator_sidecar_inputs(
+        authority,
+        dataset_root=dataset_root.resolve(strict=True),
+        dataset_receipt=dataset,
+        runtime_receipt=runtime_receipt,
+        launcher_source=Path(__file__).with_name("evaluator_sidecar_entry.py"),
+        launcher_sha256=contract.launcher_sha256,
+    )
+    projected_runtime = replace(runtime_receipt, root=inputs.runtime_mount)
     sidecar_root = authority / "sidecar"
     sidecar_root.mkdir(mode=0o700)
     output = sidecar_root / "output"
@@ -179,9 +193,10 @@ def _finish_preparation(
     return PreparedLmEvalExecution(
         authority_root=authority,
         task_mount=authority / "task-materialization" / "task",
-        dataset_mount=dataset_root.resolve(strict=True) / "files",
-        runtime_mount=runtime_receipt.root.resolve(strict=True),
-        runtime_receipt=runtime_receipt,
+        dataset_mount=inputs.dataset_mount,
+        runtime_mount=inputs.runtime_mount,
+        runtime_receipt=projected_runtime,
+        input_projection=inputs,
         sidecar_root=sidecar_root,
         output_root=output,
         task_receipt=task,

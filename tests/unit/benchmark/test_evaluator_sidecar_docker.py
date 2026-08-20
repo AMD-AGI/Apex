@@ -80,6 +80,7 @@ def _spec(tmp_path: Path) -> EvaluatorSidecarDockerSpec:
         ),
         sidecar_argv=("python3", "/evaluator/launcher.py", "--", "python3", "-m", "lm_eval"),
         contract_sha256=_CONTRACT,
+        input_projection_sha256="f" * 64,
     )
 
 

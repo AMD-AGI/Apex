@@ -173,6 +173,17 @@ timeout, argv, environment, and output limits. Preparation creates a new
 run-scoped `authority/lm_eval` tree and never edits the Magpie or InferenceX
 checkouts.
 
+The dependency runtime and offline dataset may live on a root-squashed home
+filesystem that the Docker daemon cannot bind. Preparation therefore copies the
+already verified dataset, runtime, and launcher into a private
+`authority/lm_eval/sidecar-inputs` projection on the caller-selected results
+filesystem, rehashes the copied bytes and runtime manifest, seals the projection
+read-only, and records `apex.evaluator-sidecar-input-projection/v1`. The
+projected runtime receipt differs only in its run-local root. The projection
+digest is part of the sidecar-spec digest; source-cache paths are never handed
+to Docker as an implicit fallback. A results filesystem that the selected
+Docker daemon cannot bind still fails closed during container creation.
+
 The preparer also creates a private InferenceX projection. It copies only the
 locked source plus the reviewed Magpie launch scripts, installs the bounded
 Unix-socket handoff overlay, records complete source/projection manifests, and
@@ -190,6 +201,15 @@ authority independently observes the already-running Magpie container and its
 verified TCP listener. `EvaluatorServingBroker` then exposes only that one
 listener over a run-scoped Unix socket; the evaluator container itself never
 joins the workload network namespace.
+
+Serving images commonly run as root, so an unprivileged Apex process may be
+unable to read their host `/proc/<pid>/cwd` and file descriptors. The frozen
+host process identity permits an unavailable cwd only for containment use;
+local argv/cwd matching still rejects it. Listener ownership is obtained by a
+fixed, bounded `docker container exec` probe inside the exact observed
+container, then mapped back to exactly one member of the pre-probe host process
+closure using PID-reuse-resistant start time and command-line digest. Missing,
+foreign, ambiguous, or unbounded owners fail closed.
 
 `DockerEvaluatorSidecarAuthority` creates exactly one immutable-image sidecar
 with `--network none`, a read-only root, no GPU devices, all capabilities
@@ -215,9 +235,12 @@ container, listener, broker, cleanup, runtime, result, and sample digest before
 the quality gate may be marked verified.
 
 These paths are implemented and covered by CPU contract tests and production
-composition. They have not completed a live Docker/GPU/model qualification
-campaign. A prepared sidecar contract, fake-Docker test, or configuration pass is
-not measured quality, performance, reward, or release evidence.
+composition. A real exact-image smoke has verified root-owned listener binding
+and sidecar `create/inspect/remove` with every bind source under the run-scoped
+results tree. The representative Qwen workload has produced real baseline
+performance, but the updated evaluator path has not yet completed full lm-eval
+model quality or candidate/reward qualification. A lifecycle smoke or prepared
+contract is not measured quality, reward, winner, or release evidence.
 
 Production composition injects `DockerOneShotMagpieExecutionAttestor` for the
 published Docker one-shot path. Before Magpie starts, it freezes the config,

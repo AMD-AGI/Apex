@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from apex.core import ContractError, sha256_json
 
 from .docker_observation import DockerContainerObservation
+from .docker_listener_probe import DockerExecListenerProbe
 from .local_port_observation import (
     LocalPortObservationClient,
-    ProcfsLocalPortObservationClient,
 )
 from .local_process_observation import (
     LocalProcessIdentity,
@@ -74,9 +74,11 @@ class DockerServingListenerAuthority:
         *,
         processes: LocalProcessObservationClient | None = None,
         ports: LocalPortObservationClient | None = None,
+        docker_ports: DockerExecListenerProbe | None = None,
     ) -> None:
         self._processes = processes or ProcfsLocalProcessObservationClient()
-        self._ports = ports or ProcfsLocalPortObservationClient()
+        self._ports = ports
+        self._docker_ports = docker_ports or DockerExecListenerProbe()
 
     def observe(
         self, container: DockerContainerObservation, port: int
@@ -93,7 +95,13 @@ class DockerServingListenerAuthority:
                 key=lambda item: (item.pid, item.start_time_ticks),
             )
         )
-        owners = self._ports.listener_owners(port, snapshot)
+        owners = (
+            self._ports.listener_owners(port, snapshot)
+            if self._ports is not None
+            else self._docker_ports.listener_owners(
+                container.container_id, port, closure
+            )
+        )
         if not owners or any(item not in closure for item in owners):
             raise _invalid("Serving listener is not contained by Magpie")
         if any(not _in_container(item, container.container_id) for item in closure):

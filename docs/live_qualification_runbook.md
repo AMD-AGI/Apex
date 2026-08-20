@@ -101,6 +101,16 @@ rewards, bundles, qualifications, showcases, or release evidence. Do not use a
 symlink between the two roots, and do not make evaluator or release consumers
 automatically dereference the locator.
 
+The selected formal results filesystem must also be bind-visible to the Docker
+daemon. Apex revalidates the locked evaluator dataset/runtime in their canonical
+cache, then publishes a sealed run-scoped copy below
+`authority/lm_eval/sidecar-inputs`; dataset, runtime, and launcher mounts are
+served from that copy. This is required on hosts where the source checkout or
+home cache is root-squashed NFS. Do not work around a bind failure by making the
+source cache broadly writable or by weakening Docker inspection. Remote Docker
+contexts whose daemon cannot see the caller-selected results root remain an
+explicit unsupported infrastructure blocker.
+
 Before every GPU lease:
 
 ```bash

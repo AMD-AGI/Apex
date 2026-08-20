@@ -61,6 +61,7 @@ class EvaluatorSidecarDockerSpec:
     mounts: tuple[EvaluatorSidecarMount, ...]
     sidecar_argv: tuple[str, ...]
     contract_sha256: str
+    input_projection_sha256: str
 
     def __post_init__(self) -> None:
         if (
@@ -75,6 +76,7 @@ class EvaluatorSidecarDockerSpec:
             or len({item.role for item in self.mounts}) != len(self.mounts)
             or len({item.destination for item in self.mounts}) != len(self.mounts)
             or len(self.contract_sha256) != 64
+            or len(self.input_projection_sha256) != 64
         ):
             raise ValueError("Evaluator sidecar Docker spec is invalid")
 
@@ -108,6 +110,7 @@ class EvaluatorSidecarDockerSpec:
                 "create_argv": list(self.create_argv),
                 "expected_image_id": self.image_id,
                 "mount_roles": [item.role for item in self.mounts],
+                "input_projection_sha256": self.input_projection_sha256,
             }
         )
 
@@ -132,6 +135,7 @@ class EvaluatorSidecarDockerSpec:
             ],
             "sidecar_argv": list(self.sidecar_argv),
             "contract_sha256": self.contract_sha256,
+            "input_projection_sha256": self.input_projection_sha256,
             "create_argv_sha256": sha256_json(list(self.create_argv)),
             "spec_sha256": self.sha256,
         }
@@ -143,9 +147,7 @@ def build_evaluator_sidecar_spec(
 ) -> EvaluatorSidecarDockerSpec:
     """Build a no-network/no-GPU create request from frozen authority paths."""
 
-    launcher = Path(__file__).with_name("evaluator_sidecar_entry.py").resolve(
-        strict=True
-    )
+    launcher = prepared.input_projection.launcher_path.resolve(strict=True)
     if sha256_file(launcher) != prepared.contract.launcher_sha256:
         raise _invalid("Evaluator sidecar launcher changed after contract freeze")
     mounts = (
@@ -169,6 +171,7 @@ def build_evaluator_sidecar_spec(
         mounts=mounts,
         sidecar_argv=prepared.contract.sidecar_argv,
         contract_sha256=prepared.contract.sha256,
+        input_projection_sha256=prepared.input_projection.receipt_sha256,
     )
 
 

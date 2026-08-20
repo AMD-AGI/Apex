@@ -118,6 +118,14 @@ class _Authority:
         return self.receipt
 
 
+class _FailingAuthority:
+    def execute(self, _prepared) -> LmEvalExecutionReceipt:
+        raise ConfigurationError(
+            "Docker could not create evaluator sidecar",
+            "evaluator_sidecar_create_failed",
+        )
+
+
 def _request(prepared, *, argv=None) -> dict[str, object]:
     handoff = json.loads(
         prepared.inferencex_projection.handoff_contract_path.read_text()
@@ -207,6 +215,21 @@ def test_rejects_sidecar_receipt_swap(tmp_path: Path) -> None:
     assert response["exit_code"] == 125
     with pytest.raises(ConfigurationError, match="evaluator_contract_mismatch"):
         barrier.complete(session)
+
+
+def test_preserves_typed_sidecar_failure_across_handoff(tmp_path: Path) -> None:
+    prepared = _prepared(tmp_path, _contract())
+    barrier = EvaluatorHandoffBarrier()
+    session = barrier.start(prepared, _FailingAuthority())
+
+    response = _exchange(
+        prepared.inferencex_projection.handoff_socket, _request(prepared)
+    )
+
+    assert response["exit_code"] == 125
+    with pytest.raises(ConfigurationError) as caught:
+        barrier.complete(session)
+    assert caught.value.reason_code == "evaluator_sidecar_create_failed"
 
 
 def test_abort_cleans_listener_without_execution(tmp_path: Path) -> None:

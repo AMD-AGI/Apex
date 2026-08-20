@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from apex.benchmark.local_process_observation import (
     ProcfsLocalProcessObservationClient,
     descendant_closure,
@@ -84,3 +86,33 @@ def test_process_disappearance_is_reported_as_absent(tmp_path: Path) -> None:
     client = ProcfsLocalProcessObservationClient(proc_root=proc)
 
     assert client.process(os.getpid()) is None
+
+
+def test_procfs_identity_keeps_container_facts_when_cwd_is_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    cwd = tmp_path / "container"
+    cwd.mkdir()
+    _proc_process(
+        proc, 101, ppid=1, start=500, argv=("python", "server.py"), cwd=cwd
+    )
+    original = os.readlink
+
+    def hidden(path: os.PathLike[str] | str) -> str:
+        if Path(path) == proc / "101/cwd":
+            raise PermissionError("procfs cwd is hidden")
+        return original(path)
+
+    monkeypatch.setattr(os, "readlink", hidden)
+    client = ProcfsLocalProcessObservationClient(proc_root=proc)
+
+    identity = client.process(101)
+
+    assert identity is not None
+    assert identity.cwd is None
+    assert identity.cgroup_lines == ("0::/apex.slice",)
+    assert matching_processes(
+        (identity,), argv=("python", "server.py"), cwd=cwd
+    ) == ()

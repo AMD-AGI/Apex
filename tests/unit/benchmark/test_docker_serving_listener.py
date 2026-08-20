@@ -46,6 +46,7 @@ def _identity(
     ppid: int,
     cgroup: tuple[str, ...] | None = None,
     start: int | None = None,
+    cwd: Path | None = Path("/"),
 ) -> LocalProcessIdentity:
     lines = cgroup or (f"0::/system.slice/docker-{_CONTAINER}.scope",)
     return LocalProcessIdentity(
@@ -57,7 +58,7 @@ def _identity(
         start_time_ticks=start or pid * 10,
         cmdline_sha256=f"{pid % 10}" * 64,
         argv=("process", str(pid)),
-        cwd=Path("/").resolve(),
+        cwd=cwd.resolve() if cwd is not None else None,
         cgroup_sha256="c" * 64,
         cgroup_lines=lines,
     )
@@ -108,6 +109,17 @@ def test_binds_listener_to_exact_container_process_closure() -> None:
     )
     assert receipt.to_dict()["receipt_sha256"] == receipt.sha256
     assert ports.calls == [(8888, (102, 100, 101))]
+
+
+def test_binds_root_owned_container_when_procfs_hides_cwd() -> None:
+    root = _identity(100, ppid=1, cwd=None)
+    listener = _identity(101, ppid=100, cwd=None)
+
+    receipt, _ports = _observe((root, listener), (101,))
+
+    assert receipt.root_process.cwd is None
+    assert receipt.listener_processes[0].cwd is None
+    assert receipt.to_dict()["root_process"]["cwd"] is None
 
 
 @pytest.mark.parametrize(

@@ -26,7 +26,7 @@ class LocalProcessIdentity:
     start_time_ticks: int
     cmdline_sha256: str
     argv: tuple[str, ...]
-    cwd: Path
+    cwd: Path | None
     cgroup_sha256: str
     cgroup_lines: tuple[str, ...]
 
@@ -40,7 +40,7 @@ class LocalProcessIdentity:
             "start_time_ticks": self.start_time_ticks,
             "cmdline_sha256": self.cmdline_sha256,
             "argv": list(self.argv),
-            "cwd": str(self.cwd),
+            "cwd": str(self.cwd) if self.cwd is not None else None,
             "cgroup_sha256": self.cgroup_sha256,
             "cgroup_lines": list(self.cgroup_lines),
         }
@@ -100,7 +100,7 @@ class ProcfsLocalProcessObservationClient:
             if not cmdline:
                 return None
             cgroup = _read_bounded(root / "cgroup")
-            cwd = Path(os.readlink(root / "cwd")).resolve(strict=True)
+            cwd = _read_cwd(root / "cwd")
             uid = root.stat().st_uid
             second_stat = _read_bounded(root / "stat")
         except (FileNotFoundError, ProcessLookupError):
@@ -117,8 +117,15 @@ class ProcfsLocalProcessObservationClient:
                 "magpie_local_process_identity_race",
                 {"pid": pid},
             )
-        argv = _argv(cmdline)
-        lines = _cgroup_lines(cgroup)
+        try:
+            argv = _argv(cmdline)
+            lines = _cgroup_lines(cgroup)
+        except (UnicodeError, ValueError) as error:
+            raise ContractError(
+                "A local process identity could not be frozen",
+                "magpie_local_process_identity_unavailable",
+                {"pid": pid},
+            ) from error
         return LocalProcessIdentity(
             pid=pid,
             uid=uid,
@@ -145,7 +152,7 @@ def matching_processes(
     expected_cwd = cwd.resolve()
     return tuple(
         item for item in processes
-        if item.argv == argv and item.cwd == expected_cwd
+        if item.argv == argv and item.cwd is not None and item.cwd == expected_cwd
     )
 
 
@@ -209,6 +216,15 @@ def _read_bounded(path: Path) -> bytes:
     if len(content) > _MAX_PROC_FIELD_BYTES:
         raise ValueError(f"procfs field exceeds {_MAX_PROC_FIELD_BYTES} bytes")
     return content
+
+
+def _read_cwd(path: Path) -> Path | None:
+    """Return cwd when procfs exposes it; Docker containment does not require it."""
+
+    try:
+        return Path(os.readlink(path)).resolve(strict=True)
+    except PermissionError:
+        return None
 
 
 def _stat_fields(raw: bytes) -> tuple[str, ...]:

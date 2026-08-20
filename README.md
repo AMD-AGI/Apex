@@ -412,8 +412,8 @@ Every package has its own README describing purpose, public API, invariants,
 dependencies, failure semantics, provenance, and focused tests. Architecture tests
 enforce layer direction, file/function size limits, import purity, and public surface.
 The [capability matrix](docs/capability_matrix.md) distinguishes implemented CPU
-contracts from live GPU qualification, including the composed but not yet
-live-qualified exact-image evaluator sidecar. The
+contracts, real Docker lifecycle smokes, live GPU terminal results, and still
+pending model-quality/reward qualification. The
 [Qwen3-Next 80B FP8 report](docs/validation_qwen3_next_80b_fp8.md) records the
 completed E2E no-gain/no-regression campaign without overstating it as a formal
 source-delivery winner. The clean-cut migration is tracked in

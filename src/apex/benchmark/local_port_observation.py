@@ -75,7 +75,7 @@ class ProcfsLocalPortObservationClient:
         root = self._proc_root / str(pid) / "fd"
         try:
             entries = tuple(root.iterdir())
-        except (FileNotFoundError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
             return False
         except OSError as error:
             raise ContractError(
@@ -92,7 +92,7 @@ class ProcfsLocalPortObservationClient:
         for entry in entries:
             try:
                 target = os.readlink(entry)
-            except (FileNotFoundError, ProcessLookupError):
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
                 continue
             except OSError as error:
                 raise ContractError(

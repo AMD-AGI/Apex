@@ -141,7 +141,7 @@ def _spec(tmp_path: Path, contract: LmEvalExecutionContract):
     return EvaluatorSidecarDockerSpec(
         "apex-lm-eval-test", _REPO, _IMAGE, 1000, 1000, "/authority",
         {"HF_HUB_OFFLINE": "1"}, (),
-        ("python3", "/evaluator/launcher.py"), contract.sha256,
+        ("python3", "/evaluator/launcher.py"), contract.sha256, "5" * 64,
     )
 
 

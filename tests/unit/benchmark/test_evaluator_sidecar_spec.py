@@ -51,6 +51,9 @@ def _prepared(tmp_path: Path, *, launcher_sha256: str | None = None):
         dataset_mount=roots["dataset"],
         runtime_mount=roots["runtime"],
         task_mount=roots["task"],
+        input_projection=SimpleNamespace(
+            launcher_path=launcher, receipt_sha256="e" * 64
+        ),
     )
 
 
@@ -75,6 +78,7 @@ def test_builds_no_network_no_gpu_read_only_sidecar_spec(tmp_path: Path) -> None
     assert all(item.read_only for role, item in mounts.items() if role != "authority")
     assert "PYTHONPATH=/evaluator/runtime/site-packages" in argv
     assert spec.sha256
+    assert spec.input_projection_sha256 == "e" * 64
 
 
 def test_rejects_launcher_drift_after_contract_freeze(tmp_path: Path) -> None:

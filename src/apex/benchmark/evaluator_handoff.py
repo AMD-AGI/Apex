@@ -62,6 +62,7 @@ class EvaluatorHandoffSession:
     handoff_released_ns: int | None = None
     execution_receipt: LmEvalExecutionReceipt | None = None
     error: str | None = None
+    error_reason_code: str | None = None
 
 
 class EvaluatorHandoffBarrier:
@@ -97,7 +98,10 @@ class EvaluatorHandoffBarrier:
         if session.thread.is_alive():
             self.abort(session, reason="handoff_incomplete_after_magpie_exit")
         if session.error is not None or session.execution_receipt is None:
-            raise _invalid(session.error or "Evaluator handoff did not execute")
+            raise ConfigurationError(
+                session.error or "Evaluator handoff did not execute",
+                session.error_reason_code or "evaluator_handoff_invalid",
+            )
         value = _handoff_receipt(session)
         path = _write_new(
             session.prepared.authority_root / "handoff_receipt.json", value
@@ -112,6 +116,7 @@ class EvaluatorHandoffBarrier:
         session.abort.set()
         if session.error is None:
             session.error = reason
+            session.error_reason_code = reason
         _wake(session.prepared.inferencex_projection.handoff_socket)
         if session.thread is not None:
             session.thread.join(timeout=5)
@@ -146,6 +151,9 @@ def _serve(session: EvaluatorHandoffSession) -> None:
         session.handoff_released_ns = time.monotonic_ns()
     except Exception as error:
         session.error = f"{type(error).__name__}:{error}"
+        session.error_reason_code = getattr(
+            error, "reason_code", "evaluator_handoff_invalid"
+        )
         if connection is not None:
             try:
                 _send_response(connection, 125)

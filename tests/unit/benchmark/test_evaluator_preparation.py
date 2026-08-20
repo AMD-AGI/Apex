@@ -23,6 +23,8 @@ from apex.runtime import (
     EvaluatorPolicyLock,
     LmEvalRuntimeReceipt,
 )
+from apex.runtime.lm_eval_lock import RUNTIME_SCHEMA
+from apex.runtime.lm_eval_runtime import canonical_json
 
 
 def _dataset_root(tmp_path: Path, revision: str) -> Path:
@@ -97,15 +99,42 @@ def _receipt(tmp_path: Path) -> DependencyReceipt:
         ),
     )
     runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    site_packages = runtime / "site-packages"
+    site_packages.mkdir(parents=True)
+    runtime_file = site_packages / "lm_eval.py"
+    runtime_content = b"__version__ = 'test'\n"
+    runtime_file.write_bytes(runtime_content)
+    runtime_file.chmod(0o400)
+    site_packages.chmod(0o500)
+    identity = {
+        "base_image_id": "sha256:" + "5" * 64,
+        "base_image_repo_digest": "example/eval@sha256:" + "6" * 64,
+    }
+    files = [{
+        "path": "lm_eval.py",
+        "size_bytes": len(runtime_content),
+        "mode": 0o400,
+        "sha256": hashlib.sha256(runtime_content).hexdigest(),
+    }]
+    runtime_sha256 = hashlib.sha256(
+        canonical_json({"identity": identity, "files": files})
+    ).hexdigest()
+    manifest = runtime / "lm_eval_runtime_manifest.json"
+    manifest.write_bytes(json.dumps({
+        "schema": RUNTIME_SCHEMA,
+        "runtime_sha256": runtime_sha256,
+        "site_packages": "site-packages",
+        "identity": identity,
+        "files": files,
+    }, indent=2, sort_keys=True).encode() + b"\n")
+    manifest_sha256 = sha256_file(manifest)
+    manifest.chmod(0o400)
+    runtime.chmod(0o500)
     lm_eval = LmEvalRuntimeReceipt(
         runtime,
-        "3" * 64,
-        "4" * 64,
-        {
-            "base_image_id": "sha256:" + "5" * 64,
-            "base_image_repo_digest": "example/eval@sha256:" + "6" * 64,
-        },
+        runtime_sha256,
+        manifest_sha256,
+        identity,
         1,
         "7" * 64,
     )
@@ -182,8 +211,13 @@ def test_prepares_private_immutable_inputs_without_source_mutation(
     assert source.read_bytes() == before
     assert prepared.task_mount == prepared.authority_root / "task-materialization/task"
     assert prepared.dataset_mount.name == "files"
-    assert prepared.runtime_mount == receipt.lm_eval_runtime.root
-    assert prepared.runtime_receipt == receipt.lm_eval_runtime
+    assert prepared.runtime_mount != receipt.lm_eval_runtime.root
+    assert prepared.runtime_mount.is_relative_to(prepared.authority_root)
+    assert prepared.dataset_mount.is_relative_to(prepared.authority_root)
+    assert prepared.input_projection.receipt_path.is_file()
+    assert prepared.runtime_receipt == replace(
+        receipt.lm_eval_runtime, root=prepared.runtime_mount
+    )
     assert prepared.output_root.is_dir()
     assert prepared.contract.config_sha256 == request.config_sha256
     assert prepared.contract.dataset_revision == "2" * 40
