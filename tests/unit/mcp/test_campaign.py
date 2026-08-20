@@ -19,6 +19,8 @@ from apex.orchestration import RunController, RunPhase
 from apex.reporting import resolve_run_source
 from apex.storage import ArtifactStore, EventJournal, SnapshotStore
 from apex.optimization.kernel import KernelCampaignDraftUseCase
+from apex.cli.app import _parser
+from apex.mcp.campaign import _formal_continuation
 
 
 def _git(workspace: Path, *arguments: str) -> None:
@@ -276,6 +278,28 @@ def test_campaign_start_freezes_unverified_draft_without_agent_or_gpu(
     assert campaign["evaluation_contract"]["unverified_reason"] == (
         "evaluation_authority_missing"
     )
+    assert campaign["formal_continuation"] == {
+        "schema": "apex.kernel-campaign-continuation/v1",
+        "ready": False,
+        "blocked_reason": "campaign_baseline_receipt_required",
+        "requires_user_confirmation": True,
+        "run_only_after_chat_exits": True,
+        "argv_template": [
+            "apex",
+            "optimize",
+            "kernel",
+            "--campaign",
+            str((results / campaign["run_locator"]["relative_path"]).resolve()),
+            "--workspace",
+            str(workspace.resolve()),
+            "--results",
+            str(results.resolve()),
+            "--evaluation-contract-draft-digest",
+            campaign["evaluation_contract_draft_digest"],
+            "--release-candidate-receipt",
+            "<valid-release-candidate-receipt-under-results>",
+        ],
+    }
     run = results / campaign["run_locator"]["relative_path"]
     source = resolve_run_source(run, run_id=campaign["run_id"])
     events = tuple(source.journal.iter_events(campaign["run_id"], verify=True))
@@ -371,6 +395,36 @@ def test_campaign_start_invalid_release_receipt_remains_unverified(
     source = resolve_run_source(results / campaign["run_locator"]["relative_path"])
     events = tuple(source.journal.iter_events(source.run_id, verify=True))
     assert all(event.event_type != "reward_committed" for event in events)
+
+
+def test_ready_continuation_round_trips_absolute_paths_through_cli_parser(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace with spaces"
+    workspace.mkdir()
+    results = tmp_path / "results with spaces"
+    campaign = results / "campaigns" / "campaign-ready"
+    campaign.mkdir(parents=True)
+    receipt = results / "baseline receipt.json"
+    receipt.write_text("{}\n", encoding="utf-8")
+    scope = CapabilityScope(workspace, results)
+    request = CapabilityRequest(
+        "campaign.start",
+        {"release_candidate_receipt": receipt.name},
+    )
+
+    continuation = _formal_continuation(
+        scope, campaign, "d" * 64, request, None
+    )
+    parsed = _parser().parse_args(continuation["argv_template"][1:])
+
+    assert continuation["ready"] is True
+    assert continuation["blocked_reason"] is None
+    assert parsed.campaign == campaign
+    assert parsed.workspace == workspace
+    assert parsed.results == results
+    assert parsed.evaluation_contract_draft_digest == "d" * 64
+    assert parsed.release_candidate_receipt == receipt
 
 
 def test_campaign_resume_delegates_after_scoped_baseline_load(

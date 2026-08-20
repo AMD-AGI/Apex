@@ -19,6 +19,7 @@ from .release_evidence import (
     BaselineAuditEvidence,
     CpuGateEvidence,
     DependencyVerificationEvidence,
+    MagpieConfigResolutionEntryEvidence,
     ReleaseEvidence,
 )
 from .release_qualification import QUALIFICATION_IDS
@@ -322,14 +323,33 @@ def _assess_magpie_config_resolution(
         return
     magpie = static["magpie"]
     expected = tuple(
-        (str(item["path"]), str(item["sha256"])) for item in magpie["configs"]
+        (
+            str(item["path"]),
+            str(item["config_sha256"]),
+            str(item["status"]),
+            str(item["run_mode"]),
+            str(item["lifecycle"]),
+        )
+        for item in magpie["config_resolution_scope"]
     )
-    observed = tuple((item.path, item.config_sha256) for item in value.entries)
+    observed = tuple(
+        (
+            item.path,
+            item.config_sha256,
+            item.status,
+            item.run_mode,
+            item.lifecycle,
+        )
+        for item in value.entries
+    )
     identity_matches = (
         value.magpie_commit == magpie["commit"]
         and value.corpus_manifest_sha256 == magpie["corpus_manifest_sha256"]
         and observed == expected
         and len(value.entries) == magpie["config_count"]
+        and len(value.e2e_v2_entries()) == magpie["e2e_v2_config_count"]
+        and len(value.e2e_v2_rejection_entries())
+        == magpie["e2e_v2_rejection_count"]
     )
     if not identity_matches:
         blockers.add("magpie_config_resolution_identity_mismatch")
@@ -427,20 +447,62 @@ def _assess_qualifications(
     if magpie and (
         resolved is None
         or magpie.subject_sha256 != resolved.resolved_manifest_sha256
-        or magpie.coverage_count != static["magpie"]["config_count"]
         or magpie.formal_delivery_count < 1
     ):
         blockers.add("magpie_live_coverage_incomplete")
     if magpie and resolved is not None:
-        ray_entries = tuple(
-            item for item in resolved.entries if item.run_mode == "ray"
-        )
+        docker_entries = resolved.e2e_v2_entries()
         if (
-            magpie.details["ray_config_count"] != len(ray_entries)
-            or magpie.details["ray_plan_manifest_sha256"]
-            != resolved.run_mode_manifest_sha256("ray")
+            magpie.coverage_count != len(docker_entries)
+            or magpie.details["e2e_v2_scope"] != "docker_one_shot"
+            or magpie.details["e2e_v2_config_count"] != len(docker_entries)
+            or magpie.details["e2e_v2_plan_manifest_sha256"]
+            != resolved.e2e_v2_manifest_sha256()
+            or magpie.details["e2e_v2_rejection_count"]
+            != len(resolved.e2e_v2_rejection_entries())
+            or magpie.details["e2e_v2_rejection_manifest_sha256"]
+            != resolved.e2e_v2_rejection_manifest_sha256()
+            or not _representatives_bind_selected_rows(
+                static["magpie"], magpie, docker_entries
+            )
         ):
-            blockers.add("magpie_ray_evidence_incomplete")
+            blockers.add("magpie_e2e_v2_scope_incomplete")
+
+
+def _representatives_bind_selected_rows(
+    static: Mapping[str, Any],
+    qualification,
+    selected: tuple[MagpieConfigResolutionEntryEvidence, ...],
+) -> bool:
+    frameworks = {
+        item["path"]: item["framework"]
+        for item in static["config_resolution_scope"]
+    }
+    expected = {
+        (
+            item.path,
+            item.config_sha256,
+            item.plan_sha256,
+            item.capability_receipt_sha256,
+            frameworks[item.path],
+            item.run_mode,
+            item.lifecycle,
+        )
+        for item in selected
+    }
+    return all(
+        (
+            item["config_path"],
+            item["config_sha256"],
+            item["plan_sha256"],
+            item["capability_receipt_sha256"],
+            item["framework"],
+            item["run_mode"],
+            item["lifecycle"],
+        )
+        in expected
+        for item in qualification.details["formal_delivery_representatives"]
+    )
 
 
 def _validate_payload(value: Mapping[str, Any]) -> None:

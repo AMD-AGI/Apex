@@ -224,7 +224,7 @@ def _campaign_start_descriptor() -> CapabilityDescriptor:
         "Start a formal kernel campaign draft",
         "Freeze an unverified task plus release baseline; run no agent, GPU, or evaluator.",
         CapabilityKind.CAMPAIGN,
-        {"task": _object(), "release_candidate_receipt": _string()},
+        {"task": _kernel_task_schema(), "release_candidate_receipt": _string()},
         {"campaign": _object()},
         required=("task",),
         effects=(
@@ -234,6 +234,93 @@ def _campaign_start_descriptor() -> CapabilityDescriptor:
         authority=CapabilityAuthority.WORKSPACE_USER,
         artifacts=("campaign_state", "evaluation_contract_draft"),
         reward=CapabilityRewardRole.EVIDENCE_ONLY,
+    )
+
+
+def _kernel_task_schema() -> dict[str, Any]:
+    command = _command_schema()
+    return _schema(
+        {
+            "schema_version": {"type": "integer", "const": 1},
+            "task_id": _string(),
+            "instructions": _string(),
+            "language": {"type": "string", "enum": ["python", "triton"]},
+            "editable_files": _string_array(),
+            "target_functions": _string_array(),
+            "commands": _schema(
+                {
+                    "compile": command,
+                    "correctness": command,
+                    "performance": command,
+                },
+                ("compile", "correctness", "performance"),
+            ),
+            "measurement": _measurement_schema(),
+            "gpu_arch": _string(),
+            "mode": {"type": "string", "const": "optimize_existing"},
+            "agent_backend": {
+                "type": "string",
+                "enum": ["codex", "claude", "cursor"],
+            },
+            "agent_options": _object(),
+            "budget": _object(),
+            "scope": _object(),
+            "delivery": _object(),
+            "dataset_split": {
+                "type": "string",
+                "enum": ["train", "validation", "heldout"],
+            },
+            "data_visibility": {
+                "type": "string",
+                "enum": ["public", "private", "heldout_private"],
+            },
+        },
+        (
+            "task_id",
+            "instructions",
+            "language",
+            "editable_files",
+            "target_functions",
+            "commands",
+        ),
+    )
+
+
+def _command_schema() -> dict[str, Any]:
+    return _schema(
+        {
+            "argv": _string_array(),
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "cwd": _string(),
+            "env": {"type": "object", "additionalProperties": {"type": "string"}},
+        },
+        ("argv",),
+    )
+
+
+def _measurement_schema() -> dict[str, Any]:
+    return _schema(
+        {
+            "schema": {"type": "string", "const": "apex.kernel-measurement/v1"},
+            "adapter_id": _string(),
+            "harness_files": _string_array(),
+            "measurement_method_sha256": {
+                "type": "string",
+                "pattern": "^(sha256:)?[0-9a-f]{64}$",
+            },
+            "runner": _command_schema(),
+            "aggregation": {
+                "type": "string",
+                "enum": ["equal_case", "workload_weighted"],
+            },
+        },
+        (
+            "schema",
+            "adapter_id",
+            "harness_files",
+            "measurement_method_sha256",
+            "runner",
+        ),
     )
 
 
@@ -398,6 +485,10 @@ def _object() -> dict[str, Any]:
 
 def _array() -> dict[str, Any]:
     return {"type": "array"}
+
+
+def _string_array() -> dict[str, Any]:
+    return {"type": "array", "items": _string(), "minItems": 1}
 
 
 __all__ = ["planned_capability_descriptors"]

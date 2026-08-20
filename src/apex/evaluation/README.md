@@ -12,7 +12,10 @@ scope, budget, measurement method, recipe claim, and parser/repository/safety/
 grading policy identities. A recipe claim inside TaskSpec is inert; only a
 composition-root `EvaluationContractAuthorizer` can issue authority. The
 digest-bound user-confirmation authorizer accepts exactly one draft previously
-emitted by CLI preview. Any source, harness, repository, command, or policy
+emitted by CLI preview or canonically recorded by `campaign.start` and reloaded
+through the host `--campaign` continuation. It trusts neither chat text nor an
+agent's digest echo: the current contract must recompute to the exact confirmed
+digest after the backend exits. Any source, harness, repository, command, or policy
 change fails before GPU acquisition. Its `user_confirmation` kind remains
 distinct from `reviewed_template` and `external_evaluator`, so downstream
 validators can require stronger authority.

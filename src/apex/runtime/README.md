@@ -226,7 +226,7 @@ namespace, and Slurm identity for every mapped owner and the supervisor. A
 bounded exact-name scan records active NHC/`rocminfo`/`rocm-smi`/`amd-smi`
 process contexts without retaining command arguments. ROCm health is bound to
 the same library hash and ownership receipt: fixed APIs capture edge
-temperature, current system clock, busy percentage, and VRAM used/total for each
+Junction temperature, current system clock, busy percentage, and VRAM used/total for each
 selected physical UUID. Missing APIs remain an explicit `incomplete` result;
 only a clean complete receipt reports formal measurement readiness.
 
@@ -253,11 +253,10 @@ explicitly marked non-authoritative for live release claims. `collect-local`
 loads every frozen config through published Magpie main APIs and binds each
 Apex-owned plan/capability receipt plus one self-digested corpus result. Missing
 rows, digest drift, an unavailable public API, or any
-`capability_upgrade_required` blocks the campaign baseline. The exact pin accepts
-all 27 configs; its Ray quality path requires the
-locked evaluator below one identical canonical shared-storage path, synchronous
-execution, and driver-side replay of the worker report and quality/runtime
-artifacts. Regenerate a future ledger only with
+`capability_upgrade_required` blocks the campaign baseline. The exact pin resolves
+all 27 configs for identity, while the V2 live product scope is the exact 21
+Docker one-shot entries; the other six remain audited inputs and must return
+`e2e_docker_only` before GPU or agent work. Regenerate a future ledger only with
 `scripts/build_magpie_compatibility_ledger.py` from the exact locked checkout.
 No config-resolution or ledger claim is GPU, workflow,
 winner, or formal-delivery evidence.
@@ -280,14 +279,15 @@ all eight before/after fault boundaries, reference/recovered manifests, duplicat
 prevention, partial-window discard, and GPU-identity rejection. Knowledge
 ablation binds all three arms and matched dimensions to evaluator-owned episodes;
 AKA binds the independent validator, central regrade, and matched cohort of at
-least ten tasks. Magpie live evidence binds the Apex config-resolution manifest plus
-workflow, quality, reward, framework, run-mode, lifecycle, source-adapter, and
-formal-delivery coverage. Its v2 detail contract also binds the exact
-resolution-derived Ray slice, shared-storage and locked-runtime receipt aggregates,
-worker report manifests, and driver replay receipts. A qualified Ray claim
-requires synchronous quality, verified shared runtime, and driver-side evidence
-replay. The release gate recomputes the Ray-slice digest from config-resolution evidence,
-so a self-consistent live receipt cannot omit or substitute a resolved Ray config.
+least ten tasks. Magpie V2 live evidence keeps the full 27-row resolution
+manifest as its subject but binds live coverage to the derived Docker one-shot
+slice, plus workflow, quality, reward, framework, lifecycle, source-adapter, and
+formal-delivery receipts. The release gate anchors every resolved row's
+run-mode/lifecycle to the checked product scope, recomputes the exact 21-row
+slice and six-row rejection-complement digests, requires early-rejection
+receipts, and binds each delivery representative to a concrete selected config,
+plan, and capability receipt. A self-consistent live receipt therefore cannot
+reclassify, omit, or substitute rows.
 Missing or weakened typed fields fail before release status is assessed.
 Typed shape and a self-digest still do not prove that any campaign ran. Release
 candidate v2 therefore requires every `qualified` record to be reverified by an
@@ -297,9 +297,10 @@ recomputed on verification. An explicit external formal result root is resolved
 through `FormalResultsRootValidator`; the index is re-read around verification,
 every CAS file is no-follow, single-link, size/digest checked, and only an
 installed kind-specific verifier may recompute evidence. The current production
-registry has no kind-specific qualification verifiers, so even a valid CAS index
-remains typed `unavailable` and joined JSON fragments stay visibly blocked rather
-than manufacturing release readiness.
+registry installs the three backend verifiers but not the Magpie, recovery,
+ablation, or AKA verifiers. Those claims therefore remain typed `unavailable`
+even with a valid CAS index; joined JSON fragments cannot manufacture release
+readiness.
 
 Published showcases similarly require the path-free
 `apex.showcase-verification/v2` receipt produced by offline verification. Its
@@ -310,8 +311,8 @@ boolean-only release showcase shape is rejected.
 The checked-in 27-row Magpie ledger is historical identity input, not release
 authority. Fresh baseline evidence must cover the exact corpus through the Apex
 config adapter and bind its resolution-manifest digest. Separate
-`magpie-corpus-live` evidence must bind that digest, cover every config,
-include formal-delivery coverage, and satisfy the Ray-specific v2 binding above.
+`magpie-corpus-live` evidence must bind that full digest, cover the exact derived
+Docker one-shot V2 slice, and include formal-delivery coverage.
 The three attributed template locks
 similarly remain visibly pending until immutable in-image source identities,
 Apex-owned evaluation, and real published showcases exist.
@@ -369,6 +370,8 @@ config before baseline execution.
 `RunProvenance` schema version 2 records the resolved `run_mode` as a typed field;
 deployment registries consume it together with the active source component so
 local, Ray, and Docker authorities cannot be confused.
+These generic provenance adapters are lower-level future inventory; Plan V2's
+`apex optimize e2e` rejects Local and Ray before reaching them.
 
 `FormalResultsRootValidator` protects evaluator-owned output placement. It
 canonicalizes a caller-selected absolute root without creating it, rejects every

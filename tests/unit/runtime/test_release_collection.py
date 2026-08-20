@@ -127,6 +127,7 @@ def _resolver_evidence(root, static, receipt):
         "b" * 64,
         "config_compatible",
         "docker",
+        "one_shot",
     )
     return build_magpie_config_resolution_evidence(
         magpie_commit="5" * 40,

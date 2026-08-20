@@ -101,41 +101,36 @@ def _aka_details(subject: str) -> dict:
 
 def _magpie_details(subject: str) -> dict:
     return {
-        "schema": "apex.magpie-corpus-live-qualification/v3",
+        "schema": "apex.magpie-corpus-live-qualification/v4",
         "resolved_manifest_sha256": subject,
         "workflow_manifest_sha256": _SHA,
         "quality_receipts_sha256": _SHA,
         "reward_receipts_sha256": _SHA,
-        "frameworks": ["atom", "sglang", "vllm"],
-        "run_modes": ["docker", "local", "ray"],
-        "lifecycles": ["cleanup", "one_shot", "reuse"],
+        "frameworks": ["sglang", "vllm"],
+        "run_modes": ["docker"],
+        "lifecycles": ["one_shot"],
         "source_adapters": ["aiter", "vllm"],
         "formal_delivery_representatives": [
             {
-                "framework": "atom", "run_mode": "docker",
-                "lifecycle": "cleanup", "source_adapter": "aiter",
+                "framework": "vllm", "run_mode": "docker",
+                "lifecycle": "one_shot", "source_adapter": "vllm",
+                "config_path": "examples/benchmarks/benchmark_vllm_qwen.yaml",
+                "config_sha256": _SHA,
+                "plan_sha256": _SHA,
+                "capability_receipt_sha256": _SHA,
                 "delivery_receipt_sha256": "1" * 64,
             },
-            {
-                "framework": "sglang", "run_mode": "local",
-                "lifecycle": "one_shot", "source_adapter": "vllm",
-                "delivery_receipt_sha256": "2" * 64,
-            },
-            {
-                "framework": "vllm", "run_mode": "ray",
-                "lifecycle": "reuse", "source_adapter": "vllm",
-                "delivery_receipt_sha256": "3" * 64,
-            },
         ],
-        "ray_config_count": 3,
-        "ray_plan_manifest_sha256": _SHA,
-        "ray_shared_storage_receipts_sha256": _SHA,
-        "ray_runtime_receipts_sha256": _SHA,
-        "ray_worker_reports_sha256": _SHA,
-        "ray_driver_replay_receipts_sha256": _SHA,
-        "ray_quality_sync_only": True,
-        "ray_shared_runtime_verified": True,
-        "ray_driver_evidence_replayed": True,
+        "e2e_v2_scope": "docker_one_shot",
+        "e2e_v2_config_count": 21,
+        "e2e_v2_plan_manifest_sha256": _SHA,
+        "e2e_v2_rejection_count": 6,
+        "e2e_v2_rejection_manifest_sha256": _SHA,
+        "early_rejection_receipts_sha256": _SHA,
+        "rejected_before_provenance": True,
+        "rejected_before_gpu": True,
+        "rejected_before_agent": True,
+        "rejected_without_result_root": True,
     }
 
 
@@ -147,7 +142,7 @@ def _counts(name: str) -> tuple[int, int]:
     if name == "aka-v14-matched":
         return 20, 1
     if name == "magpie-corpus-live":
-        return 27, 3
+        return 21, 1
     return 2, 1
 
 
@@ -205,25 +200,25 @@ def test_every_release_qualification_round_trips_typed_evidence(name: str) -> No
         ),
         (
             "magpie-corpus-live",
-            lambda value: value.update(ray_driver_evidence_replayed=False),
+            lambda value: value.update(e2e_v2_scope="full_corpus"),
+            "E2E V2 qualification scope differs",
+        ),
+        (
+            "magpie-corpus-live",
+            lambda value: value.update(e2e_v2_config_count=0),
+            "Docker qualification coverage is incomplete",
+        ),
+        (
+            "magpie-corpus-live",
+            lambda value: value.update(rejected_before_gpu=False),
             "truth claim is incomplete",
         ),
         (
             "magpie-corpus-live",
-            lambda value: value.update(ray_config_count=0),
-            "Ray qualification coverage is incomplete",
-        ),
-        (
-            "magpie-corpus-live",
-            lambda value: (
-                value["formal_delivery_representatives"][1].update(
-                    source_adapter="aiter"
-                ),
-                value["formal_delivery_representatives"][2].update(
-                    source_adapter="aiter"
-                ),
+            lambda value: value["formal_delivery_representatives"][0].update(
+                run_mode="local"
             ),
-            "formal-delivery source_adapters coverage is incomplete",
+            "formal-delivery representative is outside product scope",
         ),
     ],
 )

@@ -204,6 +204,17 @@ def _magpie_projection(
     ledger: Mapping[str, Any],
 ) -> dict[str, Any]:
     summary = ledger["summary"]
+    scope = [
+        {
+            "path": item["path"],
+            "config_sha256": item["config_sha256"],
+            "framework": item["framework"],
+            "run_mode": item["run_mode"],
+            "lifecycle": item["lifecycle"],
+            "status": item["compatibility_status"],
+        }
+        for item in ledger["entries"]
+    ]
     return {
         "repository": canonical_repository(corpus.repository),
         "commit": corpus.commit,
@@ -216,6 +227,15 @@ def _magpie_projection(
         "compatibility_authority": "legacy_apex_projection_not_release_evidence",
         "apex_config_resolution_evidence_required": True,
         "configs": [item.to_dict() for item in corpus.files],
+        "config_resolution_scope": scope,
+        "e2e_v2_config_count": sum(
+            item["run_mode"] == "docker" and item["lifecycle"] == "one_shot"
+            for item in scope
+        ),
+        "e2e_v2_rejection_count": sum(
+            item["run_mode"] != "docker" or item["lifecycle"] != "one_shot"
+            for item in scope
+        ),
         "workflow_qualified_count": summary["workflow_qualified"],
         "formal_delivery_qualified_count": summary["formal_delivery_qualified"],
     }

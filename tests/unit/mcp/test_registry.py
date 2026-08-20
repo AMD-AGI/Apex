@@ -11,6 +11,7 @@ import apex.bootstrap as bootstrap_module
 from apex.core import ContractError
 from apex.knowledge import KnowledgeRetriever, load_knowledge_catalog
 from apex.mcp import (
+    CapabilityGrantGate,
     CapabilityRegistry,
     KernelDraftSessionGrantAuthority,
     KnowledgeExplainHandler,
@@ -239,6 +240,44 @@ def test_kernel_session_grant_exposes_only_unverified_campaign_start() -> None:
 
     names = {tool.name for tool in anyio.run(project).root.tools}
     assert names == {"campaign.start"}
+
+
+def test_kernel_session_grant_can_create_only_one_draft() -> None:
+    authority = KernelDraftSessionGrantAuthority()
+    descriptor = next(
+        item
+        for item in planned_capability_descriptors()
+        if item.capability_id == "campaign.start"
+    )
+    gate = CapabilityGrantGate(authority, session_id="kernel-session-once")
+
+    first = gate.authorize(descriptor, {"task": {"task_id": "one"}})
+
+    assert first is not None
+    with pytest.raises(ContractError) as replay:
+        gate.authorize(descriptor, {"task": {"task_id": "two"}})
+    assert replay.value.reason_code == "capability_grant_replayed"
+
+
+def test_campaign_start_schema_declares_the_chat_to_formal_task_shape() -> None:
+    descriptor = next(
+        item
+        for item in planned_capability_descriptors()
+        if item.capability_id == "campaign.start"
+    )
+
+    task = descriptor.input_schema["properties"]["task"]
+    assert task["additionalProperties"] is False
+    assert task["properties"]["language"]["enum"] == ["python", "triton"]
+    assert "workspace" not in task["properties"]
+    commands = task["properties"]["commands"]
+    assert commands["required"] == ["compile", "correctness", "performance"]
+    assert commands["properties"]["compile"]["properties"]["argv"]["type"] == "array"
+    measurement = task["properties"]["measurement"]
+    assert measurement["properties"]["runner"]["properties"]["argv"]["type"] == "array"
+    assert measurement["properties"]["schema"]["const"] == (
+        "apex.kernel-measurement/v1"
+    )
 
 
 def test_presented_skill_is_available_but_not_an_mcp_tool() -> None:

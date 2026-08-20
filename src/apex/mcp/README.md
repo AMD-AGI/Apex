@@ -99,11 +99,19 @@ verifies and replays the canonical journal, rebuilds only the disposable state
 snapshot, then proves journal events remained byte-for-byte unchanged.
 `campaign.start` is also implemented for standalone kernels: an agent submits
 its discovered editable scope and fixed command/measurement draft directly as
-typed data, so no YAML file is required. The optimization use case resolves and
+typed data, so no YAML file is required. Its MCP JSON Schema enumerates the
+Python/Triton language boundary, required source scope, three fixed-argv command
+phases, and optional canonical raw-measurement runner. It rejects invented
+nested targets, shell-string commands, caller-supplied workspace/results roots,
+and standalone HIP before the handler runs. The optimization use case resolves and
 hashes the workspace, records an unverified Evaluation Contract in a new
 journal/CAS, binds a caller-selected release baseline, and returns the exact
 draft digest plus a results-scoped candidate projection only when that baseline
-verifies. It never invokes an agent,
+verifies. It also returns a host-generated `formal_continuation.argv_template`
+containing every required CLI argument. Agents must relay that argv unchanged
+after the chat exits instead of searching files or inventing CLI syntax; when
+the baseline is absent or invalid, the template is explicitly not ready and
+names the blocker. It never invokes an agent,
 acquires a GPU, trusts self-declared evaluator authority, or awards reward;
 trusted local confirmation and the formal composition boundary still own execution. E2E remains
 the explicit long-running `apex optimize e2e` workflow. An explicit
@@ -111,7 +119,9 @@ kernel-enhanced native session receives a one-shot authority that supports only
 `campaign.start`; it cannot expose acquisition, compile, correctness,
 measurement, grade, stop, resume, or bundle mutations. The supported measured
 continuation is the host CLI's `apex optimize kernel --campaign ...` path after
-the native backend exits. `campaign.stop` applies
+the native backend exits. A second start attempt in the same MCP server is
+rejected as `capability_grant_replayed`, even when the backend requests a fresh
+argument set. `campaign.stop` applies
 only to these standalone formal campaigns. It closes pending work, records
 REVERT for an unselected verified candidate, and derives one evidence-bound
 terminal reward or an explicit untrainable/null result; replaying it adds no

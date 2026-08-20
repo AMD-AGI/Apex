@@ -39,9 +39,15 @@ An explicit root `apex "..." --kernel` session may call only the host-authorized
 `campaign.start` mutation in addition to inert knowledge tools. It can create an
 unverified descriptor-free task draft, but Magpie acquisition and formal
 compile/correctness/measurement/grade tools stay hidden. After the backend exits,
-the user continues with `apex optimize kernel --campaign <run> --workspace <repo>
---results <root> --evaluation-contract-draft-digest <digest>
---release-candidate-receipt <receipt>`. The CLI reloads canonical draft bytes,
+the user continues with:
+
+```bash
+apex optimize kernel --campaign <run> --workspace <repo> --results <root> \
+  --evaluation-contract-draft-digest <digest> \
+  --release-candidate-receipt <receipt>
+```
+
+The CLI reloads canonical draft bytes,
 checks that the campaign is results-scoped, recomputes the current contract, and
 delegates once to `KernelOptimizeUseCase`. Drift fails before GPU acquisition.
 
@@ -113,8 +119,9 @@ and all four published showcases. Symlinked roots/evidence and edited self-hashe
 receipts fail closed.
 Live receipts use kind-specific v2 schemas: three backend/GFX950 receipts,
 two-task crash/resume fault coverage, three-arm matched knowledge ablation,
-independently validated AKA matched evaluation, and full Magpie corpus workflow
-coverage. A qualification name, count, or arbitrary digest is insufficient.
+independently validated AKA matched evaluation, and the exact Magpie 27-row
+resolution subject with 21 Docker live rows plus six typed early rejections. A
+qualification name, count, or arbitrary digest is insufficient.
 `--qualification-artifact-root <existing-absolute-formal-root>` asks the
 composition root for a read-only authority over that root. It never creates the
 root, rejects source/dependency overlap and symlink traversal, and still leaves

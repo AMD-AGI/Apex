@@ -284,6 +284,7 @@ class MagpieConfigResolutionEntryEvidence:
     capability_receipt_sha256: str
     status: str
     run_mode: str
+    lifecycle: str
 
     def __post_init__(self) -> None:
         path = PurePosixPath(_text(self.path, "Magpie config path"))
@@ -312,6 +313,11 @@ class MagpieConfigResolutionEntryEvidence:
             raise ContractError(
                 "Magpie config resolution run mode is invalid", "invalid_release_evidence"
             )
+        if self.lifecycle not in {"one_shot", "reuse", "cleanup"}:
+            raise ContractError(
+                "Magpie config resolution lifecycle is invalid",
+                "invalid_release_evidence",
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -334,7 +340,7 @@ class MagpieConfigResolutionEvidence:
     entries: tuple[MagpieConfigResolutionEntryEvidence, ...]
     resolved_manifest_sha256: str
 
-    SCHEMA = "apex.release-magpie-config-resolution-evidence/v1"
+    SCHEMA = "apex.release-magpie-config-resolution-evidence/v2"
 
     def __post_init__(self) -> None:
         _match(self.magpie_commit, _GIT, "Magpie config resolution commit")
@@ -394,6 +400,43 @@ class MagpieConfigResolutionEvidence:
         """Return a path-free digest over the exact selected plan receipts."""
 
         return sha256_json(self.run_mode_manifest_payload(run_mode))
+
+    def e2e_v2_entries(self) -> tuple[MagpieConfigResolutionEntryEvidence, ...]:
+        """Return the exact Docker one-shot product scope."""
+
+        return tuple(
+            item
+            for item in self.entries
+            if item.run_mode == "docker" and item.lifecycle == "one_shot"
+        )
+
+    def e2e_v2_manifest_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "apex.release-magpie-e2e-v2-scope-manifest/v1",
+            "resolved_manifest_sha256": self.resolved_manifest_sha256,
+            "product_scope": "docker_one_shot",
+            "entries": [item.to_dict() for item in self.e2e_v2_entries()],
+        }
+
+    def e2e_v2_manifest_sha256(self) -> str:
+        return sha256_json(self.e2e_v2_manifest_payload())
+
+    def e2e_v2_rejection_entries(self) -> tuple[MagpieConfigResolutionEntryEvidence, ...]:
+        """Return the exact complement that V2 rejects before execution."""
+
+        selected = set(self.e2e_v2_entries())
+        return tuple(item for item in self.entries if item not in selected)
+
+    def e2e_v2_rejection_manifest_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "apex.release-magpie-e2e-v2-rejection-manifest/v1",
+            "resolved_manifest_sha256": self.resolved_manifest_sha256,
+            "reason_code": "e2e_docker_only",
+            "entries": [item.to_dict() for item in self.e2e_v2_rejection_entries()],
+        }
+
+    def e2e_v2_rejection_manifest_sha256(self) -> str:
+        return sha256_json(self.e2e_v2_rejection_manifest_payload())
 
     def to_dict(self) -> dict[str, Any]:
         return {**self.manifest_payload(),

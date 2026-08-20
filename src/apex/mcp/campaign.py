@@ -105,6 +105,13 @@ class CampaignStartHandler:
             if baseline_reason is None
             else "valid_release_candidate_baseline_required"
         )
+        content["campaign"]["formal_continuation"] = _formal_continuation(
+            self._scope,
+            draft.root,
+            draft.contract.draft.digest,
+            request,
+            baseline_reason,
+        )
         invocation = begin_formal_capability(
             campaign.record, request.capability_id, request.arguments
         )
@@ -126,6 +133,44 @@ class CampaignStartHandler:
             return self._baseline_loader(path), None
         except ApexError as error:
             return None, error.reason_code
+
+
+def _formal_continuation(
+    scope: CapabilityScope,
+    campaign_root,
+    draft_digest: str,
+    request: CapabilityRequest,
+    baseline_reason: str | None,
+) -> dict[str, object]:
+    receipt = "<valid-release-candidate-receipt-under-results>"
+    supplied = request.arguments.get("release_candidate_receipt")
+    if supplied is not None:
+        try:
+            receipt = str(scope.read_results(str(supplied)))
+        except ApexError:
+            pass
+    return {
+        "schema": "apex.kernel-campaign-continuation/v1",
+        "ready": baseline_reason is None,
+        "blocked_reason": baseline_reason,
+        "requires_user_confirmation": True,
+        "run_only_after_chat_exits": True,
+        "argv_template": [
+            "apex",
+            "optimize",
+            "kernel",
+            "--campaign",
+            str(campaign_root.resolve(strict=True)),
+            "--workspace",
+            str(scope.workspace),
+            "--results",
+            str(scope.results),
+            "--evaluation-contract-draft-digest",
+            draft_digest,
+            "--release-candidate-receipt",
+            receipt,
+        ],
+    }
 
 
 class CampaignStopHandler:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from apex.core import new_identifier
+from apex.core import ContractError, new_identifier
 from apex.ports import (
     CapabilityAuthority,
     CapabilityDescriptor,
@@ -17,6 +17,9 @@ from apex.ports import (
 
 class KernelDraftSessionGrantAuthority:
     """Permit only an unverified campaign draft, never formal execution."""
+
+    def __init__(self) -> None:
+        self._consumed = False
 
     def supports(self, descriptor: CapabilityDescriptor) -> bool:
         return bool(
@@ -42,6 +45,12 @@ class KernelDraftSessionGrantAuthority:
         del arguments
         if not self.supports(descriptor):
             raise AssertionError("unsupported descriptor reached kernel draft authority")
+        if self._consumed:
+            raise ContractError(
+                "Kernel draft session authority was already consumed",
+                "capability_grant_replayed",
+            )
+        self._consumed = True
         return CapabilityGrantReceipt(
             grant_id=new_identifier("draft-grant"),
             session_id=session_id,

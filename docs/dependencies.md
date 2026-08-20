@@ -147,7 +147,7 @@ dependency verification. Workflow and formal-delivery qualification remain
 separate live receipts and are not inferred by this CPU ledger.
 
 For a release or live-campaign baseline, dependency verification is one input to
-`apex.release-candidate-receipt/v1`. Build the deterministic snapshot with
+`apex.release-candidate-receipt/v2`. Build the deterministic snapshot with
 `scripts/build_release_candidate_receipt.py`; it also binds the clean Apex tree,
 fresh reviewed Apex/Magpie remote tips, full CPU/static gate, installed CLI,
 immutable images, live qualifications, and all four canonical showcase

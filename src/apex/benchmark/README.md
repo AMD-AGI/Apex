@@ -14,12 +14,13 @@ receipt, result expectation, reward contract, redaction, and compatibility
 decision. Unknown semantic fields produce `capability_upgrade_required`; strict
 YAML, import-origin, file-identity, and cross-document drift checks fail closed.
 
-The exact pin reports all 27 configs compatible. Its three Ray configs require a caller-built locked
-evaluator under the identical canonical shared-storage path and use only the
-synchronous path, where the driver replays the persisted worker report,
-runtime/source/model receipts, and quality artifacts. Configuration resolution
-does not itself run a workload and never proves GPU execution, quality,
-performance, or formal delivery.
+The exact pin reports all 27 configs compatible at the published Magpie model
+boundary. Apex V2 derives 21 Docker one-shot product rows and rejects the six
+Local/Ray/reuse/cleanup rows with `e2e_docker_only` before this execution
+boundary. Legacy local/Ray adapters remain typed implementation inventory for a
+future product scope; their existence is not V2 support or release evidence.
+Configuration resolution does not itself run a workload and never proves GPU
+execution, quality, performance, or formal delivery.
 
 ## Phase views
 

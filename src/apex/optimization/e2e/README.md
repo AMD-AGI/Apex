@@ -503,10 +503,11 @@ separate `formal_delivery_verified` field becomes true only for
 `succeeded/source_rebuild_verified`, so a truthful partial intake cannot be
 mistaken for an unverified final delivery.
 Raw-config, runtime-hint, dependency/view, provenance, and resume-oracle failures
-occur before GPU acquisition. A config that delegates Docker image selection to
-Magpie, or uses local/Ray execution, may proceed with honest partial intake
-provenance; it cannot enter source deployment or formal delivery until its
-runtime, source, and engagement evidence is complete.
+occur before GPU acquisition. A Docker one-shot config that delegates image
+selection to Magpie may proceed with honest partial intake provenance; it cannot
+enter source deployment or formal delivery until runtime, source, and engagement
+evidence is complete. Lower-level local/Ray adapters are future inventory and
+are not reachable through the V2 CLI.
 New formal CLI runs also carry the non-circular campaign baseline receipt in the
 typed E2E spec. `_prepare` stores it in CAS and emits the shared
 `campaign_baseline` dependency event before workload initialization; the durable

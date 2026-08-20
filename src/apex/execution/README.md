@@ -56,6 +56,29 @@ that typed difference.
 The scoped server receives a host grant authority that supports only
 `campaign.start`: it may freeze an unverified chat-discovered draft under the
 selected results root, but it cannot expose GPU acquisition or evaluator tools.
+Kernel prompts explicitly activate the packaged optimization skill, preserve the
+original user request verbatim as a labeled suffix, and direct the backend to the
+tool's declared schema instead of backend session history. The `campaign.start`
+schema names every required TaskSpec field, fixed-argv command, and optional
+structured measurement contract; `workspace` and `results_dir` are deliberately
+absent because the host injects those scoped roots.
+The result also includes a host-rendered `formal_continuation.argv_template`
+with absolute campaign/workspace/results paths, the exact draft digest, and the
+release receipt argument. The backend returns it unchanged and does not search
+the workspace or session history for CLI syntax. A missing or invalid baseline
+keeps this template `ready=false` with a typed blocker.
+Codex receives a session-local MCP allowlist for exactly `campaign.start` and
+the two inert knowledge tools. Only `campaign.start` has tool-specific
+`approval_mode="approve"`, so headless draft creation cannot be canceled by an
+impossible prompt; all other MCP tools default to prompt, and shell/file approval
+plus the normal sandbox are unchanged. Apex never sets global approval to
+`never` or uses the dangerous approval-and-sandbox bypass.
+Claude receives the equivalent exact `--allowedTools` list for these three Apex
+tools; this does not pre-approve shell, edit, or any other native tool. The host
+grant itself is consumed after one `campaign.start`, so a backend cannot create
+multiple drafts in one enhanced MCP server process even if it retries the
+auto-approved call. A later native CLI resume starts a new scoped server and is
+therefore a new grant boundary.
 Measured work resumes through the host-owned `apex optimize kernel --campaign`
 CLI after the native backend exits and the user confirms the exact draft digest.
 Kernel-related sessions also receive the same integrity-checked, instruction-only

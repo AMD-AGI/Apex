@@ -130,6 +130,9 @@ returns its locator and exact digest. It does not run an agent, acquire a GPU,
 or grant evaluator authority. Active Magpie/TraceLens and formal evaluator
 capabilities remain hidden from the live chat because its MCP channel cannot
 mint trusted evaluation authority.
+Codex receives a session-local tool allowlist and auto-approval only for this
+unverified draft mutation; global shell/file approvals and sandbox policy remain
+native, and no evaluator capability is auto-approved.
 `campaign.stop` closes a standalone formal campaign without selecting a
 candidate. It records any missing REVERT/terminal decision, derives exactly one
 task-terminal reward from evidence already sealed by the evaluator (including
@@ -183,6 +186,10 @@ apex optimize kernel \
 The second command revalidates the exact draft and clean repository, then uses
 the same bounded formal optimizer as descriptor-backed tasks. The chat process
 must have exited first; agent text or a tool call cannot confirm the digest.
+`campaign.start` returns this complete command as
+`formal_continuation.argv_template`; clients should render it without guessing
+or dropping arguments. A `ready=false` template names the release-baseline
+blocker that must be resolved first.
 
 ## Kernel optimization CLI
 
@@ -449,10 +456,10 @@ On a clean candidate commit, generate the locally provable subset first:
 This command runs the complete fixed CPU gate, exact dependency/runtime verifier,
 fresh installed-CLI import probe, and the Apex config projection over the frozen
 Magpie corpus using published `main` APIs. It binds the result to unchanged source
-bytes before and after execution. All 27 pinned configs resolve as compatible;
-Ray quality runs still require a hash-locked
-evaluator below the identical shared-storage path plus synchronous driver-side
-evidence replay. The command performs no fetch, GPU, image, agent, Magpie live
+bytes before and after execution. All 27 pinned configs resolve for identity;
+the V2 live scope is the derived 21-row Docker one-shot slice, while the six
+Local/Ray/reuse/cleanup rows are required rejection tests. The command performs
+no fetch, GPU, image, agent, Magpie live
 campaign, or showcase work, so those release blockers cannot be cleared by it.
 
 After real runs, `apex release collect-showcase` converts an official offline

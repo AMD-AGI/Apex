@@ -257,40 +257,45 @@ def _validate_magpie(value: QualificationEvidence) -> None:
         "schema", "resolved_manifest_sha256", "workflow_manifest_sha256",
         "quality_receipts_sha256", "reward_receipts_sha256", "frameworks",
         "run_modes", "lifecycles", "source_adapters",
-        "formal_delivery_representatives", "ray_config_count",
-        "ray_plan_manifest_sha256", "ray_shared_storage_receipts_sha256",
-        "ray_runtime_receipts_sha256", "ray_worker_reports_sha256",
-        "ray_driver_replay_receipts_sha256", "ray_quality_sync_only",
-        "ray_shared_runtime_verified", "ray_driver_evidence_replayed",
-    }, "apex.magpie-corpus-live-qualification/v3")
+        "formal_delivery_representatives", "e2e_v2_scope",
+        "e2e_v2_config_count", "e2e_v2_plan_manifest_sha256",
+        "e2e_v2_rejection_count", "e2e_v2_rejection_manifest_sha256",
+        "early_rejection_receipts_sha256", "rejected_before_provenance",
+        "rejected_before_gpu", "rejected_before_agent",
+        "rejected_without_result_root",
+    }, "apex.magpie-corpus-live-qualification/v4")
     _hash_fields(raw, {
         "resolved_manifest_sha256", "workflow_manifest_sha256",
         "quality_receipts_sha256", "reward_receipts_sha256",
-        "ray_plan_manifest_sha256", "ray_shared_storage_receipts_sha256",
-        "ray_runtime_receipts_sha256", "ray_worker_reports_sha256",
-        "ray_driver_replay_receipts_sha256",
+        "e2e_v2_plan_manifest_sha256",
+        "e2e_v2_rejection_manifest_sha256",
+        "early_rejection_receipts_sha256",
     })
-    _exact_list(raw["frameworks"], ["atom", "sglang", "vllm"], "framework coverage")
-    _exact_list(raw["run_modes"], ["docker", "local", "ray"], "run-mode coverage")
-    _exact_list(raw["lifecycles"], ["cleanup", "one_shot", "reuse"], "lifecycle coverage")
+    _exact_list(raw["frameworks"], ["sglang", "vllm"], "framework coverage")
+    _exact_list(raw["run_modes"], ["docker"], "run-mode coverage")
+    _exact_list(raw["lifecycles"], ["one_shot"], "lifecycle coverage")
     adapters = raw["source_adapters"]
     if not isinstance(adapters, list) or not adapters or adapters != sorted(set(adapters)):
         raise _invalid("source-adapter coverage is invalid")
     _validate_formal_delivery_representatives(value, raw)
-    _count(raw["ray_config_count"], "ray_config_count")
-    ray_truth = {
-        "ray_quality_sync_only", "ray_shared_runtime_verified",
-        "ray_driver_evidence_replayed",
-    }
-    if any(type(raw[field]) is not bool for field in ray_truth):
-        raise _invalid("Ray qualification truth claim is invalid")
+    if raw["e2e_v2_scope"] != "docker_one_shot":
+        raise _invalid("E2E V2 qualification scope differs")
+    _count(raw["e2e_v2_config_count"], "e2e_v2_config_count")
+    _count(raw["e2e_v2_rejection_count"], "e2e_v2_rejection_count")
+    _true_fields(raw, {
+        "rejected_before_provenance", "rejected_before_gpu",
+        "rejected_before_agent", "rejected_without_result_root",
+    })
     _subject(value, raw["resolved_manifest_sha256"])
     if value.status == "qualified":
         if value.formal_delivery_count < 1:
             raise _invalid("Magpie formal-delivery coverage is incomplete")
-        if raw["ray_config_count"] < 1:
-            raise _invalid("Ray qualification coverage is incomplete")
-        _true_fields(raw, ray_truth)
+        if (
+            raw["e2e_v2_config_count"] < 1
+            or value.coverage_count != raw["e2e_v2_config_count"]
+            or raw["e2e_v2_rejection_count"] < 1
+        ):
+            raise _invalid("Docker qualification coverage is incomplete")
 
 
 def _validate_formal_delivery_representatives(
@@ -299,38 +304,49 @@ def _validate_formal_delivery_representatives(
     representatives = raw["formal_delivery_representatives"]
     fields = {
         "framework", "run_mode", "lifecycle", "source_adapter",
-        "delivery_receipt_sha256",
+        "config_path", "config_sha256", "plan_sha256",
+        "capability_receipt_sha256", "delivery_receipt_sha256",
     }
     if not isinstance(representatives, list) or len(representatives) != (
         value.formal_delivery_count
     ):
         raise _invalid("formal-delivery representatives are incomplete")
-    identities: list[tuple[str, str, str, str, str]] = []
+    identities: list[tuple[str, ...]] = []
     for item in representatives:
         entry = _strict(item, fields, "formal-delivery representative")
         _match(
             entry["delivery_receipt_sha256"], _SHA256,
             "formal-delivery receipt",
         )
+        _match(entry["config_sha256"], _SHA256, "representative config")
+        _match(entry["plan_sha256"], _SHA256, "representative plan")
+        _match(
+            entry["capability_receipt_sha256"],
+            _SHA256,
+            "representative capability receipt",
+        )
         identity = (
             str(entry["framework"]),
             str(entry["run_mode"]),
             str(entry["lifecycle"]),
             str(entry["source_adapter"]),
+            str(entry["config_path"]),
+            str(entry["config_sha256"]),
+            str(entry["plan_sha256"]),
+            str(entry["capability_receipt_sha256"]),
             str(entry["delivery_receipt_sha256"]),
         )
         identities.append(identity)
     if identities != sorted(set(identities)):
         raise _invalid("formal-delivery representatives are not unique/sorted")
-    if value.status != "qualified":
-        return
-    dimensions = (
-        (0, "frameworks"), (1, "run_modes"), (2, "lifecycles"),
-        (3, "source_adapters"),
-    )
-    for index, field in dimensions:
-        if sorted({identity[index] for identity in identities}) != raw[field]:
-            raise _invalid(f"formal-delivery {field} coverage is incomplete")
+    for identity in identities:
+        if (
+            identity[0] not in raw["frameworks"]
+            or identity[1] not in raw["run_modes"]
+            or identity[2] not in raw["lifecycles"]
+            or identity[3] not in raw["source_adapters"]
+        ):
+            raise _invalid("formal-delivery representative is outside product scope")
 
 
 def _details(

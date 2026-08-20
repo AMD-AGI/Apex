@@ -85,6 +85,7 @@ class NativeCodingSessionLauncher:
     def prepare(self, request: CodingSessionRequest) -> NativeSessionInvocation:
         requested_enhancement = _should_enable_kernel_capabilities(request)
         enhanced = requested_enhancement
+        session_prompt = _session_prompt(request.prompt, enhanced=enhanced)
         notices: tuple[str, ...] = ()
         mcp_command = _scoped_mcp_command(
             self._mcp_command,
@@ -99,6 +100,7 @@ class NativeCodingSessionLauncher:
                 executable,
                 mcp_command if enhanced else (),
                 skills,
+                session_prompt,
             )
             credential = "OPENAI_API_KEY"
         elif request.backend is AgentBackendName.CLAUDE:
@@ -108,6 +110,7 @@ class NativeCodingSessionLauncher:
                 executable,
                 mcp_command if enhanced else (),
                 skills,
+                session_prompt,
             )
             credential = "ANTHROPIC_API_KEY"
         else:
@@ -117,7 +120,7 @@ class NativeCodingSessionLauncher:
                     "agent_effort_unsupported",
                 )
             executable = self._resolve("cursor-agent")
-            argv = _cursor_argv(request, executable, skills)
+            argv = _cursor_argv(request, executable, skills, session_prompt)
             credential = "CURSOR_API_KEY"
             if requested_enhancement:
                 notices = (
@@ -134,7 +137,7 @@ class NativeCodingSessionLauncher:
             tuple(argv),
             request.workspace,
             invocation_environment({}, credential_key=credential),
-            request.prompt
+            session_prompt
             if request.output is not CodingSessionOutput.INTERACTIVE
             else None,
             _prompt_transport(request),
@@ -191,11 +194,27 @@ def _prompt_transport(request: CodingSessionRequest) -> str:
     return "stdin"
 
 
+def _session_prompt(prompt: str | None, *, enhanced: bool) -> str | None:
+    if prompt is None or not enhanced:
+        return prompt
+    guidance = (
+        "Apex kernel session: use the packaged amd-kernel-optimization skill. "
+        "For an optimization request, inspect the authorized workspace and call "
+        "campaign.start using its declared TaskSpec schema; create only an "
+        "unverified draft, then return its run locator, draft digest, and the "
+        "tool-provided formal_continuation argv without changing it. Do not invoke "
+        "evaluator phases in this chat or search backend history/filesystem for "
+        "Apex schemas or CLI syntax."
+    )
+    return f"{guidance}\n\nUser request:\n{prompt}"
+
+
 def _codex_argv(
     request: CodingSessionRequest,
     executable: str,
     mcp_command: Sequence[str],
     skills: KernelSkillPackage | None,
+    prompt: str | None,
 ) -> list[str]:
     argv = [executable]
     if request.output is not CodingSessionOutput.INTERACTIVE:
@@ -215,8 +234,8 @@ def _codex_argv(
             if request.resume_session is not None
             else ["--last"]
         )
-    if request.prompt is not None and request.output is CodingSessionOutput.INTERACTIVE:
-        argv.append(request.prompt)
+    if prompt is not None and request.output is CodingSessionOutput.INTERACTIVE:
+        argv.append(prompt)
     return argv
 
 
@@ -225,6 +244,7 @@ def _claude_argv(
     executable: str,
     mcp_command: Sequence[str],
     skills: KernelSkillPackage | None,
+    prompt: str | None,
 ) -> list[str]:
     argv = [executable]
     if request.output is not CodingSessionOutput.INTERACTIVE:
@@ -240,14 +260,15 @@ def _claude_argv(
     _model_effort(argv, request, codex=False)
     if mcp_command:
         argv.extend(["--mcp-config", _claude_mcp_config(mcp_command)])
+        argv.extend(["--allowedTools", _claude_kernel_tools()])
     if skills is not None:
         argv.extend(["--plugin-dir", str(skills.root)])
     if request.resume_session is not None:
         argv.extend(["--resume", request.resume_session])
     elif request.resume_latest:
         argv.append("--continue")
-    if request.prompt is not None and request.output is CodingSessionOutput.INTERACTIVE:
-        argv.append(request.prompt)
+    if prompt is not None and request.output is CodingSessionOutput.INTERACTIVE:
+        argv.append(prompt)
     return argv
 
 
@@ -255,6 +276,7 @@ def _cursor_argv(
     request: CodingSessionRequest,
     executable: str,
     skills: KernelSkillPackage | None,
+    prompt: str | None,
 ) -> list[str]:
     argv = [executable, "--workspace", str(request.workspace)]
     if request.output is not CodingSessionOutput.INTERACTIVE:
@@ -274,8 +296,8 @@ def _cursor_argv(
         argv.extend(["--resume", request.resume_session])
     elif request.resume_latest:
         argv.append("--continue")
-    if request.prompt is not None and request.output is CodingSessionOutput.INTERACTIVE:
-        argv.append(request.prompt)
+    if prompt is not None and request.output is CodingSessionOutput.INTERACTIVE:
+        argv.append(prompt)
     return argv
 
 
@@ -290,12 +312,17 @@ def _model_effort(argv: list[str], request: CodingSessionRequest, *, codex: bool
 
 
 def _codex_mcp_config(command: Sequence[str]) -> list[str]:
-    return [
-        "--config",
-        f"mcp_servers.apex.command={json.dumps(command[0])}",
-        "--config",
-        f"mcp_servers.apex.args={json.dumps(list(command[1:]))}",
-    ]
+    args = json.dumps(list(command[1:]), separators=(",", ":"))
+    config = (
+        "{command="
+        + json.dumps(command[0])
+        + ",args="
+        + args
+        + ',enabled_tools=["campaign.start","knowledge.search","knowledge.explain"]'
+        + ',default_tools_approval_mode="prompt"'
+        + ',tools={"campaign.start"={approval_mode="approve"}}}'
+    )
+    return ["--config", f"mcp_servers.apex={config}"]
 
 
 def _codex_skill_config(skills: KernelSkillPackage) -> str:
@@ -315,6 +342,16 @@ def _claude_mcp_config(command: Sequence[str]) -> str:
         },
         separators=(",", ":"),
         sort_keys=True,
+    )
+
+
+def _claude_kernel_tools() -> str:
+    return ",".join(
+        (
+            "mcp__apex__campaign_start",
+            "mcp__apex__knowledge_search",
+            "mcp__apex__knowledge_explain",
+        )
     )
 
 

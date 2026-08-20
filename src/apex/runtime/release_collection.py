@@ -293,6 +293,7 @@ def _magpie_config_resolution_evidence(
                 str(resolved.capability_receipt["receipt_sha256"]),
                 resolved.status,
                 str(resolved.capability_receipt["run_mode"]),
+                str(resolved.plan["lifecycle"]),
             )
         )
     return build_magpie_config_resolution_evidence(

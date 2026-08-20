@@ -80,7 +80,11 @@ def test_kernel_hint_lazily_mounts_read_only_mcp_for_codex(tmp_path: Path) -> No
     argv = runner.invocation.argv
     assert argv[1] == "exec"
     assert "--json" in argv
-    assert any("mcp_servers.apex.command" in value for value in argv)
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+    mcp_config = next(value for value in argv if value.startswith("mcp_servers.apex="))
+    assert 'enabled_tools=["campaign.start","knowledge.search","knowledge.explain"]' in mcp_config
+    assert 'default_tools_approval_mode="prompt"' in mcp_config
+    assert 'tools={"campaign.start"={approval_mode="approve"}}' in mcp_config
     skill_config = next(value for value in argv if value.startswith("skills.config="))
     assert "amd-hip-kernel-optimization/SKILL.md" in skill_config
     assert "amd-kernel-debugging/SKILL.md" in skill_config
@@ -96,7 +100,11 @@ def test_kernel_hint_lazily_mounts_read_only_mcp_for_codex(tmp_path: Path) -> No
     )
     assert len(runner.invocation.kernel_skill_digest or "") == 64
     assert runner.invocation.prompt_transport == "stdin"
-    assert runner.invocation.stdin_text == "Explain this Triton kernel on gfx950"
+    assert runner.invocation.stdin_text is not None
+    assert "use the packaged amd-kernel-optimization skill" in runner.invocation.stdin_text
+    assert runner.invocation.stdin_text.endswith(
+        "User request:\nExplain this Triton kernel on gfx950"
+    )
     assert runner.invocation.stdin_text not in runner.invocation.argv
 
 
@@ -125,6 +133,7 @@ def test_plain_mode_disables_kernel_augmentation(tmp_path: Path) -> None:
 
     assert invocation.kernel_capabilities_enabled is False
     assert not any("mcp_servers.apex" in value for value in invocation.argv)
+    assert invocation.argv[-1] == "Optimize this AMD kernel"
 
 
 def test_claude_kernel_session_uses_native_permissions_and_explicit_mcp(
@@ -145,6 +154,12 @@ def test_claude_kernel_session_uses_native_permissions_and_explicit_mcp(
         invocation.argv.index("--mcp-config") + 1
     ]
     assert "--plugin-dir" in invocation.argv
+    allowed_tools = invocation.argv.index("--allowedTools") + 1
+    assert invocation.argv[allowed_tools] == (
+        "mcp__apex__campaign_start,mcp__apex__knowledge_search,"
+        "mcp__apex__knowledge_explain"
+    )
+    assert allowed_tools > invocation.argv.index("--mcp-config")
     assert "--bare" not in invocation.argv
     assert "--safe-mode" not in invocation.argv
     assert "--permission-mode" not in invocation.argv
@@ -210,6 +225,21 @@ def test_interactive_prompt_receipt_matches_argv_transport(tmp_path: Path) -> No
     assert invocation.argv[-1] == prompt
     assert invocation.stdin_text is None
     assert invocation.prompt_transport == "argv"
+
+
+def test_kernel_interactive_prompt_activates_skill_and_preserves_request(
+    tmp_path: Path,
+) -> None:
+    prompt = "Make vector_add faster"
+
+    invocation = _launcher(_Runner()).prepare(
+        _request(tmp_path, prompt, enhancement=KernelEnhancement.KERNEL)
+    )
+
+    rendered = invocation.argv[-1]
+    assert "amd-kernel-optimization skill" in rendered
+    assert "campaign.start" in rendered
+    assert rendered.endswith(f"User request:\n{prompt}")
 
 
 def test_subprocess_session_runner_writes_prompt_only_to_stdin(

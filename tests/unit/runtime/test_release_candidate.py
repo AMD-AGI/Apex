@@ -140,13 +140,14 @@ def _resolver_evidence(static: dict):
     entries = tuple(
         MagpieConfigResolutionEntryEvidence(
             item["path"],
-            item["sha256"],
+            item["config_sha256"],
             f"{index + 1:064x}",
             f"{index + 101:064x}",
-            "config_compatible",
-            "ray" if index < 3 else ("local" if index < 5 else "docker"),
+            item["status"],
+            item["run_mode"],
+            item["lifecycle"],
         )
-        for index, item in enumerate(magpie["configs"])
+        for index, item in enumerate(magpie["config_resolution_scope"])
     )
     return build_magpie_config_resolution_evidence(
         magpie_commit=magpie["commit"],
@@ -178,7 +179,7 @@ def _ready_evidence(static: dict) -> ReleaseEvidence:
         coverage, formal = 2, 1
         if name == "magpie-corpus-live":
             subject = resolver.resolved_manifest_sha256
-            coverage, formal = static["magpie"]["config_count"], 3
+            coverage, formal = len(resolver.e2e_v2_entries()), 1
         elif name == "crash-resume-recovery":
             coverage, formal = 32, 2
         elif name == "knowledge-ablation":
@@ -306,44 +307,46 @@ def _qualification_details(
             ],
             "independent_validator": True,
         }
+    representative = next(
+        item
+        for item in resolver.e2e_v2_entries()
+        if item.path.endswith("benchmark_vllm_qwen3_next_80b_fp8.yaml")
+    )
     return {
-        "schema": "apex.magpie-corpus-live-qualification/v3",
+        "schema": "apex.magpie-corpus-live-qualification/v4",
         "resolved_manifest_sha256": subject,
         "workflow_manifest_sha256": _SHA,
         "quality_receipts_sha256": _SHA,
         "reward_receipts_sha256": _SHA,
-        "frameworks": ["atom", "sglang", "vllm"],
-        "run_modes": ["docker", "local", "ray"],
-        "lifecycles": ["cleanup", "one_shot", "reuse"],
+        "frameworks": ["sglang", "vllm"],
+        "run_modes": ["docker"],
+        "lifecycles": ["one_shot"],
         "source_adapters": ["aiter", "vllm"],
         "formal_delivery_representatives": [
             {
-                "framework": "atom", "run_mode": "docker",
-                "lifecycle": "cleanup", "source_adapter": "aiter",
+                "framework": "vllm", "run_mode": "docker",
+                "lifecycle": "one_shot", "source_adapter": "vllm",
+                "config_path": representative.path,
+                "config_sha256": representative.config_sha256,
+                "plan_sha256": representative.plan_sha256,
+                "capability_receipt_sha256": (
+                    representative.capability_receipt_sha256
+                ),
                 "delivery_receipt_sha256": "1" * 64,
             },
-            {
-                "framework": "sglang", "run_mode": "local",
-                "lifecycle": "one_shot", "source_adapter": "vllm",
-                "delivery_receipt_sha256": "2" * 64,
-            },
-            {
-                "framework": "vllm", "run_mode": "ray",
-                "lifecycle": "reuse", "source_adapter": "vllm",
-                "delivery_receipt_sha256": "3" * 64,
-            },
         ],
-        "ray_config_count": sum(
-            item.run_mode == "ray" for item in resolver.entries
+        "e2e_v2_scope": "docker_one_shot",
+        "e2e_v2_config_count": len(resolver.e2e_v2_entries()),
+        "e2e_v2_plan_manifest_sha256": resolver.e2e_v2_manifest_sha256(),
+        "e2e_v2_rejection_count": len(resolver.e2e_v2_rejection_entries()),
+        "e2e_v2_rejection_manifest_sha256": (
+            resolver.e2e_v2_rejection_manifest_sha256()
         ),
-        "ray_plan_manifest_sha256": resolver.run_mode_manifest_sha256("ray"),
-        "ray_shared_storage_receipts_sha256": _SHA,
-        "ray_runtime_receipts_sha256": _SHA,
-        "ray_worker_reports_sha256": _SHA,
-        "ray_driver_replay_receipts_sha256": _SHA,
-        "ray_quality_sync_only": True,
-        "ray_shared_runtime_verified": True,
-        "ray_driver_evidence_replayed": True,
+        "early_rejection_receipts_sha256": _SHA,
+        "rejected_before_provenance": True,
+        "rejected_before_gpu": True,
+        "rejected_before_agent": True,
+        "rejected_without_result_root": True,
     }
 
 
@@ -373,6 +376,10 @@ def test_checked_in_ledger_requires_config_resolution_evidence() -> None:
     assert first.baseline_status == "blocked"
     magpie = first.document["static"]["magpie"]
     assert (magpie["config_count"], magpie["config_compatible_count"]) == (27, 27)
+    assert (
+        magpie["e2e_v2_config_count"],
+        magpie["e2e_v2_rejection_count"],
+    ) == (21, 6)
     assert magpie["compatibility_authority"] == (
         "legacy_apex_projection_not_release_evidence"
     )
@@ -526,7 +533,7 @@ def test_nested_qualification_mutation_is_revalidated_before_assessment(
         inspect_release_candidate(ROOT, evidence)
 
 
-@pytest.mark.parametrize("mutation", ["missing", "config_digest"])
+@pytest.mark.parametrize("mutation", ["missing", "config_digest", "run_mode"])
 def test_resolver_corpus_identity_drift_blocks_baseline(monkeypatch, mutation) -> None:
     static = _ready_static()
     monkeypatch.setattr(
@@ -539,7 +546,7 @@ def test_resolver_corpus_identity_drift_blocks_baseline(monkeypatch, mutation) -
     entries = list(original.entries)
     if mutation == "missing":
         entries.pop()
-    else:
+    elif mutation == "config_digest":
         first = entries[0]
         entries[0] = MagpieConfigResolutionEntryEvidence(
             first.path,
@@ -548,6 +555,23 @@ def test_resolver_corpus_identity_drift_blocks_baseline(monkeypatch, mutation) -
             first.capability_receipt_sha256,
             first.status,
             first.run_mode,
+            first.lifecycle,
+        )
+    else:
+        index = next(
+            index
+            for index, item in enumerate(entries)
+            if item.run_mode == "docker" and item.lifecycle == "one_shot"
+        )
+        first = entries[index]
+        entries[index] = MagpieConfigResolutionEntryEvidence(
+            first.path,
+            first.config_sha256,
+            first.plan_sha256,
+            first.capability_receipt_sha256,
+            first.status,
+            "local",
+            first.lifecycle,
         )
     resolver = build_magpie_config_resolution_evidence(
         magpie_commit=original.magpie_commit,
@@ -584,6 +608,7 @@ def test_resolver_upgrade_status_blocks_baseline(monkeypatch) -> None:
         first.capability_receipt_sha256,
         "capability_upgrade_required",
         first.run_mode,
+        first.lifecycle,
     )
     resolver = build_magpie_config_resolution_evidence(
         magpie_commit=original.magpie_commit,
@@ -634,7 +659,14 @@ def test_stale_cpu_gate_and_incomplete_magpie_live_coverage_block(monkeypatch) -
                 else item.coverage_count
             ),
             formal_delivery_count=item.formal_delivery_count,
-            details=item.details,
+            details=(
+                {
+                    **item.details,
+                    "e2e_v2_config_count": item.coverage_count - 1,
+                }
+                if item.qualification_id == "magpie-corpus-live"
+                else item.details
+            ),
         )
         for item in evidence.qualifications
     )
@@ -655,12 +687,12 @@ def test_stale_cpu_gate_and_incomplete_magpie_live_coverage_block(monkeypatch) -
 
     assert "cpu_gate_identity_mismatch" in blocked.blockers
     assert "cpu_gate_identity_mismatch" in blocked.baseline_blockers
-    assert "magpie_live_coverage_incomplete" in blocked.blockers
+    assert "magpie_e2e_v2_scope_incomplete" in blocked.blockers
     with pytest.raises(ContractError, match="Release candidate is blocked"):
         freeze_release_candidate(blocked.to_dict(), apex_root=ROOT)
 
 
-def test_magpie_live_ray_evidence_must_bind_exact_resolver_slice(monkeypatch) -> None:
+def test_magpie_live_e2e_v2_scope_must_bind_exact_resolver_slice(monkeypatch) -> None:
     static = _ready_static()
     monkeypatch.setattr(
         "apex.runtime.release_candidate.collect_release_static_identity",
@@ -672,7 +704,7 @@ def test_magpie_live_ray_evidence_must_bind_exact_resolver_slice(monkeypatch) ->
         if item.qualification_id == "magpie-corpus-live"
     )
     details = dict(original.details)
-    details["ray_plan_manifest_sha256"] = "f" * 64
+    details["e2e_v2_plan_manifest_sha256"] = "f" * 64
     forged = build_qualification_evidence(
         qualification_id=original.qualification_id,
         apex_tree=original.apex_tree,
@@ -692,7 +724,48 @@ def test_magpie_live_ray_evidence_must_bind_exact_resolver_slice(monkeypatch) ->
         replace(evidence, qualifications=qualifications),
     )
 
-    assert "magpie_ray_evidence_incomplete" in blocked.blockers
+    assert "magpie_e2e_v2_scope_incomplete" in blocked.blockers
+
+    resolver = evidence.magpie_config_resolution
+    assert resolver is not None
+    sglang = next(
+        item
+        for item in resolver.e2e_v2_entries()
+        if item.path.endswith("benchmark_inferencex.yaml")
+    )
+    representative = {
+        **original.details["formal_delivery_representatives"][0],
+        "config_path": sglang.path,
+        "config_sha256": sglang.config_sha256,
+        "plan_sha256": sglang.plan_sha256,
+        "capability_receipt_sha256": sglang.capability_receipt_sha256,
+        "framework": "vllm",
+    }
+    mislabeled = build_qualification_evidence(
+        qualification_id=original.qualification_id,
+        apex_tree=original.apex_tree,
+        subject_sha256=original.subject_sha256,
+        status=original.status,
+        coverage_count=original.coverage_count,
+        formal_delivery_count=original.formal_delivery_count,
+        details={
+            **original.details,
+            "formal_delivery_representatives": [representative],
+        },
+    )
+    mislabeled_evidence = replace(
+        evidence,
+        qualifications=tuple(
+            mislabeled
+            if item.qualification_id == original.qualification_id
+            else item
+            for item in evidence.qualifications
+        ),
+    )
+
+    mislabeled_receipt = inspect_release_candidate(ROOT, mislabeled_evidence)
+
+    assert "magpie_e2e_v2_scope_incomplete" in mislabeled_receipt.blockers
 
 
 def test_campaign_baseline_does_not_wait_for_future_showcases(monkeypatch) -> None:

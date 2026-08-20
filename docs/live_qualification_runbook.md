@@ -2,7 +2,8 @@
 
 This runbook covers the operator-owned work that CPU contracts cannot perform:
 real GPU/backend qualification, crash/resume fault injection, matched knowledge
-ablation, the full Magpie corpus, independent AgentKernelArena evaluation, and
+ablation, the 27-row Magpie resolution subject with its 21-row Docker live
+slice, independent AgentKernelArena evaluation, and
 canonical showcase publication. These operations are explicit and must write to
 a caller-selected results directory outside the source checkout.
 
@@ -82,7 +83,7 @@ existing symlink component before GPU acquisition.
 For the Plan V2 refactor, use this split:
 
 ```text
-/home/viouyang/apex-results/refactor/   # canonical formal evidence
+/data/viouyang/apex-results/refactor/   # canonical formal evidence
 /home/viouyang/Apex/tmp/refactor/       # non-authoritative preflight/index only
 ```
 
@@ -133,7 +134,7 @@ campaign harness after it verifies the retained source artifacts.
 | `backend-cursor-gfx950` | Same matrix through the Cursor backend; capability gaps remain visible rather than borrowed from Codex |
 | `crash-resume-recovery` | Apex fault harness; both task kinds, all eight before/after boundaries, reference/recovered manifests, no duplicate apply/decision/reward/stack mutation, complete-window discard, and GPU-identity rejection |
 | `knowledge-ablation` | Matched Apex experiment harness; disabled, static-card, and static-plus-experience arms for both task kinds with identical cohort/backend-model/budget/seed/GPU/measurement policy and evaluator-owned episodes only |
-| `magpie-corpus-live` | Trusted Apex/Magpie workflow harness; Apex resolution-manifest subject, every config, framework/run-mode/lifecycle/source-adapter coverage, quality/reward manifests, exact Ray resolution-slice/shared-runtime/worker-report/driver-replay receipts, and at least one formal-delivery representative |
+| `magpie-corpus-live` | Trusted Apex/Magpie workflow harness; full 27-row resolution-manifest subject, exact 21-row Docker one-shot V2 scope, six pre-GPU `e2e_docker_only` rejections, quality/reward manifests, and at least one formal-delivery representative |
 | `aka-v14-matched` | Independent AgentKernelArena validator; clean exact AKA commit/tree, audited validator, at least ten matched tasks per control/treatment arm, immutable images/GPU pool/budget/seed/cloud/time window, bundle consumption, and central regrade |
 
 Missing external sanitizer authority is recorded as
@@ -191,43 +192,28 @@ become measured evidence. If cards or experience do not improve matched outcomes
 the qualification report records that result and retrieval/routing must be
 revisited; the score must not be edited or the cohort changed afterward.
 
-## 6. Full Magpie corpus and Ray evidence
+## 6. Docker-only Magpie V2 evidence
 
-Run every config selected by the Apex config-resolution manifest; do not use the
-checked-in compatibility ledger as a live-workflow list. Preserve one workflow
-row per resolved config. The two persistent-server configs form one ordered
-start/reuse/isolation/cleanup scenario, while each other row reaches a truthful
-terminal outcome. A missing runtime, source adapter, topology, secret, or quality
-artifact remains unqualified rather than being converted into `no_gain`.
+Resolve all 27 frozen configs through the published Magpie model, then derive the
+product scope from the typed `run_mode` and `lifecycle` fields. The exact 21
+Docker one-shot rows enter live qualification. The remaining six Local, Ray,
+reuse, or cleanup rows must each return `e2e_docker_only` before provenance,
+GPU lease, agent invocation, or result-root mutation. Do not use the checked-in
+compatibility ledger as live authority.
 
-For every resolution entry whose run mode is `ray`, the trusted harness must:
-
-1. use synchronous benchmark execution when quality is required; asynchronous
-   submission cannot produce a qualified quality or reward receipt;
-2. validate one canonical, non-linked shared-storage root and a hash-locked
-   lm-eval runtime strictly beneath it before dispatch, with identical bytes
-   visible to the driver and every worker;
-3. reserve a new path-safe per-task result root before contacting Ray and reject
-   stale, linked, hard-linked, escaped, oversized, or multiply populated result
-   artifacts;
-4. retain the worker return, persisted benchmark report, locked-runtime receipt,
-   quality artifacts, and report manifest;
-5. have the driver compare the return to the persisted report, reread and hash
-   runtime/evaluator bytes, and independently reconstruct quality evidence before
-   accepting the result.
+Every supported row reaches a truthful terminal outcome. A missing runtime,
+source adapter, topology, secret, or quality artifact remains a typed blocker
+rather than being converted into `no_gain`. Diagnostic traces stay separate from
+normal scoring measurements.
 
 The trusted producer emits
-`apex.magpie-corpus-live-qualification/v3`. Its path-free detail payload includes
-`ray_config_count`, `ray_plan_manifest_sha256`, aggregate shared-storage,
-locked-runtime, worker-report, and driver-replay receipt digests, plus the exact
-truth claims `ray_quality_sync_only`, `ray_shared_runtime_verified`, and
-`ray_driver_evidence_replayed`. `formal_delivery_representatives` binds each
-delivery receipt to its framework, run mode, lifecycle, and source adapter; a
-qualified receipt must cover every declared value in all four dimensions. The
-release gate derives the expected Ray count
-and plan-manifest digest from the Apex config-resolution receipt. Re-signing a live
-fragment after omitting or substituting a Ray plan therefore still blocks the
-release.
+`apex.magpie-corpus-live-qualification/v4`. Its full 27-row resolution manifest
+is the subject; `e2e_v2_scope=\"docker_one_shot\"`, the selected row count, and
+`e2e_v2_plan_manifest_sha256` bind the live slice. Workflow, quality, reward, and
+formal-delivery receipts cover only that slice. The release gate independently
+recomputes the slice digest, so adding a Docker reuse row, omitting a supported
+row, or substituting Local/Ray evidence still blocks release. Local and Ray live
+qualification are deferred to a later product version.
 
 ## 7. Canonical showcases
 

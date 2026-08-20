@@ -5,9 +5,13 @@
 `apex.intake` turns either a natural-language request or caller-owned JSON/YAML
 into an immutable task contract before an agent or GPU process starts. Machine
 callers submit `TaskSpec`; human callers submit `NaturalLanguageRequest` plus a
-workspace. Natural language may select a task and refine its objective, but
-editable files, compile/correctness/performance commands, recipes, and scope facts
-only come from a trusted checked-in descriptor.
+workspace. Direct formal intake takes editable files, fixed commands, recipes,
+and scope only from a trusted checked-in descriptor. A kernel-enhanced native
+chat may instead discover those fields and submit the exact typed
+`campaign.start` schema, but that creates only an unverified journal/CAS draft.
+The host injects workspace/results roots, reloads and recomputes the draft after
+the backend exits, and requires exact user digest confirmation before the single
+formal optimizer receives authority. Chat text never becomes a trusted oracle.
 
 Descriptors are discovered at the workspace root (`apex-task.*` or
 `task_spec.*`), under `.apex/tasks/`, or beside an explicitly named source as
