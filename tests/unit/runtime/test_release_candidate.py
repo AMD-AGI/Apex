@@ -72,12 +72,17 @@ def _ready_static() -> dict:
     return value
 
 
-def _baseline(name: str, static: dict) -> BaselineAuditEvidence:
+def _baseline(
+    name: str,
+    static: dict,
+    *,
+    branch: str = "origin/main",
+) -> BaselineAuditEvidence:
     source = static["apex_checkout"] if name == "apex" else static["magpie"]
     return BaselineAuditEvidence(
         component=name,
         repository=source["repository"],
-        branch="origin/main",
+        branch=branch,
         commit=source["commit"],
         tree=source.get("tree", source.get("repository_tree")),
         remote_tip=source["commit"],
@@ -792,6 +797,123 @@ def test_campaign_baseline_does_not_wait_for_future_showcases(monkeypatch) -> No
     assert freeze_campaign_baseline(receipt.to_dict(), apex_root=ROOT) == receipt
     with pytest.raises(ContractError, match="Release candidate is blocked"):
         freeze_release_candidate(receipt.to_dict(), apex_root=ROOT)
+
+
+def test_reviewed_codex_ref_can_freeze_campaign_but_not_release(monkeypatch) -> None:
+    static = _ready_static()
+    monkeypatch.setattr(
+        "apex.runtime.release_candidate.collect_release_static_identity",
+        lambda *args, **kwargs: copy.deepcopy(static),
+    )
+    full = _ready_evidence(static)
+    campaign = replace(
+        full,
+        apex_baseline=replace(
+            full.apex_baseline,
+            branch="refs/remotes/origin/codex/recovery-integration",
+        ),
+        magpie_baseline=None,
+        images=(),
+        showcases=(),
+        qualifications=(),
+    )
+
+    receipt = inspect_release_candidate(ROOT, campaign)
+
+    assert receipt.baseline_status == "ready"
+    assert receipt.baseline_blockers == ()
+    assert receipt.status == "blocked"
+    assert "apex_release_branch_not_main" in receipt.blockers
+    assert "magpie_baseline_missing" in receipt.blockers
+    assert freeze_campaign_baseline(receipt.to_dict(), apex_root=ROOT) == receipt
+    with pytest.raises(ContractError, match="Release candidate is blocked"):
+        freeze_release_candidate(receipt.to_dict(), apex_root=ROOT)
+
+
+def test_reviewed_codex_ref_never_authorizes_final_release(monkeypatch) -> None:
+    static = _ready_static()
+    monkeypatch.setattr(
+        "apex.runtime.release_candidate.collect_release_static_identity",
+        lambda *args, **kwargs: copy.deepcopy(static),
+    )
+    full = _ready_evidence(static)
+    evidence = replace(
+        full,
+        apex_baseline=replace(full.apex_baseline, branch="origin/codex/main"),
+    )
+
+    receipt = inspect_release_candidate(
+        ROOT,
+        evidence,
+        qualification_authority=_AUTHORITY,
+    )
+
+    assert receipt.baseline_status == "ready"
+    assert receipt.status == "blocked"
+    assert receipt.blockers == ("apex_release_branch_not_main",)
+
+
+@pytest.mark.parametrize(
+    "branch",
+    (
+        "codex/feature",
+        "refs/heads/codex/feature",
+        "origin/feature/branch",
+        "origin/codex",
+        "origin/codex/../feature",
+        "origin/codex//feature",
+    ),
+)
+def test_campaign_baseline_rejects_untrusted_apex_ref(monkeypatch, branch) -> None:
+    static = _ready_static()
+    monkeypatch.setattr(
+        "apex.runtime.release_candidate.collect_release_static_identity",
+        lambda *args, **kwargs: copy.deepcopy(static),
+    )
+    full = _ready_evidence(static)
+    campaign = replace(
+        full,
+        apex_baseline=replace(full.apex_baseline, branch=branch),
+        magpie_baseline=None,
+        images=(),
+        showcases=(),
+        qualifications=(),
+    )
+
+    receipt = inspect_release_candidate(ROOT, campaign)
+
+    assert receipt.baseline_status == "blocked"
+    assert "apex_campaign_branch_untrusted" in receipt.baseline_blockers
+
+
+def test_campaign_still_requires_exact_clean_locked_magpie(monkeypatch) -> None:
+    static = _ready_static()
+    monkeypatch.setattr(
+        "apex.runtime.release_candidate.collect_release_static_identity",
+        lambda *args, **kwargs: copy.deepcopy(static),
+    )
+    full = _ready_evidence(static)
+    components = tuple(
+        replace(item, clean=False) if item.name == "magpie" else item
+        for item in full.dependencies.components
+    )
+    campaign = replace(
+        full,
+        apex_baseline=replace(
+            full.apex_baseline,
+            branch="origin/codex/recovery-integration",
+        ),
+        magpie_baseline=None,
+        dependencies=replace(full.dependencies, components=components),
+        images=(),
+        showcases=(),
+        qualifications=(),
+    )
+
+    receipt = inspect_release_candidate(ROOT, campaign)
+
+    assert receipt.baseline_status == "blocked"
+    assert "dependency_component_mismatch:magpie" in receipt.baseline_blockers
 
 
 def test_dependency_receipt_tamper_and_nonportable_argv_fail_closed() -> None:

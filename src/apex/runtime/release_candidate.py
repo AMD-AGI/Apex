@@ -15,8 +15,12 @@ from .release_commands import (
     CPU_GATE_PYTEST_ARGV,
     CPU_GATE_SCAN_ARGV,
 )
+from .release_baseline import (
+    assess_campaign_apex_baseline,
+    assess_release_baseline,
+    repository_key,
+)
 from .release_evidence import (
-    BaselineAuditEvidence,
     CpuGateEvidence,
     DependencyVerificationEvidence,
     MagpieConfigResolutionEntryEvidence,
@@ -24,7 +28,6 @@ from .release_evidence import (
 )
 from .release_qualification import QUALIFICATION_IDS
 from .release_static import collect_release_static_identity
-from .repositories import canonical_repository
 
 
 SCHEMA = "apex.release-candidate-receipt/v2"
@@ -193,46 +196,22 @@ def _assess(
     checkout = static["apex_checkout"]
     if not checkout["clean"]:
         baseline.add("apex_source_dirty")
-    if _repository_key(checkout["repository"]) != APEX_REPOSITORY:
+    if repository_key(checkout["repository"]) != APEX_REPOSITORY:
         baseline.add("apex_repository_unofficial")
-    _assess_baseline("apex", evidence.apex_baseline, checkout, baseline)
-    _assess_baseline("magpie", evidence.magpie_baseline, static["magpie"], baseline)
+    assess_campaign_apex_baseline(evidence.apex_baseline, checkout, baseline)
     _assess_dependencies(static, evidence.dependencies, baseline)
     _assess_magpie_config_resolution(static, evidence, baseline)
     _assess_cpu_gate(static, evidence.cpu_gate, baseline)
     _assess_cli(static, evidence, baseline)
     release = set(baseline)
+    assess_release_baseline("apex", evidence.apex_baseline, checkout, release)
+    assess_release_baseline(
+        "magpie", evidence.magpie_baseline, static["magpie"], release
+    )
     _assess_images(static, evidence, release)
     _assess_showcases(static, evidence, release)
     _assess_qualifications(static, evidence, authorities, release)
     return tuple(sorted(baseline)), tuple(sorted(release))
-
-
-def _assess_baseline(
-    name: str,
-    value: BaselineAuditEvidence | None,
-    expected: Mapping[str, Any],
-    blockers: set[str],
-) -> None:
-    if value is None:
-        blockers.add(f"{name}_baseline_missing")
-        return
-    if value.component != name:
-        blockers.add(f"{name}_baseline_component_mismatch")
-    if _repository_key(value.repository) != _repository_key(expected["repository"]):
-        blockers.add(f"{name}_baseline_repository_mismatch")
-    if value.commit != expected["commit"] or value.tree != expected.get("tree", expected.get("repository_tree")):
-        blockers.add(f"{name}_baseline_source_mismatch")
-    if value.remote_tip != value.commit:
-        blockers.add(f"{name}_baseline_not_remote_tip")
-    if not value.fetched:
-        blockers.add(f"{name}_fetch_unverified")
-    if not value.ancestry_reviewed:
-        blockers.add(f"{name}_ancestry_unreviewed")
-    if not value.clean:
-        blockers.add(f"{name}_baseline_dirty")
-    if not value.branch.removeprefix("refs/remotes/").endswith("/main"):
-        blockers.add(f"{name}_release_branch_not_main")
 
 
 def _assess_dependencies(
@@ -266,7 +245,7 @@ def _assess_dependencies(
         target = expected[name]
         valid = (
             item.clean
-            and _repository_key(item.repository) == _repository_key(target["repository"])
+            and repository_key(item.repository) == repository_key(target["repository"])
             and item.commit == target["commit"]
             and ("tree" not in target or item.tree == target["tree"])
         )
@@ -575,18 +554,6 @@ def _qualification_authorities(
             )
         results.append(receipt)
     return tuple(sorted(results, key=lambda item: item.qualification_id))
-
-
-def _repository_key(value: object) -> str:
-    text = str(value).strip().rstrip("/")
-    if (
-        "://" not in text
-        and ":" not in text
-        and not text.startswith(("/", "."))
-        and "/" in text
-    ):
-        return text.lower().removesuffix(".git")
-    return canonical_repository(text)
 
 
 __all__ = [

@@ -325,13 +325,17 @@ adding a config, or reusing evidence from another Apex tree fails. Only
 `freeze_release_candidate` returns a final release-authorizing receipt.
 
 The document deliberately has two non-circular gates. `baseline_status` and
-`baseline_blockers` cover only the clean/fetched/reviewed Apex and Magpie sources,
-fresh dependency/runtime verification, full CPU/static gate, and installed CLI;
-`freeze_campaign_baseline` accepts that state so live qualifications can begin.
-Top-level release `status`/`blockers` additionally require immutable showcase
-images, all live/independent qualifications, and four published showcases.
-Therefore future live results cannot be prerequisites for starting the runs that
-produce them, while no run can use a stale or untested software baseline.
+`baseline_blockers` require a clean official Apex checkout at the exact fetched,
+reviewed tip of either remote `main` or a remote `codex/*` qualification ref,
+plus fresh exact dependency/runtime verification (including the clean locked
+Magpie tree), the full CPU/static gate, config resolution, and installed CLI.
+`freeze_campaign_baseline` accepts that state so a reviewed PR commit can produce
+the live evidence needed before merge. Top-level release `status`/`blockers`
+still require exact remote `main` audits for both Apex and Magpie, immutable
+showcase images, all live/independent qualifications, and four published
+showcases. A `codex/*` ref can never authorize final release. Therefore future
+live results are not prerequisites for the runs that produce them, while no run
+can use a stale, dirty, unfetched, or unreviewed software baseline.
 
 Build a truthful snapshot, or verify an existing one:
 

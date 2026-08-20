@@ -37,10 +37,14 @@ substitute for a GPU workflow, Ray worker receipt, reward, or formal delivery.
 ## 1. Freeze one non-circular campaign baseline
 
 Start from the reviewed release-candidate commit, not a mutable development
-worktree. The Apex and Magpie repositories must have official origins, reviewed
-remote-main ancestry, exact clean trees, and no untracked files. Prepare and
-verify the locked dependencies in a fresh environment, then collect the locally
-provable evidence:
+worktree. Apex may be the exact fetched tip of official remote `main` or of a
+reviewed official remote `codex/*` qualification ref. Magpie remains the exact
+clean revision fixed by the Apex dependency lock; do not modify it. Final release
+still requires independent exact remote-`main` audits for both repositories, so
+a `codex/*` campaign can produce qualification evidence but can never authorize
+release. All checkouts must have official origins, exact clean trees, and no
+untracked files. Prepare and verify the locked dependencies in a fresh
+environment, then collect the locally provable evidence:
 
 ```bash
 ./setup.sh
@@ -58,9 +62,12 @@ does not fetch, review ancestry, build images, launch agents, acquire GPUs, run
 benchmarks, or create live/showcase claims. If the public Magpie API is missing
 or any config requires a capability upgrade, collection fails without evidence.
 
-The release orchestrator must add independently produced Apex/Magpie fetch and
-ancestry-audit receipts, then rebuild with `--require-baseline`. Do not begin GPU
-work unless this succeeds:
+The release orchestrator must add an independently produced Apex fetch and
+ancestry-audit receipt for the selected `main` or `codex/*` tip, then rebuild
+with `--require-baseline`. The dependency receipt remains authoritative for the
+exact clean locked Magpie checkout during campaign qualification; a separate
+Magpie remote-main audit is required later by the final release gate. Do not
+begin GPU work unless campaign baseline verification succeeds:
 
 ```bash
 apex release check \
