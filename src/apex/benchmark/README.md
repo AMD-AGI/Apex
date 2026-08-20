@@ -239,12 +239,17 @@ composition. A real exact-image smoke has verified root-owned listener binding
 and sidecar `create/inspect/remove` with every bind source under the run-scoped
 results tree. A representative Qwen workload produced real baseline performance
 and completed the full 1,319-sample GSM8K sidecar with a verified quality gate.
-Its execution attestation remained fail-closed because a live GPU observation
-was still draining after the former two-second observer join. Shutdown now
-allows a bounded 20-second drain while preserving the same fail-closed timeout;
-a fresh updated-tree run is still required before candidate/reward
-qualification. A lifecycle smoke, isolated quality receipt, or prepared
-contract is not reward, winner, or release evidence.
+A fresh run after the bounded 20-second observer-drain fix completed formal
+baseline quality and performance without observer errors. Its diagnostic action
+then failed before container start because Docker could not bind the original
+InferenceX checkout from the root-squashed source filesystem. Diagnostic input
+therefore still needs a plain, run-scoped InferenceX projection under the
+Docker-visible results root, with a diagnostic-only receipt and post-run drift
+check. It must not reuse the evaluator projection's lm-eval handoff overlay.
+Until that path is implemented and replayed, there is no new full trace,
+candidate, reward, winner, or release evidence. A lifecycle smoke, isolated
+quality receipt, or prepared contract is not reward, winner, or release
+evidence.
 
 Production composition injects `DockerOneShotMagpieExecutionAttestor` for the
 published Docker one-shot path. Before Magpie starts, it freezes the config,

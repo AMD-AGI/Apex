@@ -7,18 +7,23 @@ slice, independent AgentKernelArena evaluation, and
 canonical showcase publication. These operations are explicit and must write to
 a caller-selected results directory outside the source checkout.
 
-## Current hard stop
+## Current campaign status
 
-Do not launch the full release matrix from a dirty development tree. Apex now
-pins published Magpie `main@12896a49`, and its Apex-owned projection accepts all
-27 configs through Magpie's public loader/model. That CPU compatibility result
-does not provide the missing clean release baseline, runtime images, trusted
-live producers, GPU measurements, delivery representatives, or showcases. The
-27-row compatibility ledger is not authority to waive those blockers.
+Do not launch the full release matrix from a dirty development tree. Apex pins
+published Magpie `main@12896a49`, and its Apex-owned projection accepts all 27
+configs through Magpie's public loader/model. Commit `a75e3ce` has a clean,
+reviewed campaign baseline and a representative Qwen run has completed formal
+baseline quality and performance. That does not provide the still-missing
+diagnostic trace, candidate measurement/reward, trusted live producers, delivery
+representatives, showcases, or final remote-main release ancestry. The 27-row
+compatibility ledger and one baseline are not authority to waive those blockers.
 
-Development smoke runs may continue when explicitly requested, but they cannot
-produce a ready campaign baseline, a `magpie-corpus-live` receipt, or release
-qualification.
+Development smoke runs may continue when explicitly requested. The current next
+blocker is diagnostic Docker access to the root-squashed InferenceX checkout; a
+safe implementation must create a diagnostic-only run-scoped projection below
+the caller-selected results root and bind it with its own provenance and drift
+receipt. Do not make the checkout broadly writable, hand-edit Magpie, or reuse
+the scoring evaluator's lm-eval handoff overlay for a trace-only diagnostic.
 
 The full GPU-free production preview can be rebuilt without claiming those
 facts:

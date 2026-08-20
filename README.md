@@ -85,12 +85,17 @@ Docker composition also includes an exact-image lm-eval sidecar authority. It
 locks an offline dataset and private InferenceX task projection, starts a bounded
 Unix handoff to the observed Magpie listener, and executes one no-network/no-GPU,
 read-only-root evaluator container whose result, sample, runtime, lifecycle, and
-cleanup receipts are independently bound. A representative live Qwen run has
-completed all 1,319 GSM8K samples through this sidecar and produced a verified
-quality gate. That run still failed closed because an in-flight GPU observer
-exceeded the former two-second shutdown grace, so it did not clear a workflow,
-reward, showcase, or release gate. The observer now gets a bounded 20-second
-drain grace; qualification still requires a fresh run on the updated tree.
+cleanup receipts are independently bound. A representative live Qwen run
+completed all 1,319 GSM8K samples through this sidecar and exposed a
+false-negative two-second observer shutdown threshold. After increasing that
+bounded drain grace to 20 seconds, a fresh run on the updated tree completed
+formal baseline quality and performance with accuracy 0.95451, throughput
+2454.64 token/s, TTFT p99 450.74 ms, and TPOT p99 13.34 ms. It then failed
+closed before tracing because the Docker daemon could not bind the diagnostic's
+original InferenceX checkout from the root-squashed source filesystem. The
+retained run therefore proves the exact-image baseline path, but it is not a
+full trace, candidate, reward, winner, showcase, or release qualification. See
+`tmp/refactor/README.md` for the non-authoritative result locator.
 See [docs/dependencies.md](docs/dependencies.md) for offline and path overrides.
 
 Install only Apex development dependencies when external runtime adapters are not
