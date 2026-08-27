@@ -18,6 +18,7 @@ from apex.evaluation import EvaluationContractAuthorizer
 from apex.execution import (
     KernelTemplateMaterializer,
     KernelSkillPackage,
+    MagpieKernelDiagnosticsAdapter,
     NativeBackendDoctor,
     NativeCodingSessionLauncher,
     StructuredKernelMeasurementAdapter,
@@ -301,9 +302,9 @@ def _kernel_optimizer(
         agents=agents,
         contexts=KernelContextBuilder(retriever),
         measurement_evaluator=StructuredKernelMeasurementAdapter(),
+        diagnostics_evaluator=MagpieKernelDiagnosticsAdapter(verify_runtime_dependencies),
         evaluation_authorizer=authorizer,
     )
-
 
 def _default_knowledge_catalog() -> Path:
     return Path(__file__).resolve().parent / "knowledge" / "data" / "cards.json"

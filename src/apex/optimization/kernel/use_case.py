@@ -28,6 +28,7 @@ from apex.execution import AgentRegistry
 from apex.intake import ResolvedTaskSpec, TaskSpec
 from apex.ports import (
     AgentTerminationKind,
+    KernelDiagnosticsPort,
     KernelMeasurementPort,
     SafetyToolRunRequest,
     SafetyToolRunResult,
@@ -57,6 +58,7 @@ from .attempts import (
 from .agent_request import agent_failure_status, build_agent_request
 from .context import KernelContextBuilder
 from .contract_recording import record_evaluation_contract
+from .diagnostics import run_kernel_diagnostics
 from .finalization import deliver_best, failure_result, finish_without_candidate, publish
 from .formal_contract import KernelFormalContractResolver
 from .gate_verification import verify_compile_correctness
@@ -100,6 +102,7 @@ class KernelOptimizeUseCase:
         safety_tools: Sequence[ToolVerificationPlan] = (),
         gpu_leases: GpuLeaseManager | None = None,
         measurement_evaluator: KernelMeasurementPort | None = None,
+        diagnostics_evaluator: KernelDiagnosticsPort | None = None,
         evaluation_authorizer: EvaluationContractAuthorizer | None = None,
         repository_identities: WorkspaceRepositoryIdentityPort | None = None,
     ) -> None:
@@ -121,6 +124,7 @@ class KernelOptimizeUseCase:
         self._safety_gate = safety_gate or SafetyGate(_UnexpectedSafetyRunner())
         self._gpu_leases = gpu_leases or LocalGpuLeaseManager()
         self._measurement_evaluator = measurement_evaluator
+        self._diagnostics_evaluator = diagnostics_evaluator
         self._formal_contracts = KernelFormalContractResolver(
             evaluation_authorizer,
             repository_identities,
@@ -131,6 +135,13 @@ class KernelOptimizeUseCase:
         """Expose the composed trusted measurement authority without its internals."""
 
         evaluator = self._measurement_evaluator
+        return evaluator.adapter_id if evaluator is not None else None
+
+    @property
+    def diagnostics_adapter_id(self) -> str | None:
+        """Expose the advisory adapter identity without granting grade authority."""
+
+        evaluator = self._diagnostics_evaluator
         return evaluator.adapter_id if evaluator is not None else None
 
     def preview_evaluation_contract(
@@ -460,6 +471,9 @@ class KernelOptimizeUseCase:
         )
         if isinstance(evaluated, KernelAttemptOutcome):
             return evaluated
+        diagnostic_evidence = run_kernel_diagnostics(
+            self._diagnostics_evaluator, attempt, prepared
+        )
         measurement = evaluated.measurement
         verification = attempt.run.record.mark_verified(
             attempt.attempt_id,
@@ -469,7 +483,7 @@ class KernelOptimizeUseCase:
             performance_receipt=capture.performance_receipt,
             measurement_receipt=evaluated.receipt,
         )
-        complete_evidence = (*evaluated.evidence, verification)
+        complete_evidence = (*evaluated.evidence, *diagnostic_evidence, verification)
         if measurement is not None and not measurement.improved:
             reason = measurement.grade.promotion_reason_code
             return close_prepared(

@@ -13,6 +13,10 @@ from .kernel_measurement import (
     STRUCTURED_KERNEL_MEASUREMENT_METHOD_SHA256,
     StructuredKernelMeasurementAdapter,
 )
+from .magpie_kernel_diagnostics import (
+    MAGPIE_KERNEL_DIAGNOSTICS_ADAPTER_ID,
+    MagpieKernelDiagnosticsAdapter,
+)
 from .template_materialization import (
     DockerTemplateImageSourceRuntime,
     KernelTemplateMaterializer,
@@ -51,6 +55,8 @@ __all__ = [
     "STRUCTURED_KERNEL_MEASUREMENT_METHOD_SHA256",
     "SubprocessSupervisor",
     "StructuredKernelMeasurementAdapter",
+    "MAGPIE_KERNEL_DIAGNOSTICS_ADAPTER_ID",
+    "MagpieKernelDiagnosticsAdapter",
     "DockerTemplateImageSourceRuntime",
     "KernelTemplateMaterializer",
     "KernelSkillPackage",

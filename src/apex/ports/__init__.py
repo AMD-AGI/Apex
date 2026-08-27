@@ -83,6 +83,12 @@ from .kernel_measurement import (
     KernelMeasurementPort,
     KernelMeasurementRequest,
 )
+from .kernel_diagnostics import (
+    KernelDiagnosticCommand,
+    KernelDiagnosticOutput,
+    KernelDiagnosticRequest,
+    KernelDiagnosticsPort,
+)
 from .safety import (
     SafetyToolRunRequest,
     SafetyToolRunResult,
@@ -159,6 +165,10 @@ __all__ = [
     "KernelMeasurementOutput",
     "KernelMeasurementPort",
     "KernelMeasurementRequest",
+    "KernelDiagnosticCommand",
+    "KernelDiagnosticOutput",
+    "KernelDiagnosticRequest",
+    "KernelDiagnosticsPort",
     "FORMAL_AGENT_PERMISSION_POLICY",
     "FORMAL_PROMPT_TRANSPORT_POLICY",
     "SafetyToolRunRequest",

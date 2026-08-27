@@ -1,7 +1,8 @@
 # Execution
 
 `apex.execution` implements the `AgentBackend` port for Codex, Claude Code, and
-Cursor Agent, plus the production `StructuredKernelMeasurementAdapter`. Codex
+Cursor Agent, plus the production `StructuredKernelMeasurementAdapter` and
+`MagpieKernelDiagnosticsAdapter`. Codex
 is the registry default; callers can explicitly select the other two without
 preflighting unrelated credentials.
 
@@ -118,6 +119,25 @@ controller-owned private output directory. The runner receives no report path;
 malformed, duplicate-key, nonfinite, truncated, timed-out, nonzero-exit, or
 incompletely contained output fails closed. Statistics and reward remain owned
 by `apex.evaluation`, not this adapter.
+
+## Magpie kernel diagnostics adapter
+
+Formal kernel CLI runs compose the exact dependency-receipt Magpie revision and
+invoke its public `compare` command only after Apex has committed the protected
+raw measurement and reward. Magpie receives disposable baseline/candidate
+projections, fixed compile/correctness/profile argv, and an evaluator-private
+output root. Apex seals Magpie's unchanged report, generated config, dependency
+lock/commit, and process-containment receipt as `diagnostic` CAS evidence with
+`reward_eligible=false`. The adapter also supports one-candidate `analyze` for
+scoped callers, while the optimization loop uses paired `compare` evidence.
+
+This reuses Magpie's structured correctness result, comparative ranking,
+rocprof-compute/Metrix metrics, and GPU-monitoring fields without making them a
+second grade. Magpie hardware control, GPU selection, Ray scheduling, and its
+score/winner do not replace Apex GPU leases, robust ABBA timing, promotion
+gates, or `kernel_robust_v1` reward authority. Accordo can be admitted later
+through a reviewed correctness contract when standalone HIP execution is
+available; it is not inferred from a caller command today.
 Its V1 identity is `apex-structured-kernel-v1`; the matching immutable method
 digest is
 `4bb99ecf991a6d28448f46c071bc3c09fbe91aba2cf5f5194e3c1928d96990c1`.

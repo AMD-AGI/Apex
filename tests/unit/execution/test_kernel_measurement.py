@@ -11,11 +11,13 @@ from apex.bootstrap import build_application
 from apex.core import ContractError
 from apex.evaluation import load_kernel_measurement_report
 from apex.execution import (
+    MAGPIE_KERNEL_DIAGNOSTICS_ADAPTER_ID,
     STRUCTURED_KERNEL_MEASUREMENT_ADAPTER_ID,
     STRUCTURED_KERNEL_MEASUREMENT_METHOD_SHA256,
     StructuredKernelMeasurementAdapter,
 )
 from apex.ports import KernelMeasurementRequest
+from apex.runtime import DependencyReceipt
 
 
 class _Supervisor:
@@ -154,4 +156,29 @@ def test_production_bootstrap_injects_structured_measurement_adapter() -> None:
     assert (
         application.kernel_optimizer.measurement_adapter_id
         == STRUCTURED_KERNEL_MEASUREMENT_ADAPTER_ID
+    )
+
+
+def test_production_bootstrap_can_inject_pinned_magpie_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    magpie = tmp_path / "Magpie"
+    magpie.mkdir()
+    receipt = DependencyReceipt(
+        schema="apex.dependency-receipt.v1",
+        lock_sha256="a" * 64,
+        python=Path(sys.executable),
+        roots={"magpie": magpie},
+        commits={"magpie": "b" * 40},
+        raw={},
+    )
+    monkeypatch.setattr("apex.bootstrap.verify_runtime_dependencies", lambda: receipt)
+
+    application = build_application(
+        knowledge_enabled=False,
+    )
+
+    assert (
+        application.kernel_optimizer.diagnostics_adapter_id
+        == MAGPIE_KERNEL_DIAGNOSTICS_ADAPTER_ID
     )

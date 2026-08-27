@@ -56,6 +56,8 @@ from apex.ports import (
     AgentTranscriptEvent,
     AgentTerminationKind,
     AgentUsage,
+    KernelDiagnosticOutput,
+    KernelDiagnosticRequest,
     KernelMeasurementOutput,
     KernelMeasurementRequest,
     STRUCTURED_TURN_CHECKPOINT_POLICY,
@@ -425,6 +427,31 @@ class FixtureMeasurementEvaluator:
         return KernelMeasurementOutput(self.writer_id, request.report_path)
 
 
+class FixtureDiagnosticsEvaluator:
+    adapter_id = "fixture-magpie-diagnostics-v1"
+
+    def __init__(self) -> None:
+        self.requests: list[KernelDiagnosticRequest] = []
+
+    def run(self, request: KernelDiagnosticRequest) -> KernelDiagnosticOutput:
+        self.requests.append(request)
+        request.output_root.mkdir(parents=True)
+        report = request.output_root / "compare_report.json"
+        config = request.output_root / "kernel_config.json"
+        report.write_text('{"winner": 1}', encoding="utf-8")
+        config.write_text('{"kernels": []}', encoding="utf-8")
+        return KernelDiagnosticOutput(
+            self.adapter_id,
+            request.mode,
+            report,
+            config,
+            {
+                "schema": "apex.magpie-kernel-diagnostic-execution/v1",
+                "reward_eligible": False,
+            },
+        )
+
+
 class _FixtureEvaluationAuthorizer:
     """Test composition authority; task recipe provenance is deliberately ignored."""
 
@@ -561,6 +588,7 @@ def _run(
     measurement_values: tuple[float, float, int] | None = None,
     executable: str = sys.executable,
     campaign_baseline: ReleaseCandidateReceipt | None = None,
+    diagnostics_evaluator=None,
 ):
     task = _task(
         tmp_path,
@@ -581,6 +609,7 @@ def _run(
             if measurement_values is not None
             else None
         ),
+        diagnostics_evaluator=diagnostics_evaluator,
     )
     result = use_case.run(KernelOptimizeRequest(
         task=task,
@@ -1128,6 +1157,40 @@ def test_raw_measurement_commits_robust_reward_and_rl_receipts(tmp_path: Path) -
     )
     assert exported_parent["task_reward"] == result.task_reward
     assert exported_parent["reward_vector"] == result.task_reward_vector
+
+
+def test_magpie_compare_runs_after_reward_and_remains_diagnostic(tmp_path: Path) -> None:
+    diagnostics = FixtureDiagnosticsEvaluator()
+    task, result, _ = _run(
+        tmp_path,
+        EditingAgent(),
+        measurement_values=(10.0, 8.0, 300),
+        diagnostics_evaluator=diagnostics,
+    )
+
+    assert result.reward == 170.0
+    assert len(diagnostics.requests) == 1
+    request = diagnostics.requests[0]
+    assert request.mode == "compare"
+    assert request.baseline_root != task.workspace
+    assert request.candidate_root != task.workspace
+    run_root = next((task.results_dir / "runs").iterdir())
+    journal = EventJournal(run_root / "events" / "run.db")
+    events = journal.iter_events(run_root.name)
+    reward = next(event for event in events if event.event_type == "reward_committed")
+    diagnostic = next(
+        event
+        for event in events
+        if event.event_type == "tool_result"
+        and event.payload.get("tool_name") == "magpie.compare"
+    )
+    assert reward.sequence < diagnostic.sequence
+    assert diagnostic.payload["evidence_class"] == "diagnostic"
+    assert diagnostic.payload["reward_eligible"] is False
+    graph = EpisodeGraphMaterializer(
+        journal, ArtifactStore(run_root / "artifacts")
+    ).materialize(run_root.name)
+    assert graph.children[0].scalar_reward == 170.0
     measured = next(event for event in events if event.event_type == "measurement_result")
     bindings = {item["role"]: item["receipt"] for item in measured.payload["artifacts"]}
     assert {"raw_measurement", "measurement_execution", "harness", "kernel_grade"} <= set(bindings)
