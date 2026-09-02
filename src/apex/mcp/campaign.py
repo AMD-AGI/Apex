@@ -13,7 +13,9 @@ from apex.orchestration.replay import replay_workload_state
 from apex.ports import CapabilityRequest, CapabilityResult
 from apex.reporting import materialize_run_graph, resolve_run_source
 from apex.rl import EpisodeGraph
+from apex.runtime import ApexExecutionIdentity
 from apex.storage import SnapshotStore
+from apex.optimization.execution_identity_recording import record_apex_execution_identity
 
 from .scope import CapabilityScope
 
@@ -42,10 +44,15 @@ class CampaignStatusHandler:
 class CampaignStartHandler:
     """Create one unverified formal draft through the optimization use case."""
 
-    def __init__(self, scope: CapabilityScope, starter, baseline_loader=None) -> None:
+    def __init__(
+        self,
+        scope: CapabilityScope,
+        starter,
+        execution_identity: ApexExecutionIdentity,
+    ) -> None:
         self._scope = scope
         self._starter = starter
-        self._baseline_loader = baseline_loader
+        self._execution_identity = execution_identity
 
     def invoke(self, request: CapabilityRequest) -> CapabilityResult:
         run_id = new_identifier("campaign")
@@ -80,37 +87,28 @@ class CampaignStartHandler:
             workspace=self._scope.workspace,
             results=self._scope.results,
         )
-        baseline, baseline_reason = self._load_baseline(request)
-        campaign.bind_release_candidate_baseline(
-            baseline, reason_code=baseline_reason
+        record_apex_execution_identity(
+            campaign.record.artifacts,
+            campaign.record.controller,
+            self._execution_identity,
         )
-        candidate_locator = None
-        if baseline is not None and baseline_reason is None:
-            candidate = campaign.ensure_candidate_projection()
-            candidate_root, candidate_path = self._scope.locator(candidate)
-            candidate_locator = {
-                "root": candidate_root,
-                "relative_path": candidate_path,
-            }
-        content["campaign"]["release_candidate_baseline_status"] = (
-            "verified" if baseline_reason is None else "unverified"
-        )
-        content["campaign"]["release_candidate_baseline_reason"] = baseline_reason
-        content["campaign"]["release_candidate_receipt_sha256"] = (
-            getattr(baseline, "receipt_sha256", None)
+        candidate = campaign.ensure_candidate_projection()
+        candidate_root, candidate_path = self._scope.locator(candidate)
+        candidate_locator = {
+            "root": candidate_root,
+            "relative_path": candidate_path,
+        }
+        content["campaign"]["execution_identity_sha256"] = (
+            self._execution_identity.receipt_sha256
         )
         content["campaign"]["candidate_projection"] = candidate_locator
         content["campaign"]["next_action"] = (
             "explicit_trusted_user_confirmation_required"
-            if baseline_reason is None
-            else "valid_release_candidate_baseline_required"
         )
         content["campaign"]["formal_continuation"] = _formal_continuation(
             self._scope,
             draft.root,
             draft.contract.draft.digest,
-            request,
-            baseline_reason,
         )
         invocation = begin_formal_capability(
             campaign.record, request.capability_id, request.arguments
@@ -122,37 +120,15 @@ class CampaignStartHandler:
             reward_eligible=False,
         )
 
-    def _load_baseline(self, request: CapabilityRequest):
-        value = request.arguments.get("release_candidate_receipt")
-        if value is None:
-            return None, "campaign_baseline_receipt_required"
-        if self._baseline_loader is None:
-            return None, "campaign_baseline_verifier_unavailable"
-        try:
-            path = self._scope.read_results(str(value))
-            return self._baseline_loader(path), None
-        except ApexError as error:
-            return None, error.reason_code
-
-
 def _formal_continuation(
     scope: CapabilityScope,
     campaign_root,
     draft_digest: str,
-    request: CapabilityRequest,
-    baseline_reason: str | None,
 ) -> dict[str, object]:
-    receipt = "<valid-release-candidate-receipt-under-results>"
-    supplied = request.arguments.get("release_candidate_receipt")
-    if supplied is not None:
-        try:
-            receipt = str(scope.read_results(str(supplied)))
-        except ApexError:
-            pass
     return {
         "schema": "apex.kernel-campaign-continuation/v1",
-        "ready": baseline_reason is None,
-        "blocked_reason": baseline_reason,
+        "ready": True,
+        "blocked_reason": None,
         "requires_user_confirmation": True,
         "run_only_after_chat_exits": True,
         "argv_template": [
@@ -167,8 +143,6 @@ def _formal_continuation(
             str(scope.results),
             "--evaluation-contract-draft-digest",
             draft_digest,
-            "--release-candidate-receipt",
-            receipt,
         ],
     }
 
@@ -240,21 +214,16 @@ class CampaignCheckpointHandler:
 
 
 class CampaignResumeHandler:
-    """Delegate E2E recovery to the formal use case after baseline revalidation."""
+    """Delegate E2E recovery to the formal use case after identity revalidation."""
 
-    def __init__(self, scope: CapabilityScope, baseline_loader, resumer) -> None:
+    def __init__(self, scope: CapabilityScope, resumer) -> None:
         self._scope = scope
-        self._baseline_loader = baseline_loader
         self._resumer = resumer
 
     def invoke(self, request: CapabilityRequest) -> CapabilityResult:
         run_locator = str(request.arguments["run_locator"])
         run_root = self._scope.read_results(run_locator)
-        baseline_path = self._scope.read_results(
-            str(request.arguments["release_candidate_receipt"])
-        )
-        baseline = self._baseline_loader(baseline_path)
-        resumed = self._resumer(run_root, baseline)
+        resumed = self._resumer(run_root)
         status = CampaignStatusHandler(self._scope).invoke(
             CapabilityRequest(
                 "campaign.status",
@@ -265,7 +234,6 @@ class CampaignResumeHandler:
         campaign = dict(status)
         campaign["resume"] = {
             "schema": "apex.campaign-resume/v1",
-            "release_candidate_receipt_sha256": baseline.receipt_sha256,
             "result": resumed.to_dict(),
         }
         return CapabilityResult(

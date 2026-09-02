@@ -60,11 +60,10 @@ The supported API is the set exported by `apex.optimization.kernel.__all__`:
 context/run-record contracts. External callers should normally use only the
 request and use-case types.
 
-`KernelOptimizeRequest.campaign_baseline` carries the receipt already rebuilt by
-the formal CLI. When present, the use case records it through the shared CAS/event
-writer before any kernel attempt. CPU/direct callers may omit it for isolated
-contract tests, but the public non-dry-run CLI does not. A blocked or self-digest-
-tampered document is rejected and cannot become run provenance.
+`KernelOptimizeUseCase` receives the automatically collected
+`ApexExecutionIdentity` from the production composition root and records it through
+the shared CAS/event writer before any kernel attempt. It is an observation of the
+actual Apex package bytes, not a release or evaluator authorization.
 
 ## Invariants
 

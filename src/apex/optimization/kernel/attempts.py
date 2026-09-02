@@ -10,7 +10,7 @@ from apex.core import AgentBackendName, TaskStatus
 from apex.evaluation import EvaluationContractReceipt
 from apex.evaluation.safety import FrozenCandidate, SafetyGateResult, VerificationPlan
 from apex.intake import ResolvedTaskSpec, TaskSpec
-from apex.runtime import GpuLease, GpuLeaseReceipt, ReleaseCandidateReceipt
+from apex.runtime import GpuLease, GpuLeaseReceipt
 from apex.storage import ArtifactReceipt
 
 from .context import KernelContext
@@ -26,7 +26,6 @@ class KernelOptimizeRequest:
     backend_override: AgentBackendName | None = None
     model_override: str | None = None
     effort_override: str | None = None
-    campaign_baseline: ReleaseCandidateReceipt | None = None
 
 
 @dataclass(frozen=True, slots=True)

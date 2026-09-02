@@ -36,6 +36,7 @@ from apex.ports import (
     WorkspaceRepositoryIdentityPort,
 )
 from apex.runtime import (
+    ApexExecutionIdentity,
     GpuLease,
     GpuLeaseManager,
     LocalGpuLeaseManager,
@@ -43,7 +44,7 @@ from apex.runtime import (
 )
 from apex.storage import ArtifactReceipt
 
-from ..baseline_recording import record_campaign_baseline
+from ..execution_identity_recording import record_apex_execution_identity
 from .attempts import (
     AttemptSession,
     CompileCorrectnessReceipts,
@@ -105,6 +106,7 @@ class KernelOptimizeUseCase:
         diagnostics_evaluator: KernelDiagnosticsPort | None = None,
         evaluation_authorizer: EvaluationContractAuthorizer | None = None,
         repository_identities: WorkspaceRepositoryIdentityPort | None = None,
+        execution_identity: ApexExecutionIdentity,
     ) -> None:
         self._agents = agents
         self._verifier = verifier or CandidateVerifier()
@@ -129,6 +131,7 @@ class KernelOptimizeUseCase:
             evaluation_authorizer,
             repository_identities,
         )
+        self._execution_identity = execution_identity
 
     @property
     def measurement_adapter_id(self) -> str | None:
@@ -218,6 +221,11 @@ class KernelOptimizeUseCase:
             dataset_split=request.task.dataset_split,
             data_visibility=request.task.data_visibility,
         )
+        record_apex_execution_identity(
+            record.artifacts,
+            record.controller,
+            self._execution_identity,
+        )
         contract_artifact = record_evaluation_contract(
             artifacts=record.artifacts,
             controller=record.controller,
@@ -225,12 +233,6 @@ class KernelOptimizeUseCase:
         )
         receipt = gpu_lease.receipt
         lease_artifact = record.record_gpu_lease(receipt)
-        if request.campaign_baseline is not None:
-            record_campaign_baseline(
-                record.artifacts,
-                record.controller,
-                request.campaign_baseline.to_dict(),
-            )
         return RunSession(
             request,
             resolved,

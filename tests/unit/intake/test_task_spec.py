@@ -477,31 +477,15 @@ def test_specs_validate_dataset_partition(tmp_path: Path, kind: str) -> None:
     assert accepted.data_visibility == "heldout_private"
 
 
-def test_e2e_spec_round_trips_ready_campaign_baseline_and_rejects_tamper(
+def test_e2e_spec_rejects_superseded_campaign_baseline_field(
     tmp_path: Path,
 ) -> None:
-    baseline = {
-        "schema": "apex.release-candidate-receipt/v2",
-        "baseline_status": "ready",
-        "baseline_blockers": [],
-        "status": "blocked",
-        "blockers": ["live_pending"],
-        "qualification_authorities": [],
-    }
-    baseline["receipt_sha256"] = sha256_bytes(canonical_json_bytes(baseline))
     values = {
         "config_path": str((tmp_path / "benchmark.yaml").resolve()),
         "results_dir": str((tmp_path / "results").resolve()),
-        "campaign_baseline_receipt": baseline,
+        "campaign_baseline_receipt": {},
     }
 
-    spec = E2EOptimizeSpec.from_mapping(values)
-    assert E2EOptimizeSpec.from_mapping(spec.to_dict()).to_dict() == spec.to_dict()
-
-    with pytest.raises(ContractError, match="invalid or blocked"):
-        E2EOptimizeSpec.from_mapping({
-            **values,
-            "campaign_baseline_receipt": {**baseline, "baseline_status": "blocked"},
-        })
-    with pytest.raises(ContractError, match="must be an object"):
-        E2EOptimizeSpec.from_mapping({**values, "campaign_baseline_receipt": "fake"})
+    with pytest.raises(ContractError) as caught:
+        E2EOptimizeSpec.from_mapping(values)
+    assert caught.value.reason_code == "superseded_campaign_baseline_receipt"

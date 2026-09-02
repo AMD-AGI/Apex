@@ -55,6 +55,7 @@ from apex.runtime import (
 )
 from apex.runtime.qualification_artifacts import INDEX_NAME, INDEX_SCHEMA
 from apex.storage import ArtifactReceipt, ArtifactStore
+from tests.support.execution_identity import execution_identity
 
 
 _TREE = "b" * 40
@@ -413,16 +414,17 @@ def _graph(
     contract: ArtifactReceipt,
     evidence: Mapping[str, ArtifactReceipt],
 ) -> EpisodeGraph:
-    baseline = _campaign_baseline(store)
-    baseline_event = _event(
+    identity = _execution_identity(store)
+    identity_event = _event(
         1,
-        "dependency_verified",
+        "provenance_observed",
         {
-            "kind": "campaign_baseline",
-            "release_candidate_receipt_sha256": baseline["document"]["receipt_sha256"],
+            "kind": "apex_execution_identity",
+            "execution_identity_sha256": identity["document"]["receipt_sha256"],
             "apex_tree": _TREE,
+            "source_manifest_sha256": "d" * 64,
         },
-        (("campaign_baseline", baseline["receipt"]),),
+        (("apex_execution_identity", identity["receipt"]),),
     )
     contract_event = _event(
         2,
@@ -500,7 +502,7 @@ def _graph(
     )
     parent = ParentEpisode(
         parent_id, "single_kernel", _RUN, None, _TASK,
-        (baseline_event, contract_event, reward_event, delivery, finished), (child_id,),
+        (identity_event, contract_event, reward_event, delivery, finished), (child_id,),
         "succeeded", terminal["task_reward"], terminal["reward_vector"],
         terminal["reward_policy_id"], terminal["reward_policy_digest"],
         evidence["source"].digest, (evidence["raw"].digest,), "complete", None,
@@ -511,18 +513,8 @@ def _graph(
     )
 
 
-def _campaign_baseline(store: ArtifactStore) -> dict[str, Any]:
-    payload = {
-        "schema": "apex.release-candidate-receipt/v2",
-        "baseline_status": "ready",
-        "status": "blocked",
-        "static": {"apex_checkout": {"tree": _TREE, "clean": True}},
-        "evidence": {},
-        "qualification_authorities": [],
-        "baseline_blockers": [],
-        "blockers": ["live_qualifications_missing"],
-    }
-    document = {**payload, "receipt_sha256": sha256_json(payload)}
+def _execution_identity(store: ArtifactStore) -> dict[str, Any]:
+    document = execution_identity(apex_tree=_TREE).to_dict()
     receipt = store.put_bytes(
         canonical_json_bytes(document), media_type="application/json"
     )

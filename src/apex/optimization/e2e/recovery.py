@@ -22,7 +22,7 @@ from .recovery_plan import plan_dict, plan_from_mapping
 from .run_record import E2ERunRecord
 
 
-RUN_REQUEST_SCHEMA = "apex.e2e-run-request/v1"
+RUN_REQUEST_SCHEMA = "apex.e2e-run-request/v2"
 ACTION_COMPLETION_SCHEMA = "apex.e2e-action-completion/v1"
 DIAGNOSIS_SCHEMA = "apex.e2e-diagnosis/v2"
 
@@ -31,6 +31,7 @@ class RecoveredRunRequest:
     run_id: str
     spec: E2EOptimizeSpec
     dependency_lock_sha256: str
+    execution_identity_sha256: str
     provenance_digest: str
     views: BenchmarkConfigViews
     correctness_oracle_policy_sha256: str | None
@@ -42,6 +43,7 @@ def persist_run_request(
     *,
     spec: E2EOptimizeSpec,
     dependency_lock_sha256: str,
+    execution_identity_sha256: str,
     provenance_digest: str,
     views: BenchmarkConfigViews,
     correctness_oracle_policy_sha256: str | None,
@@ -52,6 +54,7 @@ def persist_run_request(
         "run_id": record.run_id,
         "spec": spec.to_dict(),
         "dependency_lock_sha256": dependency_lock_sha256,
+        "execution_identity_sha256": execution_identity_sha256,
         "provenance_digest": provenance_digest,
         "correctness_oracle_policy_sha256": correctness_oracle_policy_sha256,
         "gpu_device_scope": gpu_device_scope,
@@ -107,6 +110,9 @@ def load_run_request(root: Path) -> RecoveredRunRequest:
         run_id=str(value.get("run_id", "")),
         spec=spec,
         dependency_lock_sha256=str(value.get("dependency_lock_sha256", "")),
+        execution_identity_sha256=_required_text(
+            value.get("execution_identity_sha256"), "execution identity digest"
+        ),
         provenance_digest=str(value.get("provenance_digest", "")),
         views=_views_from_mapping(_mapping(value.get("views"), "views"), resolved),
         correctness_oracle_policy_sha256=_optional_text(

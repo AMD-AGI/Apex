@@ -43,8 +43,7 @@ the user continues with:
 
 ```bash
 apex optimize kernel --campaign <run> --workspace <repo> --results <root> \
-  --evaluation-contract-draft-digest <digest> \
-  --release-candidate-receipt <receipt>
+  --evaluation-contract-draft-digest <digest>
 ```
 
 The CLI reloads canonical draft bytes,
@@ -113,8 +112,8 @@ are explicit locator/cache controls; none permits dependency or digest drift.
 It either rebuilds `apex.release-candidate-receipt/v2` from current bytes plus an
 optional typed `--evidence` document, or independently reconstructs an existing
 `--receipt`. The output separates `baseline_status` from final release `status`.
-`--require-baseline` is the non-circular precondition for starting live
-qualification; `--require-ready` additionally requires images, live receipts,
+`--require-baseline` qualifies results from a matching execution identity;
+`--require-ready` additionally requires images, live receipts,
 and all four published showcases. Symlinked roots/evidence and edited self-hashed
 receipts fail closed.
 Live receipts use kind-specific v2 schemas: three backend/GFX950 receipts,
@@ -150,13 +149,12 @@ remain owned by their trusted campaign harnesses. See the
 not a qualification fragment or authority receipt, and the resolver performs no
 writes to the formal root.
 
-Non-dry-run `apex optimize kernel` and `apex optimize e2e` therefore require
-`--release-candidate-receipt <json>`. The CLI reconstructs it against the Apex
-source that supplies the installed entrypoint before composition or GPU lease,
-accepts `baseline_status=ready` even while final release gates are pending, and
-passes the verified bytes into the use case for canonical CAS/event recording.
-E2E resume requires the same flag and byte-identical original receipt; dependency
-or source drift cannot be hidden by supplying a newer unrelated baseline.
+Non-dry-run `apex optimize kernel` and `apex optimize e2e` automatically record
+`apex.execution-identity/v1` in CAS before evaluation. This path records the
+executed Apex package manifest, Git identity, and dependency lock without requiring
+a clean/reviewed branch or CPU release gate. E2E resume recomputes that identity
+and rejects package or dependency drift. Release-candidate receipts remain inputs
+only to explicit `apex release` qualification and readiness commands.
 
 Public API: `main`.
 

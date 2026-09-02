@@ -7,12 +7,11 @@ I/O; those are reached through ports and explicit collaborators.
 `kernel/` handles bounded standalone tasks. `e2e/` handles workload state,
 dynamic kernel opportunity selection, live-anchor KEEP/REVERT, and replanning.
 
-Formal CLI campaigns arrive with a verified campaign-software baseline. The
-shared `baseline_recording.py` writes its exact path-free release-candidate
-document to CAS and emits one `dependency_verified(kind=campaign_baseline)`
-event. This is provenance, not evaluator evidence: it authorizes starting live
-qualification but cannot claim correctness, reward, image engagement, or final
-release readiness.
+Formal campaigns automatically receive an observed `apex.execution-identity/v1`.
+The shared `execution_identity_recording.py` writes its path-free package, Git,
+and dependency identity to CAS and emits one
+`provenance_observed(kind=apex_execution_identity)` event. It records what ran;
+it neither authorizes evaluation nor claims release readiness.
 `agent_recording.py` is the one backend-neutral journal projection for both
 loops: it writes each structured `agent_message`, `tool_called`, `tool_result`,
 `usage_recorded`, and `cost_recorded` event against the same transcript CAS

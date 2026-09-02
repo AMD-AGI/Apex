@@ -39,7 +39,7 @@ Its manifest is self-digested but explicitly `non_authoritative=true` and
 production preview surface and inventories adapter blockers; it is not a
 substitute for a GPU workflow, Ray worker receipt, reward, or formal delivery.
 
-## 1. Freeze one non-circular campaign baseline
+## 1. Qualify the Apex build used for release evidence
 
 Start from the reviewed release-candidate commit, not a mutable development
 worktree. Apex may be the exact fetched tip of official remote `main` or of a
@@ -71,8 +71,10 @@ The release orchestrator must add an independently produced Apex fetch and
 ancestry-audit receipt for the selected `main` or `codex/*` tip, then rebuild
 with `--require-baseline`. The dependency receipt remains authoritative for the
 exact clean locked Magpie checkout during campaign qualification; a separate
-Magpie remote-main audit is required later by the final release gate. Do not
-begin GPU work unless campaign baseline verification succeeds:
+Magpie remote-main audit is required later by the final release gate. Experimental
+GPU work does not consume this receipt: every run automatically records its exact
+Apex execution identity. Before accepting a run as formal qualification evidence,
+verify that its execution tree matches a ready release baseline:
 
 ```bash
 apex release check \
@@ -87,10 +89,11 @@ or showcases.
 ## 2. Select and protect the live results scope
 
 Use a new absolute directory for each campaign. Never put live outputs under the
-Apex, Magpie, vLLM, AITER, or AgentKernelArena checkout. Retain the baseline
-receipt in the campaign root and pass it to every formal optimization command.
-The runtime placement validator rejects both directions of overlap and every
-existing symlink component before GPU acquisition.
+Apex, Magpie, vLLM, AITER, or AgentKernelArena checkout. Retain the automatically
+recorded `apex.execution-identity/v1` artifact with the campaign and later match
+its Apex tree to release qualification evidence. The runtime placement validator
+rejects both directions of overlap and every existing symlink component before
+GPU acquisition.
 
 For the Plan V2 refactor, use this split:
 

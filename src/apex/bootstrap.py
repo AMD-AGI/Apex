@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import json
 from pathlib import Path
 import sys
 from apex.benchmark import DockerOneShotMagpieExecutionAttestor, MagpieBenchmarkAdapter
@@ -83,16 +82,16 @@ from apex.optimization.kernel import (
 from apex.ports import BenchmarkPass, CodingSessionLauncher
 from apex.rl import backend_live_qualification_verifiers
 from apex.runtime import (
+    ApexExecutionIdentity,
     DependencyReceipt,
     EvaluatorQualificationArtifactAuthority,
     GpuDoctorInspector,
     LinuxGpuDoctorInspector,
     LocalGpuLeaseManager,
+    collect_apex_execution_identity,
     formal_results_validator,
-    freeze_campaign_baseline,
     verify_runtime_dependencies,
 )
-from apex.runtime.repositories import BootstrapError
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +252,9 @@ def _e2e_optimizer(
     )
     return E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=collect_apex_execution_identity(
+            _project_root(), dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=MagpieBenchmarkAdapter(
             receipt, execution_attestor=DockerOneShotMagpieExecutionAttestor(receipt)
         ),
@@ -304,6 +306,7 @@ def _kernel_optimizer(
         measurement_evaluator=StructuredKernelMeasurementAdapter(),
         diagnostics_evaluator=MagpieKernelDiagnosticsAdapter(verify_runtime_dependencies),
         evaluation_authorizer=authorizer,
+        execution_identity=collect_apex_execution_identity(_project_root()),
     )
 
 def _default_knowledge_catalog() -> Path:
@@ -413,6 +416,11 @@ def _register_planned_capabilities(
     skill_package: KernelSkillPackage | None,
     formal_authority_provider: FormalEvaluationAuthorityProvider | None,
 ) -> None:
+    execution_identity = (
+        collect_apex_execution_identity(_project_root())
+        if scope is not None
+        else None
+    )
     evaluator = (
         KernelFormalCapabilityUseCase(
             KernelFormalEvaluator(
@@ -420,7 +428,7 @@ def _register_planned_capabilities(
                 gpu_leases=LocalGpuLeaseManager(),
                 measurement_evaluator=StructuredKernelMeasurementAdapter(),
                 authority_provider=formal_authority_provider,
-                baseline_loader=_load_campaign_baseline,
+                execution_identity=execution_identity,
             )
         )
         if scope is not None
@@ -434,7 +442,7 @@ def _register_planned_capabilities(
             registry.register_presentation(descriptor)
             continue
         handler = _planned_scoped_handler(
-            descriptor.capability_id, scope, evaluator
+            descriptor.capability_id, scope, evaluator, execution_identity
         )
         if handler is not None:
             registry.register(descriptor, handler)
@@ -473,6 +481,7 @@ def _planned_scoped_handler(
     capability_id: str,
     scope: CapabilityScope | None,
     evaluator: KernelFormalCapabilityUseCase | None,
+    execution_identity: ApexExecutionIdentity | None,
 ):
     if scope is None:
         return None
@@ -483,15 +492,16 @@ def _planned_scoped_handler(
     if capability_id == "campaign.checkpoint":
         return CampaignCheckpointHandler(scope)
     if capability_id == "campaign.start":
+        assert execution_identity is not None
         return CampaignStartHandler(
-            scope, KernelCampaignDraftUseCase(), _load_campaign_baseline
+            scope,
+            KernelCampaignDraftUseCase(),
+            execution_identity,
         )
     if capability_id == "campaign.stop":
         return CampaignStopHandler(scope, stop_formal_campaign)
     if capability_id == "campaign.resume":
-        return CampaignResumeHandler(
-            scope, _load_campaign_baseline, _resume_e2e_campaign
-        )
+        return CampaignResumeHandler(scope, _resume_e2e_campaign)
     if capability_id in {"benchmark.run", "profile.capture"}:
         pass_type = (
             BenchmarkPass.MEASUREMENT
@@ -529,53 +539,12 @@ def _magpie_benchmark_adapter():
     return MagpieBenchmarkAdapter(receipt, execution_attestor=DockerOneShotMagpieExecutionAttestor(receipt))
 
 
-def _load_campaign_baseline(path: Path):
-    if path.stat().st_size > 16 * 1024 * 1024:
-        raise ContractError(
-            "Release candidate receipt is too large",
-            "invalid_release_evidence",
-        )
-
-    def reject_duplicates(pairs):
-        value = {}
-        for key, item in pairs:
-            if key in value:
-                raise ContractError(
-                    "Release candidate receipt has duplicate keys",
-                    "invalid_release_evidence",
-                )
-            value[key] = item
-        return value
-
-    try:
-        value = json.loads(
-            path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ContractError(
-            "Release candidate receipt is not valid JSON",
-            "invalid_release_evidence",
-        ) from error
-    if not isinstance(value, dict):
-        raise ContractError(
-            "Release candidate receipt must be an object",
-            "invalid_release_evidence",
-        )
-    try:
-        return freeze_campaign_baseline(value, apex_root=_project_root())
-    except BootstrapError as error:
-        raise ContractError(
-            "Release candidate baseline does not match current Apex source",
-            "release_identity_invalid",
-        ) from error
-
-
-def _resume_e2e_campaign(run_root: Path, baseline):
+def _resume_e2e_campaign(run_root: Path):
     receipt = verify_runtime_dependencies()
     agents = build_default_registry()
     retriever = _knowledge_retriever(None, enabled=True)
     optimizer = _e2e_optimizer(agents, retriever, receipt, None)
-    return optimizer.resume(run_root, campaign_baseline=baseline)
+    return optimizer.resume(run_root)
 
 
 def _project_root() -> Path:

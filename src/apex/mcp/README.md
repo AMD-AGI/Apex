@@ -104,14 +104,11 @@ Python/Triton language boundary, required source scope, three fixed-argv command
 phases, and optional canonical raw-measurement runner. It rejects invented
 nested targets, shell-string commands, caller-supplied workspace/results roots,
 and standalone HIP before the handler runs. The optimization use case resolves and
-hashes the workspace, records an unverified Evaluation Contract in a new
-journal/CAS, binds a caller-selected release baseline, and returns the exact
-draft digest plus a results-scoped candidate projection only when that baseline
-verifies. It also returns a host-generated `formal_continuation.argv_template`
+hashes the workspace, records an unverified Evaluation Contract plus the observed
+Apex execution identity in a new journal/CAS, and returns the exact draft digest
+plus a results-scoped candidate projection. It also returns a host-generated `formal_continuation.argv_template`
 containing every required CLI argument. Agents must relay that argv unchanged
-after the chat exits instead of searching files or inventing CLI syntax; when
-the baseline is absent or invalid, the template is explicitly not ready and
-names the blocker. It never invokes an agent,
+after the chat exits instead of searching files or inventing CLI syntax. It never invokes an agent,
 acquires a GPU, trusts self-declared evaluator authority, or awards reward;
 trusted local confirmation and the formal composition boundary still own execution. E2E remains
 the explicit long-running `apex optimize e2e` workflow. An explicit
@@ -127,15 +124,15 @@ REVERT for an unselected verified candidate, and derives one evidence-bound
 terminal reward or an explicit untrainable/null result; replaying it adds no
 events. `campaign.resume` is a
 thin route back into that same E2E `resume()` use case: it accepts only a
-results-scoped run and release-candidate receipt, rebuilds the baseline receipt
-against current Apex source, lazily verifies dependencies, then preserves the
+results-scoped run, recomputes the current Apex execution identity, lazily verifies
+dependencies, then preserves the
 same provenance and GPU preflight as the formal CLI. It does not implement a
 second recovery loop or reuse backend chat state.
 
 The standalone `kernel.compile`, `kernel.correctness`, `kernel.measure`,
 `kernel.grade`, and `bundle.build` surfaces are implemented over that draft.
-Compile rebuilds the bound release receipt against current source, requires the
-original Git checkout to remain clean, consumes injected one-shot authority,
+Compile verifies that the current Apex execution identity matches the draft,
+requires the original target Git checkout to remain clean, consumes injected one-shot authority,
 freezes allowlisted edits from the persistent results-scoped candidate tree into
 CAS, and runs in a fresh evaluator projection under a GPU lease. Correctness and
 measurement reconstruct those same bytes from CAS.

@@ -53,6 +53,7 @@ from apex.runtime import (
 from apex.storage import EventJournal, SnapshotStore
 from tests.support.magpie_contract import ResolvedPlanStub
 from tests.support.gpu_evidence import StaticGpuDoctorInspector
+from tests.support.execution_identity import execution_identity
 
 
 class _FakeOwnershipInspector:
@@ -316,6 +317,9 @@ def test_e2e_vertical_slice_records_trace_and_no_regression(tmp_path: Path) -> N
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
@@ -365,6 +369,9 @@ def test_intake_config_failure_does_not_leave_a_running_run(tmp_path: Path) -> N
     receipt = replace(_receipt(tmp_path), lm_eval_runtime=None)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
@@ -387,6 +394,9 @@ def test_live_results_overlapping_dependency_fail_before_gpu(
     results = receipt.root("magpie") / "ignored-formal-results"
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
@@ -408,6 +418,9 @@ def test_e2e_preflight_emits_capability_receipt_without_gpu_lease(
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
@@ -443,6 +456,9 @@ def test_e2e_preflight_reports_default_execution_attestor_unavailable(
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
         resolved_plans=ResolvedPlanStub(receipt),
@@ -470,6 +486,9 @@ def test_e2e_run_rejects_missing_attestor_before_gpu_lease(
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
         resolved_plans=ResolvedPlanStub(receipt),
@@ -488,6 +507,9 @@ def test_e2e_run_rejects_missing_quality_authority_before_gpu_lease(
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=UnavailableQualityBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
@@ -508,6 +530,9 @@ def test_e2e_preflight_reports_capability_upgrade_without_materializing_views(
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
@@ -538,6 +563,9 @@ def test_e2e_run_rejects_capability_upgrade_before_provenance_or_gpu(
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         provenance=ForbiddenProvenance(),
         resolved_plans=ResolvedPlanStub(
             receipt,
@@ -563,6 +591,9 @@ def test_e2e_v2_rejects_non_docker_one_shot_before_provenance_or_gpu(
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         provenance=ForbiddenProvenance(),
         resolved_plans=ResolvedPlanStub(receipt),
         gpu_leases=_ForbiddenLeaseManager(),
@@ -594,6 +625,9 @@ def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Pat
     receipt = _receipt(tmp_path)
     interrupted = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=benchmark,
         diagnostics=CrashDiagnostics(),
         provenance=FakeProvenance(),
@@ -604,13 +638,19 @@ def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Pat
         interrupted.run(_spec(tmp_path, results))
 
     request = json.loads((results / "run.request.json").read_text(encoding="utf-8"))
-    assert request["schema"] == "apex.e2e-run-request/v1"
+    assert request["schema"] == "apex.e2e-run-request/v2"
+    assert request["execution_identity_sha256"] == execution_identity(
+        dependency_lock_sha256=receipt.lock_sha256
+    ).receipt_sha256
     assert request["spec"]["results_dir"] == str(results)
     assert (results / "action_receipts/baseline-measurement.json").is_file()
     assert (results / "action_receipts/diagnostic-0.json").is_file()
 
     resumed = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=benchmark,
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
@@ -637,12 +677,31 @@ def test_resume_recovers_completed_baseline_and_retries_diagnostic(tmp_path: Pat
     )
     assert plan.payload["opportunity_count"] == 1
 
+    mismatched = E2EOptimizeUseCase(
+        dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            apex_tree="e" * 40,
+            dependency_lock_sha256=receipt.lock_sha256,
+        ),
+        benchmark=benchmark,
+        diagnostics=FakeDiagnostics(),
+        provenance=FakeProvenance(),
+        resolved_plans=ResolvedPlanStub(receipt),
+        gpu_leases=_ForbiddenLeaseManager(),
+    )
+    with pytest.raises(IntegrityError) as identity_error:
+        mismatched.resume(results)
+    assert identity_error.value.reason_code == "resume_execution_identity_mismatch"
+
 
 def test_resume_rejects_mutated_run_request_projection(tmp_path: Path) -> None:
     results = tmp_path / "tampered-resume-run"
     receipt = _receipt(tmp_path)
     interrupted = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=FakeBenchmark(),
         diagnostics=CrashDiagnostics(),
         provenance=FakeProvenance(),
@@ -660,6 +719,9 @@ def test_resume_rejects_mutated_run_request_projection(tmp_path: Path) -> None:
     with pytest.raises(IntegrityError) as failure:
         E2EOptimizeUseCase(
             dependency_receipt=receipt,
+            execution_identity=execution_identity(
+                dependency_lock_sha256=receipt.lock_sha256
+            ),
             benchmark=FakeBenchmark(),
             diagnostics=FakeDiagnostics(),
             provenance=FakeProvenance(),
@@ -674,6 +736,9 @@ def test_terminal_resume_rejects_unbound_result_projection(tmp_path: Path) -> No
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=FakeBenchmark(),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),
@@ -699,6 +764,9 @@ def test_e2e_no_winner_final_replay_drift_remains_observed_evidence(
     receipt = _receipt(tmp_path)
     result = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=FakeBenchmark(final_throughput=98.0),
         diagnostics=FakeDiagnostics(),
         provenance=FakeProvenance(),

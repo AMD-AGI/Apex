@@ -43,7 +43,7 @@ from .projection_commands import (
     export_rl_command as _export_rl,
     report_command as _report,
 )
-from .release import add_release_commands, require_campaign_baseline, run_release_command
+from .release import add_release_commands, run_release_command
 from .recovery import run_resume
 from .showcase import add_showcase_commands, run_showcase_command
 from .session import (
@@ -94,7 +94,6 @@ def _parser() -> argparse.ArgumentParser:
     kernel.add_argument("--timeout-seconds", type=int)
     kernel.add_argument("--non-interactive", action="store_true")
     kernel.add_argument("--dry-run", action="store_true", help="Resolve and persist the task only")
-    kernel.add_argument("--release-candidate-receipt", type=Path)
     kernel.add_argument(
         "--evaluation-contract-draft-digest",
         help="Explicitly confirm the exact draft digest emitted by --dry-run",
@@ -108,7 +107,6 @@ def _parser() -> argparse.ArgumentParser:
         "resume", help="Resume an interrupted E2E run from durable state"
     )
     resume.add_argument("--run", type=Path, required=True, help="Existing run root")
-    resume.add_argument("--release-candidate-receipt", type=Path)
     bundle = commands.add_parser("bundle", help="Inspect or verify source bundles")
     bundle_commands = bundle.add_subparsers(dest="bundle_command", required=True)
     verify = bundle_commands.add_parser("verify", help="Independently verify a source bundle")
@@ -176,7 +174,6 @@ def _add_e2e_parser(optimize_commands) -> None:
         action="store_true",
         help="Resolve config and capability composition without acquiring a GPU",
     )
-    e2e.add_argument("--release-candidate-receipt", type=Path)
 
 
 def _session(args: argparse.Namespace) -> int:
@@ -264,7 +261,6 @@ def _kernel(args: argparse.Namespace) -> int:
         backend_override=AgentBackendName(args.agent_backend) if args.agent_backend else None,
         model_override=args.agent_model,
         effort_override=args.agent_effort,
-        campaign_baseline=require_campaign_baseline(args.release_candidate_receipt),
     )
     result = optimizer.run(request)
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -333,7 +329,6 @@ def _kernel_template(args: argparse.Namespace) -> int:
         ),
         model_override=args.agent_model,
         effort_override=args.agent_effort,
-        campaign_baseline=require_campaign_baseline(args.release_candidate_receipt),
     )
     result = optimizer.run(request)
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -496,9 +491,7 @@ def _bundle_apply(args: argparse.Namespace) -> int:
 
 
 def _e2e(args: argparse.Namespace) -> int:
-    spec = _e2e_spec(
-        args, None if args.dry_run else require_campaign_baseline(args.release_candidate_receipt)
-    )
+    spec = _e2e_spec(args)
     application = build_application(include_e2e=True)
     if application.e2e_optimizer is None:
         raise ApexError("E2E composition is unavailable", "e2e_not_composed")
@@ -515,7 +508,7 @@ def _e2e(args: argparse.Namespace) -> int:
     return _status_exit_code(result.status)
 
 
-def _e2e_spec(args: argparse.Namespace, campaign_baseline=None) -> E2EOptimizeSpec:
+def _e2e_spec(args: argparse.Namespace) -> E2EOptimizeSpec:
     config = _regular_e2e_config(args.config)
     results = args.results.expanduser()
     if args.dry_run:
@@ -546,7 +539,6 @@ def _e2e_spec(args: argparse.Namespace, campaign_baseline=None) -> E2EOptimizeSp
         "max_kernels": args.max_kernels,
         "max_turns": args.max_turns,
         "agent_timeout_seconds": args.timeout_seconds,
-        "campaign_baseline_receipt": campaign_baseline.to_dict() if campaign_baseline else None,
     }
     return E2EOptimizeSpec.from_mapping(
         {key: value for key, value in values.items() if value is not None}

@@ -28,6 +28,7 @@ from apex.intake import E2EOptimizeSpec
 from apex.orchestration import RunPhase, SearchStage
 from apex.ports import TraceComparisonPort
 from apex.runtime import (
+    ApexExecutionIdentity,
     DependencyReceipt,
     FormalResultsRootValidator,
     GpuLease,
@@ -36,14 +37,13 @@ from apex.runtime import (
     LocalGpuLeaseManager,
     MagpieMainConfigAdapter,
     ProvenanceResolver,
-    ReleaseCandidateReceipt,
     RunProvenance,
     formal_results_validator,
 )
 
-from ..baseline_recording import (
-    record_campaign_baseline,
-    validate_resume_campaign_baseline,
+from ..execution_identity_recording import (
+    record_apex_execution_identity,
+    require_same_execution_identity,
 )
 from .benchmarking import (
     BenchmarkAdapter,
@@ -132,6 +132,7 @@ class E2EOptimizeUseCase:
         gpu_leases: GpuLeaseManager | None = None,
         correctness_oracles: CorrectnessOracleRegistry | None = None,
         results_validator: FormalResultsRootValidator | None = None,
+        execution_identity: ApexExecutionIdentity,
     ) -> None:
         self._receipt = dependency_receipt
         self._benchmark = benchmark or MagpieBenchmarkAdapter(dependency_receipt)
@@ -155,6 +156,7 @@ class E2EOptimizeUseCase:
         self._results_validator = results_validator or _results_policy(
             dependency_receipt
         )
+        self._execution_identity = execution_identity
 
     def preview(self, spec: E2EOptimizeSpec) -> E2EPreflightResult:
         """Resolve config/capabilities without creating a run or acquiring a GPU."""
@@ -216,16 +218,14 @@ class E2EOptimizeUseCase:
     def resume(
         self,
         run_root: Path,
-        *,
-        campaign_baseline: ReleaseCandidateReceipt | None = None,
     ) -> E2EOptimizationResult:
         """Resume a crash at a durable baseline/diagnostic boundary."""
 
         self._results_validator.validate(run_root)
         request = load_run_request(run_root)
-        validate_resume_campaign_baseline(
-            request.spec.campaign_baseline_receipt,
-            campaign_baseline,
+        require_same_execution_identity(
+            request.execution_identity_sha256,
+            self._execution_identity,
         )
         if request.dependency_lock_sha256 != self._receipt.lock_sha256:
             raise ContractError(
@@ -352,12 +352,11 @@ class E2EOptimizeUseCase:
         views = _relocate_views(staged, destination)
         receipt = gpu_lease.receipt
         self._record_run_identity(record, receipt, provenance)
-        if spec.campaign_baseline_receipt is not None:
-            record_campaign_baseline(
-                record.artifacts,
-                record.controller,
-                spec.campaign_baseline_receipt,
-            )
+        record_apex_execution_identity(
+            record.artifacts,
+            record.controller,
+            self._execution_identity,
+        )
         record.controller.initialize_e2e(
             workload_id=f"workload-{provenance.benchmark_config_sha256[:16]}",
             provenance_hash=provenance.digest,
@@ -373,6 +372,7 @@ class E2EOptimizeUseCase:
             record,
             spec=spec,
             dependency_lock_sha256=self._receipt.lock_sha256,
+            execution_identity_sha256=self._execution_identity.receipt_sha256,
             provenance_digest=provenance.digest,
             views=views,
             correctness_oracle_policy_sha256=getattr(

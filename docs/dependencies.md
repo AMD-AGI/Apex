@@ -146,7 +146,7 @@ change. A missing row, config hash drift, or `capability_upgrade_required` block
 dependency verification. Workflow and formal-delivery qualification remain
 separate live receipts and are not inferred by this CPU ledger.
 
-For a release or live-campaign baseline, dependency verification is one input to
+For release qualification, dependency verification is one input to
 `apex.release-candidate-receipt/v2`. Build the deterministic snapshot with
 `scripts/build_release_candidate_receipt.py`; it also binds the clean Apex tree,
 fresh reviewed Apex/Magpie remote tips, full CPU/static gate, installed CLI,
@@ -157,10 +157,10 @@ a truthful `blocked` receipt. `--require-ready` fails unless current source and
 lock bytes reconstruct a blocker-free receipt.
 
 The receipt separates `baseline_status` from final release `status`.
-`--require-baseline` checks only evidence that must exist before a live campaign;
-`--require-ready` additionally checks the live qualifications and showcase
-outputs. This avoids making a completed showcase a circular prerequisite for the
-campaign that produces it.
+`--require-baseline` checks whether a matching experimental run may be admitted
+as release qualification evidence; `--require-ready` additionally checks the live
+qualifications and showcase outputs. Optimization itself records dependency and
+execution identities without consuming this release receipt.
 
 The same JSON contains `e2e_source_locks`, with nested receipt schema
 `apex.e2e-source-locks.receipt/v1`. Production `apex optimize e2e` consumes these

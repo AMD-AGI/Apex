@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.support.execution_identity import execution_identity
 from tests.support.gpu_evidence import StaticGpuDoctorInspector
 
 from apex.core import (
@@ -69,7 +70,6 @@ from apex.runtime import (
     HsaGpuIdentity,
     HsaInventoryEvidence,
     LocalGpuLeaseManager,
-    ReleaseCandidateReceipt,
     RsmiDeviceIdentity,
 )
 
@@ -587,7 +587,6 @@ def _run(
     performance_marker: Path | None = None,
     measurement_values: tuple[float, float, int] | None = None,
     executable: str = sys.executable,
-    campaign_baseline: ReleaseCandidateReceipt | None = None,
     diagnostics_evaluator=None,
 ):
     task = _task(
@@ -599,6 +598,7 @@ def _run(
     result_json = tmp_path / "machine" / "result.json"
     use_case = KernelOptimizeUseCase(
         agents=AgentRegistry([agent], default=AgentBackendName.CODEX),
+        execution_identity=execution_identity(),
         safety_gate=safety_gate,
         safety_policy=safety_policy,
         safety_tools=safety_tools,
@@ -611,27 +611,8 @@ def _run(
         ),
         diagnostics_evaluator=diagnostics_evaluator,
     )
-    result = use_case.run(KernelOptimizeRequest(
-        task=task,
-        result_json=result_json,
-        campaign_baseline=campaign_baseline,
-    ))
+    result = use_case.run(KernelOptimizeRequest(task=task, result_json=result_json))
     return task, result, result_json
-
-
-def _campaign_baseline() -> ReleaseCandidateReceipt:
-    payload = {
-        "schema": "apex.release-candidate-receipt/v2",
-        "baseline_status": "ready",
-        "baseline_blockers": [],
-        "status": "blocked",
-        "blockers": ["live_qualification_pending"],
-        "static": {"apex_checkout": {"tree": "a" * 40}},
-        "evidence": {},
-        "qualification_authorities": [],
-    }
-    content = canonical_json_bytes(payload)
-    return ReleaseCandidateReceipt(content, sha256_bytes(content))
 
 
 def _run_sequence(
@@ -650,6 +631,7 @@ def _run_sequence(
     result_json = tmp_path / "machine" / "result.json"
     use_case = KernelOptimizeUseCase(
         agents=AgentRegistry([agent], default=AgentBackendName.CODEX),
+        execution_identity=execution_identity(),
         measurement_evaluator=(
             FixtureMeasurementEvaluator(dynamic=True)
             if dynamic_measurement
@@ -761,23 +743,19 @@ def test_use_case_never_modifies_input_and_emits_verified_source_bundle(tmp_path
     assert event_types.index("safety_result") < event_types.index("performance_command_result")
 
 
-def test_kernel_run_records_verified_campaign_baseline(tmp_path: Path) -> None:
-    task, result, _ = _run(
-        tmp_path,
-        EditingAgent(),
-        campaign_baseline=_campaign_baseline(),
-    )
+def test_kernel_run_records_apex_execution_identity(tmp_path: Path) -> None:
+    task, result, _ = _run(tmp_path, EditingAgent())
     run_root = task.results_dir / "runs" / str(result.run_id)
     events = EventJournal(run_root / "events" / "run.db").iter_events(str(result.run_id))
     event = next(
         item
         for item in events
-        if item.event_type == "dependency_verified"
-        and item.payload.get("kind") == "campaign_baseline"
+        if item.event_type == "provenance_observed"
+        and item.payload.get("kind") == "apex_execution_identity"
     )
 
     assert event.payload["apex_tree"] == "a" * 40
-    assert event.payload["artifacts"][0]["role"] == "campaign_baseline"
+    assert event.payload["artifacts"][0]["role"] == "apex_execution_identity"
 
 
 def test_missing_evaluator_authority_rejects_before_gpu_or_agent(tmp_path: Path) -> None:
@@ -788,6 +766,7 @@ def test_missing_evaluator_authority_rejects_before_gpu_or_agent(tmp_path: Path)
 
     result = KernelOptimizeUseCase(
         agents=AgentRegistry([agent], default=AgentBackendName.CODEX),
+        execution_identity=execution_identity(),
         gpu_leases=gpu_leases,  # type: ignore[arg-type]
     ).run(KernelOptimizeRequest(task=task, result_json=result_json))
 
@@ -809,6 +788,7 @@ def test_command_success_without_measurement_authority_never_becomes_candidate_r
     task = _task(tmp_path, external_evaluator=False)
     result = KernelOptimizeUseCase(
         agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
+        execution_identity=execution_identity(),
         gpu_leases=_gpu_leases(tmp_path),
         evaluation_authorizer=_FixtureEvaluationAuthorizer(),
     ).run(
@@ -1307,6 +1287,7 @@ def test_candidate_written_measurement_cannot_create_tampering_pass_or_reward(
     result_json = tmp_path / "machine" / "result.json"
     use_case = KernelOptimizeUseCase(
         agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
+        execution_identity=execution_identity(),
         gpu_leases=_gpu_leases(tmp_path),
         evaluation_authorizer=_FixtureEvaluationAuthorizer(),
     )
@@ -1339,6 +1320,7 @@ def test_candidate_report_is_ignored_when_trusted_evaluator_is_bound(
     evaluator = FixtureMeasurementEvaluator((10.0, 8.0, 300))
     use_case = KernelOptimizeUseCase(
         agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
+        execution_identity=execution_identity(),
         measurement_evaluator=evaluator,
         gpu_leases=_gpu_leases(tmp_path),
         evaluation_authorizer=_FixtureEvaluationAuthorizer(),
@@ -1393,6 +1375,7 @@ def test_measurement_authority_mismatch_never_commits_reward(
     task = _task(tmp_path, measurement_values=(10.0, 8.0, 300))
     use_case = KernelOptimizeUseCase(
         agents=AgentRegistry([EditingAgent()], default=AgentBackendName.CODEX),
+        execution_identity=execution_identity(),
         measurement_evaluator=evaluator,
         gpu_leases=_gpu_leases(tmp_path),
         evaluation_authorizer=_FixtureEvaluationAuthorizer(),

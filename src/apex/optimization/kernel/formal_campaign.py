@@ -7,7 +7,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Iterator, Mapping
 
 from apex.core import (
     ApexError,
@@ -31,9 +31,6 @@ from .formal_authority import FormalEvaluationAuthorityProvider
 from .run_record import KernelRunRecord
 from .verification import candidate_source_digest
 from .workspace import CandidateWorkspace, candidate_file_bytes
-
-
-FormalBaselineLoader = Callable[[Path], object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +176,7 @@ class FormalKernelCampaign:
         if not frozen.resolved or frozen.dirty_paths:
             raise ContractError(
                 "Formal execution requires a clean resolved draft repository",
-                "campaign_baseline_not_clean",
+                "campaign_repository_not_clean",
             )
         if (
             not current.resolved
@@ -198,83 +195,6 @@ class FormalKernelCampaign:
                 "undeclared_workspace_edit",
                 {"dirty_paths": list(current.dirty_paths)},
             )
-
-    def bind_release_candidate_baseline(
-        self,
-        receipt: object | None,
-        *,
-        reason_code: str | None,
-    ) -> None:
-        if _baseline_event(self.record, required=False) is not None:
-            raise IntegrityError(
-                "Formal campaign baseline was already bound",
-                "campaign_baseline_ambiguous",
-            )
-        artifact = None
-        digest = None
-        if receipt is not None:
-            document = _baseline_document(receipt)
-            artifact = self.record.artifacts.put_bytes(
-                canonical_json_bytes(document), media_type="application/json"
-            )
-            digest = _baseline_digest(receipt)
-            if document.get("receipt_sha256") != digest:
-                raise IntegrityError(
-                    "Release candidate receipt digest is incoherent",
-                    "release_identity_invalid",
-                )
-        verified = receipt is not None and reason_code is None
-        payload: dict[str, object] = {
-            "kind": "formal_release_candidate_baseline",
-            "status": "verified" if verified else "unverified",
-            "reason_code": reason_code,
-            "release_candidate_receipt_sha256": digest,
-            "artifacts": [],
-        }
-        if artifact is not None:
-            payload["artifacts"] = [
-                {"role": "release_candidate_baseline", "receipt": artifact.to_dict()}
-            ]
-        self.record.controller.record_domain_event(
-            "dependency_verified",
-            payload,
-            idempotency_key="formal.release_candidate_baseline",
-        )
-
-    def revalidate_release_candidate_baseline(
-        self, loader: FormalBaselineLoader | None
-    ) -> str | None:
-        event = _baseline_event(self.record, required=False)
-        if event is None:
-            return "campaign_baseline_receipt_required"
-        if event.payload.get("status") != "verified":
-            return str(
-                event.payload.get("reason_code")
-                or "campaign_baseline_receipt_required"
-            )
-        if loader is None:
-            return "campaign_baseline_verifier_unavailable"
-        try:
-            receipt = _one_binding(event, "release_candidate_baseline")
-            self.record.artifacts.verify(receipt)
-            path = self.record.artifacts.root / receipt.relative_path
-            rebuilt = loader(path)
-            observed = _baseline_digest(rebuilt)
-        except ApexError as error:
-            return error.reason_code
-        expected = event.payload.get("release_candidate_receipt_sha256")
-        if observed != expected:
-            return "release_identity_invalid"
-        self.record.controller.record_domain_event(
-            "dependency_verified",
-            {
-                "kind": "formal_release_candidate_baseline_revalidated",
-                "status": "verified",
-                "release_candidate_receipt_sha256": expected,
-            },
-            idempotency_key="formal.release_candidate_baseline.revalidated",
-        )
-        return None
 
     def ensure_candidate_projection(self) -> Path:
         """Create or reopen the agent-editable copy without mutating the source repo."""
@@ -431,23 +351,6 @@ def _attempt_event(record, attempt_id: str, event_type: str):
     return matches[0]
 
 
-def _baseline_event(record, *, required: bool):
-    matches = [
-        event
-        for event in record.iter_events()
-        if event.event_type == "dependency_verified"
-        and event.payload.get("kind") == "formal_release_candidate_baseline"
-    ]
-    if not matches and not required:
-        return None
-    if len(matches) != 1:
-        raise IntegrityError(
-            "Formal campaign baseline is missing or ambiguous",
-            "campaign_baseline_ambiguous",
-        )
-    return matches[0]
-
-
 def _one_binding(event, role: str) -> ArtifactReceipt:
     matches = [
         binding
@@ -488,32 +391,6 @@ def _modified_path(entry: str) -> str | None:
     return entry[3:]
 
 
-def _baseline_document(receipt: object) -> dict[str, object]:
-    converter = getattr(receipt, "to_dict", None)
-    if not callable(converter):
-        raise ContractError(
-            "Trusted baseline loader returned no typed receipt",
-            "release_identity_invalid",
-        )
-    value = converter()
-    if not isinstance(value, Mapping):
-        raise ContractError(
-            "Trusted baseline loader returned an invalid receipt",
-            "release_identity_invalid",
-        )
-    return dict(value)
-
-
-def _baseline_digest(receipt: object) -> str:
-    value = getattr(receipt, "receipt_sha256", None)
-    if not isinstance(value, str) or len(value) != 64:
-        raise ContractError(
-            "Trusted baseline receipt has no digest",
-            "release_identity_invalid",
-        )
-    return value
-
-
 def _new_evaluator_projection(root: Path, phase: str) -> Path:
     parent = root / "formal-work" / "evaluator-projections"
     parent.mkdir(parents=True, exist_ok=True)
@@ -533,7 +410,6 @@ def _overwrite(
 
 
 __all__ = [
-    "FormalBaselineLoader",
     "FormalCandidateProjection",
     "FormalKernelCampaign",
 ]

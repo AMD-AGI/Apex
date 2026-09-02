@@ -21,6 +21,7 @@ from apex.storage import ArtifactStore, EventJournal, SnapshotStore
 from apex.optimization.kernel import KernelCampaignDraftUseCase
 from apex.cli.app import _parser
 from apex.mcp.campaign import _formal_continuation
+from tests.support.execution_identity import execution_identity
 
 
 def _git(workspace: Path, *arguments: str) -> None:
@@ -240,7 +241,9 @@ def test_campaign_start_freezes_unverified_draft_without_agent_or_gpu(
     registry.register(
         descriptor,
         CampaignStartHandler(
-            CapabilityScope(workspace, results), KernelCampaignDraftUseCase()
+            CapabilityScope(workspace, results),
+            KernelCampaignDraftUseCase(),
+            execution_identity(),
         ),
     )
 
@@ -266,12 +269,9 @@ def test_campaign_start_freezes_unverified_draft_without_agent_or_gpu(
 
     campaign = result.content["campaign"]
     assert campaign["status"] == "unverified"
-    assert campaign["next_action"] == "valid_release_candidate_baseline_required"
-    assert campaign["release_candidate_baseline_status"] == "unverified"
-    assert campaign["release_candidate_baseline_reason"] == (
-        "campaign_baseline_receipt_required"
-    )
-    assert campaign["candidate_projection"] is None
+    assert campaign["next_action"] == "explicit_trusted_user_confirmation_required"
+    assert campaign["execution_identity_sha256"] == execution_identity().receipt_sha256
+    assert campaign["candidate_projection"] is not None
     assert campaign["agent_invoked"] is False
     assert campaign["gpu_acquired"] is False
     assert campaign["reward"] is None
@@ -280,8 +280,8 @@ def test_campaign_start_freezes_unverified_draft_without_agent_or_gpu(
     )
     assert campaign["formal_continuation"] == {
         "schema": "apex.kernel-campaign-continuation/v1",
-        "ready": False,
-        "blocked_reason": "campaign_baseline_receipt_required",
+        "ready": True,
+        "blocked_reason": None,
         "requires_user_confirmation": True,
         "run_only_after_chat_exits": True,
         "argv_template": [
@@ -296,8 +296,6 @@ def test_campaign_start_freezes_unverified_draft_without_agent_or_gpu(
             str(results.resolve()),
             "--evaluation-contract-draft-digest",
             campaign["evaluation_contract_draft_digest"],
-            "--release-candidate-receipt",
-            "<valid-release-candidate-receipt-under-results>",
         ],
     }
     run = results / campaign["run_locator"]["relative_path"]
@@ -307,7 +305,7 @@ def test_campaign_start_freezes_unverified_draft_without_agent_or_gpu(
         "run.started",
         "provenance_observed",
         "dependency_verified",
-        "dependency_verified",
+        "provenance_observed",
         "tool_called",
         "tool_result",
     ]
@@ -334,67 +332,13 @@ def test_campaign_start_freezes_unverified_draft_without_agent_or_gpu(
     assert result.reward_eligible is False
 
 
-def test_campaign_start_invalid_release_receipt_remains_unverified(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "kernel.py").write_text("def kernel(x): return x\n")
-    _git(workspace, "init", "--quiet")
-    _git(workspace, "config", "user.email", "apex@example.invalid")
-    _git(workspace, "config", "user.name", "Apex Test")
-    _git(workspace, "remote", "add", "origin", "https://example.invalid/invalid.git")
-    _git(workspace, "add", "kernel.py")
-    _git(workspace, "commit", "--quiet", "-m", "baseline")
-    results = tmp_path / "results"
-    results.mkdir()
-    (results / "invalid.json").write_text("{}")
-
-    def reject(_path: Path):
-        raise ContractError("receipt is invalid", "release_identity_invalid")
-
+def test_campaign_start_schema_has_no_release_receipt_input() -> None:
     descriptor = next(
         item
         for item in planned_capability_descriptors()
         if item.capability_id == "campaign.start"
     )
-    registry = CapabilityRegistry()
-    registry.register(
-        descriptor,
-        CampaignStartHandler(
-            CapabilityScope(workspace, results),
-            KernelCampaignDraftUseCase(),
-            reject,
-        ),
-    )
-    result = registry.invoke(
-        CapabilityRequest(
-            "campaign.start",
-            {
-                "task": {
-                    "task_id": "invalid-baseline",
-                    "instructions": "Optimize kernel",
-                    "language": "triton",
-                    "editable_files": ["kernel.py"],
-                    "target_functions": ["kernel"],
-                    "commands": {
-                        phase: {"argv": ["true"]}
-                        for phase in ("compile", "correctness", "performance")
-                    },
-                },
-                "release_candidate_receipt": "invalid.json",
-            },
-            frozenset({CapabilityAuthority.WORKSPACE_USER}),
-        )
-    )
-
-    campaign = result.content["campaign"]
-    assert campaign["release_candidate_baseline_status"] == "unverified"
-    assert campaign["release_candidate_baseline_reason"] == "release_identity_invalid"
-    assert campaign["candidate_projection"] is None
-    source = resolve_run_source(results / campaign["run_locator"]["relative_path"])
-    events = tuple(source.journal.iter_events(source.run_id, verify=True))
-    assert all(event.event_type != "reward_committed" for event in events)
+    assert "release_candidate_receipt" not in descriptor.input_schema["properties"]
 
 
 def test_ready_continuation_round_trips_absolute_paths_through_cli_parser(
@@ -405,17 +349,9 @@ def test_ready_continuation_round_trips_absolute_paths_through_cli_parser(
     results = tmp_path / "results with spaces"
     campaign = results / "campaigns" / "campaign-ready"
     campaign.mkdir(parents=True)
-    receipt = results / "baseline receipt.json"
-    receipt.write_text("{}\n", encoding="utf-8")
     scope = CapabilityScope(workspace, results)
-    request = CapabilityRequest(
-        "campaign.start",
-        {"release_candidate_receipt": receipt.name},
-    )
 
-    continuation = _formal_continuation(
-        scope, campaign, "d" * 64, request, None
-    )
+    continuation = _formal_continuation(scope, campaign, "d" * 64)
     parsed = _parser().parse_args(continuation["argv_template"][1:])
 
     assert continuation["ready"] is True
@@ -424,10 +360,10 @@ def test_ready_continuation_round_trips_absolute_paths_through_cli_parser(
     assert parsed.workspace == workspace
     assert parsed.results == results
     assert parsed.evaluation_contract_draft_digest == "d" * 64
-    assert parsed.release_candidate_receipt == receipt
+    assert not hasattr(parsed, "release_candidate_receipt")
 
 
-def test_campaign_resume_delegates_after_scoped_baseline_load(
+def test_campaign_resume_delegates_after_scoped_run_load(
     tmp_path: Path,
 ) -> None:
     run_id = "e2e-resume-capability"
@@ -445,24 +381,14 @@ def test_campaign_resume_delegates_after_scoped_baseline_load(
         initial_anchor_id="anchor-resume",
     )
     ArtifactStore(destination / "artifacts").put_bytes(b"evidence")
-    baseline_path = results / "baseline.json"
-    baseline_path.write_text("{}\n", encoding="utf-8")
-    loaded: list[Path] = []
-    resumed: list[tuple[Path, object]] = []
-
-    class _Baseline:
-        receipt_sha256 = "b" * 64
+    resumed: list[Path] = []
 
     class _Result:
         def to_dict(self):
             return {"status": "no_gain", "run_id": run_id}
 
-    def load_baseline(path: Path):
-        loaded.append(path)
-        return _Baseline()
-
-    def resume(root: Path, baseline):
-        resumed.append((root, baseline))
+    def resume(root: Path):
+        resumed.append(root)
         RunController.recover(run_id, journal, snapshots).finish(
             RunPhase.SUCCEEDED, reason="no_gain"
         )
@@ -476,26 +402,19 @@ def test_campaign_resume_delegates_after_scoped_baseline_load(
     registry = CapabilityRegistry()
     registry.register(
         descriptor,
-        CampaignResumeHandler(
-            CapabilityScope(workspace, results), load_baseline, resume
-        ),
+        CampaignResumeHandler(CapabilityScope(workspace, results), resume),
     )
 
     result = registry.invoke(
         CapabilityRequest(
             "campaign.resume",
-            {
-                "run_locator": run_id,
-                "release_candidate_receipt": "baseline.json",
-            },
+            {"run_locator": run_id},
             frozenset({CapabilityAuthority.WORKSPACE_USER}),
         )
     )
 
     campaign = result.content["campaign"]
-    assert loaded == [baseline_path]
-    assert resumed == [(destination, resumed[0][1])]
+    assert resumed == [destination]
     assert campaign["terminal_status"] == "succeeded"
-    assert campaign["resume"]["release_candidate_receipt_sha256"] == "b" * 64
     assert campaign["resume"]["result"]["status"] == "no_gain"
     assert result.reward_eligible is False

@@ -508,12 +508,11 @@ selection to Magpie may proceed with honest partial intake provenance; it cannot
 enter source deployment or formal delivery until runtime, source, and engagement
 evidence is complete. Lower-level local/Ray adapters are future inventory and
 are not reachable through the V2 CLI.
-New formal CLI runs also carry the non-circular campaign baseline receipt in the
-typed E2E spec. `_prepare` stores it in CAS and emits the shared
-`campaign_baseline` dependency event before workload initialization; the durable
-run request retains the same bytes. Resume accepts only a currently reconstructed
-receipt byte-identical to the original. CPU fixtures may omit it without making
-a live qualification claim.
+New formal CLI runs automatically store `apex.execution-identity/v1` in CAS and
+emit the shared `apex_execution_identity` provenance event before workload
+initialization. The durable run request retains its digest. Resume recomputes the
+current execution identity and rejects Apex package or dependency-lock drift.
+Release qualification remains a separate post-run operation.
 `apex optimize e2e --config ... --results /new/path --dry-run` writes a
 canonical `preflight.json` without creating a run or acquiring a GPU. A
 `config_compatible` receipt means only that the Apex adapter projected the

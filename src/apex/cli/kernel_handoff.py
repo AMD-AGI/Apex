@@ -10,7 +10,6 @@ from apex.evaluation import user_confirmed_evaluation_authorizer
 from apex.optimization.kernel import FormalKernelCampaign, KernelOptimizeRequest
 
 from .formal import formal_result_path, formal_results_root, status_exit_code
-from .release import require_campaign_baseline
 
 
 def run_kernel_campaign_handoff(args, build_application) -> int:
@@ -35,7 +34,6 @@ def run_kernel_campaign_handoff(args, build_application) -> int:
             "Confirmed digest differs from the chat-created draft",
             "evaluation_authority_mismatch",
         )
-    baseline = require_campaign_baseline(args.release_candidate_receipt)
     application = build_application(
         kernel_evaluation_authorizer=user_confirmed_evaluation_authorizer(
             confirmed
@@ -68,7 +66,6 @@ def run_kernel_campaign_handoff(args, build_application) -> int:
             ),
             model_override=args.agent_model,
             effort_override=args.agent_effort,
-            campaign_baseline=baseline,
         )
     )
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))

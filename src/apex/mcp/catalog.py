@@ -163,14 +163,11 @@ def _state_descriptors() -> tuple[CapabilityDescriptor, ...]:
         _descriptor(
             "campaign.resume",
             "Resume a formal E2E campaign",
-            "Resume canonical E2E state only after current release, dependency, provenance, and GPU preflight.",
+            "Resume canonical E2E state only after current execution identity, dependency, provenance, and GPU preflight.",
             CapabilityKind.CAMPAIGN,
-            {
-                "run_locator": _string(),
-                "release_candidate_receipt": _string(),
-            },
+            {"run_locator": _string()},
             {"campaign": _object()},
-            required=("run_locator", "release_candidate_receipt"),
+            required=("run_locator",),
             effects=(
                 CapabilitySideEffect.READ_RESULTS,
                 CapabilitySideEffect.WRITE_RESULTS,
@@ -222,9 +219,9 @@ def _campaign_start_descriptor() -> CapabilityDescriptor:
     return _descriptor(
         "campaign.start",
         "Start a formal kernel campaign draft",
-        "Freeze an unverified task plus release baseline; run no agent, GPU, or evaluator.",
+        "Freeze an unverified task plus Apex execution identity; run no agent, GPU, or evaluator.",
         CapabilityKind.CAMPAIGN,
-        {"task": _kernel_task_schema(), "release_candidate_receipt": _string()},
+        {"task": _kernel_task_schema()},
         {"campaign": _object()},
         required=("task",),
         effects=(

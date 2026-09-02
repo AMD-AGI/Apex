@@ -256,23 +256,6 @@ def _write_new(path: Path, value: Mapping[str, Any]) -> Path:
     return output
 
 
-def require_campaign_baseline(path: Path | None):
-    """Rebuild one supplied receipt against the installed Apex source checkout."""
-
-    if path is None:
-        raise ApexError(
-            "Live optimization requires --release-candidate-receipt",
-            "campaign_baseline_receipt_required",
-        )
-    try:
-        return freeze_campaign_baseline(
-            _mapping(path, "release receipt"),
-            apex_root=_source_root(),
-        )
-    except BootstrapError as error:
-        raise ApexError(str(error), "release_identity_invalid") from error
-
-
 def _root(value: Path) -> Path:
     selected = value.expanduser()
     if selected.is_symlink():
@@ -321,5 +304,5 @@ def _print(value: Mapping[str, Any], *, json_output: bool) -> None:
 
 
 __all__ = [
-    "add_release_commands", "require_campaign_baseline", "run_release_command",
+    "add_release_commands", "run_release_command",
 ]

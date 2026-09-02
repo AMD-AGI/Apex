@@ -57,7 +57,6 @@ def _args(workspace, results, campaign, digest):
         results=results,
         campaign=campaign,
         evaluation_contract_draft_digest=digest,
-        release_candidate_receipt=results / "release.json",
         result_json=None,
         agent_backend="claude",
         agent_model=None,
@@ -72,7 +71,6 @@ def test_confirmed_chat_draft_delegates_once_to_formal_optimizer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace, results, root, draft = _draft(tmp_path)
-    baseline = object()
     calls = []
 
     class Optimizer:
@@ -87,9 +85,6 @@ def test_confirmed_chat_draft_delegates_once_to_formal_optimizer(
                 to_dict=lambda: {"status": TaskStatus.NO_GAIN.value},
             )
 
-    monkeypatch.setattr(
-        kernel_handoff, "require_campaign_baseline", lambda _path: baseline
-    )
     built = []
 
     def build_application(**values):
@@ -106,7 +101,7 @@ def test_confirmed_chat_draft_delegates_once_to_formal_optimizer(
     assert [name for name, _ in calls] == ["preview", "run"]
     request = calls[-1][1]
     assert request.backend_override.value == "claude"
-    assert request.campaign_baseline is baseline
+    assert not hasattr(request, "campaign_baseline")
     assert request.result_json == results / "result.json"
 
 

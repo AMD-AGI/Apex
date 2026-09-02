@@ -12,8 +12,6 @@ from apex.core import (
     AgentBackendName,
     ApexError,
     TaskStatus,
-    canonical_json_bytes,
-    sha256_bytes,
 )
 from apex.intake import TaskSpec
 
@@ -199,7 +197,7 @@ def test_e2e_dry_run_uses_preview_and_never_runs_campaign(
     assert calls == ["preview:benchmark.yaml"]
 
 
-def test_e2e_live_run_requires_verified_campaign_baseline(
+def test_e2e_live_run_starts_without_release_baseline(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     config = tmp_path / "benchmark.yaml"
@@ -207,52 +205,16 @@ def test_e2e_live_run_requires_verified_campaign_baseline(
         "benchmark: {framework: vllm, model: example/model}\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        app,
-        "build_application",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must fail before composition")),
-    )
-
-    status = app.main([
-        "optimize", "e2e", "--config", str(config),
-        "--results", str(tmp_path / "results"),
-    ])
-
-    assert status == 2
-    assert json.loads(capsys.readouterr().err)["reason_code"] == (
-        "campaign_baseline_receipt_required"
-    )
-
-
-def test_e2e_live_run_carries_verified_baseline_into_spec(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    config = tmp_path / "benchmark.yaml"
-    config.write_text(
-        "benchmark: {framework: vllm, model: example/model}\n",
-        encoding="utf-8",
-    )
-    payload = {
-        "schema": "apex.release-candidate-receipt/v2",
-        "baseline_status": "ready",
-        "baseline_blockers": [],
-    }
-    payload["receipt_sha256"] = sha256_bytes(canonical_json_bytes(payload))
     observed = []
 
     class Optimizer:
         def run(self, spec):
-            observed.append(spec.campaign_baseline_receipt)
+            observed.append(spec)
             return SimpleNamespace(
                 status=TaskStatus.NO_GAIN,
                 to_dict=lambda: {"status": "no_gain"},
             )
 
-    monkeypatch.setattr(
-        app,
-        "require_campaign_baseline",
-        lambda path: SimpleNamespace(to_dict=lambda: payload),
-    )
     monkeypatch.setattr(
         app,
         "build_application",
@@ -262,12 +224,28 @@ def test_e2e_live_run_carries_verified_baseline_into_spec(
     status = app.main([
         "optimize", "e2e", "--config", str(config),
         "--results", str(tmp_path / "results"),
-        "--release-candidate-receipt", str(tmp_path / "receipt.json"),
     ])
 
     assert status == 0
-    assert observed == [payload]
+    assert len(observed) == 1
+    assert not hasattr(observed[0], "campaign_baseline_receipt")
     assert json.loads(capsys.readouterr().out)["status"] == "no_gain"
+
+
+def test_e2e_cli_rejects_removed_release_baseline_option(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "benchmark.yaml"
+    config.write_text(
+        "benchmark: {framework: vllm, model: example/model}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        app._parser().parse_args([
+            "optimize", "e2e", "--config", str(config),
+            "--results", str(tmp_path / "results"),
+            "--release-candidate-receipt", str(tmp_path / "receipt.json"),
+        ])
 
 
 def test_resume_parser_requires_explicit_run_root() -> None:
@@ -278,13 +256,19 @@ def test_resume_parser_requires_explicit_run_root() -> None:
     assert args.run == Path("/tmp/apex-run")
 
 
-def test_resume_requires_current_original_campaign_baseline(capsys) -> None:
+def test_resume_dispatches_without_release_baseline(monkeypatch) -> None:
+    observed = []
+    monkeypatch.setattr(
+        app,
+        "run_resume",
+        lambda args, builder: observed.append((args, builder)) or 0,
+    )
+
     status = app.main(["run", "resume", "--run", "/tmp/apex-run"])
 
-    assert status == 2
-    assert json.loads(capsys.readouterr().err)["reason_code"] == (
-        "campaign_baseline_receipt_required"
-    )
+    assert status == 0
+    assert len(observed) == 1
+    assert not hasattr(observed[0][0], "release_candidate_receipt")
 
 
 def test_pending_attributed_template_fails_before_execution(

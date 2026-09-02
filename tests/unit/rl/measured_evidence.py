@@ -196,9 +196,10 @@ def build_measured_run(
     run_request = artifacts.put_bytes(
         canonical_json_bytes(
             {
-                "schema": "apex.e2e-run-request/v1",
+                "schema": "apex.e2e-run-request/v2",
                 "run_id": run_id,
                 "spec": {"goal": goal},
+                "execution_identity_sha256": "a" * 64,
             }
         ),
         media_type="application/json",

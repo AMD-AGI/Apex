@@ -128,10 +128,8 @@ fall back to self-reported timing.
 Resolved specs retain the original request plus normalized scope, framework,
 version, oracle, budget, delivery, and raw-measurement contract.
 
-`E2EOptimizeSpec.campaign_baseline_receipt` is optional only for CPU preview and
-direct contract fixtures. A formal CLI run supplies the already reconstructed
-`apex.release-candidate-receipt/v2`; intake rechecks its canonical self-digest,
-`baseline_status=ready`, and empty `baseline_blockers`, then preserves the full
-path-free document in `run.request.json` for exact resume comparison. Intake does
-not upgrade final release status or substitute this receipt for workload/image/GPU
-provenance.
+`E2EOptimizeSpec` contains only workload and search intent; release-candidate
+receipts are explicitly rejected as a superseded optimization input. Production
+composition automatically records `apex.execution-identity/v1`, while intake
+continues to preserve workload, image, source, and evaluation contracts without
+granting release authority.

@@ -186,8 +186,7 @@ apex "Optimize this kernel and prove it is faster" --kernel \
 apex optimize kernel \
   --campaign /absolute/path/to/results/campaigns/<campaign-id> \
   --workspace /absolute/path/to/repo --results /absolute/path/to/results \
-  --evaluation-contract-draft-digest <digest-from-campaign.start> \
-  --release-candidate-receipt /absolute/path/to/campaign-baseline.json
+  --evaluation-contract-draft-digest <digest-from-campaign.start>
 ```
 
 The second command revalidates the exact draft and clean repository, then uses
@@ -195,8 +194,9 @@ the same bounded formal optimizer as descriptor-backed tasks. The chat process
 must have exited first; agent text or a tool call cannot confirm the digest.
 `campaign.start` returns this complete command as
 `formal_continuation.argv_template`; clients should render it without guessing
-or dropping arguments. A `ready=false` template names the release-baseline
-blocker that must be resolved first.
+or dropping arguments. Apex automatically records the exact package bytes and
+repository identity that execute the campaign; this observation does not require
+release qualification.
 
 ## Kernel optimization CLI
 
@@ -228,7 +228,6 @@ apex optimize kernel \
   "Optimize the declared kernel on MI355X/gfx950" \
   --template examples/optimization_showcases/kernel_triton_paged_attention_2d \
   --results /absolute/path/to/run \
-  --release-candidate-receipt /absolute/path/to/campaign-baseline.json \
   --backend codex
 ```
 
@@ -240,7 +239,6 @@ apex optimize kernel \
   "Optimize rms_norm in kernels/rms_norm.py for gfx950" \
   --workspace /absolute/path/to/kernel-repo \
   --results /absolute/path/to/run \
-  --release-candidate-receipt /absolute/path/to/campaign-baseline.json \
   --backend codex
 ```
 
@@ -251,7 +249,6 @@ caller-neutral JSON or YAML contract:
 ```bash
 apex optimize kernel \
   --task-spec /absolute/path/to/task.yaml \
-  --release-candidate-receipt /absolute/path/to/campaign-baseline.json \
   --result-json /absolute/path/to/run/result.json
 ```
 
@@ -314,7 +311,6 @@ apex optimize e2e \
   --config /absolute/path/to/Magpie/examples/benchmarks/benchmark.yaml \
   --results /absolute/path/to/apex-run \
   --backend codex \
-  --release-candidate-receipt /absolute/path/to/campaign-baseline.json \
   --gpu-arch gfx950
 ```
 
@@ -443,7 +439,7 @@ measurement, and GPU-lease receipts. See [tests/README.md](tests/README.md).
 The operator sequence and typed receipt ownership are documented in
 [docs/live_qualification_runbook.md](docs/live_qualification_runbook.md).
 
-Release/live baselines additionally use `apex.release-candidate-receipt/v2`.
+Release qualification additionally uses `apex.release-candidate-receipt/v2`.
 `scripts/build_release_candidate_receipt.py` recomputes current Apex Git, lock,
 Magpie 27-config corpus/ledger, lm-eval, and attributed-template identity, then
 joins only explicit fresh-fetch, dependency, CPU-gate, CLI, immutable-image,
@@ -475,11 +471,13 @@ Apex tree. `apex release join-evidence` combines only already validated
 qualification/showcase fragments into a new evidence file; it never manufactures
 or upgrades a live claim.
 
-The same document has a narrower, non-circular `baseline_status`: clean reviewed
-source, exact dependency/runtime verification, the full CPU/static gate, and CLI
-identity can authorize live qualification through `--require-baseline`; images,
-live results, and published showcases are required only by final
-`--require-ready`.
+The same document has a narrower `baseline_status`: clean reviewed source, exact
+dependency/runtime verification, the full CPU/static gate, and CLI identity can
+qualify an experimental result through `--require-baseline`; images, live results,
+and published showcases are required only by final `--require-ready`. Optimization
+does not consume this release document. Each run instead stores
+`apex.execution-identity/v1`, which records the actual Apex package bytes without
+claiming that they passed a release gate.
 
 ## Knowledge and upstream provenance
 

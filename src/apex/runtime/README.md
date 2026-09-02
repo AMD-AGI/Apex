@@ -25,7 +25,8 @@ select a Magpie checkout independently.
 | `ShowcaseEvidence`, `build_showcase_evidence` | `release_showcase.py` | Path-free binding to an official showcase-verifier v2 receipt and all critical projection digests |
 | `ReleaseEvidence` and other typed evidence records | `release_evidence.py` | Path-free fetch, Magpie config resolution, environment, CPU-gate, CLI, image, showcase, and live-qualification inputs |
 | `LocalReleaseEvidenceCollector`, `collect_local_release_evidence` | `release_collection.py` | Clean-tree producer for exact dependency, all-corpus config resolution, fixed CPU/static, and installed-CLI evidence |
-| `ReleaseCandidateReceipt`, `inspect_release_candidate`, `verify_release_candidate_receipt`, `freeze_campaign_baseline`, `freeze_release_candidate` | `release_candidate.py` | Rebuilt baseline/release identity gates; blocked baseline receipts cannot authorize live work |
+| `ReleaseCandidateReceipt`, `inspect_release_candidate`, `verify_release_candidate_receipt`, `freeze_campaign_baseline`, `freeze_release_candidate` | `release_candidate.py` | Rebuilt qualification/release identity gates; not an optimization intake artifact |
+| `ApexExecutionIdentity`, `collect_apex_execution_identity` | `execution_identity.py` | Automatic path-free observation of executed Apex package bytes, Git state, and dependency lock |
 | dependency CLI parser/composition | `dependency_cli.py` | Executable setup/verify surface kept out of the lock domain module |
 | `DependencyReceipt`, `verify_runtime_dependencies` | `receipt.py` | One verified identity consumed by all runtime adapters |
 | `LmEvalRuntimeLock`, `load_lm_eval_runtime_lock` | `lm_eval_lock.py` | Strict source, wheel, base-image, ABI, installed-tree, and evaluator-identity lock |
@@ -253,7 +254,7 @@ explicitly marked non-authoritative for live release claims. `collect-local`
 loads every frozen config through published Magpie main APIs and binds each
 Apex-owned plan/capability receipt plus one self-digested corpus result. Missing
 rows, digest drift, an unavailable public API, or any
-`capability_upgrade_required` blocks the campaign baseline. The exact pin resolves
+`capability_upgrade_required` blocks release qualification. The exact pin resolves
 all 27 configs for identity, while the V2 live product scope is the exact 21
 Docker one-shot entries; the other six remain audited inputs and must return
 `e2e_docker_only` before GPU or agent work. Regenerate a future ledger only with
@@ -329,13 +330,15 @@ The document deliberately has two non-circular gates. `baseline_status` and
 reviewed tip of either remote `main` or a remote `codex/*` qualification ref,
 plus fresh exact dependency/runtime verification (including the clean locked
 Magpie tree), the full CPU/static gate, config resolution, and installed CLI.
-`freeze_campaign_baseline` accepts that state so a reviewed PR commit can produce
-the live evidence needed before merge. Top-level release `status`/`blockers`
+`freeze_campaign_baseline` accepts that state so a reviewed PR commit's experimental
+evidence can be admitted to qualification before merge. Optimization does not
+consume this receipt; it records `apex.execution-identity/v1` and qualification
+must match that recorded tree. Top-level release `status`/`blockers`
 still require exact remote `main` audits for both Apex and Magpie, immutable
 showcase images, all live/independent qualifications, and four published
-showcases. A `codex/*` ref can never authorize final release. Therefore future
-live results are not prerequisites for the runs that produce them, while no run
-can use a stale, dirty, unfetched, or unreviewed software baseline.
+showcases. A `codex/*` ref can never authorize final release. Experimental runs
+may use dirty or unreviewed Apex bytes only with that state recorded explicitly;
+such runs cannot pass release qualification.
 
 Build a truthful snapshot, or verify an existing one:
 

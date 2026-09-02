@@ -37,6 +37,8 @@ _EXPORT_MODULES = {
     "verify_magpie_compatibility_ledger": "magpie_compatibility",
     "DependencyReceipt": "receipt",
     "verify_runtime_dependencies": "receipt",
+    "ApexExecutionIdentity": "execution_identity",
+    "collect_apex_execution_identity": "execution_identity",
     "DownloadLock": "lm_eval_lock",
     "LmEvalRuntimeLock": "lm_eval_lock",
     "EvaluatorDatasetLockFile": "evaluator_lock",

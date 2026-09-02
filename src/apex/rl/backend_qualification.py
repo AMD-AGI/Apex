@@ -86,7 +86,7 @@ class BackendLiveQualificationArtifactVerifier:
             episode.parent.events, result, artifact_set
         )
         _contract_gpu_identity(contract_receipt, artifact_set)
-        apex_tree = _campaign_apex_tree(
+        apex_tree = _execution_apex_tree(
             episode.parent.events, manifest, artifact_set
         )
         agent_identity = _coding_identity(
@@ -240,45 +240,45 @@ def _contract_gpu_identity(
         _reject("Backend qualification contract identity differs")
 
 
-def _campaign_apex_tree(
+def _execution_apex_tree(
     events: Sequence[Any],
     manifest: Mapping[str, Any],
     artifact_set: QualificationArtifactSet,
 ) -> str:
     matches = tuple(
         event for event in events
-        if event.event_type.replace(".", "_") == "dependency_verified"
-        and event.payload.get("kind") == "campaign_baseline"
+        if event.event_type.replace(".", "_") == "provenance_observed"
+        and event.payload.get("kind") == "apex_execution_identity"
     )
     if len(matches) != 1:
-        _reject("Backend qualification lacks one campaign baseline")
-    receipts = _role_receipts(matches[0], "campaign_baseline")
+        _reject("Backend qualification lacks one Apex execution identity")
+    receipts = _role_receipts(matches[0], "apex_execution_identity")
     if len(receipts) != 1:
-        _reject("Backend qualification campaign baseline receipt is missing")
+        _reject("Backend qualification Apex execution identity is missing")
     document = artifact_set.artifacts.read_json(receipts[0])
     internal_digest = document.get("receipt_sha256")
     payload = {key: value for key, value in document.items() if key != "receipt_sha256"}
-    static = _mapping(document.get("static"), "campaign baseline static identity")
-    checkout = _mapping(static.get("apex_checkout"), "campaign baseline Apex checkout")
+    repository = _mapping(document.get("repository"), "Apex execution repository")
+    package = _mapping(document.get("package"), "Apex execution package")
     tree = manifest["apex_tree"]
     expected = {
-        "schema", "baseline_status", "status", "static", "evidence",
-        "qualification_authorities", "baseline_blockers", "blockers",
+        "schema", "repository", "package", "dependency_lock_sha256",
         "receipt_sha256",
     }
     if (
         set(document) != expected
-        or document.get("schema") != "apex.release-candidate-receipt/v2"
+        or document.get("schema") != "apex.execution-identity/v1"
         or internal_digest != sha256_json(payload)
-        or document.get("baseline_status") != "ready"
-        or document.get("baseline_blockers") != []
-        or checkout.get("tree") != tree
-        or checkout.get("clean") is not True
-        or matches[0].payload.get("release_candidate_receipt_sha256")
+        or repository.get("status") != "resolved"
+        or repository.get("tree") != tree
+        or repository.get("dirty_paths") != []
+        or matches[0].payload.get("execution_identity_sha256")
         != internal_digest
         or matches[0].payload.get("apex_tree") != tree
+        or matches[0].payload.get("source_manifest_sha256")
+        != package.get("source_manifest_sha256")
     ):
-        _reject("Backend qualification Apex baseline identity differs")
+        _reject("Backend qualification Apex execution identity differs")
     return str(tree)
 
 
@@ -468,7 +468,7 @@ def _verifier_identity() -> dict[str, object]:
         "schema": VERIFIER_SCHEMA,
         "manifest_schema": MANIFEST_SCHEMA,
         "episode_schema": "apex.episode_graph/v1",
-        "campaign_baseline_schema": "apex.release-candidate-receipt/v2",
+        "execution_identity_schema": "apex.execution-identity/v1",
         "terminal_result_schema": "apex.kernel-terminal-result/v1",
         "agent_transcript_schema": "apex.agent-transcript/v3",
         "agent_invocation_schema": "apex.agent-invocation/v4",

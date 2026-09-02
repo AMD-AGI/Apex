@@ -39,6 +39,7 @@ from tests.support.gpu_evidence import (
     synthetic_gpu_heartbeat,
     synthetic_gpu_lease,
 )
+from tests.support.execution_identity import execution_identity
 
 
 def _git(workspace: Path, *arguments: str) -> None:
@@ -236,28 +237,6 @@ class _AuthorityProvider:
         return user_confirmed_evaluation_authorizer(draft.digest).authorize(draft)
 
 
-@dataclass(frozen=True)
-class _Baseline:
-    receipt_sha256: str = "b" * 64
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "schema": "fixture.release-candidate-baseline/v1",
-            "receipt_sha256": self.receipt_sha256,
-        }
-
-
-def _load_baseline(path: Path) -> _Baseline:
-    try:
-        value = json.loads(path.read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
-        raise ContractError("invalid fixture baseline", "release_identity_invalid") from error
-    expected = _Baseline().to_dict()
-    if value != expected:
-        raise ContractError("invalid fixture baseline", "release_identity_invalid")
-    return _Baseline()
-
-
 class _Measurement:
     adapter_id = "fixture-evaluator-v1"
     measurement_method_sha256 = "1" * 64
@@ -325,13 +304,13 @@ def _registry(
     verifier=None,
     authority_provider=True,
     leases=None,
+    evaluator_identity=None,
+    campaign_identity=None,
 ) -> CapabilityRegistry:
     results.mkdir(parents=True, exist_ok=True)
-    (results / "baseline.json").write_bytes(
-        canonical_json_bytes(_Baseline().to_dict())
-    )
     scope = CapabilityScope(workspace, results)
     selected_leases = leases or _Leases()
+    current_identity = evaluator_identity or execution_identity()
     evaluator = KernelFormalEvaluator(
         verifier=verifier or _Verifier(),  # type: ignore[arg-type]
         gpu_leases=selected_leases,  # type: ignore[arg-type]
@@ -339,7 +318,7 @@ def _registry(
         authority_provider=(
             _AuthorityProvider() if authority_provider else None
         ),
-        baseline_loader=_load_baseline,
+        execution_identity=current_identity,
     )
     handler = KernelEvaluatorHandler(
         scope, KernelFormalCapabilityUseCase(evaluator)
@@ -350,7 +329,9 @@ def _registry(
             registry.register(
                 descriptor,
                 CampaignStartHandler(
-                    scope, KernelCampaignDraftUseCase(), _load_baseline
+                    scope,
+                    KernelCampaignDraftUseCase(),
+                    campaign_identity or current_identity,
                 ),
             )
         elif descriptor.capability_id == "campaign.stop":
@@ -377,7 +358,7 @@ def _invoke(registry, capability_id: str, arguments: dict[str, object]):
     )
 
 
-def _start(registry, *, with_baseline: bool = True) -> dict[str, object]:
+def _start(registry) -> dict[str, object]:
     task = {
         "task_id": "chat-formal",
         "instructions": "Optimize the kernel",
@@ -397,13 +378,10 @@ def _start(registry, *, with_baseline: bool = True) -> dict[str, object]:
             "aggregation": "equal_case",
         },
     }
-    arguments: dict[str, object] = {"task": task}
-    if with_baseline:
-        arguments["release_candidate_receipt"] = "baseline.json"
     return _invoke(
         registry,
         "campaign.start",
-        arguments,
+        {"task": task},
     ).content["campaign"]
 
 
@@ -589,7 +567,7 @@ def test_agent_echo_cannot_mint_formal_authority(tmp_path: Path) -> None:
     assert all(event.event_type != "reward_committed" for event in events)
 
 
-def test_missing_release_baseline_stays_unverified_before_gpu(tmp_path: Path) -> None:
+def test_execution_identity_drift_stays_unverified_before_gpu(tmp_path: Path) -> None:
     workspace, results = tmp_path / "workspace", tmp_path / "results"
     workspace.mkdir()
     (workspace / "kernel.py").write_text("def kernel(x): return x\n")
@@ -601,8 +579,14 @@ def test_missing_release_baseline_stays_unverified_before_gpu(tmp_path: Path) ->
     _git(workspace, "add", "kernel.py", "harness.py")
     _git(workspace, "commit", "--quiet", "-m", "baseline")
     leases = _Leases()
-    registry = _registry(workspace, results, leases=leases)
-    campaign = _start(registry, with_baseline=False)
+    registry = _registry(
+        workspace,
+        results,
+        leases=leases,
+        evaluator_identity=execution_identity(apex_tree="e" * 40),
+        campaign_identity=execution_identity(apex_tree="a" * 40),
+    )
+    campaign = _start(registry)
 
     compiled = _invoke(
         registry,
@@ -613,9 +597,9 @@ def test_missing_release_baseline_stays_unverified_before_gpu(tmp_path: Path) ->
         },
     ).content["receipt"]
 
-    assert campaign["candidate_projection"] is None
+    assert campaign["candidate_projection"] is not None
     assert compiled["status"] == "unverified"
-    assert compiled["reason_code"] == "campaign_baseline_receipt_required"
+    assert compiled["reason_code"] == "resume_execution_identity_mismatch"
     assert leases.calls == 0
 
 

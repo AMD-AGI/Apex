@@ -76,14 +76,13 @@ def test_chat_campaign_handoff_dispatches_without_natural_language_resolution(
             str(tmp_path / "results"),
             "--evaluation-contract-draft-digest",
             "a" * 64,
-            "--release-candidate-receipt",
-            str(tmp_path / "release.json"),
         ]
     )
 
     assert status == 19
     assert len(captured) == 1
     assert captured[0][0].campaign.name == "campaign-1"
+    assert not hasattr(captured[0][0], "release_candidate_receipt")
 
 
 def test_interactive_unresolved_kernel_enters_native_discovery_only(

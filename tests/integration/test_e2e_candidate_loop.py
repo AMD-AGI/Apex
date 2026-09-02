@@ -141,6 +141,7 @@ from apex.storage import (
     SnapshotStore,
 )
 from tests.support.magpie_contract import ResolvedPlanStub
+from tests.support.execution_identity import execution_identity
 from tests.support.gpu_evidence import (
     SyntheticGpuMeasurementGuard,
     clean_gpu_doctor,
@@ -1147,6 +1148,9 @@ def _system(
     receipt = _receipt(tmp_path)
     use_case = E2EOptimizeUseCase(
         dependency_receipt=receipt,
+        execution_identity=execution_identity(
+            dependency_lock_sha256=receipt.lock_sha256
+        ),
         benchmark=benchmark,
         diagnostics=diagnostics,
         provenance=_Provenance(),

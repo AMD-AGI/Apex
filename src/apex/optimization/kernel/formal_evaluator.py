@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from apex.core import ApexError, ContractError, IntegrityError, canonical_json_bytes
+from apex.core import ContractError, IntegrityError, canonical_json_bytes
 from apex.evaluation.safety import (
     PhaseIsolationReceipt,
     SafetyGate,
@@ -17,7 +17,7 @@ from apex.ports import (
     SafetyToolRunRequest,
     SafetyToolRunResult,
 )
-from apex.runtime import GpuLeaseManager, require_gpu_lease_heartbeat
+from apex.runtime import ApexExecutionIdentity, GpuLeaseManager, require_gpu_lease_heartbeat
 from apex.storage import ArtifactReceipt
 
 from .formal_campaign import FormalKernelCampaign
@@ -47,6 +47,7 @@ from .safety_bridge import (
     validate_safety_result,
 )
 from .verification import CandidateVerifier
+from ..execution_identity_recording import recorded_execution_identity_reason
 
 
 class _NoSafetyRuntime:
@@ -64,13 +65,13 @@ class KernelFormalEvaluator:
         gpu_leases: GpuLeaseManager,
         measurement_evaluator: KernelMeasurementPort,
         authority_provider: FormalEvaluationAuthorityProvider | None = None,
-        baseline_loader=None,
+        execution_identity: ApexExecutionIdentity,
     ) -> None:
         self._verifier = verifier
         self._gpu_leases = gpu_leases
         self._measurement_evaluator = measurement_evaluator
         self._authority_provider = authority_provider
-        self._baseline_loader = baseline_loader
+        self._execution_identity = execution_identity
         self._safety_policy = VerificationPolicy.no_tools()
         self._safety_gate = SafetyGate(_NoSafetyRuntime())
 
@@ -81,11 +82,11 @@ class KernelFormalEvaluator:
         confirmed_draft_digest: str,
         requested_devices: str | None,
     ) -> FormalEvaluatorResult:
-        baseline_reason = campaign.revalidate_release_candidate_baseline(
-            self._baseline_loader
+        identity_reason = recorded_execution_identity_reason(
+            campaign.record.artifacts, campaign.record.iter_events(), self._execution_identity
         )
-        if baseline_reason is not None:
-            return _unverified_compile(baseline_reason)
+        if identity_reason is not None:
+            return _unverified_compile(identity_reason)
         contract = campaign.confirm(
             confirmed_draft_digest, self._authority_provider
         )
