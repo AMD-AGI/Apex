@@ -1,0 +1,556 @@
+{
+  "benchmark_tree": "c63881f80146e987d5563b553df233b7cb8ba643",
+  "corpus_manifest_sha256": "5b688fdb232a2a67e7abdcc6269af174ad7062d351b092a1637ece81751b7bbc",
+  "entries": [
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "64c8e144ef63c187bba6c4367d4c9a98463e19c7443d3c1cc2d5f2208f50b796",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "atom",
+      "image_status": "not_applicable",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "8dfed28bba401d41ab69eeed1ed09965f6f7f27bab81001a8ab539f8837e7e87",
+      "path": "examples/benchmarks/benchmark_atom_dsr1.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "local",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "46937bbf2d2e3f2b79592e9aeb745214279c51b1aa5604395f2b5414cea19a92",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "sglang",
+      "image_status": "runtime_selection_required",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "2830c70067c1296d25f03262cdcf35124fc9c155b63fc809434f9436d7b69b0c",
+      "path": "examples/benchmarks/benchmark_inferencex.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "59f10550ae02feda94f8dd392bdd0b7efa8d0fbae327d660d5d6241ce2399924",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "sglang",
+      "image_status": "runtime_selection_required",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "2830c70067c1296d25f03262cdcf35124fc9c155b63fc809434f9436d7b69b0c",
+      "path": "examples/benchmarks/benchmark_sglang_dsr1.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "f992f6cbcb776533d6148a3b0e05c8d8940bc8ce0f108181374054948fa2d384",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "sglang",
+      "image_status": "runtime_selection_required",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "2829efc42f6e9511a96d6ad8c596fd0a25471ee8c04e3aa163975b58bce012ea",
+      "path": "examples/benchmarks/benchmark_sqlang_amd_dsr1_fp4.yaml",
+      "precision": "fp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "42e36d54b60e96fa994c0fa7dc6d04d65290b07f63473eb9b145ad414f323b0e",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "72b46d33d7a179bf703ce6dedc3ceaa3cf0d81eb2a9f096d07a11be6f87ef099",
+      "path": "examples/benchmarks/benchmark_vllm_amd_dsv32_mxfp4.yaml",
+      "precision": "mxfp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "0cb5fc9eab89f0e4e048f42a75f79fcacdb6b406f9f9fcca993c545f5299edbb",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "bb6bf8636b6bdb878154cacd8360e3dfe78461846aebc9bca34e43aa1ef2f66a",
+      "path": "examples/benchmarks/benchmark_vllm_amd_glm51_mxfp4.yaml",
+      "precision": "mxfp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "9ef2c305c590e1c849eb869ef6f807b2cf8a2d9fc9286b24dae98661a794b22b",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "59b8666ae11934806bf37c1548d5746852f544b1acf4e593a2762f4b70223801",
+      "path": "examples/benchmarks/benchmark_vllm_amd_glm5_mxfp4.yaml",
+      "precision": "mxfp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "20e2f5bb47b60da58653b88aa61f503a5db2195135aec616bb62fe6ab5cd57a6",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "4972a10bf4a7afb68fabd875d220ea4c42b2b581dc37c232b1c3d9fe37f893da",
+      "path": "examples/benchmarks/benchmark_vllm_amd_kimi_k2_6_mxfp4.yaml",
+      "precision": "mxfp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "b81f2955f2112834be4c70c877f7df1ef71742e5f7dc9ba27391864653050a07",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "fb0e4d892f7f4594033fa617709b0f4bcd979582f6bc2b7f33c9a870ad512cf1",
+      "path": "examples/benchmarks/benchmark_vllm_amd_kimi_k2_mxfp4.yaml",
+      "precision": "mxfp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "52a95dda1b5e32865aef4155b54a1f3bf54f40b87ffeff303a2e3754308f3a93",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "9c2981c0e364d97b218c2dd2ccc87dd4de11fcfef5bd9d8bd1cae5360344579a",
+      "path": "examples/benchmarks/benchmark_vllm_amd_mini_max_25_mxfp4.yaml",
+      "precision": "mxfp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "b2f55575415324a959d5c04005a6d4d0b7c711ff7683038269ee629f54b9c698",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "d9dc2e9d2a6f67266d6deb43c4c5934f226cbd9dd586bde1a324610754c04698",
+      "path": "examples/benchmarks/benchmark_vllm_deepseek_v4_pro.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "3cff5c292f581af353766bd5af33fdf12bc4465b26b54953fb4ed2c2a09de1fa",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "runtime_selection_required",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "2830c70067c1296d25f03262cdcf35124fc9c155b63fc809434f9436d7b69b0c",
+      "path": "examples/benchmarks/benchmark_vllm_dsr1.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "e7a8fbd5ef1eb4346add0c73459e3a15405c2d2a511c8f5eb0db43575a7f9745",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "not_applicable",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "8dfed28bba401d41ab69eeed1ed09965f6f7f27bab81001a8ab539f8837e7e87",
+      "path": "examples/benchmarks/benchmark_vllm_dsr1_ray.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "ray",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "4a41bd5318deb07345e053052864914a14c33015b5d1d72779fa8b91a79e51aa",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "52d4f10f0d4b88df4f65c3ea975b53ac36bd10c3ec9e66a59b1a01010a0226f0",
+      "path": "examples/benchmarks/benchmark_vllm_dsv32_fp8.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "b918e3935ce31bce49bb7a0bbe87b71c593eeefaeaa9905ce97ad90655e25916",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "e9c5c2111004081d4c5d9f6a7941c03747ca4e1fce2e0bc46246953677652557",
+      "path": "examples/benchmarks/benchmark_vllm_glm51_fp8.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "cfe2e9cfc00e252fff2d56cb49e7b8181469a950a48dac6d75219401e8db0dbf",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "a85a272d4a17186597113a3a7634e32b44542345c6ca8862811b8fe5f0f62e3d",
+      "path": "examples/benchmarks/benchmark_vllm_glm5_fp8.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "4a784dfa2c768cda1200127169cc9577b9fd0e6a600404e3f96eee4bd0a5daf6",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "66e0f11141d9a8ea3b85649d3beb8cacf88046ea45582d26fb19d6474b489882",
+      "path": "examples/benchmarks/benchmark_vllm_gptoss_120b.yaml",
+      "precision": "fp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "7d188a9f134ca528b33558edd4647996c696d17c9c590ed1c7610db875d3fd49",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "c42b75fb14a01f94c001314007fe9b9e0a8c7d523302b978db1511c9bcf405b7",
+      "path": "examples/benchmarks/benchmark_vllm_gptoss_20b.yaml",
+      "precision": "fp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "c5bb006d6b630367215671da0d8e473633687144a9eb698cba225a7fd03c579b",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "83fd774a6d8ddee4d7ecd2564563579cad5030c0d7b49ce0c619b92616b15234",
+      "path": "examples/benchmarks/benchmark_vllm_kimi_k2_6_w4a16_flydsl.yaml",
+      "precision": "w4a16",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "bb9f292e7eb6d17133fe658aba6af4e2282422110634b01fb6ab96c4628f341d",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "not_applicable",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "560184eeb12530bbd24d07a658de53c65f99953eef1e4601e2aedc07fe526015",
+      "path": "examples/benchmarks/benchmark_vllm_kimi_k2_ray.yaml",
+      "precision": "mxfp4",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "ray",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "8d19628d60a0e9017b370fba52996600c8aff14cab74144215efbd9cb2f45f9a",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "4463f15fc4a4240391422dcc8199461d31d16d37029f257267f4c78160b7c674",
+      "path": "examples/benchmarks/benchmark_vllm_mini_max_25_fp8.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "a871e0fdacc2e07417132a3d4d2cf5f4149bd59aadb693daf14663e48d7caa8b",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "2e208414d21f02454f8742892a419175e68f3e9410e1c313c0d81d01eba8dae1",
+      "path": "examples/benchmarks/benchmark_vllm_qwen35_235b_fp8.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "ea77c2b6c98978cad0b288ec2b33694027b20f8c2dadfab0857e6ab992a3c26d",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "mutable_locator",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "e09e7db895b351b34d13b56ae9adc919e257cf17a586a438006b965c705726d4",
+      "path": "examples/benchmarks/benchmark_vllm_qwen3_next_80b_fp8.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "a8d02a004f17293ea502a782a7735eb21786bbdeebcaf73acf6e14b771e89cfd",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "not_applicable",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "aceef6e973733f2314fe675801f4699bea72ca4f7860dc4d6b6efcd30bca2fd2",
+      "path": "examples/benchmarks/benchmark_vllm_qwen3_ray.yaml",
+      "precision": "bf16",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "ray",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "8062438693d82420ba1a0060ddc6108de0e6f782151b784cb84fb3ffeb1ebdd0",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "not_applicable",
+      "lifecycle": "reuse",
+      "model_identity_sha256": "4463f15fc4a4240391422dcc8199461d31d16d37029f257267f4c78160b7c674",
+      "path": "examples/benchmarks/benchmark_vllm_reuse.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "local",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "7129594f742d8f584f27c31628ab4046af333abf65fd32e403f13c274c8434c1",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "not_applicable",
+      "lifecycle": "cleanup",
+      "model_identity_sha256": "4463f15fc4a4240391422dcc8199461d31d16d37029f257267f4c78160b7c674",
+      "path": "examples/benchmarks/benchmark_vllm_reuse_cleanup.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "local",
+      "workflow_qualification": "not_claimed"
+    },
+    {
+      "compatibility_status": "config_compatible",
+      "config_sha256": "15b206a62248528f988e7777257b38af17e8c97b0fa8d50f89ef5b4c05cd259d",
+      "formal_delivery_qualification": "not_claimed",
+      "framework": "vllm",
+      "image_status": "runtime_selection_required",
+      "lifecycle": "one_shot",
+      "model_identity_sha256": "2830c70067c1296d25f03262cdcf35124fc9c155b63fc809434f9436d7b69b0c",
+      "path": "examples/benchmarks/benchmark_vllm_tracelens.yaml",
+      "precision": "fp8",
+      "required_reward_metrics": [
+        "total_token_throughput",
+        "ttft_p99",
+        "tpot_p99",
+        "quality"
+      ],
+      "reward_policy_id": "e2e_throughput_qos_v1",
+      "run_mode": "docker",
+      "workflow_qualification": "not_claimed"
+    }
+  ],
+  "ledger_sha256": "438e057b7a373f5e286978737dca14a8da02e1e5507cf1454536a559f91eef72",
+  "magpie_commit": "12896a49a731ad72c791b7a23abcef7a0d6c4487",
+  "schema": "apex.magpie-config-compatibility/v1",
+  "summary": {
+    "capability_upgrade_required": 0,
+    "config_compatible": 27,
+    "config_count": 27,
+    "formal_delivery_qualified": 0,
+    "workflow_qualified": 0
+  }
+}

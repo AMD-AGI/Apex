@@ -1,0 +1,121 @@
+{
+  "benchmark_tree": "c63881f80146e987d5563b553df233b7cb8ba643",
+  "commit": "12896a49a731ad72c791b7a23abcef7a0d6c4487",
+  "files": [
+    {
+      "path": "examples/benchmarks/benchmark_atom_dsr1.yaml",
+      "sha256": "64c8e144ef63c187bba6c4367d4c9a98463e19c7443d3c1cc2d5f2208f50b796"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_inferencex.yaml",
+      "sha256": "46937bbf2d2e3f2b79592e9aeb745214279c51b1aa5604395f2b5414cea19a92"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_sglang_dsr1.yaml",
+      "sha256": "59f10550ae02feda94f8dd392bdd0b7efa8d0fbae327d660d5d6241ce2399924"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_sqlang_amd_dsr1_fp4.yaml",
+      "sha256": "f992f6cbcb776533d6148a3b0e05c8d8940bc8ce0f108181374054948fa2d384"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_amd_dsv32_mxfp4.yaml",
+      "sha256": "42e36d54b60e96fa994c0fa7dc6d04d65290b07f63473eb9b145ad414f323b0e"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_amd_glm51_mxfp4.yaml",
+      "sha256": "0cb5fc9eab89f0e4e048f42a75f79fcacdb6b406f9f9fcca993c545f5299edbb"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_amd_glm5_mxfp4.yaml",
+      "sha256": "9ef2c305c590e1c849eb869ef6f807b2cf8a2d9fc9286b24dae98661a794b22b"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_amd_kimi_k2_6_mxfp4.yaml",
+      "sha256": "20e2f5bb47b60da58653b88aa61f503a5db2195135aec616bb62fe6ab5cd57a6"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_amd_kimi_k2_mxfp4.yaml",
+      "sha256": "b81f2955f2112834be4c70c877f7df1ef71742e5f7dc9ba27391864653050a07"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_amd_mini_max_25_mxfp4.yaml",
+      "sha256": "52a95dda1b5e32865aef4155b54a1f3bf54f40b87ffeff303a2e3754308f3a93"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_deepseek_v4_pro.yaml",
+      "sha256": "b2f55575415324a959d5c04005a6d4d0b7c711ff7683038269ee629f54b9c698"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_dsr1.yaml",
+      "sha256": "3cff5c292f581af353766bd5af33fdf12bc4465b26b54953fb4ed2c2a09de1fa"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_dsr1_ray.yaml",
+      "sha256": "e7a8fbd5ef1eb4346add0c73459e3a15405c2d2a511c8f5eb0db43575a7f9745"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_dsv32_fp8.yaml",
+      "sha256": "4a41bd5318deb07345e053052864914a14c33015b5d1d72779fa8b91a79e51aa"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_glm51_fp8.yaml",
+      "sha256": "b918e3935ce31bce49bb7a0bbe87b71c593eeefaeaa9905ce97ad90655e25916"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_glm5_fp8.yaml",
+      "sha256": "cfe2e9cfc00e252fff2d56cb49e7b8181469a950a48dac6d75219401e8db0dbf"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_gptoss_120b.yaml",
+      "sha256": "4a784dfa2c768cda1200127169cc9577b9fd0e6a600404e3f96eee4bd0a5daf6"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_gptoss_20b.yaml",
+      "sha256": "7d188a9f134ca528b33558edd4647996c696d17c9c590ed1c7610db875d3fd49"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_kimi_k2_6_w4a16_flydsl.yaml",
+      "sha256": "c5bb006d6b630367215671da0d8e473633687144a9eb698cba225a7fd03c579b"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_kimi_k2_ray.yaml",
+      "sha256": "bb9f292e7eb6d17133fe658aba6af4e2282422110634b01fb6ab96c4628f341d"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_mini_max_25_fp8.yaml",
+      "sha256": "8d19628d60a0e9017b370fba52996600c8aff14cab74144215efbd9cb2f45f9a"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_qwen35_235b_fp8.yaml",
+      "sha256": "a871e0fdacc2e07417132a3d4d2cf5f4149bd59aadb693daf14663e48d7caa8b"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_qwen3_next_80b_fp8.yaml",
+      "sha256": "ea77c2b6c98978cad0b288ec2b33694027b20f8c2dadfab0857e6ab992a3c26d"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_qwen3_ray.yaml",
+      "sha256": "a8d02a004f17293ea502a782a7735eb21786bbdeebcaf73acf6e14b771e89cfd"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_reuse.yaml",
+      "sha256": "8062438693d82420ba1a0060ddc6108de0e6f782151b784cb84fb3ffeb1ebdd0"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_reuse_cleanup.yaml",
+      "sha256": "7129594f742d8f584f27c31628ab4046af333abf65fd32e403f13c274c8434c1"
+    },
+    {
+      "path": "examples/benchmarks/benchmark_vllm_tracelens.yaml",
+      "sha256": "15b206a62248528f988e7777257b38af17e8c97b0fa8d50f89ef5b4c05cd259d"
+    }
+  ],
+  "manifest_sha256": "5b688fdb232a2a67e7abdcc6269af174ad7062d351b092a1637ece81751b7bbc",
+  "repository": "https://github.com/AMD-AGI/Magpie.git",
+  "repository_tree": "01031c456c273493bc14ce487c0a6436be00f35b",
+  "schema": "apex.magpie-benchmark-corpus/v1",
+  "summary": {
+    "config_count": 27
+  }
+}

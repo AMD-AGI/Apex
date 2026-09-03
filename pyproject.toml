@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amd-apex-optimizer"
+version = "0.1.0"
+description = "Evidence-driven RL environment for AMD GPU kernel optimization"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = [
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+  "tools/perf_knowledge/LICENSE.upstream",
+  "examples/optimization_showcases/*/template/LICENSE.agent-kernel-arena",
+]
+authors = [{ name = "Advanced Micro Devices, Inc." }]
+dependencies = [
+  "mcp>=1.27,<2",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+]
+
+[project.scripts]
+apex = "apex.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"apex.knowledge" = [
+  "data/cards.json",
+  "data/LICENSE.GEAK-Apache-2.0",
+  "data/THIRD_PARTY_NOTICES.md",
+]
+"apex.intake" = ["data/kernel_template_registry.json"]
+"apex.execution" = [
+  "plugins/apex-amd-kernel/.codex-plugin/plugin.json",
+  "plugins/apex-amd-kernel/.claude-plugin/plugin.json",
+  "plugins/apex-amd-kernel/skills/*/SKILL.md",
+  "plugins/apex-amd-kernel/skills/*/agents/openai.yaml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "gpu: requires an AMD GPU",
+  "live: invokes a real agent or external workload",
+  "integration: crosses module or process boundaries",
+]

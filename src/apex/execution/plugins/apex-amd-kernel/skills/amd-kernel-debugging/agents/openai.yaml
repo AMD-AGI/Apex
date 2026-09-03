@@ -1,0 +1,4 @@
+interface:
+  display_name: "AMD Kernel Debugging"
+  short_description: "Diagnose AMD kernel failures with typed evidence"
+  default_prompt: "Use $amd-kernel-debugging to diagnose this AMD GPU kernel failure."

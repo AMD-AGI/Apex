@@ -1,28 +1,43 @@
-# Security Policy
+# Security policy
 
-## Reporting a Vulnerability
+## Report a vulnerability
 
-**Do not open a public GitHub issue.** Report privately via one of:
+Do not open a public issue. Report privately through one of these channels:
 
-- **GitHub Private Vulnerability Reporting:** [Report a vulnerability](https://github.com/AMD-AGI/Apex/security/advisories/new)
-- **AMD Product Security portal:** https://www.amd.com/en/resources/product-security.html
+- [GitHub Private Vulnerability Reporting](https://github.com/AMD-AGI/Apex/security/advisories/new)
+- [AMD Product Security](https://www.amd.com/en/resources/product-security.html)
 
-Please include: description and impact, steps to reproduce, and affected versions or commits.
-
-We aim to acknowledge reports within 1 business day.
+Include the affected revision, impact, reproduction steps, and any relevant redacted
+receipts. Do not include API keys, model credentials, private workload data, or an
+unnecessary weaponized GPU kernel.
 
 ## Scope
 
-This policy covers code and configuration in this repository — the Apex RL training environment, kernel-optimization pipeline (`workload_optimizer.py`, `eval.py`), MCP servers and tools under `tools/`, agent integrations under `agents/`, graders under `graders/`, and the `setup.sh` installer.
+This policy covers the Apex Python package, CLI and bootstrap scripts, static
+knowledge-card build, agent execution adapters, supervised command execution,
+benchmark/trace adapters, safety policy, event and artifact storage, RL export, and
+kernel/E2E bundle delivery.
 
-Because Apex orchestrates third-party LLM coding agents (Claude Code, OpenAI Codex, Cursor Agent), runs MCP servers, downloads ROCm source code and AMD documentation at setup time, and executes the kernel code that agents produce, please flag any of the following privately:
+High-value properties include:
 
-- Sandbox escape from agent execution or the kernel grader
-- Credential leakage through prompts, logs, MCP server traffic, or generated code
-- Supply-chain risk from `setup.sh` downloads (ROCm source repos, AMD docs, agent CLIs, Magpie clone)
-- Hot-patching of `site-packages` performing unexpected mutations outside the intended kernel files
-- Resource-exhaustion or denial-of-service against the host runner
+- agent code and advisory knowledge cannot redefine trusted commands or evaluator
+  policy;
+- subprocesses are fixed argv with bounded time/output and confined workspaces;
+- editable paths, measurement destinations, artifacts, and bundles resist path
+  escape, symlink/hardlink substitution, and time-of-check/time-of-use changes;
+- event history and content-addressed artifacts detect mutation or causal forks;
+- raw timing, correctness, safety, and reward evidence cannot be forged from agent
+  text or command stdout;
+- E2E patches cannot alter protected benchmark semantics or claim stronger
+  provenance/validation than the receipts prove;
+- secrets and private/held-out episodes do not enter exported training data;
+- dependency bootstrap uses exact reviewed commits and detects split import roots.
 
-For issues in the upstream agent CLIs (Claude Code, Codex, Cursor Agent), model providers (Anthropic, OpenAI, Cursor), or third-party dependencies (Magpie, vLLM, Triton, ROCm libraries), report to those vendors directly.
+Please also report credential leakage, sandbox/container escape, unsafe source-build
+recipes, malicious dependency/knowledge content, unauthorized host mutation, bundle
+verification bypass, or denial-of-service against shared GPU runners.
 
-For AMD product issues unrelated to this repo, use the [AMD Product Security portal](https://www.amd.com/en/resources/product-security.html).
+Issues in Codex, Claude, Cursor, Docker, ROCm, Magpie, TraceLens, vLLM, SGLang,
+PyTorch, Triton, or another upstream project should be reported to that vendor as
+well. AMD product issues unrelated to Apex belong at the AMD Product Security link
+above.

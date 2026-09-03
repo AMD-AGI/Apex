@@ -1,0 +1,588 @@
+"""Deterministic JSON/JSONL/SFT export from an :class:`EpisodeGraph`."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+from apex.core import ContractError, IntegrityError, canonical_json_bytes, sha256_bytes
+from apex.evaluation import GateVerdict, kernel_reward
+from apex.storage import ArtifactReceipt, ArtifactStore
+
+from .e2e_validation import allows_source_free_e2e, validate_e2e_export_reward
+from .export_sanitization import (
+    HOST_PATH_POLICY,
+    encode_public_artifact,
+    redact_host_paths,
+    summarize_export,
+)
+from .models import CandidateEpisode, EpisodeArtifact, EpisodeGraph, SemanticRole
+
+
+_SECRET_KEY = re.compile(r"(?:api[_-]?key|authorization|password|secret|access[_-]?token)$", re.I)
+_SECRET_NAME = (
+    r"(?:[A-Za-z0-9]+[_-])*"
+    r"(?:api[_-]?key|authorization|password|secret|access[_-]?token)"
+)
+_SECRET_TEXT = re.compile(
+    r"(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|"
+    r"github_pat_[A-Za-z0-9_]{16,}|Bearer\s+[A-Za-z0-9._~+/-]{16,}|"
+    r"https?://[^\s/@:]+:[^\s/@]+@)"
+)
+_SECRET_VALUE = (
+    r'(?:"[^"\r\n]{4,512}"|'
+    r"'[^'\r\n]{4,512}'|"
+    r"[A-Za-z0-9._~+/@=\[\]-]{4,512})"
+)
+_SECRET_QUOTED_FIELD = re.compile(
+    rf'''^[ \t]*(?:"{_SECRET_NAME}"|'{_SECRET_NAME}')[ \t]*[:=][ \t]*'''
+    rf"(?P<value>{_SECRET_VALUE})[ \t]*(?:$|[,#;}}])",
+    re.I | re.M,
+)
+_SECRET_LINE_ASSIGNMENT = re.compile(
+    rf"^[ \t]*(?:export[ \t]+)?{_SECRET_NAME}[ \t]*[:=][ \t]*"
+    rf"(?P<value>{_SECRET_VALUE})[ \t]*(?:$|[#;])",
+    re.I | re.M,
+)
+_SECRET_OPTION = re.compile(
+    rf"(?:^|\s)--{_SECRET_NAME}(?:=|\s+)(?P<value>{_SECRET_VALUE})(?=$|\s)",
+    re.I,
+)
+_SECRET_OPTION_NAME = re.compile(rf"--{_SECRET_NAME}", re.I)
+_NON_SECRET_SENTINELS = frozenset({"", "[redacted]", "empty"})
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetExportConfig:
+    """Frozen selection and failure policy for one export batch."""
+
+    split: str | None = None
+    policy_id: str | None = None
+    on_incomplete: str = "fail"
+    include_sft: bool = True
+    exporter_version: str = "apex_rl_export_v3"
+
+    def __post_init__(self) -> None:
+        if self.on_incomplete not in {"fail", "skip"}:
+            raise ContractError("Invalid incomplete policy", "invalid_export_policy")
+        if self.split is not None and self.split not in {"train", "validation", "heldout"}:
+            raise ContractError("Invalid dataset split", "invalid_export_split")
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetExportResult:
+    output_dir: Path
+    record_count: int
+    sft_count: int
+    skipped: tuple[Mapping[str, str], ...]
+    dataset_sha256: str
+    manifest_sha256: str
+
+
+class DatasetExporter:
+    """A read-only graph/CAS consumer; no event writer exists here."""
+
+    def __init__(self, artifacts: ArtifactStore) -> None:
+        self._artifacts = artifacts
+
+    def export(
+        self,
+        graph: EpisodeGraph,
+        output_dir: Path,
+        *,
+        config: DatasetExportConfig | None = None,
+    ) -> DatasetExportResult:
+        chosen = config or DatasetExportConfig()
+        _validate_export_partition(graph, chosen)
+        parent_document = redact_host_paths(graph.parent.to_dict())
+        _reject_secrets(parent_document)
+        records, sft, skipped = self._select_records(graph, chosen)
+        payloads = _dataset_payloads(parent_document, records, sft, skipped, chosen)
+        manifest = _dataset_manifest(graph, records, payloads, chosen)
+        payloads["export_manifest.json"] = canonical_json_bytes(manifest)
+        output_dir = Path(output_dir)
+        _write_files(output_dir, payloads)
+        jsonl = payloads["dataset.jsonl"]
+        return DatasetExportResult(
+            output_dir=output_dir,
+            record_count=len(records),
+            sft_count=len(sft),
+            skipped=tuple(skipped),
+            dataset_sha256=sha256_bytes(jsonl),
+            manifest_sha256=sha256_bytes(payloads["export_manifest.json"]),
+        )
+
+    def _select_records(
+        self, graph: EpisodeGraph, chosen: DatasetExportConfig
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]]:
+        records: list[dict[str, Any]] = []
+        sft: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        for child in graph.children:
+            reason = self._selection_reason(child, chosen)
+            if reason is not None:
+                if chosen.on_incomplete == "fail" and reason not in {
+                    "split_filtered",
+                    "policy_filtered",
+                }:
+                    raise ContractError(
+                        f"Episode {child.attempt_id} cannot be exported: {reason}",
+                        "episode_export_incomplete",
+                        {"attempt_id": child.attempt_id, "reason": reason},
+                    )
+                skipped.append({"attempt_id": child.attempt_id, "reason": reason})
+                continue
+            record, candidate_text = self._record(graph, child, chosen.exporter_version)
+            records.append(record)
+            if chosen.include_sft and child.verdict == "keep" and candidate_text is not None:
+                sft.append(self._sft_record(record, candidate_text))
+        if not records:
+            raise ContractError("Dataset filter produced no records", "empty_dataset_export")
+        records.sort(key=lambda item: (item["parent_episode_id"], item["attempt_id"]))
+        sft.sort(key=lambda item: item["episode_id"])
+        return records, sft, skipped
+
+    def _selection_reason(
+        self, child: CandidateEpisode, config: DatasetExportConfig
+    ) -> str | None:
+        if config.split is not None and child.split != config.split:
+            return "split_filtered"
+        if (
+            config.policy_id is not None
+            and child.policy_ids
+            and config.policy_id not in child.policy_ids
+        ):
+            return "policy_filtered"
+        if child.trainability != "complete":
+            return ",".join(child.validation_reasons) or "episode_truncated"
+        return None
+
+    def _record(
+        self,
+        graph: EpisodeGraph,
+        child: CandidateEpisode,
+        exporter_version: str,
+    ) -> tuple[dict[str, Any], str | None]:
+        if child.context_packet_receipt is None:
+            raise IntegrityError("ContextPacket receipt is missing", "context_packet_missing")
+        context_bytes = self._artifacts.read_bytes(child.context_packet_receipt)
+        try:
+            observation = json.loads(context_bytes)
+        except json.JSONDecodeError as error:
+            raise IntegrityError("ContextPacket is not JSON", "invalid_context_packet_artifact") from error
+        _reject_secrets(observation)
+        artifact_values, candidate_text = self._materialize_artifacts(child)
+        events = redact_host_paths([event.to_dict() for event in child.events])
+        _reject_secrets(events)
+        self._validate_reward(graph, child)
+        roles: dict[str, list[Mapping[str, Any]]] = {}
+        for item in artifact_values:
+            roles.setdefault(str(item["role"]), []).append(item)
+        record = {
+            "schema_name": "apex.rl_transition",
+            "schema_version": 1,
+            "exporter_version": exporter_version,
+            "episode_id": child.episode_id,
+            "parent_episode_id": child.parent_episode_id,
+            "run_id": graph.run_id,
+            "attempt_id": child.attempt_id,
+            "candidate_id": child.candidate_id,
+            "opportunity_id": child.opportunity_id,
+            "task_id": child.task_id,
+            "kernel_id": child.kernel_id,
+            "state_generation": child.state_generation,
+            "anchor_generation": child.anchor_generation,
+            "causal_event_ids": [event.event_id for event in child.events],
+            "observation": {
+                "context_packet_id": child.context_packet_id,
+                "receipt": child.context_packet_receipt.to_dict(),
+                "content": redact_host_paths(observation),
+            },
+            "observations": _events_with_roles(child, {SemanticRole.OBSERVATION}),
+            "actions": _events_with_roles(child, {SemanticRole.ACTION}),
+            "tools": _events_with_roles(child, {SemanticRole.TOOL}),
+            "outcomes": _events_with_roles(child, {SemanticRole.OUTCOME}),
+            "decisions": _events_with_roles(child, {SemanticRole.DECISION}),
+            "reward": {
+                "scalar": child.scalar_reward,
+                "vector": dict(child.reward_vector) if child.reward_vector else None,
+                "policy_ids": list(child.policy_ids),
+            },
+            "costs": {
+                "events": _events_with_roles(child, {SemanticRole.COST}),
+                "reward_component": (
+                    child.reward_vector.get("cost")
+                    if child.reward_vector is not None
+                    else None
+                ),
+            },
+            "failures": _events_with_roles(child, {SemanticRole.FAILURE}),
+            "artifacts_by_role": {key: roles[key] for key in sorted(roles)},
+            "provenance": redact_host_paths(dict(graph.provenance)),
+            "termination": {"status": child.status, "verdict": child.verdict},
+            "split": child.split,
+            "visibility": child.visibility,
+        }
+        return record, candidate_text
+
+    def _materialize_artifacts(
+        self, child: CandidateEpisode
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        unique: dict[tuple[str, str], EpisodeArtifact] = {}
+        for event in child.events:
+            for artifact in event.artifacts:
+                unique.setdefault((artifact.role, artifact.receipt.digest), artifact)
+        values: list[dict[str, Any]] = []
+        candidate_parts: list[str] = []
+        for (role, _), artifact in sorted(unique.items()):
+            content = self._artifacts.read_bytes(artifact.receipt)
+            _reject_artifact_secrets(content, artifact.receipt.media_type)
+            encoding, body, redaction_policy = encode_public_artifact(
+                content, artifact.receipt
+            )
+            value = {
+                "role": role,
+                "receipt": artifact.receipt.to_dict(),
+                "encoding": encoding,
+                "content": body,
+                "redaction_policy_id": redaction_policy,
+                "export_sha256": sha256_bytes(
+                    body.encode("utf-8") if encoding == "utf-8" else content
+                ),
+            }
+            values.append(value)
+            if role in {
+                "candidate",
+                "candidate_patch",
+                "candidate_source",
+                "solution",
+            } and encoding == "utf-8":
+                if not body.strip():
+                    raise IntegrityError("Candidate artifact is empty", "empty_candidate_artifact")
+                candidate_parts.append(
+                    f"# artifact role={role} sha256={artifact.receipt.digest}\n{body}"
+                )
+        candidate_text = "\n\n".join(candidate_parts) if candidate_parts else None
+        if (
+            child.status != "infrastructure_error"
+            and candidate_text is None
+            and not allows_source_free_e2e(child)
+        ):
+            raise IntegrityError("Real textual candidate is missing", "candidate_artifact_missing")
+        return values, candidate_text
+
+    def _validate_reward(
+        self,
+        graph: EpisodeGraph,
+        child: CandidateEpisode,
+    ) -> None:
+        if not child.policy_ids:
+            return
+        if "e2e_throughput_qos_v1" in child.policy_ids:
+            validate_e2e_export_reward(graph, child, self._artifacts)
+            return
+        if "kernel_robust_v1" not in child.policy_ids:
+            return
+        vector = child.reward_vector
+        if vector is None:
+            raise IntegrityError("Kernel reward vector is missing", "reward_vector_missing")
+        try:
+            safety = vector.get("safety", {})
+            if not isinstance(safety, Mapping):
+                raise TypeError("safety")
+            gates = GateVerdict(
+                compiled=bool(vector["compile"]),
+                correct=bool(vector["correctness"]),
+                integrity_passed=bool(vector["integrity"]),
+                tampering_passed=bool(vector["anti_tampering"]),
+                safety_finding=bool(safety.get("finding", False)),
+            )
+            srobust_value = vector.get("kernel_srobust")
+            expected = kernel_reward(
+                gates, None if srobust_value is None else float(srobust_value)
+            )
+            recorded = vector.get("kernel_robust_reward", child.scalar_reward)
+            if expected is None and recorded is None:
+                return
+            if expected is None or recorded is None or abs(float(recorded) - expected) > 1e-9:
+                raise ValueError("reward mismatch")
+        except (KeyError, TypeError, ValueError) as error:
+            raise IntegrityError(
+                "Stored kernel reward cannot be exactly replayed",
+                "reward_replay_mismatch",
+            ) from error
+
+    @staticmethod
+    def _sft_record(record: Mapping[str, Any], candidate_text: str) -> dict[str, Any]:
+        return {
+            "schema_name": "apex.sft_pair",
+            "schema_version": 1,
+            "episode_id": record["episode_id"],
+            "task_id": record["task_id"],
+            "prompt": canonical_json_bytes(record["observation"]["content"]).decode(),
+            "response": candidate_text,
+            "policy_ids": record["reward"]["policy_ids"],
+            "split": record["split"],
+        }
+
+
+def _validate_export_partition(
+    graph: EpisodeGraph, config: DatasetExportConfig
+) -> None:
+    private = tuple(
+        child.attempt_id
+        for child in graph.children
+        if child.visibility != "public" or child.split == "heldout"
+    )
+    if private:
+        raise ContractError(
+            "Private episode evidence cannot enter a public dataset export",
+            "private_dataset_evidence",
+            {"attempt_ids": private},
+        )
+    if len(graph.policy_ids) > 1 and config.policy_id is None:
+        raise ContractError(
+            "Mixed reward policies require an explicit export partition",
+            "mixed_reward_policy_export",
+        )
+
+
+def _dataset_payloads(
+    parent: Mapping[str, Any],
+    records: list[dict[str, Any]],
+    sft: list[dict[str, Any]],
+    skipped: list[dict[str, str]],
+    config: DatasetExportConfig,
+) -> dict[str, bytes]:
+    jsonl = b"".join(canonical_json_bytes(item) + b"\n" for item in records)
+    sft_jsonl = b"".join(canonical_json_bytes(item) + b"\n" for item in sft)
+    document = {
+        "schema_name": "apex.rl_dataset",
+        "schema_version": 2,
+        "exporter_version": config.exporter_version,
+        "parent_episode": parent,
+        "records": records,
+    }
+    validation = {
+        "schema_name": "apex.rl_dataset_validation",
+        "schema_version": 2,
+        "valid": True,
+        "record_count": len(records),
+        "sft_count": len(sft),
+        "skipped": skipped,
+        "quality_gates": {
+            "schema_validation_pct": 100,
+            "placeholder_solution_count": 0,
+            "secret_count": 0,
+            "missing_artifact_count": 0,
+            "stdout_transition_recovery_count": 0,
+        },
+    }
+    return {
+        "dataset.json": canonical_json_bytes(document),
+        "dataset.jsonl": jsonl,
+        "parent_episode.json": canonical_json_bytes(parent),
+        "sft.jsonl": sft_jsonl,
+        "validation_report.json": canonical_json_bytes(validation),
+    }
+
+
+def _dataset_manifest(
+    graph: EpisodeGraph,
+    records: list[dict[str, Any]],
+    payloads: Mapping[str, bytes],
+    config: DatasetExportConfig,
+) -> dict[str, Any]:
+    return {
+        "schema_name": "apex.rl_dataset_manifest",
+        "schema_version": 2,
+        "exporter_version": config.exporter_version,
+        "episode_graph_id": graph.graph_id,
+        "episode_graph_sha256": sha256_bytes(graph.canonical_bytes),
+        "run_id": graph.run_id,
+        "high_water_mark": graph.high_water_mark,
+        "policy_ids": sorted(
+            {
+                policy
+                for record in records
+                for policy in record["reward"]["policy_ids"]
+            }
+        ),
+        "split_filter": config.split,
+        "policy_filter": config.policy_id,
+        "visibility_policy": {
+            "policy_id": "public_episode_only_fail_closed_v1",
+            "summary": (
+                "Only public episode evidence is exportable; private and "
+                "heldout_private evidence aborts the entire export."
+            ),
+        },
+        "redaction_policy": {
+            "policy_id": HOST_PATH_POLICY,
+            "summary": (
+                "Credentials abort export; private host absolute paths are "
+                "deterministically replaced while original CAS receipts remain bound."
+            ),
+        },
+        "license_policy": {
+            "policy_id": "source_terms_preserved_no_relicense_v1",
+            "summary": (
+                "The export does not relicense source or evidence; consumers must "
+                "honor the licenses attached to the originating run and artifacts."
+            ),
+        },
+        "retention_policy": {
+            "policy_id": "manifest_bound_export_retention_v1",
+            "summary": (
+                "All exported projections are retained as one immutable digest-bound "
+                "inventory; original evaluator evidence remains in the source CAS."
+            ),
+        },
+        "summary": summarize_export(records),
+        "files": {
+            name: sha256_bytes(content) for name, content in sorted(payloads.items())
+        },
+    }
+
+
+def _events_with_roles(
+    child: CandidateEpisode, roles: set[SemanticRole]
+) -> list[dict[str, Any]]:
+    return redact_host_paths(
+        [event.to_dict() for event in child.events if event.semantic_role in roles]
+    )
+
+
+def _reject_artifact_secrets(content: bytes, media_type: str) -> None:
+    text = content.decode("utf-8", errors="ignore")
+    if _SECRET_TEXT.search(text):
+        _raise_secret_detected()
+    if media_type == "application/json":
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            _reject_secret_text(text)
+        else:
+            _reject_secrets(value)
+        return
+    if media_type == "application/x-ndjson":
+        for line in text.split("\n"):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                _reject_secret_text(line)
+            else:
+                _reject_secrets(value)
+        return
+    _reject_secret_text(text)
+
+
+def _reject_secrets(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if _SECRET_KEY.search(str(key)) and not _is_non_secret_sentinel(item):
+                _raise_secret_detected(field=True)
+            _reject_secrets(item)
+        return
+    if isinstance(value, (list, tuple)):
+        _reject_secret_option_sequence(value)
+        for item in value:
+            _reject_secrets(item)
+        return
+    if isinstance(value, str):
+        _reject_secret_text(value)
+
+
+def _reject_secret_text(value: str) -> None:
+    if _SECRET_TEXT.search(value):
+        _raise_secret_detected()
+    _reject_json_document_secrets(value)
+    for pattern in (
+        _SECRET_QUOTED_FIELD,
+        _SECRET_LINE_ASSIGNMENT,
+        _SECRET_OPTION,
+    ):
+        for match in pattern.finditer(value):
+            if not _is_non_secret_sentinel(match.group("value")):
+                _raise_secret_detected()
+
+
+def _reject_json_document_secrets(value: str) -> None:
+    candidate = value.strip()
+    if len(candidate) < 2 or candidate[0] not in "[{":
+        return
+    try:
+        document = json.loads(candidate)
+    except json.JSONDecodeError:
+        return
+    if isinstance(document, (Mapping, list)):
+        _reject_secrets(document)
+
+
+def _reject_secret_option_sequence(value: Sequence[Any]) -> None:
+    for option, argument in zip(value, value[1:]):
+        if not isinstance(option, str) or not isinstance(argument, str):
+            continue
+        if not _SECRET_OPTION_NAME.fullmatch(option.strip()):
+            continue
+        normalized = _normalized_secret_scalar(argument)
+        if len(normalized) >= 4 and normalized not in _NON_SECRET_SENTINELS:
+            _raise_secret_detected()
+
+
+def _is_non_secret_sentinel(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    return _normalized_secret_scalar(value) in _NON_SECRET_SENTINELS
+
+
+def _normalized_secret_scalar(value: str) -> str:
+    normalized = value.strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"\"", "'"}
+    ):
+        normalized = normalized[1:-1]
+    return normalized.casefold()
+
+
+def _raise_secret_detected(*, field: bool = False) -> None:
+    message = (
+        "Dataset contains a secret field"
+        if field
+        else "Dataset contains secret-like content"
+    )
+    raise IntegrityError(message, "dataset_secret_detected")
+
+
+def _write_files(output_dir: Path, files: Mapping[str, bytes]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name, content in sorted(files.items()):
+        descriptor, temporary_name = tempfile.mkstemp(dir=output_dir, prefix=f".{name}.")
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, output_dir / name)
+        finally:
+            temporary.unlink(missing_ok=True)
+    descriptor = os.open(output_dir, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+__all__ = ["DatasetExportConfig", "DatasetExportResult", "DatasetExporter"]
