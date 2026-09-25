@@ -1,86 +1,80 @@
 # Contributing to Apex
 
-Thanks for your interest in Apex! This guide explains how to contribute, report issues, and submit changes.
+Thank you for improving Apex. Changes should strengthen the evidence-driven kernel
+optimizer and RL environment while preserving its module boundaries and fail-closed
+evaluation model.
 
-## Before You Start
-
-- Read `README.md` to understand the project scope, pipeline stages (benchmark → identify → optimize → grade → integrate → score), and usage.
-- Review `AGENTS.md` and `CLAUDE.md` for agent-specific conventions if you plan to work on the LLM-agent integration.
-- Ensure you have a supported GPU environment (AMD Instinct GPU with ROCm 6.x+ for real kernel grading), or run CPU-only eval.
-- Confirm you have access to at least one supported agent CLI (Claude Code, OpenAI Codex, or Cursor Agent) if your change touches the agent pipeline.
-
-## Development Setup
+## Development setup
 
 ```bash
-# Interactive setup — creates .venv, installs Python deps, ROCm PyTorch, Triton, MCP servers, Magpie, etc.
-bash setup.sh
-
-# Non-interactive (auto-detect CLIs, accept defaults)
-bash setup.sh --non-interactive
-
-# Activate the venv and export Magpie root
+git switch -c your-branch
+./setup.sh
 source .venv/bin/activate
-export MAGPIE_ROOT=$(pwd)/tools/magpie
+apex dependencies verify --json
 ```
 
-## Workflow
+For CPU-only work that does not exercise Magpie or TraceLens, install with
+`.venv/bin/pip install -e '.[dev]'`. Do not substitute unpinned external checkouts in
+test evidence.
 
-1. Create a new branch from `main`.
-2. Keep changes focused and scoped.
-3. Run tests before submitting:
+## Before opening a change
+
+- Keep behavior in the module that owns the policy; `apex.bootstrap` is the sole
+  concrete composition root.
+- Keep source files at most 600 lines and functions at most 80 lines.
+- Use immutable typed contracts at boundaries and supervised fixed-argv processes.
+- Add stable reason codes for expected failures. Missing evidence must fail closed.
+- Update the owning module's README when its public API, artifacts, invariants,
+  dependencies, failure semantics, or provenance changes.
+- Preserve exact upstream attribution and generated-card manifests.
+- Do not add compatibility readers or writers for removed formats.
+
+Run the hermetic CPU suite:
 
 ```bash
-pytest tests/ -x
+pytest -q -p no:cacheprovider --import-mode=importlib \
+  tests/unit tests/contract tests/integration tests/architecture \
+  tests/test_bootstrap_dependencies.py
+python -m compileall -q src/apex main.py scripts
 ```
 
-4. Open a Pull Request with motivation, impact, and verification steps.
+Focused test commands are listed in each package README. A pull request should state
+which focused and full gates ran and include the exact failure if a required external
+campaign could not run.
 
-## Code Style and Quality
+## Evidence-sensitive changes
 
-- Follow PEP 8 for Python code.
-- Keep functions small and single-purpose; prefer composition over deeply nested logic.
-- Add documentation or comments when intent is non-obvious.
-- Update `README.md`, `AGENTS.md`, or skill prompts under `prompts/` when behavior visible to agents or users changes.
+Changes to evaluation, orchestration, safety, benchmark adapters, provenance, or
+delivery need negative tests in addition to the happy path. At minimum, cover missing
+proof, malformed evidence, stale state or anchors, timeout/failure, and tampering or
+path-escape behavior appropriate to the component.
 
-## Testing and Verification
+Kernel reward changes must retain raw-sample replay tests. E2E acceptance changes must
+test throughput, accuracy, TTFT p99, TPOT p99, normal-versus-diagnostic measurement,
+and KEEP/REVERT behavior. Delivery changes must prove bundle digest validation and
+that the caller checkout is not modified.
 
-This project depends on GPU hardware/drivers and orchestrates external LLM agent CLIs. In your PR, include:
+## GPU and live verification
 
-- Test environment (GPU model, ROCm version, Python version, Node.js version)
-- Agent CLI(s) used (Claude Code, Codex, Cursor Agent) and their versions
-- Execution mode (local or Docker; see `docker/`)
-- Key commands and output summary, e.g.:
+Real GPU and model runs are separate from the CPU gate. Record:
 
-```bash
-python3 workload_optimizer.py run -r ./results --task <task_id>
-pytest tests/test_gpu_kernel_grader.py -v
-```
+- exact Apex, Magpie, TraceLens, and workload source commits;
+- immutable baseline and derived image identities;
+- GPU architecture, ROCm/runtime versions, and visible device lease;
+- fixed benchmark config and agent backend/model/budget;
+- raw measurement and safety receipts;
+- final bundle digest and validation level.
 
-- For changes touching the grader, include a Magpie compilation + correctness + speedup result for at least one baseline kernel.
+Do not report an instrumented trace as a normal benchmark, an overlay as a source
+rebuild, or an agent-claimed speedup as an evaluator result. Do not commit model data,
+credentials, private traces, or run directories.
 
-## Filing Issues
+## Pull requests and issues
 
-Please include:
+Keep pull requests focused and explain motivation, contract impact, compatibility
+impact (normally none), test evidence, and provenance changes. Report security issues
+privately using [SECURITY.md](SECURITY.md). Public bug reports should include a
+minimal reproduction, exact commits/configuration, expected and observed behavior,
+and redacted logs.
 
-- Reproduction steps (exact commands and config flags)
-- Expected vs actual behavior
-- Environment (OS, GPU, ROCm version, Python version, Node.js version, agent CLI version)
-- Relevant logs from `results/<task_id>/` or a minimal repro
-
-## Security
-
-If you discover a security issue, do not open a public issue. Contact maintainers through a private channel.
-
-This project orchestrates third-party AI agents and downloads model weights, ROCm source, and AMD documentation at setup time — flag any credential leakage, supply-chain, or sandbox-escape concerns privately.
-
-## Suggested Contributions
-
-- Add new optimization skills under `prompts/` or `tools/`
-- Improve the grader (`graders/`) — new correctness checks, additional speedup metrics
-- Add baseline kernels or workloads to expand the benchmark surface
-- Improve MCP server reliability or add new MCP tools under `tools/`
-- Improve docs, examples, and tests
-
-## License
-
-By contributing, you agree that your contributions are licensed under the repository `LICENSE` (MIT).
+Contributions are licensed under the repository [MIT License](LICENSE).

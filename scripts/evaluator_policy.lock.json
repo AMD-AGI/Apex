@@ -1,0 +1,36 @@
+{
+  "schema": "apex.evaluator-policy-lock/v2",
+  "policy_id": "apex-lm-eval-gsm8k-v2",
+  "primary_metric": "exact_match,strict-match",
+  "sample_logging_required": true,
+  "task": {
+    "name": "gsm8k",
+    "definition_dependency": "inferencex",
+    "definition_path": "utils/evals/gsm8k.yaml",
+    "definition_sha256": "c0e109ed6dc356e082aea80cd775c12d64dada787b88c602408a3b960e0b04a1"
+  },
+  "dataset": {
+    "repository": "https://huggingface.co/datasets/openai/gsm8k",
+    "path": "openai/gsm8k",
+    "name": "main",
+    "revision": "740312add88f781978c0658806c59bc2815b9866",
+    "splits": [
+      "test",
+      "train"
+    ],
+    "files": [
+      {
+        "split": "test",
+        "path": "main/test-00000-of-00001.parquet",
+        "size_bytes": 419088,
+        "sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59"
+      },
+      {
+        "split": "train",
+        "path": "main/train-00000-of-00001.parquet",
+        "size_bytes": 2306545,
+        "sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d"
+      }
+    ]
+  }
+}

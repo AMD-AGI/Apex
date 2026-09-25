@@ -1,0 +1,4 @@
+interface:
+  display_name: "AMD Kernel Optimization"
+  short_description: "Evidence-first AMD kernel optimization workflow"
+  default_prompt: "Use $amd-kernel-optimization to optimize this AMD GPU kernel with trusted evidence."

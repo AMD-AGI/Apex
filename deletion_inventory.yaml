@@ -1,0 +1,867 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "migration": "clean_cut_no_legacy_reader",
+    "status": "certified_deleted",
+    "zero_reference_roots": [
+      "src",
+      "main.py",
+      "setup.sh",
+      "pyproject.toml"
+    ],
+    "exclusions": [
+      "deletion_inventory.yaml",
+      "tmp",
+      "results",
+      "tools/perf_knowledge"
+    ]
+  },
+  "entries": [
+    {
+      "path": "agents/__init__.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.7 execution backends",
+      "status": "deleted"
+    },
+    {
+      "path": "agents/backends.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.7 execution backends",
+      "status": "deleted"
+    },
+    {
+      "path": "docker/Dockerfile.eval",
+      "kind": "config",
+      "replacement_owner": "PR-4.3 runtime and source delivery",
+      "status": "deleted"
+    },
+    {
+      "path": "docker/Dockerfile.grader",
+      "kind": "config",
+      "replacement_owner": "PR-4.3 runtime and source delivery",
+      "status": "deleted"
+    },
+    {
+      "path": "docker/Dockerfile.mcp",
+      "kind": "config",
+      "replacement_owner": "PR-4.3 runtime and source delivery",
+      "status": "deleted"
+    },
+    {
+      "path": "docker/Dockerfile.workload",
+      "kind": "config",
+      "replacement_owner": "PR-4.3 runtime and source delivery",
+      "status": "deleted"
+    },
+    {
+      "path": "docker/start-mcps.sh",
+      "kind": "config",
+      "replacement_owner": "PR-4.3 runtime and source delivery",
+      "status": "deleted"
+    },
+    {
+      "path": "eval.py",
+      "kind": "production",
+      "replacement_owner": "PR-4.3 CLI clean cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "files/README.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "files/hip_best_practices.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "files/setup_files.sh",
+      "kind": "config",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "files/triton_best_practices.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/README.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/cache_manager.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/config_generator.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/curriculum.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/ground_truth.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/kernel_grader.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/model_grader.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/reward_backends.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/reward_fn.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/reward_trace.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "graders/score.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.4 canonical evaluation and safety",
+      "status": "deleted"
+    },
+    {
+      "path": "mcp_config.json",
+      "kind": "config",
+      "replacement_owner": "PR-0.3 pinned dependency bootstrap",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/__init__.py",
+      "kind": "production",
+      "replacement_owner": "PR-4.3 final clean cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/export_rl_dataset.py",
+      "kind": "production",
+      "replacement_owner": "PR-4.3 canonical journal and RL projections",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_bottleneck.py",
+      "kind": "production",
+      "replacement_owner": "PR-3.2 evidence-driven kernel lane",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/README.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/__init__.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/agent_harness.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/discovery.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/examples/benchmark_sglang_dsr1_isl1024_osl1024.yaml",
+      "kind": "config",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/examples/benchmark_vllm_amd_kimi_k2_6_mxfp4.yaml",
+      "kind": "config",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/examples/benchmark_vllm_qwen3_next_80b_a3b_instruct_bf16.yaml",
+      "kind": "config",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/examples/trace_deepseek_r1_1k_multi_kernels.sh",
+      "kind": "config",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/examples/trace_kimi_k2_6_mxfp4_multi_kernels.sh",
+      "kind": "config",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/examples/trace_qwen3_next_80b_a3b_instruct_bf16_8k_multi_kernels.sh",
+      "kind": "config",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/mode_detection.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/overlay.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/patch_triton.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/patch_wrapper.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/postprocess.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/registries/sglang_v0_5_12_rocm720_mi35x.yaml",
+      "kind": "config",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/registries/vllm_v0_23_0.yaml",
+      "kind": "config",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/registry.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/registry_update.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/runner.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/runtime.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/serializer.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/kernel_tracing/test_cases.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.4 Magpie tracing cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/knowledge_base.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/leaderboard.py",
+      "kind": "production",
+      "replacement_owner": "PR-4.2 reporting projections",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/reflector.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.6 state-derived context",
+      "status": "deleted"
+    },
+    {
+      "path": "pipeline/trajectory.py",
+      "kind": "production",
+      "replacement_owner": "PR-4.3 canonical journal and RL projections",
+      "status": "deleted"
+    },
+    {
+      "path": "prompts/README.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.6 context compiler",
+      "status": "deleted"
+    },
+    {
+      "path": "prompts/claude_code_gptoss20b_full_pipeline.txt",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.6 context compiler",
+      "status": "deleted"
+    },
+    {
+      "path": "prompts/configs.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.6 context compiler",
+      "status": "deleted"
+    },
+    {
+      "path": "prompts/kernel_prompt.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.6 context compiler",
+      "status": "deleted"
+    },
+    {
+      "path": "prompts/model_prompt.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.6 context compiler",
+      "status": "deleted"
+    },
+    {
+      "path": "prompts/models.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.6 context compiler",
+      "status": "deleted"
+    },
+    {
+      "path": "requirements-eval.txt",
+      "kind": "documentation",
+      "replacement_owner": "PR-4.3 runtime and source delivery",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/conftest.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.3 final cutover tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/fused_moe/baseline_fused_moe.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.3 final cutover tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/fused_moe/eval_fused_moe.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.3 final cutover tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/fused_moe/test_and_bench.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.3 final cutover tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/run_gpu_correctness_modes.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.4 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_backends.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.7 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_cache_and_anticheat.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.3 final cutover tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_dataset_generation.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.3 canonical journal and RL projections",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_deepseek_e2e.py",
+      "kind": "test",
+      "replacement_owner": "PR-3.3 E2E and delivery replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_files.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.5 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_gpu_kernel_grader.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.4 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_graders.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.4 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_kernel_tracing.py",
+      "kind": "test",
+      "replacement_owner": "PR-1.4 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_kernel_tracing_cases.py",
+      "kind": "test",
+      "replacement_owner": "PR-1.4 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_knowledge_base.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.5 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_leaderboard.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.2 reporting projections",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_live_codex_e2e.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.7 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_live_cursor_e2e.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.7 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_live_dataset_generation.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.3 canonical journal and RL projections",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_live_pipeline_e2e.py",
+      "kind": "test",
+      "replacement_owner": "PR-3.3 E2E and delivery replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_prompts.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.6 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_reflector.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.6 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_reinjection.py",
+      "kind": "test",
+      "replacement_owner": "PR-3.3 E2E and delivery replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_reward_fn.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.4 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_tampering.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.4 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_tools.py",
+      "kind": "test",
+      "replacement_owner": "PR-2.5 replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_trajectory.py",
+      "kind": "test",
+      "replacement_owner": "PR-4.3 canonical journal and RL projections",
+      "status": "deleted"
+    },
+    {
+      "path": "tests/test_workload_optimizer.py",
+      "kind": "test",
+      "replacement_owner": "PR-3.3 E2E and delivery replacement tests",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/README.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-4.3 final runtime cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/build_ck.sh",
+      "kind": "config",
+      "replacement_owner": "PR-4.3 final runtime cutover",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/jsons/hip_sheet.json",
+      "kind": "config",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/jsons/rocm.json",
+      "kind": "config",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/jsons/triton_sheet.json",
+      "kind": "config",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/_shared.sh",
+      "kind": "config",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/fusion_advisor/__init__.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/fusion_advisor/pyproject.toml",
+      "kind": "config",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/fusion_advisor/server.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/fusion_advisor/setup.sh",
+      "kind": "config",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/gpu_info/__init__.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/gpu_info/pyproject.toml",
+      "kind": "config",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/gpu_info/server.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/gpu_info/setup.sh",
+      "kind": "config",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/magpie/setup.sh",
+      "kind": "config",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/rag_tool/__init__.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/rag_tool/index.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/rag_tool/pyproject.toml",
+      "kind": "config",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/rag_tool/server.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/rag_tool/setup.sh",
+      "kind": "config",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/source_finder/__init__.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/source_finder/pyproject.toml",
+      "kind": "config",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/source_finder/server.py",
+      "kind": "production",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/mcps/source_finder/setup.sh",
+      "kind": "config",
+      "replacement_owner": "PR-1.2 diagnostics ports and pinned dependencies",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/setup_tools.sh",
+      "kind": "config",
+      "replacement_owner": "PR-0.3 pinned dependency bootstrap",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/aiter-reflection/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/gpu-architecture-fundamentals/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/hip-kernel-optimization/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/kernel-exp-history/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/kernel-exp-history/references/kernel_exp_dataclass.py",
+      "kind": "data",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/mi300-cdna3-architecture/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/mi300-cdna3-architecture/references/AMD Instinct MI300 CDNA3 Architecture Guide for High-Quality HIP Kernel Development.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/mi300-hip-programming-insights/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/mi300-hip-programming-insights/references/AMD MI300 HIP Kernel Programming Guide_ CDNA3 Architecture Insights.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/mi300-hip-vs-nvidia/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/mi300-hip-vs-nvidia/references/HIP Kernel Programming Guide for MI300_ Key Differences from NVIDIA AI Chips.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/pytorch-kernel-optimization/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/rocprof-compute/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/rocprof-compute/references/rocprof_compute_analyze_help.txt",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/rocprof-compute/references/rocprof_compute_profile_help.txt",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/skill-creator/LICENSE.txt",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/skill-creator/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/skill-creator/scripts/init_skill.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/skill-creator/scripts/package_skill.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/skill-creator/scripts/quick_validate.py",
+      "kind": "production",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/triton-hip-reference-kernel-search/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/triton-hip-reference-kernel-search/references/SEARCH.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/triton-hip-reference-kernel-search/references/train_crawl.json",
+      "kind": "config",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/triton-kernel-optimization/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/triton-kernel-reflection-prompts/SKILL.md",
+      "kind": "documentation",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "tools/skills/triton-kernel-reflection-prompts/references/prompt_for_reflection.py",
+      "kind": "data",
+      "replacement_owner": "PR-2.5 typed knowledge",
+      "status": "deleted"
+    },
+    {
+      "path": "workload_optimizer.py",
+      "kind": "production",
+      "replacement_owner": "PR-4.3 CLI clean cutover",
+      "status": "deleted"
+    }
+  ]
+}

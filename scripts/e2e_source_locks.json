@@ -1,0 +1,25 @@
+{
+  "schema": "apex.e2e-source-locks",
+  "version": 1,
+  "receipt_schema": "apex.e2e-source-locks.receipt/v1",
+  "sources": {
+    "vllm": {
+      "name": "vLLM",
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "commit": "b1388b1fbf5aaef47937fabe98931211684666a6",
+      "tree": "33b782e425e42d42851a33f7876e97a8deeabb29",
+      "sibling": "vllm",
+      "managed_checkout": "vllm-v0.19.1",
+      "root_env": "APEX_VLLM_SOURCE_ROOT"
+    },
+    "aiter": {
+      "name": "AITER",
+      "repository": "https://github.com/ROCm/aiter.git",
+      "commit": "c3708fb7445899c14cdc6e8055953ee02ed78ddf",
+      "tree": "a30409ac03524781f175cbb03e82eefcafd52af1",
+      "sibling": "aiter",
+      "managed_checkout": "aiter-v0.1.10.post2",
+      "root_env": "APEX_AITER_SOURCE_ROOT"
+    }
+  }
+}

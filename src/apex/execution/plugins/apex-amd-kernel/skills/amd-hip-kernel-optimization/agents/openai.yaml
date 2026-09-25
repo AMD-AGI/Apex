@@ -1,0 +1,4 @@
+interface:
+  display_name: "AMD HIP Kernel Optimization"
+  short_description: "Optimize HIP kernels with evidence-first AMD methods"
+  default_prompt: "Use $amd-hip-kernel-optimization to inspect and optimize this HIP kernel without weakening its evaluator."

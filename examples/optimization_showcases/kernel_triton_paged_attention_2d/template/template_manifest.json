@@ -1,0 +1,91 @@
+{
+  "blockers": [
+    "immutable_image_digest_missing",
+    "in_image_source_digest_missing",
+    "apex_evaluator_missing"
+  ],
+  "evaluator": null,
+  "manifest_sha256": "5a5865aff2463585174fd833dcc7dece7696c5a5821c7f7bc66fac04180ef740",
+  "runtime": {
+    "gpu_arch": "gfx950",
+    "hardware": "MI355X",
+    "image_id": null,
+    "immutable_locator": null,
+    "mutable_reference": "harbor.crusoe.primus-safe.amd.com/sync/vllm-openai-rocm:v0.24.0"
+  },
+  "schema": "apex.kernel-template/v1",
+  "showcase_id": "kernel-triton-paged-attention-2d",
+  "snapshot_files": [
+    {
+      "path": "template/LICENSE.agent-kernel-arena",
+      "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1",
+      "size": 11356
+    },
+    {
+      "path": "template/THIRD_PARTY_NOTICES.md",
+      "sha256": "70654e92e599061c0510654f83a1f0ff5a9999f5228db6cdec8d4d2b735f45fa",
+      "size": 589
+    },
+    {
+      "path": "template/UPSTREAM_SOURCES.md",
+      "sha256": "b6b8da315efea9d38e3fc1eb3ec434dd84dd8efed0e2b839cc87a73e49f31b96",
+      "size": 965
+    },
+    {
+      "path": "template/upstream/README.md",
+      "sha256": "63134bb081f836c30ffe6dc4d7a00fd6ba7a6db95a96938b7778c07caebcfc4b",
+      "size": 1142
+    },
+    {
+      "path": "template/upstream/config.yaml",
+      "sha256": "8bdb197f1282bbcaa632bcf918170b2b2db9d11f50bdaef5fb579a836fe6ddd4",
+      "size": 1475
+    },
+    {
+      "path": "template/upstream/session_cases.json",
+      "sha256": "5c8e419c1e2dea7f18db3ec6fc0158802c2631ad5787f8b3a385b3cc3c65b257",
+      "size": 3110
+    }
+  ],
+  "source": {
+    "baseline_tree_sha256": null,
+    "container_root": "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops",
+    "editable_files": [
+      "chunked_prefill_paged_decode.py"
+    ],
+    "language": "triton",
+    "target_functions": [
+      "kernel_paged_attention_2d"
+    ],
+    "workspace_subdir": "vllm_v1_attention_ops"
+  },
+  "status": "pending",
+  "template_id": "kernel-triton-paged-attention-2d",
+  "upstream": {
+    "commit": "1292b4531fad8bed02c0ecc292704c44cb63c49a",
+    "files": [
+      {
+        "imported_path": "template/upstream/README.md",
+        "original_path": "tasks/image_kernel/mi355x_vllm_triton_paged_attention_2d/README.md",
+        "sha256": "63134bb081f836c30ffe6dc4d7a00fd6ba7a6db95a96938b7778c07caebcfc4b",
+        "size": 1142
+      },
+      {
+        "imported_path": "template/upstream/config.yaml",
+        "original_path": "tasks/image_kernel/mi355x_vllm_triton_paged_attention_2d/config.yaml",
+        "sha256": "8bdb197f1282bbcaa632bcf918170b2b2db9d11f50bdaef5fb579a836fe6ddd4",
+        "size": 1475
+      },
+      {
+        "imported_path": "template/upstream/session_cases.json",
+        "original_path": "tasks/image_kernel/mi355x_vllm_triton_paged_attention_2d/session_cases.json",
+        "sha256": "5c8e419c1e2dea7f18db3ec6fc0158802c2631ad5787f8b3a385b3cc3c65b257",
+        "size": 3110
+      }
+    ],
+    "imported_at_utc": "2026-08-10T00:00:00Z",
+    "repository": "https://github.com/AMD-AGI/AgentKernelArena",
+    "source_path": "tasks/image_kernel/mi355x_vllm_triton_paged_attention_2d",
+    "tree": "5c5eed8279f6335bb4ea35d4e0ea45ee20aec234"
+  }
+}

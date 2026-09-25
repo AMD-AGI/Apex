@@ -1,0 +1,2 @@
+# Preserve byte-exact attributed upstream prose, including its original whitespace.
+tools/perf_knowledge/upstream/** -whitespace

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/AMD-AGI/GEAK",
+  "git_sha": "6fa40c36b68bad9d543ae551b95bd3d169865744",
+  "license": "Apache-2.0",
+  "license_path": "LICENSE.md",
+  "license_sha256": "cc09a983d7b46105587a34d759bbc9ed4e37d9857e5367766710d3f55e603315",
+  "transform_version": "geak_markdown_to_card_v1",
+  "estates": [
+    {
+      "estate_id": "perf_knowledge",
+      "path": "perf_knowledge",
+      "expected_files": 689,
+      "expected_bytes": 4207132
+    },
+    {
+      "estate_id": "kernel_workflow",
+      "path": "kernel_workflow/knowledge",
+      "expected_files": 8,
+      "expected_bytes": 63988
+    },
+    {
+      "estate_id": "e2e_workflow",
+      "path": "e2e_workflow/knowledge",
+      "expected_files": 36,
+      "expected_bytes": 249043
+    }
+  ]
+}

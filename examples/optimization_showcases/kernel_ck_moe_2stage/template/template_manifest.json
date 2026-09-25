@@ -1,0 +1,92 @@
+{
+  "blockers": [
+    "immutable_image_digest_missing",
+    "in_image_source_digest_missing",
+    "apex_evaluator_missing"
+  ],
+  "evaluator": null,
+  "manifest_sha256": "4a47cf207cb4f3a56a379fa8cbb598febdd74d7bfdab9c85ec04d0ba82a51ab2",
+  "runtime": {
+    "gpu_arch": "gfx950",
+    "hardware": "MI355X",
+    "image_id": null,
+    "immutable_locator": null,
+    "mutable_reference": "harbor.crusoe.primus-safe.amd.com/sync/vllm-openai-rocm:v0.24.0"
+  },
+  "schema": "apex.kernel-template/v1",
+  "showcase_id": "kernel-ck-moe-2stage",
+  "snapshot_files": [
+    {
+      "path": "template/LICENSE.agent-kernel-arena",
+      "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1",
+      "size": 11356
+    },
+    {
+      "path": "template/THIRD_PARTY_NOTICES.md",
+      "sha256": "9dee10e1f7c19234165951107ceafd06d44548e2ca512fbaa14dbcb22f857fe9",
+      "size": 577
+    },
+    {
+      "path": "template/UPSTREAM_SOURCES.md",
+      "sha256": "3cb82d164a99ef9834b4f098897de19f5066a7eaf12349a8b4d72fb6727c5f5c",
+      "size": 951
+    },
+    {
+      "path": "template/upstream/README.md",
+      "sha256": "749915c2deec36b988b883289890864ccdaff13ccc4c3d5a0843ecad9f8f509c",
+      "size": 189
+    },
+    {
+      "path": "template/upstream/config.yaml",
+      "sha256": "aa46e6f37f58d9c49e860ff9ba48ad5b33ce4731553dd94132cad17bb3f5e794",
+      "size": 951
+    },
+    {
+      "path": "template/upstream/session_cases.json",
+      "sha256": "a566c3946fd38e59e15dd7b823988d2ea1dfadd30a77dc6a0003f606727811bb",
+      "size": 2332
+    }
+  ],
+  "source": {
+    "baseline_tree_sha256": null,
+    "container_root": "/usr/local/lib/python3.12/dist-packages/aiter_meta",
+    "editable_files": [
+      "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.cu"
+    ],
+    "language": "hip",
+    "target_functions": [
+      "ck_moe_stage1",
+      "ck_moe_stage2"
+    ],
+    "workspace_subdir": "aiter_meta"
+  },
+  "status": "pending",
+  "template_id": "kernel-ck-moe-2stage",
+  "upstream": {
+    "commit": "1292b4531fad8bed02c0ecc292704c44cb63c49a",
+    "files": [
+      {
+        "imported_path": "template/upstream/README.md",
+        "original_path": "tasks/image_kernel/mi355x_vllm_ck_moe_2stage/README.md",
+        "sha256": "749915c2deec36b988b883289890864ccdaff13ccc4c3d5a0843ecad9f8f509c",
+        "size": 189
+      },
+      {
+        "imported_path": "template/upstream/config.yaml",
+        "original_path": "tasks/image_kernel/mi355x_vllm_ck_moe_2stage/config.yaml",
+        "sha256": "aa46e6f37f58d9c49e860ff9ba48ad5b33ce4731553dd94132cad17bb3f5e794",
+        "size": 951
+      },
+      {
+        "imported_path": "template/upstream/session_cases.json",
+        "original_path": "tasks/image_kernel/mi355x_vllm_ck_moe_2stage/session_cases.json",
+        "sha256": "a566c3946fd38e59e15dd7b823988d2ea1dfadd30a77dc6a0003f606727811bb",
+        "size": 2332
+      }
+    ],
+    "imported_at_utc": "2026-08-10T00:00:00Z",
+    "repository": "https://github.com/AMD-AGI/AgentKernelArena",
+    "source_path": "tasks/image_kernel/mi355x_vllm_ck_moe_2stage",
+    "tree": "5aac7fea5a3511f7cf2b9fcaa2f92df4e5155966"
+  }
+}
