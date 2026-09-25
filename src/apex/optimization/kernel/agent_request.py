@@ -49,6 +49,7 @@ def build_agent_request(
         max_turns=task.budget.max_turns,
         timeout_seconds=task.budget.timeout_seconds,
         runtime_closure_sha256=task.agent_options.runtime_closure_sha256,
+        require_pid_namespace=attempt.run.require_pid_namespace,
     )
 
 

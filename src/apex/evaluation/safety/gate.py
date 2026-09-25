@@ -126,7 +126,12 @@ class SafetyGate:
             receipt.evaluator_artifact_root == str(request.artifact_root),
             "phase_isolation_artifact_mismatch",
         )
-        require(receipt.complete, "phase_isolation_incomplete")
+        # No-tool evaluation needs a frozen candidate and ordinary cleanup, not
+        # a claim of hostile-code isolation. Enabled tools retain their contract.
+        ordinary = (receipt.process_group_cleaned and receipt.candidate_read_only
+                    and not any(rule.requirement is not SafetyRequirement.DISABLED
+                                for rule in request.policy.rules))
+        require(receipt.complete or ordinary, "phase_isolation_incomplete")
 
         expected_tools = tuple(
             rule.tool for rule in request.policy.rules if rule.requirement is not SafetyRequirement.DISABLED

@@ -303,7 +303,7 @@ def _kernel_optimizer(
     return KernelOptimizeUseCase(
         agents=agents,
         contexts=KernelContextBuilder(retriever),
-        measurement_evaluator=StructuredKernelMeasurementAdapter(),
+        measurement_evaluator=StructuredKernelMeasurementAdapter(require_pid_namespace=False),
         diagnostics_evaluator=MagpieKernelDiagnosticsAdapter(verify_runtime_dependencies),
         evaluation_authorizer=authorizer,
         execution_identity=collect_apex_execution_identity(_project_root()),

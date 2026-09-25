@@ -27,6 +27,7 @@ from .supervisor import ProcessResult, SubprocessSupervisor
 from .secret_redaction import redact_secret_values
 from .transcript import parse_agent_output
 from .turn_budget import AgentTurnBudget, TURN_POLICY
+from apex.ports.process_group import PROCESS_GROUP_POLICY
 
 
 _BACKEND_CREDENTIAL_KEYS = {
@@ -98,7 +99,8 @@ def invocation_receipt(
         allowed_files_enforced_by_cli=False,
         max_turns=request.max_turns,
         turn_policy=turn_policy,
-        process_containment_policy_id=AGENT_PROCESS_CONTAINMENT_POLICY,
+        process_containment_policy_id=(AGENT_PROCESS_CONTAINMENT_POLICY
+                                       if request.require_pid_namespace else PROCESS_GROUP_POLICY),
         isolation=tuple(sorted(isolation.items())),
         runtime_closure_sha256=request.runtime_closure_sha256,
     )
@@ -118,6 +120,7 @@ def resolve_cli_version(
     environment: Mapping[str, str],
     timeout_seconds: int,
     secret_values: tuple[str, ...],
+    require_pid_namespace: bool,
 ) -> str:
     """Return the CLI's own bounded version output or fail provenance closed."""
 
@@ -126,7 +129,7 @@ def resolve_cli_version(
         cwd=workspace,
         environment=environment,
         timeout_seconds=min(timeout_seconds, 30),
-        require_pid_namespace=True,
+        require_pid_namespace=require_pid_namespace,
     )
     safe_stdout = redact_secret_values(result.stdout, secret_values)
     safe_stderr = redact_secret_values(result.stderr, secret_values)
@@ -188,6 +191,7 @@ def execute_agent_cli(
         environment=environment,
         timeout_seconds=request.timeout_seconds,
         secret_values=secret_values,
+        require_pid_namespace=request.require_pid_namespace,
     )
     budget = AgentTurnBudget(request.max_turns)
     invocation = invocation_receipt(
@@ -208,7 +212,7 @@ def execute_agent_cli(
         timeout_seconds=request.timeout_seconds,
         stdin_text=stdin_text,
         stdout_budget=budget.observe,
-        require_pid_namespace=True,
+        require_pid_namespace=request.require_pid_namespace,
     )
     budget.finalize(
         process_succeeded=process.exit_code == 0 and not process.timed_out,

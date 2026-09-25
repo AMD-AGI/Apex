@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import venv
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from apex.ports import (
     AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentProcessContainmentReceipt,
 )
+from apex.rl.kernel_measurement_validation import kernel_command_executable_frozen
 
 
 def _containment() -> AgentProcessContainmentReceipt:
@@ -258,6 +260,63 @@ def test_kernel_verifier_resolves_path_symlink_to_non_symlink_target(
         expected_source_digest=digest,
     )
 
-    assert evidence.argv[0] == str(target)
-    assert not Path(evidence.argv[0]).is_symlink()
+    assert evidence.argv[0] == str(alias)
+    assert evidence.executable_identity.path == str(target.resolve())
+    assert evidence.executable_identity.invocation_path == str(alias)
+    assert not Path(evidence.executable_identity.path).is_symlink()
     assert os.access(evidence.argv[0], os.X_OK)
+    assert kernel_command_executable_frozen(evidence.to_dict())
+    invalid = evidence.to_dict()
+    invalid["argv"] = [str(target)]
+    assert not kernel_command_executable_frozen(invalid)
+
+
+def test_kernel_verifier_preserves_virtualenv_interpreter(tmp_path: Path) -> None:
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    interpreter = environment / "bin" / "python"
+    assert interpreter.is_symlink()
+    resolved = _resolved(
+        tmp_path / "task",
+        argv=[str(interpreter), "-c", "import sys; print(sys.prefix)"],
+    )
+    evidence = CandidateVerifier(require_pid_namespace=False).compile(
+        resolved,
+        candidate_root=resolved.workspace,
+        expected_source_digest=candidate_source_digest(
+            resolved.workspace, resolved.task.editable_files
+        ),
+    )
+    assert evidence.passed, evidence.stderr
+    assert Path(evidence.stdout.strip()).resolve() == environment.resolve()
+    assert evidence.argv[0] == str(interpreter)
+    assert evidence.executable_identity.path == str(interpreter.resolve())
+    assert kernel_command_executable_frozen(evidence.to_dict())
+
+
+def test_kernel_verifier_rejects_invocation_symlink_retargeting(tmp_path: Path) -> None:
+    target = tmp_path / "tool"
+    replacement = tmp_path / "replacement"
+    for path in (target, replacement):
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(target)
+    resolved = _resolved(tmp_path / "task", argv=[str(alias)])
+
+    class RetargetingSupervisor(RecordingSupervisor):
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            alias.unlink()
+            alias.symlink_to(replacement)
+            return result
+
+    with pytest.raises(IntegrityError) as raised:
+        CandidateVerifier(RetargetingSupervisor()).compile(
+            resolved,
+            candidate_root=resolved.workspace,
+            expected_source_digest=candidate_source_digest(
+                resolved.workspace, resolved.task.editable_files
+            ),
+        )
+    assert raised.value.reason_code == "verifier_executable_changed_during_compile"

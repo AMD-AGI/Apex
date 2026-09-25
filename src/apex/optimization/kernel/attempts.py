@@ -11,6 +11,7 @@ from apex.evaluation import EvaluationContractReceipt
 from apex.evaluation.safety import FrozenCandidate, SafetyGateResult, VerificationPlan
 from apex.intake import ResolvedTaskSpec, TaskSpec
 from apex.runtime import GpuLease, GpuLeaseReceipt
+from apex.runtime.assigned_gpu import AssignedGpuLease, AssignedGpuReceipt
 from apex.storage import ArtifactReceipt
 
 from .context import KernelContext
@@ -37,9 +38,10 @@ class RunSession:
     record: KernelRunRecord
     evaluation_contract: EvaluationContractReceipt
     evaluation_contract_artifact: ArtifactReceipt
-    gpu_lease: GpuLeaseReceipt
+    gpu_lease: GpuLeaseReceipt | AssignedGpuReceipt
     gpu_lease_artifact: ArtifactReceipt
-    gpu_lease_guard: GpuLease
+    gpu_lease_guard: GpuLease | AssignedGpuLease
+    require_pid_namespace: bool = False
 
 
 @dataclass(frozen=True, slots=True)

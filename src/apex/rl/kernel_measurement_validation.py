@@ -15,6 +15,8 @@ from apex.evaluation import (
     kernel_terminal_policy_source,
 )
 from apex.storage import ArtifactReceipt, ArtifactStore
+from apex.runtime.assigned_gpu import AssignedGpuReceipt, AssignedGpuMeasurement
+from apex.ports.process_group import ProcessGroupReceipt
 
 from .models import EpisodeArtifact, EpisodeEvent
 from .e2e_gpu_lease_validation import load_gpu_heartbeat, load_measurement_bracket
@@ -112,7 +114,13 @@ def _valid_gpu_bracket(
         return False
     try:
         document = _canonical_document(artifacts, roles[0])
-        bracket = load_measurement_bracket(document)
+        if document.get("schema_version") == "apex.assigned-gpu-measurement/v1":
+            bracket = AssignedGpuMeasurement(**{k: v for k, v in document.items() if k != "schema_version"})
+            allocation = _assigned_gpu(event, artifacts)
+            if allocation.run_id != bracket.run_id or allocation.digest != bracket.lease_digest:
+                return False
+        else:
+            bracket = load_measurement_bracket(document)
     except Exception:
         return False
     attempt_id = str(measurement.payload.get("attempt_id", ""))
@@ -175,7 +183,7 @@ def kernel_gate_reward_evidence_reasons(
         failed.payload.get("passed") is not False
         or evidence.get("phase") != stage
         or evidence.get("passed") is not False
-        or not _contained(evidence)
+        or not kernel_command_cleanup_verified(evidence)
         or not kernel_command_executable_frozen(evidence)
         or policy != kernel_terminal_policy_source()
         or reward.payload.get("scope") != "attempt"
@@ -196,6 +204,16 @@ def _valid_gate_heartbeat(
     artifacts: ArtifactStore,
     stage: str,
 ) -> bool:
+    ordinary = [e for e in events if e.payload.get("kind") == "assigned_gpu"
+                and e.payload.get("phase") == stage]
+    if ordinary:
+        if len(ordinary) != 1 or ordinary[0].sequence >= reward.sequence:
+            return False
+        try:
+            _assigned_gpu(ordinary[0], artifacts)
+            return ordinary[0].payload.get("attempt_id") == reward.payload.get("attempt_id")
+        except (KeyError, TypeError, ValueError):
+            return False
     matching = tuple(
         event
         for event in events
@@ -249,14 +267,30 @@ def _compile_passed(event: EpisodeEvent, artifacts: ArtifactStore) -> bool:
     return bool(
         document.get("phase") == "compile"
         and document.get("passed") is True
-        and _contained(document)
+        and kernel_command_cleanup_verified(document)
         and kernel_command_executable_frozen(document)
     )
 
 
-def _contained(document: Mapping[str, object]) -> bool:
+def kernel_command_cleanup_verified(document: Mapping[str, object]) -> bool:
     value = document.get("process_containment")
+    if isinstance(value, Mapping) and value.get("schema") == "apex.process-group/v1":
+        try:
+            return ProcessGroupReceipt(**{k: v for k, v in value.items() if k != "schema"}).cleanup_verified
+        except (TypeError, ValueError):
+            return False
     return isinstance(value, Mapping) and value.get("namespace_empty_verified") is True
+
+
+def _assigned_gpu(event: EpisodeEvent, artifacts: ArtifactStore) -> AssignedGpuReceipt:
+    roles = _roles(event.artifacts).get("assigned_gpu", ())
+    if len(roles) != 1:
+        raise ValueError("missing assigned GPU record")
+    document = _canonical_document(artifacts, roles[0])
+    receipt = AssignedGpuReceipt(**document)
+    if receipt.digest != roles[0].digest:
+        raise ValueError("assigned GPU record changed")
+    return receipt
 
 
 def kernel_command_executable_frozen(document: Mapping[str, object]) -> bool:
@@ -267,6 +301,7 @@ def kernel_command_executable_frozen(document: Mapping[str, object]) -> bool:
     if not isinstance(identity, Mapping) or not isinstance(argv, list) or not argv:
         return False
     path = identity.get("path")
+    invocation_path = identity.get("invocation_path", path)
     size = identity.get("size")
     digest = identity.get("sha256")
     integers = tuple(
@@ -277,7 +312,9 @@ def kernel_command_executable_frozen(document: Mapping[str, object]) -> bool:
         document.get("executable_identity_reverified") is True
         and isinstance(path, str)
         and path.startswith("/")
-        and argv[0] == path
+        and isinstance(invocation_path, str)
+        and invocation_path.startswith("/")
+        and argv[0] == invocation_path
         and isinstance(size, int)
         and not isinstance(size, bool)
         and size >= 0
@@ -329,6 +366,7 @@ def _roles(
 
 
 __all__ = [
+    "kernel_command_cleanup_verified",
     "kernel_command_executable_frozen",
     "kernel_gate_reward_evidence_reasons",
     "kernel_measurement_evidence_reasons",

@@ -8,7 +8,6 @@ artifacts.
 ## Setup
 
 ```bash
-cd /home/viouyang/Apex
 ./setup.sh
 source .venv/bin/activate
 apex dependencies verify --json
@@ -130,7 +129,9 @@ CPU tests are the default. Real GPU, agent, Docker, and model runs must be expli
 must use a caller-selected results directory, and must retain dependency, source,
 image, measurement, safety, and GPU-lease receipts.
 
-Before launching, resolve visible devices and inspect exact KFD process ownership.
+Standalone kernel runs use caller-assigned visible GPUs and a real startup smoke
+operation; the scheduler/operator owns allocation and final teardown. E2E and
+explicit strict-runtime callers still inspect exact KFD process ownership.
 Do not use broad process-name killing in product code. Apex's run-scoped GPU lease is
 cooperative metadata, not authority to terminate an unrelated process. Benchmark
 baseline and candidate under matched conditions and never reuse a diagnostic trace

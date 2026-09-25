@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from apex.core import ApexError
 from apex.ports import KernelMeasurementPort
 from apex.runtime import require_gpu_measurement_guard
+from apex.runtime.assigned_gpu import AssignedGpuLease
 from apex.storage import ArtifactReceipt
 
 from .attempts import AttemptSession, PreparedCandidate
@@ -61,7 +62,8 @@ def execute_lease_measurement(
             except ApexError as error:
                 measurement_error = error.reason_code
     bracket_receipt = record_gpu_measurement_bracket(
-        run.record, bracket.receipt, attempt_id=attempt.attempt_id
+        run.record, bracket.receipt, attempt_id=attempt.attempt_id,
+        allocation=run.gpu_lease_artifact if isinstance(run.gpu_lease_guard, AssignedGpuLease) else None,
     )
     return LeaseMeasurementExecution(
         performance.passed,

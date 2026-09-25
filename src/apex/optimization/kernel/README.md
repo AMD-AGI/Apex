@@ -10,6 +10,13 @@ fresh bounded `ContextPacket`, invokes a fresh stateless backend process, freeze
 the declared source bytes, and independently verifies that candidate. The
 original workspace is never modified.
 
+The standalone use case defaults to caller-assigned GPUs and ordinary process
+groups. It probes GPU execution once and retains timeout, output/turn budgets,
+group cleanup, source freeze and independent evaluator gates. No-tools safety
+plans remain uncertified. Explicit enabled safety tools retain their strict
+phase isolation requirements. Both runtime record formats remain replayable;
+ordinary records never claim verified host ownership or private PID namespaces.
+
 Before a GPU lease, the use case resolves Git repository identity and freezes
 an evaluator-owned Evaluation Contract. Missing or mismatched authority returns
 an unverified machine result without invoking an agent. The
@@ -190,12 +197,14 @@ each evaluator phase receives a separate persistent frozen projection.
   are rejected before the command starts; agent credentials never cross into
   evaluator-owned compile, correctness, or performance processes.
 - Before each verifier phase, Apex resolves `argv[0]` through the evaluator
-  `PATH` (or the phase `cwd` for a relative path), replaces it with one canonical
-  absolute regular-file path, and freezes its path, size, SHA-256, device,
+  `PATH` (or the phase `cwd` for a relative path), preserves that absolute
+  invocation path, and freezes the canonical target's path, size, SHA-256, device,
   inode, mode, and timestamps. `CommandSpec.env` cannot override `PATH`.
   Successful command evidence records that identity and proves it was hashed
   and revalidated after process-tree teardown; byte or filesystem-identity
-  drift fails the phase. Generic executables do not have a reliable common
+  drift or invocation-symlink retargeting fails the phase. Preserving the
+  invocation path keeps virtual-environment interpreters in their configured
+  environment. Generic executables do not have a reliable common
   version command, so Apex does not execute an untrusted `--version` probe or
   substitute version text for the byte identity.
 - Externally supplied safety artifacts are diagnostic-only. Their instrumented bytes and timing are

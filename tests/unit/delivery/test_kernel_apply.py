@@ -36,7 +36,7 @@ def _workspace(tmp_path: Path, *, source: str = "VALUE = 1\n") -> Path:
     return root
 
 
-def _bundle(tmp_path: Path, workspace: Path):
+def _bundle(tmp_path: Path, workspace: Path, *, candidate_source: str = "VALUE = 2\n"):
     task = TaskSpec.from_mapping(
         {
             "task_id": "apply-test",
@@ -56,7 +56,7 @@ def _bundle(tmp_path: Path, workspace: Path):
     resolved = TaskResolver().resolve(task)
     candidate = tmp_path / "candidate"
     shutil.copytree(workspace, candidate, ignore=shutil.ignore_patterns(".git"))
-    (candidate / "kernel.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (candidate / "kernel.py").write_bytes(candidate_source.encode("utf-8"))
     return build_kernel_bundle(
         resolved,
         candidate_root=candidate,
@@ -78,6 +78,21 @@ def test_apply_mutates_only_exact_clean_baseline(tmp_path: Path) -> None:
     assert receipt.applied is True
     assert receipt.changed_files == ("kernel.py",)
     assert set(receipt.applied_file_hashes) == {"kernel.py"}
+
+
+@pytest.mark.parametrize("baseline,candidate", [
+    ("VALUE = 1", "VALUE = 2"),
+    ("VALUE = 1", "VALUE = 2\n"),
+    ("VALUE = 1\n", "VALUE = 2"),
+    ("VALUE = 1\n# tail", "VALUE = 2\n# tail"),
+    ("VALUE = 1\r\n", "VALUE = 2\r\n"),
+])
+def test_bundle_preserves_exact_line_endings(tmp_path, baseline, candidate):
+    workspace = _workspace(tmp_path, source=baseline)
+    bundle = _bundle(tmp_path, workspace, candidate_source=candidate)
+    receipt = apply_verified_kernel_bundle(bundle.path, workspace, expected_digest=bundle.digest)
+    assert receipt.applied
+    assert (workspace / "kernel.py").read_bytes() == candidate.encode("utf-8")
 
 
 def test_apply_rejects_dirty_workspace_before_mutation(tmp_path: Path) -> None:

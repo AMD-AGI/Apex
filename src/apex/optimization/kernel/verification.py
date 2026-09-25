@@ -6,7 +6,7 @@ import hashlib
 import os
 import shutil
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -20,6 +20,7 @@ from apex.execution import (
 )
 from apex.intake import CommandSpec, ResolvedTaskSpec
 from apex.ports import AgentProcessContainmentReceipt
+from apex.ports.process_group import ProcessGroupReceipt
 
 
 _PHASES = ("compile", "correctness", "performance")
@@ -37,10 +38,13 @@ class ExecutableIdentity:
     mode: int
     mtime_ns: int
     ctime_ns: int
+    invocation_path: str | None = None
 
     def __post_init__(self) -> None:
         if not Path(self.path).is_absolute():
             raise ValueError("executable identity path must be absolute")
+        if self.invocation_path is not None and not Path(self.invocation_path).is_absolute():
+            raise ValueError("executable invocation path must be absolute")
         if self.size < 0 or any(
             value < 0
             for value in (
@@ -59,8 +63,12 @@ class ExecutableIdentity:
         ):
             raise ValueError("executable identity SHA-256 is invalid")
 
+    @property
+    def argv0(self) -> str:
+        return self.invocation_path or self.path
+
     def to_dict(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "path": self.path,
             "size": self.size,
             "sha256": self.sha256,
@@ -70,6 +78,9 @@ class ExecutableIdentity:
             "mtime_ns": self.mtime_ns,
             "ctime_ns": self.ctime_ns,
         }
+        if self.invocation_path is not None:
+            document["invocation_path"] = self.invocation_path
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +94,12 @@ class CommandEvidence:
     stdout: str
     stderr: str
     duration_seconds: float
-    process_containment: AgentProcessContainmentReceipt
+    process_containment: AgentProcessContainmentReceipt | ProcessGroupReceipt
 
     def __post_init__(self) -> None:
         if self.phase not in _PHASES:
             raise ValueError(f"unsupported kernel verification phase: {self.phase}")
-        if not self.argv or self.argv[0] != self.executable_identity.path:
+        if not self.argv or self.argv[0] != self.executable_identity.argv0:
             raise ValueError("command argv does not bind the executable identity")
         if not self.executable_identity_reverified:
             raise ValueError("command evidence requires post-phase executable revalidation")
@@ -116,8 +127,9 @@ class CommandEvidence:
 class CandidateVerifier:
     """Run one trusted argv phase at a time against unchanged candidate bytes."""
 
-    def __init__(self, supervisor: SubprocessSupervisor | None = None) -> None:
+    def __init__(self, supervisor: SubprocessSupervisor | None = None, *, require_pid_namespace: bool = True) -> None:
         self._supervisor = supervisor or SubprocessSupervisor()
+        self._require_pid_namespace = require_pid_namespace
 
     def compile(
         self,
@@ -189,14 +201,14 @@ class CandidateVerifier:
         )
         resolved_cwd = cwd.resolve(strict=True)
         executable = _freeze_executable(command.argv[0], resolved_cwd, environment["PATH"])
-        argv = (executable.path, *command.argv[1:])
+        argv = (executable.argv0, *command.argv[1:])
         try:
             process = self._supervisor.run(
                 argv,
                 cwd=resolved_cwd,
                 environment=environment,
                 timeout_seconds=command.timeout_seconds,
-                require_pid_namespace=True,
+                require_pid_namespace=self._require_pid_namespace,
             )
         finally:
             _revalidate_executable(executable, phase=phase)
@@ -250,6 +262,8 @@ def _assert_source_digest(
 
 def _freeze_executable(argv0: str, cwd: Path, search_path: str) -> ExecutableIdentity:
     located = _locate_executable(argv0, cwd, search_path)
+    if not located.is_absolute():
+        located = cwd / located
     try:
         canonical = located.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:
@@ -258,7 +272,8 @@ def _freeze_executable(argv0: str, cwd: Path, search_path: str) -> ExecutableIde
             "verifier_executable_not_found",
             {"argv0": argv0},
         ) from exc
-    return _snapshot_executable(canonical)
+    identity = _snapshot_executable(canonical)
+    return replace(identity, invocation_path=str(located)) if located != canonical else identity
 
 
 def _locate_executable(argv0: str, cwd: Path, search_path: str) -> Path:
@@ -361,12 +376,19 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
 
 def _revalidate_executable(expected: ExecutableIdentity, *, phase: str) -> None:
     try:
+        target = Path(expected.argv0).resolve(strict=True)
+        if str(target) != expected.path:
+            raise IntegrityError(
+                "Kernel verifier invocation path changed target during the phase",
+                "verifier_executable_target_changed",
+            )
         observed = _snapshot_executable(Path(expected.path))
-    except IntegrityError as exc:
+        observed = replace(observed, invocation_path=expected.invocation_path)
+    except (IntegrityError, OSError, RuntimeError, ValueError) as exc:
         raise IntegrityError(
             "Kernel verifier executable disappeared or became invalid during the phase",
             f"verifier_executable_changed_during_{phase}",
-            {"expected": expected.to_dict(), "observation_reason": exc.reason_code},
+            {"expected": expected.to_dict(), "observation_reason": getattr(exc, "reason_code", type(exc).__name__)},
         ) from exc
     if observed != expected:
         raise IntegrityError(
@@ -379,7 +401,7 @@ def _revalidate_executable(expected: ExecutableIdentity, *, phase: str) -> None:
 def _evidence(
     phase: str, result: ProcessResult, executable: ExecutableIdentity
 ) -> CommandEvidence:
-    if not result.argv or result.argv[0] != executable.path:
+    if not result.argv or result.argv[0] != executable.argv0:
         raise IntegrityError(
             "Kernel verifier result does not bind the frozen executable",
             "verifier_executable_evidence_mismatch",
@@ -387,7 +409,7 @@ def _evidence(
     containment = result.process_containment
     if (
         containment is None
-        or not containment.namespace_empty_verified
+        or not containment.cleanup_verified
         or not result.cleanup_succeeded
     ):
         raise IntegrityError(

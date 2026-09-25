@@ -139,6 +139,12 @@ does not capture or launch such capsules in this release.
 
 ### Evaluator phase isolation
 
+Standalone runs with no enabled safety tools may proceed after ordinary process
+group cleanup and candidate freeze. Their phase receipt records
+`process_group_cleaned`, without claiming credential revocation, private channels
+or full process-tree containment; they remain `safety_certified=false`. This
+exception cannot satisfy an enabled external safety tool's isolation gate.
+
 Before external safety evidence can influence a gate, the agent process tree
 must be gone, credentials and agent-visible tool channels revoked, and candidate
 source frozen read-only. The independent evaluator owns the GPU and artifact

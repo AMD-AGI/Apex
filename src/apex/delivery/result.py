@@ -249,6 +249,14 @@ class TaskResult:
         ):
             raise ValueError("GPU lease receipt requires its SHA-256 identity")
         lease = dict(self.gpu_lease)
+        if lease.get("schema_version") == "apex.assigned-gpu/v1":
+            runtime = lease.get("runtime")
+            if (lease.get("run_id") != self.run_id or lease.get("allocation_owner") != "caller"
+                    or lease.get("host_ownership_verified") is not False
+                    or not isinstance(runtime, Mapping) or not runtime.get("devices")
+                    or sha256_json(lease) != self.gpu_lease_receipt_digest):
+                raise ValueError("Assigned GPU runtime record is invalid")
+            return
         doctor = lease.get("doctor")
         owner_pid = lease.get("owner_pid")
         acquired = lease.get("acquired_unix_seconds")

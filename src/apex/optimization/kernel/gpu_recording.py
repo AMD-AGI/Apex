@@ -5,13 +5,37 @@ from __future__ import annotations
 from apex.core import IntegrityError, canonical_json_bytes
 from apex.runtime import GpuLeaseHeartbeatReceipt, GpuMeasurementBracketReceipt
 from apex.storage import ArtifactReceipt
+from apex.runtime.assigned_gpu import AssignedGpuLease, AssignedGpuMeasurement
+from apex.runtime import require_gpu_lease_heartbeat
+
+
+def check_kernel_gpu(run) -> None:
+    if not isinstance(run.gpu_lease_guard, AssignedGpuLease):
+        require_gpu_lease_heartbeat(run.gpu_lease_guard)
+
+
+def kernel_gpu_checkpoint(run, attempt_id: str, phase: str) -> ArtifactReceipt:
+    # Caller-assigned runs retain one startup record, not per-phase host probes.
+    if isinstance(run.gpu_lease_guard, AssignedGpuLease):
+        run.record.controller.record_domain_event(
+            "dependency_verified",
+            {**run.record.attempt_payload(attempt_id), "kind": "assigned_gpu", "phase": phase,
+             "artifacts": [{"role": "assigned_gpu", "receipt": run.gpu_lease_artifact.to_dict()}]},
+            idempotency_key=f"attempt.{attempt_id}.assigned_gpu.{phase}",
+        )
+        return run.gpu_lease_artifact
+    return record_gpu_lease_heartbeat(
+        run.record, require_gpu_lease_heartbeat(run.gpu_lease_guard),
+        attempt_id=attempt_id, phase=phase,
+    )
 
 
 def record_gpu_measurement_bracket(
     record,
-    bracket: GpuMeasurementBracketReceipt,
+    bracket: GpuMeasurementBracketReceipt | AssignedGpuMeasurement,
     *,
     attempt_id: str,
+    allocation: ArtifactReceipt | None = None,
 ) -> ArtifactReceipt:
     if bracket.run_id != record.run_id or bracket.action_id != attempt_id:
         raise IntegrityError(
@@ -29,7 +53,8 @@ def record_gpu_measurement_bracket(
             "lease_digest": bracket.lease_digest,
             "bracket_digest": bracket.digest,
             "artifacts": [
-                {"role": "gpu_measurement_bracket", "receipt": receipt.to_dict()}
+                {"role": "gpu_measurement_bracket", "receipt": receipt.to_dict()},
+                *([{"role": "assigned_gpu", "receipt": allocation.to_dict()}] if allocation else []),
             ],
         },
         idempotency_key=f"attempt.{attempt_id}.gpu_measurement_bracket",

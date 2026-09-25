@@ -34,7 +34,8 @@ def _read_source(path: Path, *, relative: str) -> str:
     if path.is_symlink() or not path.is_file():
         raise IntegrityError(f"Candidate source is not a regular file: {relative}", "invalid_candidate_source")
     try:
-        return path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8", newline="") as source:
+            return source.read()
     except UnicodeDecodeError as error:
         raise ContractError(f"Binary source bundles are unsupported: {relative}", "binary_source_unsupported") from error
 
@@ -47,7 +48,10 @@ def _unified_patch(baseline: str, candidate: str, relative: str) -> bytes:
         tofile=f"b/{relative}",
         lineterm="\n",
     )
-    return "".join(lines).encode("utf-8")
+    return "".join(
+        line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+        for line in lines
+    ).encode("utf-8")
 
 
 def _write_synced(path: Path, content: bytes) -> None:

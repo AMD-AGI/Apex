@@ -7,10 +7,25 @@ is the registry default; callers can explicitly select the other two without
 preflighting unrelated credentials.
 
 All adapters execute argv with `shell=False` through `SubprocessSupervisor`,
-drain stdout and stderr concurrently, bound captured output, and run both CLI
-identity discovery and candidate production inside an authoritative Linux PID
-namespace. They return normalized transcript events and never decide whether a
+drain stdout and stderr concurrently and bound captured output. CLI identity
+discovery and candidate production use the request's
+process policy: ordinary process groups for standalone kernel runs, or the
+existing Linux PID namespace for E2E and strict safety phases. They return
+normalized transcript events and never decide whether a
 candidate is correct or fast.
+
+Both policies enforce deadlines and exact-turn output boundaries before candidate
+capture. Ordinary cleanup terminates remaining members of the launched process
+group and reports `apex.process-group/v1`; it does not claim namespace isolation
+or containment of deliberately detached sessions. The task-owned container is
+the final lifetime boundary. `--init` is recommended to reap orphaned children.
+
+For an ordinary standalone request, the Codex adapter selects
+`--sandbox danger-full-access` so it does not create another namespace inside
+the caller's task container. Strict requests retain `workspace-write`. This is
+an explicit process policy, not a retry after sandbox failure. The caller owns
+the outer execution boundary; credential scoping, output limits and independent
+candidate verification still apply, without a sandbox claim in the receipt.
 
 Public API: `AgentRegistry`, `build_default_registry`, `SubprocessSupervisor`,
 `ProcessResult`, `build_subprocess_environment`,

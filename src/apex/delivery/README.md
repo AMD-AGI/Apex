@@ -1,5 +1,10 @@
 # Delivery
 
+Standalone results may carry `apex.assigned-gpu/v1` allocation metadata. This
+binds the visible-device startup check and caller allocation, not host ownership.
+It is validated separately from strict GPU lease receipts and does not elevate
+the bundle's external verification or safety certification status.
+
 ## Purpose
 
 `apex.delivery` turns independently measured source changes into machine-readable
@@ -218,6 +223,12 @@ package's independent verifier. Production still must inject reviewed
 implementations, plus a primary source-build/benchmark attestor, for each exact
 immutable image and vLLM/AITER repository set. There is deliberately no guessed
 recipe or fallback that mutates installed files.
+
+## Source patch bytes
+
+Kernel bundles preserve source line endings and encode missing final newlines
+with the standard patch marker. Applying a bundle must reproduce the exact
+candidate file hashes, including its final newline state.
 
 ## Provenance
 

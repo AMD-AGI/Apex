@@ -36,10 +36,11 @@ class StructuredKernelMeasurementAdapter:
     adapter_id = STRUCTURED_KERNEL_MEASUREMENT_ADAPTER_ID
     measurement_method_sha256 = STRUCTURED_KERNEL_MEASUREMENT_METHOD_SHA256
 
-    def __init__(self, supervisor: SubprocessSupervisor | None = None) -> None:
+    def __init__(self, supervisor: SubprocessSupervisor | None = None, *, require_pid_namespace: bool = True) -> None:
         self._supervisor = supervisor or SubprocessSupervisor(
             max_output_bytes=_MAX_REPORT_BYTES
         )
+        self._require_pid_namespace = require_pid_namespace
 
     def measure(self, request: KernelMeasurementRequest) -> KernelMeasurementOutput:
         if request.adapter_id != self.adapter_id:
@@ -64,12 +65,12 @@ class StructuredKernelMeasurementAdapter:
             cwd=request.runner_cwd,
             environment=environment,
             timeout_seconds=request.runner_timeout_seconds,
-            require_pid_namespace=True,
+            require_pid_namespace=self._require_pid_namespace,
         )
         containment = result.process_containment
         if (
             containment is None
-            or not containment.namespace_empty_verified
+            or not containment.cleanup_verified
             or not result.cleanup_succeeded
         ):
             raise IntegrityError(

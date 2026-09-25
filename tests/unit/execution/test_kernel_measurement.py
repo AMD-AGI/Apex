@@ -17,6 +17,7 @@ from apex.execution import (
     StructuredKernelMeasurementAdapter,
 )
 from apex.ports import KernelMeasurementRequest
+from apex.ports.process_group import ProcessGroupReceipt
 from apex.runtime import DependencyReceipt
 
 
@@ -35,7 +36,9 @@ class _Supervisor:
             stderr="",
             stdout_truncated=False,
             stderr_truncated=False,
-            process_containment=SimpleNamespace(namespace_empty_verified=True),
+            process_containment=(SimpleNamespace(namespace_empty_verified=True, cleanup_verified=True)
+                                 if kwargs["require_pid_namespace"] else
+                                 ProcessGroupReceipt(1234, "natural_exit", True)),
             cleanup_succeeded=True,
         )
 
@@ -116,11 +119,12 @@ def _request(tmp_path: Path) -> KernelMeasurementRequest:
     )
 
 
+@pytest.mark.parametrize("strict", [True, False])
 def test_adapter_captures_stdout_then_parent_writes_private_report(
-    tmp_path: Path,
+    tmp_path: Path, strict: bool,
 ) -> None:
     supervisor = _Supervisor(json.dumps(_report()))
-    adapter = StructuredKernelMeasurementAdapter(supervisor)  # type: ignore[arg-type]
+    adapter = StructuredKernelMeasurementAdapter(supervisor, require_pid_namespace=strict)
     request = _request(tmp_path)
 
     output = adapter.measure(request)
@@ -131,7 +135,7 @@ def test_adapter_captures_stdout_then_parent_writes_private_report(
     assert len(artifact.cases[0].reference.values_ms) == 300
     assert len(artifact.cases[0].optimized.values_ms) == 300
     call = supervisor.calls[0]
-    assert call["require_pid_namespace"] is True
+    assert call["require_pid_namespace"] is strict
     assert str(request.report_path) not in " ".join(call["argv"])  # type: ignore[arg-type]
     assert str(request.report_path) not in json.dumps(call["environment"])
 

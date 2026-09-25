@@ -623,6 +623,21 @@ def test_incomplete_phase_isolation_blocks_all_tools(tmp_path: Path) -> None:
     assert "phase_isolation_incomplete" in result.gate_errors
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_process_group_cleanup_only_satisfies_no_tool_plan(tmp_path: Path, enabled: bool) -> None:
+    scenario = _scenario(tmp_path, tools_enabled=enabled)
+    scenario.isolation = replace(
+        scenario.isolation, agent_process_tree_terminated=False,
+        credentials_revoked=False, tool_channels_revoked=False,
+        report_directory_hidden_from_agent=False, process_group_cleaned=True,
+    )
+    runner = _FakeRunner(lambda request: pytest.fail("no safety tool may run"))
+    result = SafetyGate(runner).evaluate(scenario.request())
+    assert not runner.calls
+    assert result.decision.reject is enabled
+    assert not result.decision.safety_certified
+
+
 def test_evaluator_artifacts_cannot_overlap_frozen_candidate(tmp_path: Path) -> None:
     scenario = _scenario(tmp_path)
     overlapping = scenario.frozen.root / "candidate-authored-evidence"

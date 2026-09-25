@@ -105,6 +105,10 @@ class AgentProcessContainmentReceipt:
             )
 
     @property
+    def cleanup_verified(self) -> bool:
+        return self.namespace_empty_verified
+
+    @property
     def namespace_empty_verified(self) -> bool:
         """Whether independent kernel and wrapper evidence proves quiescence."""
 

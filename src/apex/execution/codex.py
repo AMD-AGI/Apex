@@ -21,6 +21,7 @@ class CodexBackend:
 
     def run(self, request: AgentRequest) -> AgentResult:
         executable = require_executable("codex")
+        sandbox = "workspace-write" if request.require_pid_namespace else "danger-full-access"
         argv = [
             executable,
             "exec",
@@ -28,7 +29,7 @@ class CodexBackend:
             "--color",
             "never",
             "--sandbox",
-            "workspace-write",
+            sandbox,
             "--config",
             'approval_policy="never"',
             "--strict-config",
@@ -63,7 +64,7 @@ class CodexBackend:
                 "execpolicy_rules": "ignored",
                 "project_instructions": "backend_default_may_load",
                 "response_token_limit": "not_supported_context_advisory_only",
-                "sandbox": "workspace-write",
+                "sandbox": sandbox,
                 "session": "ephemeral",
                 "user_config": "ignored",
             },

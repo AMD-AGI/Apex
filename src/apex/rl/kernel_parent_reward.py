@@ -26,7 +26,7 @@ from apex.evaluation import (
 )
 from apex.storage import ArtifactReceipt, ArtifactStore
 
-from .kernel_measurement_validation import kernel_command_executable_frozen
+from .kernel_measurement_validation import kernel_command_executable_frozen, kernel_command_cleanup_verified
 from .models import EpisodeEvent, EvidenceClass
 
 
@@ -488,7 +488,7 @@ def _validate_command(
         document.get("phase") != phase
         or document.get("passed") is not passed
         or not isinstance(containment, Mapping)
-        or containment.get("namespace_empty_verified") is not True
+        or not kernel_command_cleanup_verified(document)
         or not kernel_command_executable_frozen(document)
     ):
         _reject("Kernel terminal gate evidence is invalid")

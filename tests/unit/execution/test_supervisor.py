@@ -40,17 +40,31 @@ def test_supervisor_drains_both_pipes_and_bounds_output(tmp_path: Path) -> None:
     assert len(result.stderr.encode()) < 5000
 
 
-def test_stream_budget_requires_pid_namespace(tmp_path: Path) -> None:
-    with pytest.raises(ContractError) as raised:
-        SubprocessSupervisor().run(
-            [sys.executable, "-c", "print('never')"],
-            cwd=tmp_path,
-            environment=os.environ,
-            timeout_seconds=1,
-            stdout_budget=lambda _: True,
-        )
+def test_stream_budget_stops_ordinary_process_group(tmp_path: Path) -> None:
+    result = SubprocessSupervisor().run(
+        [sys.executable, "-c", "import time; print('stop', flush=True); time.sleep(60)"],
+        cwd=tmp_path, environment=os.environ, timeout_seconds=5,
+        stdout_budget=lambda _: True,
+    )
+    assert result.observer_stopped and not result.timed_out
+    assert result.cleanup_succeeded
+    assert result.process_containment.policy_id == "process_group_v1"
+    assert result.process_containment.cleanup_verified
+    assert "namespace_empty_verified" not in result.process_containment.to_dict()
 
-    assert raised.value.reason_code == "agent_process_containment_required"
+
+def test_interrupt_cleans_ordinary_process(tmp_path: Path, monkeypatch) -> None:
+    processes = []
+    def interrupt(process, **kwargs):
+        processes.append(process)
+        raise KeyboardInterrupt
+    supervisor = SubprocessSupervisor()
+    monkeypatch.setattr(supervisor, "_wait_contained", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.run([sys.executable, "-c", "import time; time.sleep(60)"],
+                       cwd=tmp_path, environment=os.environ, timeout_seconds=10)
+    assert processes[0].poll() is not None
+    assert not supervisor._group_exists(processes[0].pid)
 
 
 def test_missing_bubblewrap_fails_before_agent_execution(

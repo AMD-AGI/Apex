@@ -16,6 +16,7 @@ from apex.execution import (
 from apex.execution.claude import ClaudeBackend
 from apex.execution.codex import CodexBackend
 from apex.execution.cursor import CursorBackend
+from apex.ports.process_group import ProcessGroupReceipt
 from apex.ports import (
     AGENT_PROCESS_CONTAINMENT_POLICY,
     AgentCaptureStatus,
@@ -127,7 +128,9 @@ class FakeSupervisor:
             duration_seconds=0.1,
             observer_stopped=observer_stopped,
             observer_termination_started=observer_stopped,
-            process_containment=_containment(stopped=observer_stopped),
+            process_containment=(_containment(stopped=observer_stopped) if require_pid_namespace else
+                                 ProcessGroupReceipt(1234, "stdout_budget_boundary" if observer_stopped
+                                                     else "natural_exit", self.cleanup_succeeded)),
             cleanup_succeeded=self.cleanup_succeeded,
         )
 
@@ -221,6 +224,17 @@ def test_codex_uses_stdin_ephemeral_process_and_hides_other_backend_secrets(
     assert "LD_PRELOAD" not in environment
     assert "PYTHONPATH" not in environment
     assert environment["PYTHONNOUSERSITE"] == "1"
+
+
+def test_ordinary_codex_uses_caller_execution_boundary(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("apex.execution.codex.require_executable", lambda _: sys.executable)
+    supervisor = FakeSupervisor()
+    result = CodexBackend(supervisor).run(replace(_request(tmp_path), require_pid_namespace=False))
+    assert result.succeeded
+    assert supervisor.pid_namespace_requests == [False, False]
+    assert dict(result.invocation.isolation)["sandbox"] == "danger-full-access"
+    assert "danger-full-access" in supervisor.call["argv"]
+    assert result.process_containment.policy_id == "process_group_v1"
 
 
 @pytest.mark.parametrize(

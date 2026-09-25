@@ -49,6 +49,16 @@ delivery.
 
 ## Install
 
+Standalone single-kernel runs use the caller's visible GPUs and ordinary process
+groups by default. A startup tensor operation checks GPU access and architecture;
+the scheduler or operator owns exclusive allocation and final job teardown.
+No host PID sharing, GPU-owner scan, or nested PID namespace is required for this
+path. Deadlines, bounded output, turn limits, candidate freeze, independent
+correctness checks, and measurement validation still apply. Run these jobs in a
+task-owned container; process groups are cleanup, not a hostile-code sandbox.
+E2E workflows retain their existing GPU ownership and isolation requirements.
+See [runtime](src/apex/runtime/README.md) for the distinct evidence formats.
+
 Prerequisites are Linux, Python 3.10 or newer, Git, Docker for container workloads,
 and a supported AMD ROCm environment for real measurements. Install and verify the
 exact reviewed Magpie, TraceLens, and InferenceX revisions plus the vLLM and AITER

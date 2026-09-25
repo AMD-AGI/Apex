@@ -14,6 +14,7 @@ from typing import Callable, Mapping, Sequence
 
 from apex.core import ContractError
 from apex.ports import AgentProcessContainmentReceipt
+from apex.ports.process_group import ProcessGroupReceipt
 
 from .containment import (
     ActivePidNamespace,
@@ -38,7 +39,7 @@ class ProcessResult:
     duration_seconds: float
     observer_stopped: bool = False
     observer_termination_started: bool = False
-    process_containment: AgentProcessContainmentReceipt | None = None
+    process_containment: AgentProcessContainmentReceipt | ProcessGroupReceipt | None = None
     cleanup_succeeded: bool = True
     discarded_stdout_lines: int = 0
     discarded_stdout_bytes: int = 0
@@ -108,11 +109,6 @@ class SubprocessSupervisor:
     ) -> ProcessResult:
         command = tuple(argv)
         self._validate(command, cwd, timeout_seconds)
-        if stdout_budget is not None and not require_pid_namespace:
-            raise ContractError(
-                "Streaming agent budgets require PID namespace containment",
-                "agent_process_containment_required",
-            )
         started = time.monotonic()
         process, boundary = self._start_process(
             command,
@@ -180,14 +176,26 @@ class SubprocessSupervisor:
         observer_stop: threading.Event,
         readers: tuple[threading.Thread, threading.Thread],
         timeout_seconds: int,
-    ) -> tuple[bool, bool, AgentProcessContainmentReceipt | None, bool]:
+    ) -> tuple[bool, bool, AgentProcessContainmentReceipt | ProcessGroupReceipt, bool]:
         if boundary is None:
-            timed_out = self._wait_uncontained(process, timeout_seconds)
+            try:
+                timed_out, stopped = self._wait_contained(
+                    process, observer_stop=observer_stop, timeout_seconds=timeout_seconds
+                )
+            except BaseException:
+                self._terminate_group(process)
+                self._finish_readers(process.pid, readers, contained=False)
+                self._reap_process_group(process.pid)
+                raise
+            if timed_out or stopped:
+                self._terminate_group(process)
             readers_finished = self._finish_readers(
                 process.pid, readers, contained=False
             )
             cleanup = readers_finished and self._reap_process_group(process.pid)
-            return timed_out, False, None, cleanup
+            stopped = observer_stop.is_set()
+            reason = "timeout" if timed_out else "stdout_budget_boundary" if stopped else "natural_exit"
+            return timed_out, stopped, ProcessGroupReceipt(process.pid, reason, cleanup), cleanup
         timed_out, observer_started = self._wait_contained(
             process,
             observer_stop=observer_stop,
@@ -315,9 +323,10 @@ class SubprocessSupervisor:
                         except Exception:  # pragma: no cover - defensive fail-closed boundary
                             should_stop = True
                         if should_stop:
-                            if boundary is None:
-                                raise RuntimeError("stream boundary lacks process containment")
                             observer_stop.set()
+                            if boundary is None:
+                                # The waiting thread terminates and reaps the group.
+                                continue
                             try:
                                 boundary.terminate_now()
                             except Exception:
@@ -358,16 +367,6 @@ class SubprocessSupervisor:
                 return True, False
             if observer_stop.wait(timeout=min(remaining, 0.05)):
                 return False, True
-
-    def _wait_uncontained(
-        self, process: subprocess.Popen[str], timeout_seconds: int
-    ) -> bool:
-        try:
-            process.wait(timeout=timeout_seconds)
-            return False
-        except subprocess.TimeoutExpired:
-            self._terminate_group(process)
-            return True
 
     def _terminate_group(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:

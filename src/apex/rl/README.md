@@ -1,5 +1,11 @@
 # RL
 
+Standalone replay accepts both strict namespace/lease evidence and ordinary
+process-group/assigned-GPU records. Ordinary measurement intervals must bind the
+same allocation digest and action, and command evidence must still establish
+cleanup and frozen executable identity. Formal backend qualification continues
+to require its existing strict evidence; these records do not grant that status.
+
 This package makes Apex's canonical journal useful for post-training without
 creating another run writer. `EpisodeGraphMaterializer` verifies the SQLite
 event chain and every declared `ArtifactReceipt`, then projects one standalone

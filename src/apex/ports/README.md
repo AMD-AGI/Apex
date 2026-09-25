@@ -67,7 +67,9 @@ effort is rejected instead of being silently ignored.
 `AgentCaptureStatus.CREDENTIAL_REDACTED` is a fail-closed outcome: exact backend
 credential values were removed before transcript construction, and the result
 is ineligible for candidate capture.
-`AgentInvocationReceipt` declares `private_pid_namespace_init_pidfd_v1`, while
+`AgentInvocationReceipt` declares the selected process policy. Ordinary standalone
+requests use `process_group_v1` with `ProcessGroupReceipt` (group ID, termination
+reason, cleanup result). Strict requests use `private_pid_namespace_init_pidfd_v1`;
 `AgentProcessContainmentReceipt` separately records the live namespace-init,
 pidfd, private-procfs, wrapper/status-FD, and zero-member teardown proof. A
 candidate cannot cross source freeze without a complete runtime receipt, whether

@@ -16,6 +16,7 @@ from .agent_containment import (
     AgentProcessContainmentReceipt,
 )
 from .agent_authority import AgentExecutionAuthorityReceipt
+from .process_group import PROCESS_GROUP_POLICY, ProcessGroupReceipt
 
 
 _SEMANTIC_EVENT_KINDS = {"agent_message", "tool_called", "tool_result"}
@@ -209,8 +210,11 @@ class AgentRequest:
     timeout_seconds: int = 3600
     environment: Mapping[str, str] = field(default_factory=dict)
     runtime_closure_sha256: str | None = None
+    require_pid_namespace: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.require_pid_namespace) is not bool:
+            raise ContractError("Invalid process policy", "invalid_agent_invocation")
         if self.execution_authority is not None and not isinstance(
             self.execution_authority, AgentExecutionAuthorityReceipt
         ):
@@ -372,7 +376,7 @@ class AgentResult:
     termination_reason: str | None = None
     observed_turns: int = 0
     observer_stop_sent: bool = False
-    process_containment: AgentProcessContainmentReceipt | None = None
+    process_containment: AgentProcessContainmentReceipt | ProcessGroupReceipt | None = None
     discarded_stdout_lines: int = 0
     discarded_stdout_bytes: int = 0
     discarded_stdout_sha256: str | None = None
@@ -402,7 +406,7 @@ class AgentResult:
         if not isinstance(self.observer_stop_sent, bool):
             raise ContractError("Agent observer evidence is invalid", "invalid_agent_result")
         if self.process_containment is not None and not isinstance(
-            self.process_containment, AgentProcessContainmentReceipt
+            self.process_containment, (AgentProcessContainmentReceipt, ProcessGroupReceipt)
         ):
             raise ContractError(
                 "Agent process containment receipt is invalid", "invalid_agent_result"
@@ -455,7 +459,7 @@ class AgentResult:
             invocation is None
             or invocation.turn_policy != STRUCTURED_TURN_CHECKPOINT_POLICY
             or invocation.process_containment_policy_id
-            != AGENT_PROCESS_CONTAINMENT_POLICY
+            not in {AGENT_PROCESS_CONTAINMENT_POLICY, PROCESS_GROUP_POLICY}
             or self.observed_turns != invocation.max_turns
             or self.termination_reason != "max_turns_exact_boundary"
         ):
@@ -471,7 +475,7 @@ class AgentResult:
         )
         contained = (
             self.process_containment is not None
-            and self.process_containment.namespace_empty_verified
+            and self.process_containment.cleanup_verified
         )
         return contained and self.capture_status is AgentCaptureStatus.COMPLETE and (
             self._completed_successfully or exact_boundary
@@ -489,7 +493,7 @@ class AgentResult:
             return "agent_credential_leak_redacted"
         if (
             self.process_containment is None
-            or not self.process_containment.namespace_empty_verified
+            or not self.process_containment.cleanup_verified
         ):
             return "agent_process_containment_unverified"
         if (

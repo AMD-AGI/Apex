@@ -28,6 +28,7 @@ from apex.execution import AgentRegistry
 from apex.intake import ResolvedTaskSpec, TaskSpec
 from apex.ports import (
     AgentTerminationKind,
+    AgentProcessContainmentReceipt,
     KernelDiagnosticsPort,
     KernelMeasurementPort,
     SafetyToolRunRequest,
@@ -40,8 +41,8 @@ from apex.runtime import (
     GpuLease,
     GpuLeaseManager,
     LocalGpuLeaseManager,
-    require_gpu_lease_heartbeat,
 )
+from apex.runtime.assigned_gpu import AssignedGpuLease, AssignedGpuLeaseManager
 from apex.storage import ArtifactReceipt
 
 from ..execution_identity_recording import record_apex_execution_identity
@@ -70,7 +71,7 @@ from .lifecycle import (
     safety_gate_request,
 )
 from .formal_measurement_recording import record_measurement_error
-from .gpu_recording import record_gpu_lease_heartbeat
+from .gpu_recording import kernel_gpu_checkpoint
 from .lease_measurement import LeaseMeasurementExecution, execute_lease_measurement
 from .run_record import KernelRunRecord
 from .safety_bridge import (
@@ -101,7 +102,7 @@ class KernelOptimizeUseCase:
         safety_gate: SafetyVerificationPort[SafetyGateRequest, SafetyGateResult] | None = None,
         safety_policy: VerificationPolicy | None = None,
         safety_tools: Sequence[ToolVerificationPlan] = (),
-        gpu_leases: GpuLeaseManager | None = None,
+        gpu_leases: GpuLeaseManager | AssignedGpuLeaseManager | None = None,
         measurement_evaluator: KernelMeasurementPort | None = None,
         diagnostics_evaluator: KernelDiagnosticsPort | None = None,
         evaluation_authorizer: EvaluationContractAuthorizer | None = None,
@@ -109,7 +110,7 @@ class KernelOptimizeUseCase:
         execution_identity: ApexExecutionIdentity,
     ) -> None:
         self._agents = agents
-        self._verifier = verifier or CandidateVerifier()
+        self._verifier = verifier or CandidateVerifier(require_pid_namespace=bool(safety_tools))
         self._contexts = contexts or KernelContextBuilder()
         self._safety_policy = safety_policy or VerificationPolicy.no_tools()
         self._safety_tools = tuple(safety_tools)
@@ -124,7 +125,9 @@ class KernelOptimizeUseCase:
                 reason_code="safety_plan_tool_set_mismatch",
             )
         self._safety_gate = safety_gate or SafetyGate(_UnexpectedSafetyRunner())
-        self._gpu_leases = gpu_leases or LocalGpuLeaseManager()
+        self._gpu_leases = gpu_leases or (
+            LocalGpuLeaseManager() if safety_tools else AssignedGpuLeaseManager()
+        )
         self._measurement_evaluator = measurement_evaluator
         self._diagnostics_evaluator = diagnostics_evaluator
         self._formal_contracts = KernelFormalContractResolver(
@@ -167,6 +170,12 @@ class KernelOptimizeUseCase:
                     {"evaluation_contract_digest": contract.digest},
                 )
             with self._gpu_leases.acquire(run_id) as lease:
+                if isinstance(lease, AssignedGpuLease):
+                    expected = request.task.gpu_arch
+                    if any(str(d.get("arch", "")).split(":")[0] != expected
+                           for d in lease.receipt.runtime["devices"]):
+                        raise ContractError("Assigned GPU architecture differs from task",
+                                            "assigned_gpu_arch_mismatch")
                 return self._run(request, resolved, contract, run_id, lease)
         except ApexError as error:
             result = failure_result(
@@ -184,7 +193,7 @@ class KernelOptimizeUseCase:
         resolved: ResolvedTaskSpec,
         evaluation_contract: EvaluationContractReceipt,
         run_id: str,
-        gpu_lease: GpuLease,
+        gpu_lease: GpuLease | AssignedGpuLease,
     ) -> TaskResult:
         session = self._start_session(
             request, resolved, evaluation_contract, run_id, gpu_lease
@@ -211,7 +220,7 @@ class KernelOptimizeUseCase:
         resolved: ResolvedTaskSpec,
         evaluation_contract: EvaluationContractReceipt,
         run_id: str,
-        gpu_lease: GpuLease,
+        gpu_lease: GpuLease | AssignedGpuLease,
     ) -> RunSession:
         run_root = request.task.results_dir / "runs" / run_id
         record = KernelRunRecord.create(
@@ -244,6 +253,7 @@ class KernelOptimizeUseCase:
             receipt,
             lease_artifact,
             gpu_lease,
+            bool(self._safety_tools),
         )
 
     def _execute_search(self, session: RunSession) -> TaskResult:
@@ -257,13 +267,7 @@ class KernelOptimizeUseCase:
         frozen = tuple(outcomes)
         best = select_best(frozen)
         terminal_attempt = best or frozen[-1]
-        heartbeat = require_gpu_lease_heartbeat(session.gpu_lease_guard)
-        record_gpu_lease_heartbeat(
-            session.record,
-            heartbeat,
-            attempt_id=terminal_attempt.attempt_id,
-            phase="terminal",
-        )
+        kernel_gpu_checkpoint(session, terminal_attempt.attempt_id, "terminal")
         if best is not None:
             return deliver_best(session, frozen, best)
         return finish_without_candidate(session, frozen)
@@ -310,10 +314,13 @@ class KernelOptimizeUseCase:
         )
         receipts = run.record.record_agent(attempt.attempt_id, result=result)
         evidence = (attempt.context.packet_receipt, *receipts)
-        if result.candidate_capture_allowed:
+        strict_cleanup = not run.require_pid_namespace or isinstance(
+            result.process_containment, AgentProcessContainmentReceipt
+        )
+        if result.candidate_capture_allowed and strict_cleanup:
             return evidence
         status = agent_failure_status(result.termination_kind)
-        reason = result.candidate_rejection_reason or "agent_failed"
+        reason = result.candidate_rejection_reason or "agent_containment_policy_mismatch"
         return close_attempt(
             attempt,
             status,

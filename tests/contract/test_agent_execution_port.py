@@ -66,6 +66,20 @@ def test_agent_result_defaults_preserve_minimal_fake_backends() -> None:
     assert result.effort is None
 
 
+def test_ordinary_cleanup_must_match_declared_policy() -> None:
+    from apex.ports.process_group import ProcessGroupReceipt, PROCESS_GROUP_POLICY
+    result = AgentResult(
+        AgentBackendName.CODEX, None, 0, False, (), "", "", 0.1,
+        invocation=replace(_invocation(), process_containment_policy_id=PROCESS_GROUP_POLICY),
+        process_containment=ProcessGroupReceipt(123, "natural_exit", True),
+    )
+    assert result.candidate_capture_allowed
+    with pytest.raises(ContractError, match="policy evidence is inconsistent"):
+        replace(result, invocation=_invocation())
+    assert not replace(result, process_containment=ProcessGroupReceipt(
+        123, "natural_exit", False)).candidate_capture_allowed
+
+
 def test_normalized_agent_evidence_validates_lineage_and_numeric_domain() -> None:
     usage = AgentUsage(input_tokens=10, output_tokens=5, source_event_indices=(2,))
     cost = AgentCost("0.0100", "usd", 2, "total_cost_usd")

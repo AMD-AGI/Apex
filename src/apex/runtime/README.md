@@ -147,6 +147,28 @@ helpers or silently change repository identity.
 
 ## GPU ownership boundary
 
+### Standalone kernel default
+
+`AssignedGpuLeaseManager` in `assigned_gpu.py` uses caller-assigned visible GPUs.
+It performs one real tensor operation on every visible device when the run
+starts; the kernel controller checks the requested architecture. It serializes
+runs in the same controller but does not allocate devices or inspect host PIDs,
+KFD owners, cgroups, or global contention. The operator/scheduler must allocate
+the GPUs and prevent overlapping jobs. No repeated ownership heartbeat is used.
+
+The `apex.assigned-gpu/v1` record binds the run, visible-device environment,
+inventory and startup time, with `allocation_owner=caller` and
+`host_ownership_verified=false`. `apex.assigned-gpu-measurement/v1` binds each
+measurement interval to that record; it makes no exclusivity or health claim.
+Missing GPU access or an architecture mismatch fails before invoking the agent.
+Use `tests/unit/runtime/test_assigned_gpu.py` and
+`tests/integration/test_ordinary_kernel_runtime.py` for focused CPU coverage.
+
+### Strict E2E ownership
+
+The following ownership and heartbeat implementation remains in use for E2E
+and explicit strict-runtime callers; it is not a standalone-kernel prerequisite.
+
 AMD exposes several unrelated number spaces: an HSA/ROCR GPU ordinal, a KFD node,
 a DRM render minor, and a ROCm SMI monitoring index. Apex never assumes those
 indices have the same order. A fixed-argv fresh Python helper removes

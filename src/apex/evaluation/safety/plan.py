@@ -409,6 +409,7 @@ class PhaseIsolationReceipt:
     candidate_read_only: bool
     producer: str = "apex-controller"
     schema_version: str = ISOLATION_SCHEMA_VERSION
+    process_group_cleaned: bool = False
 
     def __post_init__(self) -> None:
         if self.schema_version != ISOLATION_SCHEMA_VERSION:
@@ -449,6 +450,7 @@ class PhaseIsolationReceipt:
 
     def _body(self) -> dict[str, object]:
         return {
+            **({"process_group_cleaned": True} if self.process_group_cleaned else {}),
             "schema_version": self.schema_version,
             "run_id": self.run_id,
             "plan_fingerprint": self.plan_fingerprint,
@@ -483,6 +485,7 @@ class PhaseIsolationReceipt:
             report_directory_hidden_from_agent=value.get("report_directory_hidden_from_agent") is True,
             candidate_read_only=value.get("candidate_read_only") is True,
             producer=str(value.get("producer", "")),
+            process_group_cleaned=value.get("process_group_cleaned") is True,
         )
         if value.get("receipt_fingerprint") != receipt.fingerprint:
             raise ContractError("phase isolation receipt fingerprint mismatch", "phase_isolation_tampered")

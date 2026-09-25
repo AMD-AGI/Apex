@@ -21,6 +21,7 @@ from apex.knowledge import ExperienceIdentity, ExperienceOutcome
 from apex.orchestration import RunController, RunPhase
 from apex.ports import AgentResult
 from apex.runtime import GpuLeaseReceipt
+from apex.runtime.assigned_gpu import AssignedGpuReceipt
 from apex.storage import (
     ArtifactReceipt,
     ArtifactStore,
@@ -81,7 +82,7 @@ class KernelRunRecord:
 
     def record_gpu_lease(
         self,
-        lease: GpuLeaseReceipt,
+        lease: GpuLeaseReceipt | AssignedGpuReceipt,
         *,
         attempt_id: str | None = None,
         phase: str | None = None,

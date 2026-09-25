@@ -157,11 +157,12 @@ def phase_isolation_receipt(
         evaluator_artifact_root=str(
             attempt.run.run_root / "safety" / attempt.attempt_id
         ),
-        agent_process_tree_terminated=True,
-        credentials_revoked=True,
-        tool_channels_revoked=True,
-        report_directory_hidden_from_agent=True,
+        agent_process_tree_terminated=attempt.run.require_pid_namespace,
+        credentials_revoked=attempt.run.require_pid_namespace,
+        tool_channels_revoked=attempt.run.require_pid_namespace,
+        report_directory_hidden_from_agent=attempt.run.require_pid_namespace,
         candidate_read_only=True,
+        process_group_cleaned=not attempt.run.require_pid_namespace,
     )
 
 
