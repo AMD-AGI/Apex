@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "Multi-retriever RAG MCP server for AMD GPU kernel optimization"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "pymupdf>=1.24.0",
     "pdfplumber>=0.10.0",
     "chromadb",
